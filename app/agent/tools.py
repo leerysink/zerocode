@@ -72,9 +72,14 @@ async def execute_tool(ctx: ToolContext, name: str, args: dict) -> dict:
     if name == "write_file":
         rel = args.get("path")
         f = resolve_in_workspace(ctx.root, rel)
+        if f == Path(ctx.root).resolve() or f.is_dir():
+            raise ToolError(f"路径必须是文件: {args.get('path')}")
         content = str(args.get("content") or "")
         existed = f.exists()
-        before = f.read_text(encoding="utf-8") if existed else ""
+        try:
+            before = f.read_text(encoding="utf-8") if existed else ""
+        except UnicodeDecodeError:
+            raise ToolError(f"文件不是 UTF-8 编码，拒绝覆盖: {args.get('path')}")
         f.parent.mkdir(parents=True, exist_ok=True)
         f.write_text(content, encoding="utf-8")
         await _record_change(ctx, str(f.relative_to(ctx.root)), "edit" if existed else "create", before, content)
@@ -85,8 +90,13 @@ async def execute_tool(ctx: ToolContext, name: str, args: dict) -> dict:
         f = resolve_in_workspace(ctx.root, rel)
         if not f.is_file():
             raise ToolError(f"文件不存在: {args.get('path')}")
+        if f.suffix.lower() in BINARY_EXTS:
+            raise ToolError(f"不支持编辑二进制文件: {args.get('path')}")
         old, new = str(args.get("old_string")), str(args.get("new_string"))
-        content = f.read_text(encoding="utf-8", errors="replace")
+        try:
+            content = f.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            raise ToolError(f"文件不是 UTF-8 编码，拒绝编辑: {args.get('path')}")
         n = content.count(old)
         if n == 0:
             raise ToolError("old_string 未找到匹配")

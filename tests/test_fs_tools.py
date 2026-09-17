@@ -53,3 +53,31 @@ async def test_read_limits(tmp_path):
     (tmp_path / "ok.txt").write_text("好的", encoding="utf-8")
     r = await execute_tool(ctx, "read_file", {"path": "ok.txt"})
     assert "好的" in r["content"]
+
+@pytest.mark.asyncio
+async def test_edit_rejects_non_utf8(tmp_path):
+    ctx = make_ctx(tmp_path)
+    p = tmp_path / "gbk.txt"
+    raw = "print('hi')  # ".encode("utf-8") + "中文注释".encode("gbk")  # 含非法 UTF-8 字节
+    p.write_bytes(raw)
+    with pytest.raises(ToolError):
+        await execute_tool(ctx, "edit_file", {"path": "gbk.txt", "old_string": "print", "new_string": "pass"})
+    assert p.read_bytes() == raw  # 字节级比对：原文未变
+    # 二进制扩展名守卫：字节恰为合法 UTF-8 也必须拒绝
+    q = tmp_path / "img.png"
+    q.write_bytes(b"hello png")
+    with pytest.raises(ToolError):
+        await execute_tool(ctx, "edit_file", {"path": "img.png", "old_string": "hello", "new_string": "x"})
+    assert q.read_bytes() == b"hello png"
+
+@pytest.mark.asyncio
+async def test_write_rejects_non_utf8_and_root(tmp_path):
+    ctx = make_ctx(tmp_path)
+    p = tmp_path / "gbk.txt"
+    raw = "中文".encode("gbk")  # 非法 UTF-8 字节
+    p.write_bytes(raw)
+    with pytest.raises(ToolError):
+        await execute_tool(ctx, "write_file", {"path": "gbk.txt", "content": "new"})
+    assert p.read_bytes() == raw  # 拒绝覆写：原文未变
+    with pytest.raises(ToolError):  # root 目录守卫：path 为空指向工作区根（目录）
+        await execute_tool(ctx, "write_file", {"path": "", "content": "x"})
