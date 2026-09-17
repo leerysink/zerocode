@@ -1,6 +1,6 @@
 """WS 聊天端点 /ws/chat/{session_id}。
 
-上行：user_message / ask_answer / ask_choice / confirm / cancel；
+上行：user_message / ask_submit / confirm / cancel；
 下行：token / tool_call / tool_result / ask_user / confirm_request /
 message_done / error / status / file_change（由 runner 与 hub 经 emit 下发）。
 
@@ -85,10 +85,8 @@ async def ws_chat(ws: WebSocket, session_id: int):
                         hub.cancel_events.pop(session_id, None)
 
                 asyncio.create_task(run_task(text_))
-            elif t == "ask_answer":
-                await hub.answer(session_id, msg.get("text", ""))
-            elif t == "ask_choice":
-                await hub.choose(session_id, msg.get("option", ""))
+            elif t == "ask_submit":
+                await hub.submit_answers(session_id, msg.get("answers") or [])
             elif t == "confirm":
                 await hub.resolve_confirm(session_id, bool(msg.get("approved")))
             elif t == "cancel":

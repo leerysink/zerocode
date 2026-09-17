@@ -47,7 +47,7 @@ def test_ws_ask_flow(client):
     client.app.state.llm_factory = lambda cfg: ScriptedLLM([
         done(None, [{"id": "c1", "function": {
             "name": "ask_user",
-            "arguments": json.dumps({"question": "选哪个", "options": ["A", "B"]}, ensure_ascii=False)}}]),
+            "arguments": json.dumps({"questions": [{"question": "选哪个", "options": [{"label": "A"}]}]}, ensure_ascii=False)}}]),
         done("好的，按 A 继续"),
     ])
     with client.websocket_connect(f"/ws/chat/{client.zc_sid}") as ws:
@@ -58,18 +58,40 @@ def test_ws_ask_flow(client):
             if ev["type"] == "ask_user":
                 got = ev
                 break
-        assert got and got["question"] == "选哪个"
-        ws.send_json({"type": "ask_choice", "option": "A"})
+        assert got and got["questions"][0]["question"] == "选哪个"
+        ws.send_json({"type": "ask_submit", "answers": [{"options": ["A"]}]})
         seen_result = seen_done = False
         for _ in range(8):
             ev = ws.receive_json()
             if ev["type"] == "tool_result":
                 seen_result = True
-                assert ev["result"]["option"] == "A"
+                assert ev["result"]["answers"] == [{"options": ["A"]}]
             if ev["type"] == "message_done":
                 seen_done = True
                 break
         assert seen_result and seen_done
+
+def test_ws_multi_question_submit(client):
+    client.app.state.llm_factory = lambda cfg: ScriptedLLM([
+        done(None, [{"id": "c1", "function": {
+            "name": "ask_user", "arguments": json.dumps({"questions": [
+                {"question": "用哪种库", "options": [{"label": "X", "recommended": True}, {"label": "Y"}],
+                 "multi_select": False},
+                {"question": "补充说明？"}]}, ensure_ascii=False)}}]),
+        done("按回答继续"),
+    ])
+    with client.websocket_connect(f"/ws/chat/{client.zc_sid}") as ws:
+        ws.send_json({"type": "user_message", "content": "提问"})
+        for _ in range(6):
+            ev = ws.receive_json()
+            if ev["type"] == "ask_user":
+                break
+        assert len(ev["questions"]) == 2
+        ws.send_json({"type": "ask_submit", "answers": [{"options": ["X"]}, {"answer": "无"}]})
+        for _ in range(8):
+            ev = ws.receive_json()
+            if ev["type"] == "message_done":
+                break
 
 def test_ws_busy_rejected(client):
     client.app.state.llm_factory = lambda cfg: ScriptedLLM([
@@ -119,7 +141,7 @@ def test_ws_cross_session_emit_isolation(client):
                 break
         # A 挂在 ask 上；B 会话此刻连入（旧代码在此抢走全局单槽 hub.emit）
         with client.websocket_connect(f"/ws/chat/{sid_b}") as ws_b:
-            ws_a.send_json({"type": "ask_choice", "option": "x"})
+            ws_a.send_json({"type": "ask_submit", "answers": [{"options": ["x"]}]})
             ws_b.send_json({"type": "user_message", "content": "B 开始"})
             # B 读到终态 status 为止：只能看到 B 自己的 message_done("B完成")；
             # 修复前这里会先串入 A 的 tool_result + message_done("A完成") + status(idle)
@@ -137,7 +159,7 @@ def test_ws_cross_session_emit_isolation(client):
         got_tail = saw_status_a = False
         for _ in range(8):
             ev = ws_a.receive_json()
-            if ev["type"] == "tool_result" and ev["result"]["option"] == "x":
+            if ev["type"] == "tool_result" and ev["result"]["answers"] == [{"options": ["x"]}]:
                 got_tail = True
             if ev["type"] == "message_done" and ev["content"] == "A完成":
                 got_tail = True
@@ -186,7 +208,7 @@ def test_run_task_marks_running(client):
     client.app.state.llm_factory = lambda cfg: ScriptedLLM([
         done(None, [{"id": "c1", "function": {
             "name": "ask_user",
-            "arguments": json.dumps({"question": "中间态", "options": ["A"]}, ensure_ascii=False)}}]),
+            "arguments": json.dumps({"questions": [{"question": "选哪个", "options": [{"label": "A"}]}]}, ensure_ascii=False)}}]),
         done("完成"),
     ])
     sid = client.zc_sid
@@ -199,7 +221,7 @@ def test_run_task_marks_running(client):
         assert ev["type"] == "ask_user"
         # ask 挂起中（G2 timeout=0 不限时）：执行中状态已落库，watchdog 才有匹配对象
         assert _db_status_dev(sid) == "running"
-        ws.send_json({"type": "ask_choice", "option": "A"})
+        ws.send_json({"type": "ask_submit", "answers": [{"options": ["A"]}]})
         for _ in range(8):
             ev = ws.receive_json()
             if ev["type"] == "status":  # 终态 status 事件在 runner._set_status 落库之后发出

@@ -72,21 +72,31 @@ async def test_write_file_flow(test_engine, tmp_path):
 
 @pytest.mark.asyncio
 async def test_ask_user_resume(test_engine, tmp_path):
-    async def ask_ok(session_id, question, options, timeout):
-        return {"option": "方案A", "answer": "方案A"}
-    turns = [done(None, [tool_call("c1", "ask_user", question="选哪个", options=["方案A", "方案B"])]),
-             done("好的按方案A")]
+    async def ask_ok(session_id, questions, timeout):
+        return {"answers": [{"options": ["方案A"]}]}
+    turns = [done(None, [tool_call("c1", "ask_user", questions=[
+        {"question": "选哪个", "options": [{"label": "方案A", "recommended": True}, {"label": "方案B"}]}])]),
+        done("好的按方案A")]
     sid, status, evs, sf = await run_once(test_engine, tmp_path, turns, ask=ask_ok)
     assert status == "idle"
-    # 校验模型第二轮收到了 tool 结果（含 方案A）
     async with sf() as s:
         row = (await s.execute(sql(
             "SELECT tool_result FROM message WHERE session_id=:i AND role='tool'"), {"i": sid})).scalar()
-    assert row["option"] == "方案A"
+    assert row["answers"] == [{"options": ["方案A"]}]
+
+@pytest.mark.asyncio
+async def test_ask_user_legacy_args_wrapped(test_engine, tmp_path):
+    # 旧参数（question/options 为字符串）自动包装为单题，保证模型误用时对话不断
+    async def ask_ok(session_id, questions, timeout):
+        assert questions == [{"question": "选哪个", "options": [{"label": "A"}]}]
+        return {"answers": [{"options": ["A"]}]}
+    turns = [done(None, [tool_call("c1", "ask_user", question="选哪个", options=["A"])]), done("ok")]
+    sid, status, evs, sf = await run_once(test_engine, tmp_path, turns, ask=ask_ok)
+    assert status == "idle"
 
 @pytest.mark.asyncio
 async def test_ask_user_cancelled(test_engine, tmp_path):
-    async def ask_none(session_id, question, options, timeout):
+    async def ask_none(session_id, questions, timeout):
         return None
     turns = [done(None, [tool_call("c1", "ask_user", question="?")]), done("好的，已取消该问题")]
     sid, status, evs, sf = await run_once(test_engine, tmp_path, turns, ask=ask_none)
@@ -115,7 +125,7 @@ async def test_max_rounds(test_engine, tmp_path):
 @pytest.mark.asyncio
 async def test_cancel(test_engine, tmp_path):
     cancel = asyncio.Event()
-    async def ask_and_cancel(session_id, question, options, timeout):
+    async def ask_and_cancel(session_id, questions, timeout):
         cancel.set()
         return None
     turns = [done(None, [tool_call("c1", "ask_user", question="?")]), done("不该到达")]

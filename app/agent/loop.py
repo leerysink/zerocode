@@ -10,6 +10,17 @@ from app.agent.tools import ToolContext, ToolError, execute_tool
 from app.services.message_service import add_message
 from sqlalchemy import text
 
+def _normalize_questions(args: dict) -> list[dict]:
+    """新协议 questions 优先；兼容旧单题参数（question/options 字符串）。"""
+    qs = args.get("questions")
+    if isinstance(qs, list) and qs:
+        return qs
+    q = args.get("question")
+    if isinstance(q, str) and q:
+        opts = [{"label": o} if isinstance(o, str) else o for o in (args.get("options") or [])]
+        return [{"question": q, "options": opts}]
+    raise ToolError("缺少 question(s)")
+
 class AgentRunner:
     def __init__(self, session_factory, llm, config_provider, send, ask, confirm):
         self.sf = session_factory
@@ -138,13 +149,16 @@ class AgentRunner:
         if name == "ask_user":
             timeout = cfg.get("agent.ask_timeout_seconds", 0)
             try:
-                ans = await asyncio.wait_for(self.ask(session_id, args.get("question", ""), args.get("options") or [], timeout),
+                questions = _normalize_questions(args)
+                ans = await asyncio.wait_for(self.ask(session_id, questions, timeout),
                                              None if timeout in (None, 0) else float(timeout))
+            except ToolError as e:
+                return {"ok": False, "error": str(e)}
             except asyncio.TimeoutError:
                 return {"cancelled": True, "reason": "提问超时"}
             if ans is None:
                 return {"cancelled": True}
-            return {"answer": ans.get("answer", ""), "option": ans.get("option")}
+            return {"answers": ans.get("answers", [])}
         if name in ("write_file", "edit_file") and cfg.get("agent.write_confirm"):
             await self.send({"type": "confirm_request", "tool": name, "args": args})
             ok = await self.confirm(session_id, {"tool": name, "args": args})

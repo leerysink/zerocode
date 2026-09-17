@@ -1,6 +1,6 @@
 """ChatHub：会话级消息总线。
 
-- ask/confirm：挂起等待前端上行（ask_answer/ask_choice/confirm），cancel 时统一复位；
+- ask/confirm：挂起等待前端上行（ask_submit/confirm），cancel 时统一复位；
   confirm_request 下行事件由 AgentRunner._dispatch 统一下发（Task 7 裁定：runner 唯一
   发出方），hub.confirm 只负责挂 future 等待，避免前端收到重复卡片。
 - emits：按会话分槽的下行发送器（session_id → async (session_id, event) -> None），
@@ -32,11 +32,11 @@ class ChatHub:
         if emit:
             await emit(session_id, event)
 
-    async def ask(self, session_id, question, options, timeout):
+    async def ask(self, session_id, questions, timeout):
         fut = asyncio.get_running_loop().create_future()
         self.ask_futures[session_id] = fut
         try:
-            await self.emit_event(session_id, {"type": "ask_user", "question": question, "options": options})
+            await self.emit_event(session_id, {"type": "ask_user", "questions": questions})
             return await fut
         finally:
             self.ask_futures.pop(session_id, None)
@@ -56,8 +56,8 @@ class ChatHub:
         if fut and not fut.done():
             fut.set_result(value)
 
-    async def answer(self, session_id, text): self._resolve(self.ask_futures, session_id, {"answer": text})
-    async def choose(self, session_id, option): self._resolve(self.ask_futures, session_id, {"option": option, "answer": option})
+    async def submit_answers(self, session_id, answers):
+        self._resolve(self.ask_futures, session_id, {"answers": answers})
     async def resolve_confirm(self, session_id, approved): self._resolve(self.confirm_futures, session_id, bool(approved))
 
     def cancel(self, session_id):
