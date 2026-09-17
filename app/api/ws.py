@@ -4,8 +4,9 @@
 下行：token / tool_call / tool_result / ask_user / confirm_request /
 message_done / error / status / file_change（由 runner 与 hub 经 emit 下发）。
 
-单用户单连接场景：同会话后连连接覆盖 hub.emit，下行事件随之切到新连接。
-runner 的 send 为单参签名，这里经 hub.emit 晚绑定转发；LLM 实例按 run
+按会话分槽：同会话后连连接覆盖该会话的 emit 槽，下行事件随之切到新连接；
+断连 drop 自己的槽（防僵尸槽），跨会话互不串扰（终审修复轮2）。
+runner 的 send 为单参签名，这里经 hub 会话槽晚绑定转发；LLM 实例按 run
 解析一次（cfg 本就每 run 取一次，避免测试注入的工厂每轮重放轮次）。
 """
 import asyncio, json
@@ -29,8 +30,8 @@ async def ws_chat(ws: WebSocket, session_id: int):
         except Exception:
             pass  # 连接已断开等场景：静默丢弃（单用户场景无回压需求）
 
-    # 单用户场景：同会话一个活动连接，后连者覆盖 emit
-    hub.emit = emit
+    # 按会话分槽注入：同会话后连覆盖，跨会话互不影响（终审修复轮2）
+    hub.set_emit(session_id, emit)
 
     async def config_getter():
         async with app.state.session_factory() as s:
@@ -54,10 +55,9 @@ async def ws_chat(ws: WebSocket, session_id: int):
                     continue
 
                 async def send(event: dict):
-                    # AgentRunner.send 是单参签名；经 hub.emit 晚绑定转发，
-                    # 后连连接覆盖 emit 后事件自动切到新连接（见 busy 测试语义）
-                    if hub.emit:
-                        await hub.emit(session_id, event)
+                    # AgentRunner.send 是单参签名；经 hub 会话槽晚绑定转发，
+                    # 同会话后连覆盖槽后事件自动切到新连接（见 busy 测试语义）
+                    await hub.emit_event(session_id, event)
 
                 async def run_task(user_text_: str):
                     cancel = asyncio.Event()
@@ -94,4 +94,5 @@ async def ws_chat(ws: WebSocket, session_id: int):
             elif t == "cancel":
                 hub.cancel(session_id)
     except WebSocketDisconnect:
+        hub.drop_emit(session_id, emit)  # 断连清槽防僵尸（仅清自己注入的槽）
         pass

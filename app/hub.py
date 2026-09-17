@@ -3,8 +3,9 @@
 - ask/confirm：挂起等待前端上行（ask_answer/ask_choice/confirm），cancel 时统一复位；
   confirm_request 下行事件由 AgentRunner._dispatch 统一下发（Task 7 裁定：runner 唯一
   发出方），hub.confirm 只负责挂 future 等待，避免前端收到重复卡片。
-- emit：由 WS 层注入的下行发送器 async (session_id, event) -> None（单用户单连接，
-  后连连接覆盖）。
+- emits：按会话分槽的下行发送器（session_id → async (session_id, event) -> None），
+  同会话后连覆盖；断连 drop 清槽（仅清自己注入的槽，防误删后连者的槽），
+  跨会话互不串扰（终审修复轮2：原全局单槽会被任意会话的连接覆盖导致事件串线）。
 """
 import asyncio
 
@@ -14,14 +15,28 @@ class ChatHub:
         self.confirm_futures: dict[int, asyncio.Future] = {}
         self.cancel_events: dict[int, asyncio.Event] = {}
         self.running: set[int] = set()
-        self.emit = None  # 由 WS 层注入: async (session_id, event) -> None
+        self.emits: dict[int, callable] = {}  # session_id → 下行发送器: async (session_id, event) -> None
+
+    def set_emit(self, session_id, emit):
+        """注入/覆盖同会话的下行发送器（WS 连接建立时调用，同会话后连覆盖）。"""
+        self.emits[session_id] = emit
+
+    def drop_emit(self, session_id, emit):
+        """断连清理：仅当当前槽仍是自己注入的 emit 才移除，防误删后连者的槽。"""
+        if self.emits.get(session_id) is emit:
+            self.emits.pop(session_id, None)
+
+    async def emit_event(self, session_id, event):
+        """向指定会话的当前连接下发事件；该会话无连接（槽为空）时静默丢弃。"""
+        emit = self.emits.get(session_id)
+        if emit:
+            await emit(session_id, event)
 
     async def ask(self, session_id, question, options, timeout):
         fut = asyncio.get_running_loop().create_future()
         self.ask_futures[session_id] = fut
         try:
-            if self.emit:
-                await self.emit(session_id, {"type": "ask_user", "question": question, "options": options})
+            await self.emit_event(session_id, {"type": "ask_user", "question": question, "options": options})
             return await fut
         finally:
             self.ask_futures.pop(session_id, None)

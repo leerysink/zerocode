@@ -80,7 +80,8 @@ def test_ws_busy_rejected(client):
         for _ in range(6):
             if ws.receive_json()["type"] == "ask_user":
                 break
-        # 第二个连接：并发消息被拒；由于 hub.emit 被后连者覆盖，取消后的事件都发给 ws2
+        # 第二个连接：并发消息被拒；同会话后连覆盖该会话的 emit 槽（per-session 语义），
+        # 取消后的事件都发给 ws2
         with client.websocket_connect(f"/ws/chat/{client.zc_sid}") as ws2:
             ws2.send_json({"type": "user_message", "content": "并发消息"})
             ev = ws2.receive_json()
@@ -91,6 +92,62 @@ def test_ws_busy_rejected(client):
             tail = [ws2.receive_json() for _ in range(3)]  # tool_result + error(已取消) + status(idle)
         assert any(e["type"] == "error" and e["message"] == "已取消" for e in tail)
         assert any(e["type"] == "status" for e in tail)
+
+def test_ws_cross_session_emit_isolation(client):
+    """终审修复轮2回归网：hub 下行 emit 必须按会话分槽（多标签页/多浏览器串扰修复）。
+    修复前（全局单槽）：A 会话挂在 ask 上时 B 会话连入覆盖 hub.emit，A 应答恢复后的
+    tool_result/message_done/status 全部串到 B 的连接（A 永远收不到，UI 卡 running）。
+    修复后：各会话事件只进各自的连接——B 只收到 B 自己的事件，A 的下行全回 A。"""
+    calls = {"n": 0}
+    def factory(cfg):
+        calls["n"] += 1
+        if calls["n"] == 1:  # A 会话的 run：ask 挂起 → 应答后补发 tool_result/message_done/status
+            return ScriptedLLM([
+                done(None, [{"id": "c1", "function": {
+                    "name": "ask_user",
+                    "arguments": json.dumps({"question": "A的问题", "options": ["x"]}, ensure_ascii=False)}}]),
+                done("A完成"),
+            ])
+        return ScriptedLLM([[{"type": "content_delta", "content": "B"}, *done("B完成")]])
+    client.app.state.llm_factory = factory
+    sid_a = client.zc_sid
+    sid_b = client.post("/api/sessions", json={"workspace_id": client.zc_wsid}).json()["id"]
+    with client.websocket_connect(f"/ws/chat/{sid_a}") as ws_a:
+        ws_a.send_json({"type": "user_message", "content": "A 开始"})
+        for _ in range(6):
+            if ws_a.receive_json()["type"] == "ask_user":
+                break
+        # A 挂在 ask 上；B 会话此刻连入（旧代码在此抢走全局单槽 hub.emit）
+        with client.websocket_connect(f"/ws/chat/{sid_b}") as ws_b:
+            ws_a.send_json({"type": "ask_choice", "option": "x"})
+            ws_b.send_json({"type": "user_message", "content": "B 开始"})
+            # B 读到终态 status 为止：只能看到 B 自己的 message_done("B完成")；
+            # 修复前这里会先串入 A 的 tool_result + message_done("A完成") + status(idle)
+            seen_done, saw_status = [], False
+            for _ in range(10):
+                ev = ws_b.receive_json()
+                if ev["type"] == "message_done":
+                    seen_done.append(ev["content"])
+                if ev["type"] == "status":
+                    saw_status = True
+                    break
+            assert saw_status
+            assert seen_done == ["B完成"]  # 修复前：串入 "A完成" → RED
+        # A 应答后的下行必须全部回到 A 自己的连接（tool_result → message_done("A完成") → status）
+        got_tail = saw_status_a = False
+        for _ in range(8):
+            ev = ws_a.receive_json()
+            if ev["type"] == "tool_result" and ev["result"]["option"] == "x":
+                got_tail = True
+            if ev["type"] == "message_done" and ev["content"] == "A完成":
+                got_tail = True
+            if ev["type"] == "status":
+                saw_status_a = True
+                break
+        assert got_tail and saw_status_a
+    # 断连清理：两条连接退出后各自会话槽已 drop，不残留僵尸槽
+    hub = client.app.state.hub
+    assert sid_a not in hub.emits and sid_b not in hub.emits
 
 # ---------- 修复轮：watchdog 激活（run_task 落库 running）与挂起问答/确认防误报 ----------
 
