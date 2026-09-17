@@ -90,8 +90,8 @@ async def test_stream_parallel_tool_calls(monkeypatch):
     assert all(e["type"] == "done" for e in evs)  # 全程无 content 事件
     assert evs[-1]["message"]["content"] is None
     assert evs[-1]["message"]["tool_calls"] == [  # 按 index 排序 + 分片拼接结果
-        {"id": "call_a", "function": {"name": "write_file", "arguments": '{"path": "a.txt"}'}},
-        {"id": "call_b", "function": {"name": "read_file", "arguments": '{"path": "a.txt"}'}},
+        {"type": "function", "id": "call_a", "function": {"name": "write_file", "arguments": '{"path": "a.txt"}'}},
+        {"type": "function", "id": "call_b", "function": {"name": "read_file", "arguments": '{"path": "a.txt"}'}},
     ]
 
 @pytest.mark.asyncio
@@ -105,7 +105,24 @@ async def test_stream_content_with_tool_calls(monkeypatch):
     assert [e["type"] for e in evs] == ["content_delta", "done"]
     assert evs[-1]["message"]["content"] == "先读文件"
     assert evs[-1]["message"]["tool_calls"] == [
-        {"id": "c1", "function": {"name": "read_file", "arguments": '{"path": "a.txt"}'}}]
+        {"type": "function", "id": "c1", "function": {"name": "read_file", "arguments": '{"path": "a.txt"}'}}]
+
+@pytest.mark.asyncio
+async def test_stream_tool_calls_carry_type_function(monkeypatch):
+    # Ark（火山方舟）强制要求 messages.tool_calls[].type="function"（缺失返回
+    # 400 MissingParameter），OpenAI 官方端点容忍省略。回归：done 装配的每个
+    # tool_call 必须带 type，且 id/function.name/function.arguments 装配正确。
+    llm, _ = _make_llm(monkeypatch, [
+        _chunk(_delta(tool_calls=[_tc(0, id="call_x", name="read_file", arguments='{"pa')])),
+        _chunk(_delta(tool_calls=[_tc(0, arguments='th": "a.txt"}')])),
+    ])
+    evs = await _collect(llm)
+    assert evs[-1]["type"] == "done"
+    assert evs[-1]["message"]["tool_calls"] == [{
+        "type": "function",
+        "id": "call_x",
+        "function": {"name": "read_file", "arguments": '{"path": "a.txt"}'},
+    }]
 
 @pytest.mark.asyncio
 async def test_stream_skips_empty_choices(monkeypatch):

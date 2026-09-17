@@ -84,7 +84,8 @@ class OpenAICompatLLM:
                 yield {"type": "content_delta", "content": delta.content}
             if delta and delta.tool_calls:
                 for tc in delta.tool_calls:
-                    slot = tool_calls.setdefault(tc.index, {"id": "", "function": {"name": "", "arguments": ""}})
+                    # Ark 等严格端点强制要求 tool_calls[].type="function"（缺失 400）
+                    slot = tool_calls.setdefault(tc.index, {"type": "function", "id": "", "function": {"name": "", "arguments": ""}})
                     if tc.id:
                         slot["id"] = tc.id
                     if tc.function and tc.function.name:
