@@ -16,13 +16,14 @@ export function validateModelForm(form, isEdit) {
   return null
 }
 
-// 组装 POST/PUT 载荷：仅编辑且 api_key 留空时填掩码哨兵。
+// 组装 POST/PUT 载荷：仅编辑且 api_key 留空时填掩码哨兵；文本字段统一 trim（与校验口径一致，防空白入库）。
 export function buildModelPayload(form, isEdit) {
+  const editKeyEmpty = isEdit && !String(form.api_key || '').trim()
   return {
-    name: form.name,
-    base_url: form.base_url,
-    api_key: isEdit && !String(form.api_key || '').trim() ? API_KEY_MASK : form.api_key,
-    model: form.model,
+    name: String(form.name || '').trim(),
+    base_url: String(form.base_url || '').trim(),
+    api_key: editKeyEmpty ? API_KEY_MASK : String(form.api_key || '').trim(),
+    model: String(form.model || '').trim(),
     is_default: !!form.is_default,
   }
 }

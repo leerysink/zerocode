@@ -79,4 +79,11 @@ describe('buildModelPayload', () => {
     expect(buildModelPayload({ ...form, is_default: 1 }, false).is_default).toBe(true)
     expect(buildModelPayload({ ...form, is_default: 0 }, false).is_default).toBe(false)
   })
+
+  it('文本字段统一 trim（与校验口径一致，防空白入库）', () => {
+    const payload = buildModelPayload({ ...form, name: '  D ', base_url: ' https://x/v1 ', model: ' m ' }, false)
+    expect(payload.name).toBe('D')
+    expect(payload.base_url).toBe('https://x/v1')
+    expect(payload.model).toBe('m')
+  })
 })
