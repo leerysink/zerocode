@@ -6,7 +6,7 @@ from app.agent.llm import TOOLS, ScriptedLLM, OpenAICompatLLM
 
 def test_tools_schema():
     names = {t["function"]["name"] for t in TOOLS}
-    assert names == {"list_dir", "read_file", "write_file", "edit_file", "ask_user"}
+    assert names == {"list_dir", "read_file", "write_file", "edit_file", "ask_user", "todo_write"}
     w = next(t for t in TOOLS if t["function"]["name"] == "write_file")
     assert set(w["function"]["parameters"]["required"]) == {"path", "content"}
 

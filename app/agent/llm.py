@@ -33,6 +33,15 @@ TOOLS = [
             "question": {"type": "string"},
             "options": {"type": "array", "items": {"type": "string"},
                         "description": "可选项（可为空，空则用户自由输入）"}}, "required": ["question"]}}},
+    {"type": "function", "function": {
+        "name": "todo_write",
+        "description": "写入/全量替换当前任务清单。多步任务开始前先建清单，每完成一步即更新状态",
+        "parameters": {"type": "object", "properties": {
+            "todos": {"type": "array", "items": {"type": "object", "properties": {
+                "content": {"type": "string", "description": "任务描述"},
+                "status": {"type": "string", "enum": ["pending", "in_progress", "completed"],
+                           "description": "状态：待办/进行中/已完成"}},
+                "required": ["content", "status"]}}}, "required": ["todos"]}}},
 ]
 
 def _reasoning_of(delta):

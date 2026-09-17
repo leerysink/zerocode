@@ -165,3 +165,24 @@ async def test_reasoning_forwarded_and_saved(test_engine, tmp_path):
         r = (await s.execute(sql(
             "SELECT reasoning FROM message WHERE session_id=:i AND role='assistant'"), {"i": sid})).scalar()
     assert r == "想"
+
+@pytest.mark.asyncio
+async def test_todo_write_sync_and_persist(test_engine, tmp_path):
+    todos = [{"content": "实现A", "status": "in_progress"}, {"content": "写测试", "status": "pending"}]
+    turns = [done(None, [tool_call("c1", "todo_write", todos=todos)]), done("清单已建")]
+    sid, status, evs, sf = await run_once(test_engine, tmp_path, turns)
+    assert status == "idle"
+    sync = next(e for e in evs if e["type"] == "todo_sync")
+    assert sync["todos"] == todos
+    async with sf() as s:
+        st = (await s.execute(sql(
+            "SELECT todo_state FROM chat_session WHERE id=:i"), {"i": sid})).scalar()
+    assert st == todos
+
+@pytest.mark.asyncio
+async def test_todo_write_invalid_status(test_engine, tmp_path):
+    turns = [done(None, [tool_call("c1", "todo_write", todos=[{"content": "x", "status": "bad"}])]),
+             done("知道了")]
+    sid, status, evs, sf = await run_once(test_engine, tmp_path, turns)
+    tr = next(e for e in evs if e["type"] == "tool_result")
+    assert tr["result"]["ok"] is False and "非法" in tr["result"]["error"]

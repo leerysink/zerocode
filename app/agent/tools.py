@@ -112,4 +112,23 @@ async def execute_tool(ctx: ToolContext, name: str, args: dict) -> dict:
         await _record_change(ctx, str(f.relative_to(ctx.root)), "edit", content, after)
         return {"ok": True, "path": str(f.relative_to(ctx.root))}
 
+    if name == "todo_write":
+        raw = args.get("todos")
+        if not isinstance(raw, list):
+            raise ToolError("todos 必须是数组")
+        todos = []
+        for t in raw:
+            st = t.get("status")
+            if st not in ("pending", "in_progress", "completed"):
+                raise ToolError(f"非法任务状态: {st}")
+            todos.append({"content": str(t.get("content", "")), "status": st})
+        if ctx.session_factory is not None:
+            async with ctx.session_factory() as s:
+                await s.execute(text(
+                    "UPDATE chat_session SET todo_state = CAST(:j AS JSONB) WHERE id = :i"),
+                    {"j": json.dumps(todos, ensure_ascii=False), "i": ctx.session_id})
+                await s.commit()
+        await ctx.send({"type": "todo_sync", "todos": todos})
+        return {"ok": True, "count": len(todos)}
+
     raise ToolError(f"未知工具: {name}")
