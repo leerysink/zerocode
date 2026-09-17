@@ -8,10 +8,12 @@ import { useChatStore } from '../stores/chat'
 import MarkdownView from './MarkdownView.vue'
 import ToolCallBlock from './ToolCallBlock.vue'
 import AskUserCard from './AskUserCard.vue'
+import ThinkingBlock from './ThinkingBlock.vue'
 
 const props = defineProps({
   messages: { type: Array, default: () => [] },
   streaming: { type: String, default: '' },
+  streamingThinking: { type: String, default: '' },
   pendingAsk: { type: Object, default: null },
   pendingConfirm: { type: Object, default: null },
   hasSession: { type: Boolean, default: false },
@@ -71,9 +73,17 @@ onMounted(scrollToBottom)
         <div v-if="m.role === 'user'" class="zc-msg is-user">
           <div class="zc-bubble">{{ m.content }}</div>
         </div>
-        <!-- assistant：Markdown 渲染（MarkdownView 按 content 缓存，历史中携带 tool_calls 的空内容行不渲染） -->
-        <div v-else-if="m.role === 'assistant' && m.content" class="zc-msg is-assistant">
-          <MarkdownView class="zc-md" :content="m.content" />
+        <!-- assistant：思考块（reasoning）+ Markdown 渲染（MarkdownView 按 content 缓存，
+             空内容但有思考的历史消息也渲染；纯 tool_calls 空内容行仍不渲染） -->
+        <div v-else-if="m.role === 'assistant' && (m.content || m.reasoning)" class="zc-msg is-assistant">
+          <div class="zc-assistant">
+            <ThinkingBlock v-if="m.reasoning" :thinking="m.reasoning" />
+            <MarkdownView v-if="m.content" class="zc-md" :content="m.content" />
+          </div>
+        </div>
+        <!-- notice：压缩完成等系统提示，居中灰字分隔 -->
+        <div v-else-if="m.role === 'notice'" class="zc-msg is-notice">
+          <span class="zc-notice-text">{{ m.content }}</span>
         </div>
         <!-- tool：折叠工具块（含 diff 时内部渲染 DiffBlock） -->
         <div v-else-if="m.role === 'tool'" class="zc-msg is-tool">
@@ -87,6 +97,11 @@ onMounted(scrollToBottom)
           </div>
         </div>
       </template>
+
+      <!-- 流式思考：reasoning_delta 累积期间展示 -->
+      <div v-if="streamingThinking" class="zc-msg is-assistant">
+        <ThinkingBlock :thinking="streamingThinking" streaming />
+      </div>
 
       <!-- 流式气泡：streamingContent 非空才渲染（仅此气泡随 token 重算 Markdown） -->
       <div v-if="streaming" class="zc-msg is-assistant">
@@ -158,6 +173,23 @@ onMounted(scrollToBottom)
 }
 .zc-msg.is-tool {
   margin-bottom: 4px;
+}
+/* assistant 内容容器（思考块 + Markdown 堆叠） */
+.zc-assistant {
+  width: 100%;
+  min-width: 0;
+}
+/* notice：系统提示条居中 */
+.zc-msg.is-notice {
+  justify-content: center;
+  margin: 4px 0 12px;
+}
+.zc-notice-text {
+  font-size: 12px;
+  color: var(--zc-text-sub);
+  background: rgba(91, 122, 157, 0.06);
+  border-radius: 999px;
+  padding: 3px 12px;
 }
 
 /* user 浅蓝气泡 */
