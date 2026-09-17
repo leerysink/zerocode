@@ -28,3 +28,12 @@ export const tree = (workspaceId) => http.get('/fs/tree', { params: { workspace_
 export const readFile = (workspaceId, path) =>
   http.get('/files/read', { params: { workspace_id: workspaceId, path } })
 export const saveFile = (data) => http.put('/files/save', data) // {workspace_id, path, content}
+
+// ---- 模型库与会话级模型（交互增强） ----
+export const listModels = () => http.get('/models')
+export const createModel = (data) => http.post('/models', data)
+export const updateModel = (id, data) => http.put(`/models/${id}`, data)
+export const deleteModel = (id) => http.delete(`/models/${id}`)
+export const getSessionDetail = (id) => http.get(`/sessions/${id}`)
+export const patchSessionModel = (id, modelConfigId) =>
+  http.patch(`/sessions/${id}/model`, { model_config_id: modelConfigId })

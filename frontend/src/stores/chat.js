@@ -1,9 +1,10 @@
-// chat store：会话/消息/WS 状态。事件处理抽为导出的纯函数 applyEvent(store, ev)，
+// chat store：会话/消息/待办/模型/WS 状态。事件处理抽为导出的纯函数 applyEvent(store, ev)，
 // 便于 vitest 不经组件直接调用（connect 的 onmessage 只做 applyEvent(this, JSON.parse(e.data))）。
 // 下行事件类型与后端 loop.py / hub.py 协议一致：
-// token / tool_call / tool_result / ask_user / confirm_request / message_done / error / status / file_change
+// token / reasoning_delta / tool_call / tool_result / ask_user(多问题) / confirm_request / message_done
+// / error / status / file_change / todo_sync / compacting / compaction_done
 import { defineStore } from 'pinia'
-import { getMessages, listWorkspaces, wsUrl } from '../api'
+import { getMessages, getSessionDetail, listModels, listWorkspaces, patchSessionModel, wsUrl } from '../api'
 
 export function applyEvent(store, ev) {
   switch (ev.type) {
@@ -16,22 +17,39 @@ export function applyEvent(store, ev) {
     case 'tool_result':
       store.messages.push({ role: 'tool', name: ev.name, result: ev.result })
       break
-    case 'ask_user':
-      store.pendingAsk = { question: ev.question, options: ev.options || [] }
+    case 'ask_user': // 多问题新协议：questions 逐题渲染（AskPanel 消费）
+      store.pendingAsk = { questions: ev.questions || [] }
       break
     case 'confirm_request':
       store.pendingConfirm = { tool: ev.tool, args: ev.args }
       break
-    case 'message_done': // 整段回复固化
-      store.messages.push({ role: 'assistant', content: ev.content })
+    case 'message_done': // 整段回复固化（附带思考留痕）
+      store.messages.push({ role: 'assistant', content: ev.content, reasoning: store.streamingThinking || undefined })
       store.streamingContent = ''
+      store.streamingThinking = ''
+      break
+    case 'reasoning_delta': // 思考流式增量（有才发）
+      store.streamingThinking += ev.content
+      break
+    case 'todo_sync': // 待办清单全量替换
+      store.todoList = ev.todos || []
+      break
+    case 'compacting': // 上下文压缩进行中
+      store.compacting = true
+      break
+    case 'compaction_done': // 压缩完成：复位 + 消息流提示条
+      store.compacting = false
+      store.messages.push({ role: 'notice', content: '已压缩上下文：更早对话已替换为摘要，最近几轮保留原文' })
       break
     case 'error':
       store.messages.push({ role: 'error', content: ev.message })
       store.running = false
+      store.streamingThinking = ''
       break
     case 'status': // 终态回执（idle/error），复位执行态
       store.running = false
+      store.streamingThinking = ''
+      store.compacting = false
       break
     case 'file_change': // 挂到最近一条 tool 消息，供 diff 渲染（Task 13 最小扩展：补存 path/action 供文件名显示）
       for (let i = store.messages.length - 1; i >= 0; i--) {
@@ -58,6 +76,11 @@ export const useChatStore = defineStore('chat', {
     pendingAsk: null,
     pendingConfirm: null,
     running: false,
+    todoList: [],
+    streamingThinking: '',
+    models: [],
+    currentModelId: null,
+    compacting: false,
   }),
   actions: {
     async loadWorkspaces() {
@@ -68,6 +91,13 @@ export const useChatStore = defineStore('chat', {
       // 竞态守卫：快速切换会话时，先打开会话的慢响应后到，不得覆盖新会话的 messages
       const { data } = await getMessages(id)
       if (this.currentSessionId !== id) return
+      // 会话详情：todo/模型状态（交互增强）；detail 慢响应后到同样不得覆盖新会话
+      const detail = (await getSessionDetail(id)).data
+      if (this.currentSessionId !== id) return
+      this.todoList = detail.todo_state || []
+      this.currentModelId = detail.model_config_id ?? null
+      this.streamingThinking = ''
+      this.compacting = false
       // 渲染门：右栏（Task 13/14）以 currentWorkspaceId 判定；由调用方传入工作区 id
       if (workspaceId != null) this.currentWorkspaceId = workspaceId
       this.messages = data
@@ -124,15 +154,16 @@ export const useChatStore = defineStore('chat', {
       this.running = true
       this._uplink({ type: 'user_message', content })
     },
-    answerAsk(text) {
+    submitAsk(answers) {
+      // 旧 ask_answer/ask_choice 已随后端删除；ask_submit 一次提交全部答案。
       // 仅上行成功才清卡片；失败保留，连接恢复后用户可重试同一操作
-      if (this._uplink({ type: 'ask_answer', text })) this.pendingAsk = null
-    },
-    chooseAsk(option) {
-      if (this._uplink({ type: 'ask_choice', option })) this.pendingAsk = null
+      if (this._uplink({ type: 'ask_submit', answers })) this.pendingAsk = null
     },
     confirm(approved) {
       if (this._uplink({ type: 'confirm', approved })) this.pendingConfirm = null
+    },
+    async requestCompact() {
+      this._uplink({ type: 'compact' })
     },
     cancel() {
       this._uplink({ type: 'cancel' })
@@ -148,6 +179,13 @@ export const useChatStore = defineStore('chat', {
           return
         }
       }
+    },
+    async loadModels() {
+      this.models = (await listModels()).data
+    },
+    async setModel(id) {
+      await patchSessionModel(this.currentSessionId, id)
+      this.currentModelId = id
     },
   },
 })
