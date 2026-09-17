@@ -1,8 +1,8 @@
 """WS 聊天端点 /ws/chat/{session_id}。
 
-上行：user_message / ask_submit / confirm / cancel；
+上行：user_message / ask_submit / confirm / cancel / compact；
 下行：token / tool_call / tool_result / ask_user / confirm_request /
-message_done / error / status / file_change（由 runner 与 hub 经 emit 下发）。
+message_done / error / status / file_change / compacting / compaction_done（由 runner 与 hub 经 emit 下发）。
 
 按会话分槽：同会话后连连接覆盖该会话的 emit 槽，下行事件随之切到新连接；
 断连 drop 自己的槽（防僵尸槽），跨会话互不串扰（终审修复轮2）。
@@ -14,6 +14,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from sqlalchemy import text as _sql
 from app.agent.llm import OpenAICompatLLM
 from app.agent.loop import AgentRunner
+from app.services import compaction_service
 from app.services import config_service
 
 router = APIRouter()
@@ -91,6 +92,29 @@ async def ws_chat(ws: WebSocket, session_id: int):
                 await hub.resolve_confirm(session_id, bool(msg.get("approved")))
             elif t == "cancel":
                 hub.cancel(session_id)
+            elif t == "compact":
+                if session_id in hub.running:
+                    await emit(session_id, {"type": "error", "message": "会话正在执行中，无法压缩"})
+                    continue
+
+                async def send_local(event: dict):
+                    # 基线适配（控制方裁定）：hub 已是 per-session emit 槽（d86f9b5），
+                    # brief 中 hub.emit 单槽判断落为 emit_event 定向下发
+                    await hub.emit_event(session_id, event)
+
+                async def do_compact():
+                    hub.running.add(session_id)
+                    try:
+                        await send_local({"type": "compacting"})
+                        cfg = await config_getter()
+                        llm = llm_factory(cfg)
+                        keep = int(cfg.get("agent.compact_keep_recent", 8))
+                        await compaction_service.compact(
+                            app.state.session_factory, llm, session_id, send_local, keep)
+                    finally:
+                        hub.running.discard(session_id)
+
+                asyncio.create_task(do_compact())
     except WebSocketDisconnect:
         hub.drop_emit(session_id, emit)  # 断连清槽防僵尸（仅清自己注入的槽）
         pass

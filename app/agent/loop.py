@@ -1,13 +1,14 @@
 """Agent 循环：流式对话 + 工具调度 + ask_user 挂起恢复 + 写入确认 + 取消。
 
 事件协议（send 下发）：token/tool_call/tool_result/file_change/message_done/error，
-另有 confirm_request（写入确认请求）与 status（终态回执）。
+另有 confirm_request（写入确认请求）、status（终态回执）与 compaction_done（自动压缩完成）。
 """
 import asyncio, datetime, inspect, json
 from pathlib import Path
 from app.agent.prompts import build_system_prompt
 from app.agent.tools import ToolContext, ToolError, execute_tool
 from app.agent.mentions import expand_mentions
+from app.services import compaction_service as _comp
 from app.services.message_service import add_message
 from sqlalchemy import text
 
@@ -59,11 +60,14 @@ class AgentRunner:
                             {"st": status, "i": session_id})
             await s.commit()
 
-    async def _history(self, session_id: int, window: int) -> list[dict]:
+    async def _history(self, session_id: int, window: int) -> tuple[list[dict], str | None]:
+        # 水位过滤（Task 8）：已压缩摘要覆盖 seq≤wm 的旧消息，窗口只取 wm 之后的原文
+        summary, wm = await _comp.latest(self.sf, session_id)
         async with self.sf() as s:
             rows = (await s.execute(text(
                 "SELECT role, COALESCE(context_content, content) AS content, tool_call_id, tool_name, tool_args, tool_result "
-                "FROM message WHERE session_id=:i ORDER BY seq DESC LIMIT :w"), {"i": session_id, "w": window})).mappings().all()
+                "FROM message WHERE session_id=:i AND seq > :w ORDER BY seq DESC LIMIT :win"),
+                {"i": session_id, "w": wm, "win": window})).mappings().all()
         msgs = []
         for r in reversed(rows):
             if r["role"] == "user":
@@ -93,23 +97,44 @@ class AgentRunner:
                     msgs.pop(0)
                     continue
             break
-        return msgs
+        return msgs, summary
+
+    async def _llm_for(self, cfg):
+        llm = self.llm(cfg) if callable(self.llm) else self.llm
+        if inspect.isawaitable(llm):
+            llm = await llm
+        return llm
+
+    async def _build_messages(self, session_id: int, root: Path, cfg: dict, send) -> list[dict]:
+        """自动压缩（阈值+最小新增双条件，thr=0 关闭）→ 摘要注入 system 尾部 → 水位后窗口消息。"""
+        summary, wm = await _comp.latest(self.sf, session_id)
+        rows = await _comp.rows_after(self.sf, session_id, wm)
+        thr = int(cfg.get("agent.auto_compact_chars", 50000))
+        min_new = int(cfg.get("agent.compact_min_new", 6))
+        keep = int(cfg.get("agent.compact_keep_recent", 8))
+        if thr > 0 and len(rows) >= min_new and len(rows) > keep and _comp.estimate_chars(rows) > thr:
+            llm = await self._llm_for(cfg)
+            res = await _comp.compact(self.sf, llm, session_id, send, keep)
+            if res:
+                summary = res["summary"]
+        history, _ = await self._history(session_id, int(cfg.get("agent.history_window", 40)))
+        system_text = build_system_prompt(str(root), datetime.date.today().isoformat())
+        if summary:
+            system_text += f"\n\n<context_summary>\n{summary}\n</context_summary>"
+        return [{"role": "system", "content": system_text}] + history
 
     async def _inner(self, session_id: int, user_text: str, cancel: asyncio.Event):
         cfg = await self.get_config()
         root = await self._root_of(session_id)
         expanded = expand_mentions(root, user_text)
         await add_message(self.sf, session_id, "user", content=user_text, context_content=expanded)
-        history = await self._history(session_id, int(cfg.get("agent.history_window", 40)))
-        messages = [{"role": "system", "content": build_system_prompt(root, datetime.date.today().isoformat())}] + history
+        messages = await self._build_messages(session_id, root, cfg, self.send)
         ctx = ToolContext(root=root, session_id=session_id, session_factory=self.sf, send=self.send)
         max_rounds = int(cfg.get("agent.max_tool_rounds", 30))
         for _round in range(max_rounds):
             if cancel.is_set():
                 raise _Cancelled()
-            llm = self.llm(cfg) if callable(self.llm) else self.llm
-            if inspect.isawaitable(llm):
-                llm = await llm
+            llm = await self._llm_for(cfg)
             final = None
             async for ev in llm.chat_stream(messages, _TOOLS):
                 if cancel.is_set():

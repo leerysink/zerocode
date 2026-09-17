@@ -149,7 +149,7 @@ async def test_history_trim_keeps_tool_pairs(test_engine, tmp_path):
     rec = Recorder()
     runner = AgentRunner(sf, ScriptedLLM([]), cfg_provider(), rec,
                          lambda *a, **k: asyncio.sleep(0, None), lambda *a, **k: True)
-    msgs = await runner._history(sid, 2)
+    msgs, _ = await runner._history(sid, 2)
     # 核心：任何 tool 消息的 tool_call_id 都能在保留 assistant 的 tool_calls 中找到
     kept_call_ids = {tc.get("id") for m in msgs if m["role"] == "assistant"
                      for tc in (m.get("tool_calls") or [])}
@@ -161,7 +161,7 @@ async def test_history_trim_keeps_tool_pairs(test_engine, tmp_path):
     # 头部孤儿 tool(call_1) 被修剪，窗口有效内容从干净的 user(第二问) 开始
     assert [m["role"] for m in msgs] == ["user"]
     # 对照：窗口=3 时对完整，user 开头的正常截断不得被误剪
-    full = await runner._history(sid, 3)
+    full, _ = await runner._history(sid, 3)
     assert [m["role"] for m in full] == ["assistant", "tool", "user"]
 
 @pytest.mark.asyncio
@@ -215,3 +215,27 @@ async def test_mention_expanded_into_context(test_engine, tmp_path):
             "SELECT content, context_content FROM message WHERE session_id=:i AND role='user'"),
             {"i": sid})).first()
     assert row[0] == "请看 @a.txt" and "文件内容XYZ" in row[1]
+
+@pytest.mark.asyncio
+async def test_auto_compaction_triggers(test_engine, tmp_path):
+    sid = await mk_session(test_engine, tmp_path)
+    sf = make_session_factory(test_engine)
+    for i in range(12):
+        await add_message(sf, sid, "user" if i % 2 == 0 else "assistant", content=f"历史{i}的一些内容")
+    llm = ScriptedLLM([
+        [{"type": "done", "message": {"role": "assistant", "content": "摘要：历史已压缩", "tool_calls": None}}],
+        [delta("收到"), {"type": "done", "message": {"role": "assistant", "content": "收到", "tool_calls": None}}]])
+    rec = Recorder()
+
+    async def _p():
+        return {"agent.write_confirm": False, "agent.ask_timeout_seconds": 0,
+                "agent.max_tool_rounds": 30, "agent.history_window": 40,
+                "agent.auto_compact_chars": 10, "agent.compact_min_new": 1,
+                "agent.compact_keep_recent": 8}
+    runner = AgentRunner(sf, llm, _p, rec,
+                         lambda *a, **k: asyncio.sleep(0, None), lambda *a, **k: True)
+    status = await runner.run(sid, "继续", asyncio.Event())
+    assert status == "idle"
+    system_msg = llm.received[1][0]
+    assert system_msg["role"] == "system" and "<context_summary>" in system_msg["content"]
+    assert "摘要：历史已压缩" in system_msg["content"]

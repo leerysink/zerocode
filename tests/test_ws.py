@@ -251,3 +251,30 @@ async def test_watchdog_skips_pending_ask(test_engine):
         hub.ask_futures.pop(sid, None)
         if not fut.done():
             fut.cancel()
+
+def test_ws_manual_compact(client):
+    import asyncio as _aio
+    from app.db import make_session_factory as _mk_sf
+    from app.services.message_service import add_message as _add
+
+    async def _seed():
+        eng = make_engine(None)
+        sf = _mk_sf(eng)
+        try:
+            for i in range(12):
+                await _add(sf, client.zc_sid, "user" if i % 2 == 0 else "assistant", content=f"消息{i}")
+        finally:
+            await eng.dispose()
+    _aio.run(_seed())
+    client.app.state.llm_factory = lambda cfg: ScriptedLLM([
+        [{"type": "done", "message": {"role": "assistant", "content": "压缩摘要OK", "tool_calls": None}}]])
+    with client.websocket_connect(f"/ws/chat/{client.zc_sid}") as ws:
+        ws.send_json({"type": "compact"})
+        types = []
+        for _ in range(4):
+            ev = ws.receive_json()
+            types.append(ev["type"])
+            if ev["type"] == "compaction_done":
+                assert ev["summary"] == "压缩摘要OK"
+                break
+        assert "compaction_done" in types
