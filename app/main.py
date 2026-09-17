@@ -13,8 +13,10 @@ def create_app(database_url: str | None = None) -> FastAPI:
         await engine.dispose()
 
     from app.api.config_api import router as config_router
+    from app.api import workspaces
     app = FastAPI(title="zerocode", lifespan=lifespan)
     app.include_router(config_router)
+    app.include_router(workspaces.router)
     return app
 
 app = create_app()
