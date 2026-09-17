@@ -23,6 +23,18 @@ async def test_latest_and_rows_after(test_engine, tmp_path):
     assert [r["seq"] for r in rows] == [1, 2, 3]
     assert comp.estimate_chars(rows) > 0
 
+async def test_rows_after_reads_context_content(test_engine, tmp_path):
+    # Fix 2（spec §4.3）：压缩统计与摘要 digest 与对话窗口（loop._history）同口径——
+    # 用户消息优先读 @mention 展开后的 context_content，不得按裸 content 少计
+    sf = make_session_factory(test_engine)
+    sid = await mk_session(test_engine, tmp_path)
+    from app.services.message_service import add_message
+    expanded = "展开后的文件内容" + "x" * 200
+    await add_message(sf, sid, "user", content="@a.txt", context_content=expanded)
+    rows = await comp.rows_after(sf, sid, 0)
+    assert rows[0]["content"] == expanded  # SELECT 读 COALESCE(context_content, content)
+    assert comp.estimate_chars(rows) >= len(expanded)  # 估算按展开后口径计字
+
 async def test_compact_writes_and_emits(test_engine, tmp_path):
     sf = make_session_factory(test_engine)
     sid = await mk_session(test_engine, tmp_path)
@@ -40,8 +52,11 @@ async def test_compact_skips_when_few(test_engine, tmp_path):
     sid = await mk_session(test_engine, tmp_path)
     await _seed_messages(sf, sid, 5)
     llm = ScriptedLLM([])  # 不应被消费
-    assert await comp.compact(sf, llm, sid, _Rec(), keep_recent=8) is None
+    rec = _Rec()
+    assert await comp.compact(sf, llm, sid, rec, keep_recent=8) is None
     assert llm.turns == []
+    # skip 也是终态：必须下发 notice 事件，前端才能退出 compacting（fix-round Fix 1）
+    assert [(e["type"], e.get("text")) for e in rec.events] == [("notice", "历史消息不足，暂无需压缩")]
 
 async def test_compact_failure_emits_error_only(test_engine, tmp_path):
     sf = make_session_factory(test_engine)

@@ -56,6 +56,19 @@ describe('chat store 事件流', () => {
     expect(s.running).toBe(false)
     expect(s.streamingThinking).toBe('')
   })
+  it('error 复位 compacting（压缩失败也是终态，压缩按钮不得永久 loading）', () => {
+    const s = useChatStore()
+    s.compacting = true
+    applyEvent(s, { type: 'error', message: '压缩失败，已保留原文' })
+    expect(s.compacting).toBe(false)
+  })
+  it('notice 终态提示（压缩 skip：消息不足）：复位 compacting 并渲染提示条', () => {
+    const s = useChatStore()
+    s.compacting = true
+    applyEvent(s, { type: 'notice', text: '历史消息不足，暂无需压缩' })
+    expect(s.compacting).toBe(false)
+    expect(s.messages.at(-1)).toMatchObject({ role: 'notice', content: '历史消息不足，暂无需压缩' })
+  })
   it('file_change 事件挂到最近 tool 消息，且保留 path/action 供 diff 渲染文件名', () => {
     const s = useChatStore()
     applyEvent(s, { type: 'tool_call', name: 'write_file', args: { path: 'a.txt' } })

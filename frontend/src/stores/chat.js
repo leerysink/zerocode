@@ -2,7 +2,7 @@
 // 便于 vitest 不经组件直接调用（connect 的 onmessage 只做 applyEvent(this, JSON.parse(e.data))）。
 // 下行事件类型与后端 loop.py / hub.py 协议一致：
 // token / reasoning_delta / tool_call / tool_result / ask_user(多问题) / confirm_request / message_done
-// / error / status / file_change / todo_sync / compacting / compaction_done
+// / error / status / file_change / todo_sync / compacting / compaction_done / notice(压缩 skip 终态)
 import { defineStore } from 'pinia'
 import { getMessages, getSessionDetail, listModels, listWorkspaces, patchSessionModel, wsUrl } from '../api'
 
@@ -41,10 +41,15 @@ export function applyEvent(store, ev) {
       store.compacting = false
       store.messages.push({ role: 'notice', content: '已压缩上下文：更早对话已替换为摘要，最近几轮保留原文' })
       break
+    case 'notice': // 系统提示（压缩 skip 终态等）：复位压缩态 + 居中灰字提示条
+      store.compacting = false
+      store.messages.push({ role: 'notice', content: ev.text })
+      break
     case 'error':
       store.messages.push({ role: 'error', content: ev.message })
       store.running = false
       store.streamingThinking = ''
+      store.compacting = false // 压缩失败也是终态：复位压缩按钮 loading
       break
     case 'status': // 终态回执（idle/error），复位执行态
       store.running = false

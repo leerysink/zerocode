@@ -2,7 +2,8 @@
 
 - 摘要覆盖 up_to_seq 之前的所有消息；保留最近 keep_recent 条原文；
 - 摘要拼装在 loop._build_messages 中注入 system 尾部 <context_summary>；
-- 失败只 send error 事件并返回 None，不抛出、不改会话状态、不阻断对话。
+- 消息不足（skip）send notice 终态事件后返回 None；失败只 send error 事件并返回 None；
+  均不抛出、不改会话状态、不阻断对话。
 """
 import json
 from sqlalchemy import text
@@ -22,7 +23,7 @@ async def latest(sf, session_id: int) -> tuple[str | None, int]:
 async def rows_after(sf, session_id: int, after_seq: int) -> list[dict]:
     async with sf() as s:
         rows = (await s.execute(text(
-            "SELECT id, seq, role, content, tool_result FROM message "
+            "SELECT id, seq, role, COALESCE(context_content, content) AS content, tool_result FROM message "
             "WHERE session_id=:i AND seq > :a ORDER BY seq"),
             {"i": session_id, "a": after_seq})).mappings().all()
     return [dict(r) for r in rows]
@@ -39,6 +40,9 @@ async def compact(sf, llm, session_id: int, send, keep_recent: int = 8) -> dict 
     _, wm = await latest(sf, session_id)
     rows = await rows_after(sf, session_id, wm)
     if len(rows) <= keep_recent:
+        # skip 也是终态（fix-round Fix 1）：不下发任何事件会让前端 compacting 永久占用，
+        # 压缩按钮卡死；notice 为前端已渲染的提示条角色消息
+        await send({"type": "notice", "text": "历史消息不足，暂无需压缩"})
         return None
     head, tail = rows[:-keep_recent], rows[-keep_recent:]
     lines = []
