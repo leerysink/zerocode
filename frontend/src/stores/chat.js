@@ -70,7 +70,7 @@ export const useChatStore = defineStore('chat', {
       this.running = false
       this.connect(id)
     },
-    connect(sessionId) {
+    connect(sessionId, keepBackoff = false) {
       if (this._ws) {
         this._ws.onclose = null // 切换会话/重连前断开旧连接，不触发其重连回调
         this._ws.close()
@@ -79,6 +79,9 @@ export const useChatStore = defineStore('chat', {
         clearTimeout(this._reconnectTimer)
         this._reconnectTimer = null
       }
+      // 入口重置退避计数：用户发起的新连接（切换会话/手动重连）不沿用旧退避；
+      // 定时器重连传 keepBackoff=true，以延续同一断线期的指数退避（1s→2s→4s→…上限 15s）
+      if (!keepBackoff) this._retry = 0
       this.currentSessionId = sessionId
       const ws = new WebSocket(wsUrl(sessionId))
       this._ws = ws
@@ -92,12 +95,19 @@ export const useChatStore = defineStore('chat', {
         // 断线指数退避重连：1s→2s→4s→…上限 15s
         const delay = Math.min(1000 * 2 ** (this._retry || 0), 15000)
         this._retry = (this._retry || 0) + 1
-        this._reconnectTimer = setTimeout(() => this.connect(sessionId), delay)
+        this._reconnectTimer = setTimeout(() => this.connect(sessionId, true), delay)
       }
     },
-    // 上行辅助：仅连接就绪时发送（ws.readyState === 1 即 OPEN）
+    // 上行辅助：连接就绪才发送，返回是否真正发出。
+    // false = 未发送（断线/重连窗口期），调用方必须保留待处理状态，供连接恢复后重试
     _uplink(payload) {
-      if (this._ws && this._ws.readyState === 1) this._ws.send(JSON.stringify(payload))
+      // readyState 1 即 WebSocket.OPEN（用字面量 1，避免 node 测试环境无 WebSocket 全局）
+      if (this._ws && this._ws.readyState === 1) {
+        this._ws.send(JSON.stringify(payload))
+        return true
+      }
+      console.warn('[chat] WS 未就绪，上行丢弃：', payload.type)
+      return false
     },
     send(text) {
       const content = (text || '').trim()
@@ -108,16 +118,14 @@ export const useChatStore = defineStore('chat', {
       this._uplink({ type: 'user_message', content })
     },
     answerAsk(text) {
-      this._uplink({ type: 'ask_answer', text })
-      this.pendingAsk = null
+      // 仅上行成功才清卡片；失败保留，连接恢复后用户可重试同一操作
+      if (this._uplink({ type: 'ask_answer', text })) this.pendingAsk = null
     },
     chooseAsk(option) {
-      this._uplink({ type: 'ask_choice', option })
-      this.pendingAsk = null
+      if (this._uplink({ type: 'ask_choice', option })) this.pendingAsk = null
     },
     confirm(approved) {
-      this._uplink({ type: 'confirm', approved })
-      this.pendingConfirm = null
+      if (this._uplink({ type: 'confirm', approved })) this.pendingConfirm = null
     },
     cancel() {
       this._uplink({ type: 'cancel' })
