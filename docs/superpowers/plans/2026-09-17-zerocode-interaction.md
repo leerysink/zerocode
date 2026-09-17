@@ -1,6 +1,6 @@
 # zerocode 对话交互增强 Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use subagent-driven-development (recommended) or executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use subagent-driven-development (recommended) or executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** 为 zerocode 补齐对标 DSH 的对话交互能力：任务列表（todo_write）、多问题提问（ask_user 升级）、思考内容查看（reasoning）、@文件指定（智能注入）、上下文压缩（自动+手动）、会话级模型选择（多模型库）。
 
@@ -34,7 +34,7 @@
 **Interfaces:**
 - Produces: 表 `model_config(id,name,base_url,api_key,model,is_default,created_at)`、`compaction(id,session_id,summary,up_to_seq,created_at)`；列 `chat_session.model_config_id/todo_state`、`message.context_content/reasoning`。后续所有任务依赖。
 
-- [ ] **Step 1: 写迁移 SQL**
+- [x] **Step 1: 写迁移 SQL**
 
 ```sql
 -- V20260917_02_interaction.sql
@@ -81,7 +81,7 @@ CREATE INDEX idx_compaction_session ON compaction (session_id, id DESC);
 
 注意：迁移器 `split_statements` 会把行内 `--` 之后内容当注释剥掉，因此回滚块必须整体以 `--` 开头（如上），且 SQL 字符串里不得出现 `--`。
 
-- [ ] **Step 2: 写失败测试（追加到 tests/test_migrations.py 末尾）**
+- [x] **Step 2: 写失败测试（追加到 tests/test_migrations.py 末尾）**
 
 ```python
 # ---------- V20260917_02：交互增强表结构 ----------
@@ -101,12 +101,12 @@ async def test_interaction_migration_schema(test_engine):
     assert {"context_content", "reasoning"} <= m_cols
 ```
 
-- [ ] **Step 3: 跑测试确认失败**
+- [x] **Step 3: 跑测试确认失败**
 
 Run: `D:\project\zerocode\.venv\Scripts\python.exe -m pytest tests/test_migrations.py -q`
 Expected: 新用例 FAIL（表/列不存在），既有用例 PASS
 
-- [ ] **Step 4: 创建迁移文件（Step 1 内容）并扩展 conftest 清表**
+- [x] **Step 4: 创建迁移文件（Step 1 内容）并扩展 conftest 清表**
 
 `tests/conftest.py` 第 26 行 TRUNCATE 改为：
 
@@ -116,12 +116,12 @@ Expected: 新用例 FAIL（表/列不存在），既有用例 PASS
             "RESTART IDENTITY CASCADE"))
 ```
 
-- [ ] **Step 5: 跑测试确认通过**
+- [x] **Step 5: 跑测试确认通过**
 
 Run: `D:\project\zerocode\.venv\Scripts\python.exe -m pytest tests/test_migrations.py -q`
 Expected: PASS（迁移器对已建过表的开发库幂等——schema_migration 已记录旧文件名，新文件按序执行）
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add changelog/V20260917_02_interaction.sql tests/test_migrations.py tests/conftest.py
@@ -141,7 +141,7 @@ git commit -m "feat: 交互增强迁移（模型库/压缩表/会话todo与模�
 - Consumes: Task 1 的 `model_config` 表
 - Produces: `GET/POST /api/models`、`PUT/DELETE /api/models/{id}`；响应统一掩码 `api_key: "sk-***"|"|"`；PUT 传 `"sk-***"` 保留原密钥；POST/PUT `is_default=true` 清其他默认
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```python
 """Task 2：模型库 CRUD（掩码回显 / 默认唯一 / 掩码哨兵不改密钥）。"""
@@ -179,12 +179,12 @@ async def test_delete(client):
     assert (await client.get("/api/models")).json() == []
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `D:\project\zerocode\.venv\Scripts\python.exe -m pytest tests/test_models_api.py -q`
 Expected: FAIL（404，路由不存在）
 
-- [ ] **Step 3: 实现 app/api/models.py**
+- [x] **Step 3: 实现 app/api/models.py**
 
 ```python
 """模型库 CRUD：多模型配置（名称/接入点/密钥/模型名/默认标记）。api_key 永远掩码回显；
@@ -263,12 +263,12 @@ async def delete_model(request: Request, model_id: int):
     app.include_router(models.router)
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `D:\project\zerocode\.venv\Scripts\python.exe -m pytest tests/test_models_api.py -q`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add app/api/models.py app/main.py tests/test_models_api.py
@@ -287,7 +287,7 @@ git commit -m "feat: 模型库REST（CRUD/掩码回显/默认唯一/掩码哨兵
 - Consumes: Task 1 的列
 - Produces: `GET /api/sessions/{id}` → `{..., todo_state: list, model_config_id: int|null}`；`PATCH /api/sessions/{id}/model` body `{model_config_id: int|null}`；`GET /api/sessions/{id}/messages` 每条含 `reasoning`。前端 Task 11/15 依赖。
 
-- [ ] **Step 1: 写失败测试（追加）**
+- [x] **Step 1: 写失败测试（追加）**
 
 ```python
 # ---------- 交互增强：会话详情 / 模型切换 / messages 带 reasoning ----------
@@ -325,12 +325,12 @@ async def test_messages_include_reasoning(client):
     assert msgs[0]["reasoning"] == "想了想"
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `D:\project\zerocode\.venv\Scripts\python.exe -m pytest tests/test_sessions.py -q`
 Expected: 新用例 FAIL（404/字段缺失），既有 PASS
 
-- [ ] **Step 3: 实现（app/api/sessions.py）**
+- [x] **Step 3: 实现（app/api/sessions.py）**
 
 ```python
 class ModelIn(BaseModel):
@@ -369,12 +369,12 @@ async def set_session_model(request: Request, session_id: int, body: ModelIn):
             "SELECT id, seq, role, content, reasoning, tool_call_id, tool_name, tool_args, tool_result, created_at "
 ```
 
-- [ ] **Step 4: 跑测试确认通过（全量）**
+- [x] **Step 4: 跑测试确认通过（全量）**
 
 Run: `D:\project\zerocode\.venv\Scripts\python.exe -m pytest tests -q`
 Expected: PASS（含既有用例无回归）
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add app/api/sessions.py tests/test_sessions.py
@@ -392,7 +392,7 @@ git commit -m "feat: 会话详情与模型切换API，messages响应带reasoning
 **Interfaces:**
 - Produces: `chat_stream` 新事件 `{"type":"reasoning_delta","content":str}`（有才发）；done message 新键 `"reasoning": str|None`；`add_message(..., reasoning=None)`；WS 下行 `reasoning_delta` 原样透传。前端 Task 11/12 依赖。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 `tests/test_llm.py` 追加（复用既有 stub 基建）：
 
@@ -445,12 +445,12 @@ async def test_reasoning_forwarded_and_saved(test_engine, tmp_path):
     assert r == "想"
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `D:\project\zerocode\.venv\Scripts\python.exe -m pytest tests/test_llm.py tests/test_agent_loop.py -q`
 Expected: 新用例 FAIL，其余 PASS
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 `app/agent/llm.py` chat_stream 改造（模块级加 `_reasoning_of`）：
 
@@ -513,12 +513,12 @@ async def add_message(session_factory, session_id: int, role: str, content=None,
                               reasoning=final.get("reasoning"))
 ```
 
-- [ ] **Step 4: 跑测试确认通过（全量）**
+- [x] **Step 4: 跑测试确认通过（全量）**
 
 Run: `D:\project\zerocode\.venv\Scripts\python.exe -m pytest tests -q`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add app/agent/llm.py app/agent/loop.py app/services/message_service.py tests/test_llm.py tests/test_agent_loop.py
@@ -537,7 +537,7 @@ git commit -m "feat: 流式reasoning解析/转发/留痕（端点不支持则无
 - Consumes: Task 1 `chat_session.todo_state`
 - Produces: 工具 `todo_write(todos:[{content,status: pending|in_progress|completed}])` 全量替换；执行后下发 `todo_sync {todos}` 事件并更新 `todo_state`；返回 `{"ok":true,"count":N}`；非法 status → ToolError。前端 Task 14 依赖。
 
-- [ ] **Step 1: 写失败测试（追加到 tests/test_agent_loop.py）**
+- [x] **Step 1: 写失败测试（追加到 tests/test_agent_loop.py）**
 
 ```python
 @pytest.mark.asyncio
@@ -568,12 +568,12 @@ async def test_todo_write_invalid_status(test_engine, tmp_path):
     assert names == {"list_dir", "read_file", "write_file", "edit_file", "ask_user", "todo_write"}
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `D:\project\zerocode\.venv\Scripts\python.exe -m pytest tests/test_agent_loop.py tests/test_llm.py -q`
 Expected: FAIL
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 `app/agent/llm.py` TOOLS 追加：
 
@@ -612,12 +612,12 @@ Expected: FAIL
         return {"ok": True, "count": len(todos)}
 ```
 
-- [ ] **Step 4: 跑测试确认通过（全量）**
+- [x] **Step 4: 跑测试确认通过（全量）**
 
 Run: `D:\project\zerocode\.venv\Scripts\python.exe -m pytest tests -q`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add app/agent/llm.py app/agent/tools.py tests/test_agent_loop.py tests/test_llm.py
@@ -635,7 +635,7 @@ git commit -m "feat: todo_write工具（全量替换/todo_sync事件/todo_state�
 **Interfaces:**
 - Produces: 工具参数 `{questions:[{question, options:[{label,description?,recommended?}], multi_select?}]}`；hub.ask(session_id, questions, timeout)；恢复值 `{"answers": [...]}`（每题 `{answer}` 或 `{options:[...]}`）；WS 上行 `ask_submit {answers}`；旧参数 `question/options`(str) 自动包装单题。**移除** hub.answer/choose 与 WS ask_answer/ask_choice。
 
-- [ ] **Step 1: 改既有测试为新协议 + 新增测试**
+- [x] **Step 1: 改既有测试为新协议 + 新增测试**
 
 `tests/test_agent_loop.py`：
 - `test_ask_user_resume` 改为：
@@ -698,12 +698,12 @@ def test_ws_multi_question_submit(client):
                 break
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `D:\project\zerocode\.venv\Scripts\python.exe -m pytest tests/test_agent_loop.py tests/test_ws.py -q`
 Expected: FAIL（新协议未实现）
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 `app/agent/llm.py` ask_user schema 替换为：
 
@@ -781,12 +781,12 @@ def _normalize_questions(args: dict) -> list[dict]:
 
 （删除 `ask_answer`/`ask_choice` 两个分支。）
 
-- [ ] **Step 4: 跑测试确认通过（全量）**
+- [x] **Step 4: 跑测试确认通过（全量）**
 
 Run: `D:\project\zerocode\.venv\Scripts\python.exe -m pytest tests -q`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add app/agent/llm.py app/hub.py app/agent/loop.py app/api/ws.py tests/test_agent_loop.py tests/test_ws.py
@@ -806,7 +806,7 @@ git commit -m "feat: ask_user升级多问题协议（questions/选项说明/推�
 - Consumes: `app.agent.tools.resolve_in_workspace / BINARY_EXTS`
 - Produces: `extract_mentions(text) -> list[str]`；`expand_mentions(root, text, max_bytes=20480) -> str|None`（无标记返回 None）；`add_message(..., context_content=None)`；`_history(session_id, window)` 内部改用 `COALESCE(context_content, content)`。Task 8 依赖 `_history` 再演进。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 `tests/test_mentions.py`：
 
@@ -869,12 +869,12 @@ async def test_mention_expanded_into_context(test_engine, tmp_path):
     assert row[0] == "请看 @a.txt" and "文件内容XYZ" in row[1]
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `D:\project\zerocode\.venv\Scripts\python.exe -m pytest tests/test_mentions.py tests/test_agent_loop.py -q`
 Expected: FAIL（模块不存在）
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 `app/agent/mentions.py`：
 
@@ -946,12 +946,12 @@ def expand_mentions(root: Path, text: str, max_bytes: int = MENTION_MAX_BYTES) -
                 "FROM message WHERE session_id=:i ORDER BY seq DESC LIMIT :w"
 ```
 
-- [ ] **Step 4: 跑测试确认通过（全量）**
+- [x] **Step 4: 跑测试确认通过（全量）**
 
 Run: `D:\project\zerocode\.venv\Scripts\python.exe -m pytest tests -q`
 Expected: PASS（test_history_trim_keeps_tool_pairs 仍过——COALESCE 对 NULL 旁路列即原文）
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add app/agent/mentions.py app/services/message_service.py app/agent/loop.py tests/test_mentions.py tests/test_agent_loop.py
@@ -976,7 +976,7 @@ git commit -m "feat: @文件指定（≤20KB内联/大文件占位/越界防护�
   - `compact(sf, llm, session_id, send, keep_recent=8) -> dict|None`（写库 + 下发 `compaction_done`；失败只发 error 返回 None）
 - loop：`_history(session_id, window, after_seq=0) -> (msgs, summary)`；`_build_messages(session_id, root, cfg, send)`；WS 上行 `{"type":"compact"}`（空闲执行，期间占 hub.running，先发 `compacting`）。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 `tests/test_compaction.py`：
 
@@ -1120,12 +1120,12 @@ def test_ws_manual_compact(client):
         assert "compaction_done" in types
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `D:\project\zerocode\.venv\Scripts\python.exe -m pytest tests/test_compaction.py tests/test_agent_loop.py tests/test_ws.py -q`
 Expected: FAIL
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 `app/services/compaction_service.py`：
 
@@ -1292,12 +1292,12 @@ from app.services import compaction_service as _comp
 
 文件头 import 加 `from app.services import compaction_service`。
 
-- [ ] **Step 4: 跑测试确认通过（全量）**
+- [x] **Step 4: 跑测试确认通过（全量）**
 
 Run: `D:\project\zerocode\.venv\Scripts\python.exe -m pytest tests -q`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add app/services/compaction_service.py app/agent/loop.py app/api/ws.py tests/test_compaction.py tests/test_agent_loop.py tests/test_ws.py
@@ -1317,7 +1317,7 @@ git commit -m "feat: 上下文压缩（LLM摘要+水位/自动阈值触发/手�
 - Consumes: Task 1/2 的 model_config 与 chat_session.model_config_id
 - Produces: `await resolve_model(sf, session_id, cfg) -> {"base_url","api_key","model","source": "session"|"default"|"global"}`；回退链 会话→默认→全局 `llm.*`。ws.py 消费。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```python
 """Task 9：会话级模型解析与回退链（session → default → global）。"""
@@ -1367,12 +1367,12 @@ async def test_session_model_wins(test_engine, tmp_path):
     assert r["source"] == "session" and r["model"] == "other-model"
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `D:\project\zerocode\.venv\Scripts\python.exe -m pytest tests/test_model_resolver.py -q`
 Expected: FAIL（模块不存在）
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 `app/agent/model_resolver.py`：
 
@@ -1424,12 +1424,12 @@ async def resolve_model(sf, session_id: int, cfg: dict) -> dict:
                         llm = llm_factory(cfg_now, model_cfg)
 ```
 
-- [ ] **Step 4: 跑测试确认通过（全量）**
+- [x] **Step 4: 跑测试确认通过（全量）**
 
 Run: `D:\project\zerocode\.venv\Scripts\python.exe -m pytest tests -q`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add app/agent/model_resolver.py app/api/ws.py tests/test_model_resolver.py
@@ -1448,7 +1448,7 @@ git commit -m "feat: 会话级模型解析（session→default→global回退链
 - Consumes: Task 5/7/8 的工具与机制名
 - Produces: `build_system_prompt(root, date)` 文本追加规则 6-8（todo_write 约定、@文件说明、<context_summary> 说明）。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```python
 """Task 10：系统提示词包含新能力约定。"""
@@ -1461,12 +1461,12 @@ def test_prompt_mentions_new_capabilities():
     assert "<context_summary>" in p
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `D:\project\zerocode\.venv\Scripts\python.exe -m pytest tests/test_prompts.py -q`
 Expected: FAIL
 
-- [ ] **Step 3: 实现（prompts.py 追加规则行）**
+- [x] **Step 3: 实现（prompts.py 追加规则行）**
 
 ```python
         "6. 多步任务先用 todo_write 建立任务清单（pending/in_progress/completed），随做随更、全量提交。\n"
@@ -1474,12 +1474,12 @@ Expected: FAIL
         "8. 上下文可能被压缩：system 尾部 <context_summary> 是更早对话的摘要，据此衔接工作。")
 ```
 
-- [ ] **Step 4: 跑测试确认通过（全量）**
+- [x] **Step 4: 跑测试确认通过（全量）**
 
 Run: `D:\project\zerocode\.venv\Scripts\python.exe -m pytest tests -q`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add app/agent/prompts.py tests/test_prompts.py
@@ -1503,7 +1503,7 @@ git commit -m "docs: 系统提示词补todo/@文件/上下文摘要约定"
   - applyEvent 分支：`reasoning_delta`、`todo_sync`、`compacting`、`compaction_done`；`message_done` 附带 `reasoning` 并复位 `streamingThinking`
 - 纯函数工具（Task 15 消费）：`src/utils/mentions.js`（`activeMentionToken(text, caret)`、`applyMention(text, token, path)`）；`src/utils/tree.js`（`flattenTree(nodes)`）
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 `frontend/src/stores/chat.test.js`：
 
@@ -1602,12 +1602,12 @@ it('展平文件节点（跳过目录本身，深入子级）', () => {
 })
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run（workdir `D:\project\zerocode\frontend`）: `npx vitest run`
 Expected: FAIL（utils 模块不存在；applyEvent 无新分支）
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 `frontend/src/utils/mentions.js`：
 
@@ -1718,12 +1718,12 @@ export const patchSessionModel = (id, modelConfigId) =>
     },
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run（workdir frontend）: `npx vitest run`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add frontend/src/api/index.js frontend/src/stores/chat.js frontend/src/stores/chat.test.js frontend/src/utils/mentions.js frontend/src/utils/mentions.test.js frontend/src/utils/tree.js frontend/src/utils/tree.test.js
@@ -1742,7 +1742,7 @@ git commit -m "feat: 前端store新事件/todo与模型状态/ask_submit与compa
 - Consumes: Task 11 的 `streamingThinking` 与消息 `reasoning`/`notice`
 - Produces: `<ThinkingBlock :thinking :streaming>`；ChatMessages assistant 分支渲染思考块；流式区顶部思考气泡；`notice` 渲染为居中灰字分隔。
 
-- [ ] **Step 1: 实现 ThinkingBlock.vue**（无单测，Task 17 冒烟覆盖）
+- [x] **Step 1: 实现 ThinkingBlock.vue**（无单测，Task 17 冒烟覆盖）
 
 ```vue
 <script setup>
@@ -1808,7 +1808,7 @@ watch(() => props.streaming, (v) => { if (v) open.value = true })
 </style>
 ```
 
-- [ ] **Step 2: ChatMessages.vue 集成**
+- [x] **Step 2: ChatMessages.vue 集成**
 
 script：import `ThinkingBlock`；props 增：
 
@@ -1853,7 +1853,7 @@ style 追加：
 }
 ```
 
-- [ ] **Step 3: ChatView.vue 传参**
+- [x] **Step 3: ChatView.vue 传参**
 
 ```html
       <ChatMessages
@@ -1866,12 +1866,12 @@ style 追加：
       />
 ```
 
-- [ ] **Step 4: 验证**
+- [x] **Step 4: 验证**
 
 Run（workdir frontend）: `npx vitest run && npm run build`
 Expected: 全部 PASS、构建成功
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add frontend/src/components/ThinkingBlock.vue frontend/src/components/ChatMessages.vue frontend/src/views/ChatView.vue
@@ -1889,7 +1889,7 @@ git commit -m "feat: 思考内容折叠块（流式动画/历史回看）与压�
 - Consumes: Task 6 `pendingAsk = {questions: [...]}`、Task 11 `submitAsk(answers)`
 - Produces: 多题渲染（单选 a-radio-group / 多选 a-checkbox-group / 自由输入 a-textarea）、推荐徽标、选项说明次行、一次提交（未答完禁用）、取消执行。
 
-- [ ] **Step 1: 实现（整体替换）**
+- [x] **Step 1: 实现（整体替换）**
 
 ```vue
 <script setup>
@@ -1998,12 +1998,12 @@ function answerOf(q, i) {
 
 多选组仍用 `selectionOf(i)`。同时 `allAnswered` 逻辑不变。
 
-- [ ] **Step 2: 验证**
+- [x] **Step 2: 验证**
 
 Run（workdir frontend）: `npx vitest run && npm run build`
 Expected: PASS
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add frontend/src/components/AskUserCard.vue
@@ -2022,7 +2022,7 @@ git commit -m "feat: 提问卡多问题版（单选/多选/自由输入/推荐�
 - Consumes: Task 11 `todoList`；消息流中 `role:'tool', name:'todo_write', args.todos`
 - Produces: `<TodoBar :todos>`（输入区上方可折叠）；`<TodoCard :todos>`（tool 消息位渲染）。
 
-- [ ] **Step 1: 实现 TodoBar.vue**
+- [x] **Step 1: 实现 TodoBar.vue**
 
 ```vue
 <script setup>
@@ -2086,7 +2086,7 @@ const STATUS_TEXT = { pending: '待办', in_progress: '进行中', completed: '�
 </style>
 ```
 
-- [ ] **Step 2: 实现 TodoCard.vue**
+- [x] **Step 2: 实现 TodoCard.vue**
 
 ```vue
 <script setup>
@@ -2127,7 +2127,7 @@ const STATUS_TEXT = { pending: '待办', in_progress: '进行中', completed: '�
 </style>
 ```
 
-- [ ] **Step 3: 集成**
+- [x] **Step 3: 集成**
 
 `ChatView.vue`：import `TodoBar`，插入输入区之前：
 
@@ -2145,12 +2145,12 @@ const STATUS_TEXT = { pending: '待办', in_progress: '进行中', completed: '�
         </div>
 ```
 
-- [ ] **Step 4: 验证**
+- [x] **Step 4: 验证**
 
 Run（workdir frontend）: `npx vitest run && npm run build`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add frontend/src/components/TodoBar.vue frontend/src/components/TodoCard.vue frontend/src/views/ChatView.vue frontend/src/components/ChatMessages.vue
@@ -2168,7 +2168,7 @@ git commit -m "feat: 任务清单前端（顶部任务栏+对话流任务卡）"
 - Consumes: Task 11（store.models/currentModelId/setModel/requestCompact/compacting、utils）、`api.index.js` 的 `tree(workspaceId)`
 - Produces: 输入框 @ 弹出文件补全（选中插入 `@"path" `）；上方模型下拉（默认模型 + 模型库）；压缩按钮（running/compacting 禁用）。
 
-- [ ] **Step 1: 实现（关键改动）**
+- [x] **Step 1: 实现（关键改动）**
 
 script setup 整体替换为：
 
@@ -2328,12 +2328,12 @@ textarea 上加 `ref="textareaRef"` 与 `@input="onInput"`；textarea 容器内�
 
 （`.zc-input-actions` 里的发送/停止逻辑保留不动；模型元信息条替代原 `模型：{{ model }}` 只读文案。）
 
-- [ ] **Step 2: 验证**
+- [x] **Step 2: 验证**
 
 Run（workdir frontend）: `npx vitest run && npm run build`
 Expected: PASS（mentions/tree 纯函数已覆盖；组件由冒烟兜底）
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add frontend/src/components/ChatInput.vue
@@ -2351,7 +2351,7 @@ git commit -m "feat: 输入区@文件补全/会话级模型下拉/压缩上下�
 - Consumes: Task 2 的 `/api/models` + Task 11 的 `listModels/createModel/updateModel/deleteModel`
 - Produces: a-tabs：`模型库`（表格+新增/编辑弹窗+删除确认+设默认）与 `基础配置`（现有三卡+保存栏迁入）。
 
-- [ ] **Step 1: 实现（关键改动）**
+- [x] **Step 1: 实现（关键改动）**
 
 script setup 追加：
 
@@ -2466,12 +2466,12 @@ template：最外层加页签，原三卡与保存栏整体移入 `基础配置`
   </a-tabs>
 ```
 
-- [ ] **Step 2: 验证**
+- [x] **Step 2: 验证**
 
 Run（workdir frontend）: `npx vitest run && npm run build`
 Expected: PASS
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add frontend/src/views/SettingsView.vue
@@ -2490,17 +2490,17 @@ git commit -m "feat: 设置页模型库页签（CRUD/设默认/掩码回显/删�
 - Consumes: Task 1-16 全部交付物
 - Produces: 全量测试证据、生产构建产物、冒烟结论
 
-- [ ] **Step 1: 后端全量测试**
+- [x] **Step 1: 后端全量测试**
 
 Run: `D:\project\zerocode\.venv\Scripts\python.exe -m pytest tests -q`
 Expected: 全 PASS（0 fail）
 
-- [ ] **Step 2: 前端全量测试 + 生产构建**
+- [x] **Step 2: 前端全量测试 + 生产构建**
 
 Run（workdir frontend）: `npx vitest run` 然后 `npm run build`
 Expected: 全 PASS；`frontend/dist` 生成
 
-- [ ] **Step 3: 启动联调环境冒烟（browser-skill）**
+- [x] **Step 3: 启动联调环境冒烟（browser-skill）**
 
 启动：后台运行 `.venv\Scripts\python.exe -m uvicorn app.main:app --port 8100`（后端已托管 frontend/dist）。冒烟清单：
 1. 设置页 → 模型库 → 新增模型（is_default）；
@@ -2510,7 +2510,7 @@ Expected: 全 PASS；`frontend/dist` 生成
 5. 让 agent 调 ask_user 多问题 → 多题卡片、推荐徽标、一次提交恢复执行；
 6. 点「压缩上下文」→ 提示条出现；重开会话 → 任务栏/模型选择恢复。
 
-- [ ] **Step 4: 提交收尾 + 报告**
+- [x] **Step 4: 提交收尾 + 报告**
 
 ```bash
 git add -A
