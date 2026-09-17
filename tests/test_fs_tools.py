@@ -81,3 +81,19 @@ async def test_write_rejects_non_utf8_and_root(tmp_path):
     assert p.read_bytes() == raw  # 拒绝覆写：原文未变
     with pytest.raises(ToolError):  # root 目录守卫：path 为空指向工作区根（目录）
         await execute_tool(ctx, "write_file", {"path": "", "content": "x"})
+
+@pytest.mark.asyncio
+async def test_edit_preserves_line_endings(tmp_path):
+    # 行尾字节保真：edit 只改替换区，其余行尾（CRLF/LF 混排）必须逐字节原样保留
+    ctx = make_ctx(tmp_path)
+    p = tmp_path / "mixed.txt"
+    p.write_bytes(b"alpha\r\nbeta\n")
+    await execute_tool(ctx, "edit_file", {"path": "mixed.txt", "old_string": "beta", "new_string": "gamma"})
+    assert p.read_bytes() == b"alpha\r\ngamma\n"
+
+@pytest.mark.asyncio
+async def test_write_preserves_line_endings(tmp_path):
+    # write_file 不得把 \n 翻转为 \r\n（Windows 默认文本模式会翻转，污染 LF 目标仓库）
+    ctx = make_ctx(tmp_path)
+    await execute_tool(ctx, "write_file", {"path": "lf.txt", "content": "l1\nl2\n"})
+    assert (tmp_path / "lf.txt").read_bytes() == b"l1\nl2\n"

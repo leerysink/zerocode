@@ -81,7 +81,8 @@ async def execute_tool(ctx: ToolContext, name: str, args: dict) -> dict:
         except UnicodeDecodeError:
             raise ToolError(f"文件不是 UTF-8 编码，拒绝覆盖: {args.get('path')}")
         f.parent.mkdir(parents=True, exist_ok=True)
-        f.write_text(content, encoding="utf-8")
+        # newline='' 字节保真，避免 Windows 行尾翻转污染目标文件
+        f.write_text(content, encoding="utf-8", newline="")
         await _record_change(ctx, str(f.relative_to(ctx.root)), "edit" if existed else "create", before, content)
         return {"ok": True, "path": str(f.relative_to(ctx.root)), "bytes": len(content.encode("utf-8"))}
 
@@ -94,7 +95,9 @@ async def execute_tool(ctx: ToolContext, name: str, args: dict) -> dict:
             raise ToolError(f"不支持编辑二进制文件: {args.get('path')}")
         old, new = str(args.get("old_string")), str(args.get("new_string"))
         try:
-            content = f.read_text(encoding="utf-8")
+            # newline='' 字节保真：读取保留原 \r\n 不做统一换行，替换后原样写回
+            with open(f, "r", encoding="utf-8", newline="") as fh:
+                content = fh.read()
         except UnicodeDecodeError:
             raise ToolError(f"文件不是 UTF-8 编码，拒绝编辑: {args.get('path')}")
         n = content.count(old)
@@ -103,7 +106,9 @@ async def execute_tool(ctx: ToolContext, name: str, args: dict) -> dict:
         if n > 1:
             raise ToolError(f"old_string 匹配 {n} 处，必须唯一；请扩大上下文后重试")
         after = content.replace(old, new, 1)
-        f.write_text(after, encoding="utf-8")
+        # newline='' 字节保真，避免 Windows 行尾翻转污染目标文件
+        with open(f, "w", encoding="utf-8", newline="") as fh:
+            fh.write(after)
         await _record_change(ctx, str(f.relative_to(ctx.root)), "edit", content, after)
         return {"ok": True, "path": str(f.relative_to(ctx.root))}
 

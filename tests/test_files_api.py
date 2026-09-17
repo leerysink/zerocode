@@ -32,3 +32,11 @@ async def test_read_and_save_and_guard(client, tmp_path):
     (tmp_path / "img.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 10)
     r4 = await client.get("/api/files/read", params={"workspace_id": ws["id"], "path": "img.png"})
     assert r4.status_code == 400
+
+@pytest.mark.asyncio
+async def test_save_preserves_line_endings(client, tmp_path):
+    # UI 保存路径同款字节保真：LF 不得被翻转为 CRLF
+    ws = await _ws(client, tmp_path)
+    r = await client.put("/api/files/save", json={"workspace_id": ws["id"], "path": "lf.txt", "content": "one\ntwo\n"})
+    assert r.status_code == 200
+    assert (tmp_path / "lf.txt").read_bytes() == b"one\ntwo\n"

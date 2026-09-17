@@ -64,5 +64,6 @@ async def files_save(request: Request, body: SaveIn):
     except Exception as e:
         raise HTTPException(400, str(e))
     f.parent.mkdir(parents=True, exist_ok=True)
-    f.write_text(body.content, encoding="utf-8")
+    # newline='' 字节保真，避免 Windows 行尾翻转污染目标文件
+    f.write_text(body.content, encoding="utf-8", newline="")
     return {"ok": True}
