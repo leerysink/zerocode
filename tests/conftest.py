@@ -23,7 +23,8 @@ async def test_engine():
     # 测试间清库（全局约束），保留 schema_migration 与 app_config 种子
     async with engine.begin() as conn:
         await conn.execute(text(
-            "TRUNCATE message, file_change, chat_session, workspace RESTART IDENTITY CASCADE"))
+            "TRUNCATE message, file_change, compaction, chat_session, workspace, model_config "
+            "RESTART IDENTITY CASCADE"))
     await engine.dispose()
 
 @pytest.fixture
