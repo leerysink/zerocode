@@ -122,3 +122,34 @@ async def test_cancel(test_engine, tmp_path):
     sid, status, evs, sf = await run_once(test_engine, tmp_path, turns, ask=ask_and_cancel, cancel=cancel)
     assert status == "idle"
     assert any(e["type"] == "error" and e["message"] == "已取消" for e in evs)
+
+@pytest.mark.asyncio
+async def test_history_trim_keeps_tool_pairs(test_engine, tmp_path):
+    # 窗口边界落在 assistant(tool_calls)/tool 之间会拆散消息对：请求带孤儿 tool 消息
+    # 或无结果的 tool_calls，OpenAI 兼容 API 会 400。_history 必须从头部修剪孤儿。
+    sid = await mk_session(test_engine, tmp_path)
+    sf = make_session_factory(test_engine)
+    await add_message(sf, sid, "user", content="第一问")
+    await add_message(sf, sid, "assistant", content=None,
+                      tool_args={"tool_calls": [tool_call("call_1", "write_file", path="a.txt", content="hi")]})
+    await add_message(sf, sid, "tool", tool_call_id="call_1", tool_name="write_file",
+                      tool_result={"ok": True})
+    # 与 run() 时序一致：新 user 消息先落库再读历史 → window=2 时原始尾部恰切在对中间
+    await add_message(sf, sid, "user", content="第二问")
+    rec = Recorder()
+    runner = AgentRunner(sf, ScriptedLLM([]), cfg_provider(), rec,
+                         lambda *a, **k: asyncio.sleep(0, None), lambda *a, **k: True)
+    msgs = await runner._history(sid, 2)
+    # 核心：任何 tool 消息的 tool_call_id 都能在保留 assistant 的 tool_calls 中找到
+    kept_call_ids = {tc.get("id") for m in msgs if m["role"] == "assistant"
+                     for tc in (m.get("tool_calls") or [])}
+    assert all(m.get("tool_call_id") in kept_call_ids for m in msgs if m["role"] == "tool")
+    # 核心：任何保留 assistant 的 tool_calls 都有对应 tool 消息
+    kept_tool_ids = {m["tool_call_id"] for m in msgs if m["role"] == "tool"}
+    assert all(tc.get("id") in kept_tool_ids for m in msgs if m["role"] == "assistant"
+               for tc in (m.get("tool_calls") or []))
+    # 头部孤儿 tool(call_1) 被修剪，窗口有效内容从干净的 user(第二问) 开始
+    assert [m["role"] for m in msgs] == ["user"]
+    # 对照：窗口=3 时对完整，user 开头的正常截断不得被误剪
+    full = await runner._history(sid, 3)
+    assert [m["role"] for m in full] == ["assistant", "tool", "user"]

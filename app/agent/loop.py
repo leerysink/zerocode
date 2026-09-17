@@ -64,6 +64,23 @@ class AgentRunner:
             elif r["role"] == "tool":
                 msgs.append({"role": "tool", "tool_call_id": r["tool_call_id"],
                              "content": json.dumps(r["tool_result"], ensure_ascii=False)})
+        # 修剪窗口头部拆散的 assistant(tool_calls)/tool 消息对：孤儿 tool 消息或
+        # 无结果的 tool_calls 会让 OpenAI 兼容 API 返回 400；从头部逐条丢弃，
+        # 直到头部干净或列表为空（数据在内存且 N≤40，O(N²) 可接受）
+        while msgs:
+            head = msgs[0]
+            if head["role"] == "tool":
+                if not any(m["role"] == "assistant" and any(
+                        tc.get("id") == head["tool_call_id"] for tc in (m.get("tool_calls") or []))
+                        for m in msgs):
+                    msgs.pop(0)
+                    continue
+            elif head["role"] == "assistant" and head.get("tool_calls"):
+                kept_tools = {m["tool_call_id"] for m in msgs if m["role"] == "tool"}
+                if not all(tc.get("id") in kept_tools for tc in head["tool_calls"]):
+                    msgs.pop(0)
+                    continue
+            break
         return msgs
 
     async def _inner(self, session_id: int, user_text: str, cancel: asyncio.Event):
