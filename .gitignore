@@ -17,3 +17,6 @@ frontend/dist/
 .vscode/
 *.log
 .DS_Store
+
+# SDD workspace
+.superpowers/
