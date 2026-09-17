@@ -4,10 +4,8 @@
 // 插入写入确认卡（pendingConfirm）与提问卡（pendingAsk）。
 // 滚动策略：新消息/新卡片强制滚底；流式增量仅在用户已贴底时跟随，不打断上翻阅读。
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
-import MarkdownIt from 'markdown-it'
-import hljs from 'highlight.js/lib/common'
-import 'highlight.js/styles/github.css'
 import { useChatStore } from '../stores/chat'
+import MarkdownView from './MarkdownView.vue'
 import ToolCallBlock from './ToolCallBlock.vue'
 import AskUserCard from './AskUserCard.vue'
 
@@ -21,25 +19,8 @@ const props = defineProps({
 
 const store = useChatStore()
 
-// Markdown 渲染：markdown-it + highlight.js（素雅浅色主题）；html 关闭防注入
-const md = new MarkdownIt({
-  html: false,
-  linkify: true,
-  breaks: true, // 单换行即 <br>，聊天语境更符合直觉
-  highlight(code, lang) {
-    if (lang && hljs.getLanguage(lang)) {
-      try {
-        return `<pre class="hljs"><code>${hljs.highlight(code, { language: lang, ignoreIllegals: true }).value}</code></pre>`
-      } catch {
-        /* 未知语法退回转义输出 */
-      }
-    }
-    return `<pre class="hljs"><code>${md.utils.escapeHtml(code)}</code></pre>`
-  },
-})
-const renderMd = (text) => md.render(String(text ?? ''))
-
-const streamedHtml = computed(() => renderMd(props.streaming))
+// Markdown 渲染已抽至 MarkdownView.vue（markdown-it 模块级单例 + 按 content 的 computed 缓存）：
+// 流式期间本组件随 token 重渲染，但历史气泡的 content 不变 → 子组件 computed 不重算，零重解析。
 
 // 确认卡 args 摘要：超长截断，避免大文件内容撑爆卡片
 const confirmSummary = computed(() => {
@@ -90,9 +71,9 @@ onMounted(scrollToBottom)
         <div v-if="m.role === 'user'" class="zc-msg is-user">
           <div class="zc-bubble">{{ m.content }}</div>
         </div>
-        <!-- assistant：Markdown 渲染（历史中携带 tool_calls 的空内容行不渲染） -->
+        <!-- assistant：Markdown 渲染（MarkdownView 按 content 缓存，历史中携带 tool_calls 的空内容行不渲染） -->
         <div v-else-if="m.role === 'assistant' && m.content" class="zc-msg is-assistant">
-          <div class="zc-md" v-html="renderMd(m.content)"></div>
+          <MarkdownView class="zc-md" :content="m.content" />
         </div>
         <!-- tool：折叠工具块（含 diff 时内部渲染 DiffBlock） -->
         <div v-else-if="m.role === 'tool'" class="zc-msg is-tool">
@@ -107,9 +88,9 @@ onMounted(scrollToBottom)
         </div>
       </template>
 
-      <!-- 流式气泡：streamingContent 非空才渲染 -->
+      <!-- 流式气泡：streamingContent 非空才渲染（仅此气泡随 token 重算 Markdown） -->
       <div v-if="streaming" class="zc-msg is-assistant">
-        <div class="zc-md is-streaming" v-html="streamedHtml"></div>
+        <MarkdownView class="zc-md is-streaming" :content="streaming" />
       </div>
 
       <!-- 写入确认卡：pendingConfirm 时插入消息流 -->

@@ -1,7 +1,7 @@
 <script setup>
 // diff 渲染块：unified diff 逐行渲染（add 绿底 / del 红底 / hunk 灰字，等宽字体）。
 // Task 11/12 预警：parseDiff 会把头两行 `--- a/x` / `+++ b/x` 误归为 del/add——
-// 此处在渲染侧过滤这两类头行，不改 parseDiff 本身（决策留痕见 task-13-report）。
+// 此处在渲染侧过滤这两类头行（仅限前两行），不改 parseDiff 本身（决策留痕见 task-13-report）。
 import { computed } from 'vue'
 import { parseDiff } from '../utils/diff'
 
@@ -14,9 +14,14 @@ const props = defineProps({
 // 与后端 tools.py 的 action 取值对应（create/edit/delete），未知值原样展示
 const ACTION_LABEL = { create: '新建', edit: '修改', delete: '删除' }
 
-// 统一 diff 中 `--- `/`+++ ` 只出现在文件头；正文里的此类内容必带 +/- 前缀（如 `- --- x`），不受影响
+// 头行过滤仅作用于前两行（行索引 <2 且形如 `--- `/`+++ ` 开头才滤）：
+// 后端 unified diff 的文件头必在最前两行；正文里原文内容为 `-- x`/`++ y` 的 del/add 行
+// （raw 为 `--- x`/`+++ y`）不再被误伤。残余限制：无头行 diff 的首两行内容若恰形如 `--- ` 仍会被滤
+// （显示层缓解的取舍，见 task-13-report 修复记录）。
 const lines = computed(() =>
-  parseDiff(props.diff).filter((l) => !l.text.startsWith('--- ') && !l.text.startsWith('+++ '))
+  parseDiff(props.diff).filter(
+    (l, idx) => idx >= 2 || !(l.text.startsWith('--- ') || l.text.startsWith('+++ '))
+  )
 )
 </script>
 
