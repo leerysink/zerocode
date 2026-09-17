@@ -9,6 +9,7 @@ import MarkdownView from './MarkdownView.vue'
 import ToolCallBlock from './ToolCallBlock.vue'
 import AskUserCard from './AskUserCard.vue'
 import ThinkingBlock from './ThinkingBlock.vue'
+import TodoCard from './TodoCard.vue'
 
 const props = defineProps({
   messages: { type: Array, default: () => [] },
@@ -85,9 +86,11 @@ onMounted(scrollToBottom)
         <div v-else-if="m.role === 'notice'" class="zc-msg is-notice">
           <span class="zc-notice-text">{{ m.content }}</span>
         </div>
-        <!-- tool：折叠工具块（含 diff 时内部渲染 DiffBlock） -->
+        <!-- tool：todo_write 调用处渲染任务卡（实时 tool_call 消息才有 args.todos；
+             tool_result 与历史消息无 args，落回折叠工具块，避免同一调用渲染两张卡） -->
         <div v-else-if="m.role === 'tool'" class="zc-msg is-tool">
-          <ToolCallBlock :msg="m" />
+          <TodoCard v-if="m.name === 'todo_write' && m.args && m.args.todos" :todos="m.args.todos" />
+          <ToolCallBlock v-else :msg="m" />
         </div>
         <!-- error：红色气泡 + 尾部重试（重发最后一条 user 消息） -->
         <div v-else-if="m.role === 'error'" class="zc-msg is-error">

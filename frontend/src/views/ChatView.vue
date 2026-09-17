@@ -1,5 +1,5 @@
 <script setup>
-// 对话页三栏布局：左栏 SideBar + 中栏对话流/输入区（Task 13）+ 右栏文件面板（Task 14）。
+// 对话页三栏布局：左栏 SideBar + 中栏对话流/输入区（Task 13）+ 任务栏 TodoBar（Task 14）+ 右栏文件面板（Task 14）。
 // 右栏以 v-if="store.currentWorkspaceId" 为渲染门（无会话时整个面板不渲染）。
 // 骨架按 brief Step 1 照抄，修正两处笔误（报告留痕）：
 // ① brief 骨架多出一个 </a-layout> 闭合标签（3 闭合对 2 开启）；
@@ -9,6 +9,7 @@ import { useChatStore } from '../stores/chat'
 import SideBar from '../components/SideBar.vue'
 import ChatMessages from '../components/ChatMessages.vue'
 import ChatInput from '../components/ChatInput.vue'
+import TodoBar from '../components/TodoBar.vue'
 import FilePanel from '../components/FilePanel.vue'
 
 const store = useChatStore()
@@ -27,6 +28,7 @@ onMounted(() => store.loadWorkspaces())
         :pending-confirm="store.pendingConfirm"
         :has-session="!!store.currentSessionId"
       />
+      <TodoBar v-if="store.todoList.length" :todos="store.todoList" />
       <ChatInput :running="store.running" @send="store.send" @cancel="store.cancel" />
     </a-layout>
     <FilePanel v-if="store.currentWorkspaceId" :workspace-id="store.currentWorkspaceId" />
