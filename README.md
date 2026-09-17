@@ -20,18 +20,24 @@ Agent 循环具备工具调用、写文件确认、会话持久化与崩溃恢�
    .venv\Scripts\pip install -r requirements.txt
    ```
 
-3. **配置 LLM**：启动后打开 <http://127.0.0.1:8100> → 配置页，填入 `llm.base_url`、`llm.api_key`、`llm.model`（OpenAI 兼容接口，如 DeepSeek）。
+3. **安装前端依赖**（新克隆没有 node_modules，构建前必须先装）：
+
+   ```powershell
+   npm install --prefix frontend
+   ```
 
 4. **构建前端并启动**（双击或命令行运行，均在仓库根）：
 
    ```powershell
    .\build.bat   # 进入 frontend 执行 npm run build，产物在 frontend/dist
-   .\start.bat   # 从仓库根运行 uvicorn app.main:app --host 127.0.0.1 --port 8100
+   .\start.bat   # 优先用 .venv\Scripts\python.exe 启动 uvicorn app.main:app --host 127.0.0.1 --port 8100（无 .venv 时回退 PATH 中的 python）
    ```
 
-   也可手动执行等价命令：`npm run build --prefix frontend` + `python -m uvicorn app.main:app --host 127.0.0.1 --port 8100`。
+   手动等价命令：`npm run build --prefix frontend` + `.venv\Scripts\python -m uvicorn app.main:app --host 127.0.0.1 --port 8100`（与 start.bat 一致优先 venv；若无 .venv 则用 `python -m uvicorn ...`，需全局已装 uvicorn）。
 
-5. **访问**：<http://127.0.0.1:8100>（后端同时静态托管前端；非 `/api`、`/ws` 路径 SPA 回退 index.html）。
+5. **配置 LLM**：启动后打开 <http://127.0.0.1:8100> → 配置页，填入 `llm.base_url`、`llm.api_key`、`llm.model`（OpenAI 兼容接口，如 DeepSeek）。
+
+6. **访问**：<http://127.0.0.1:8100>（后端同时静态托管前端；非 `/api`、`/ws` 路径 SPA 回退 index.html）。
 
 ## 约定
 
