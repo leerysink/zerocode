@@ -1,34 +1,49 @@
 <script setup>
-// 对话页布局：左栏 SideBar（工作区/会话）+ 对话区（后续任务实现）+ 右栏占位（后续任务实现）
+// 对话页三栏布局：左栏 SideBar + 中栏对话流/输入区（Task 13）+ 右栏文件面板占位（Task 14 完成后
+// 替换为 <FilePanel :workspace-id="store.currentWorkspaceId" />）。
+// 骨架按 brief Step 1 照抄，修正两处笔误（报告留痕）：
+// ① brief 骨架多出一个 </a-layout> 闭合标签（3 闭合对 2 开启）；
+// ② 外层 a-layout 需显式 has-sider——SideBar 是普通 aside 而非 a-layout-sider，antd 不会自动加 row 方向，缺省会纵向堆叠。
+import { onMounted } from 'vue'
+import { useChatStore } from '../stores/chat'
 import SideBar from '../components/SideBar.vue'
+import ChatMessages from '../components/ChatMessages.vue'
+import ChatInput from '../components/ChatInput.vue'
+
+const store = useChatStore()
+onMounted(() => store.loadWorkspaces())
 </script>
 
 <template>
-  <div class="zc-layout">
+  <a-layout class="zc-layout" has-sider>
     <SideBar />
-    <main class="zc-main">
-      <!-- 对话区占位：后续任务实现 -->
-      <div class="zc-main-empty">对话</div>
-    </main>
-    <!-- 右栏占位：后续任务填充 -->
-    <div class="zc-right"></div>
-  </div>
+    <a-layout class="zc-center">
+      <ChatMessages
+        :messages="store.messages"
+        :streaming="store.streamingContent"
+        :pending-ask="store.pendingAsk"
+        :pending-confirm="store.pendingConfirm"
+        :has-session="!!store.currentSessionId"
+      />
+      <ChatInput :running="store.running" @send="store.send" @cancel="store.cancel" />
+    </a-layout>
+    <div v-if="store.currentWorkspaceId" class="zc-file-placeholder">
+      <!-- Task 14 完成后替换为 <FilePanel :workspace-id="store.currentWorkspaceId" /> -->
+    </div>
+  </a-layout>
 </template>
 
 <style scoped>
 .zc-layout {
-  display: flex;
   height: 100vh;
 }
-.zc-main {
-  flex: 1;
+.zc-center {
   min-width: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  color: var(--zc-text-sub);
+  background: #fff;
 }
-.zc-right {
-  flex: 0 0 auto;
+.zc-file-placeholder {
+  flex: 0 0 320px;
+  border-left: 1px solid var(--zc-border);
+  background: var(--zc-sidebar-bg);
 }
 </style>

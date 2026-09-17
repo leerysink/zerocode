@@ -33,10 +33,12 @@ export function applyEvent(store, ev) {
     case 'status': // 终态回执（idle/error），复位执行态
       store.running = false
       break
-    case 'file_change': // 挂到最近一条 tool 消息，供 diff 渲染
+    case 'file_change': // 挂到最近一条 tool 消息，供 diff 渲染（Task 13 最小扩展：补存 path/action 供文件名显示）
       for (let i = store.messages.length - 1; i >= 0; i--) {
         if (store.messages[i].role === 'tool') {
           store.messages[i].diff = ev.diff
+          store.messages[i].diff_path = ev.path
+          store.messages[i].diff_action = ev.action
           break
         }
       }

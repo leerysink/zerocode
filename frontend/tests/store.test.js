@@ -43,12 +43,14 @@ describe('chat store 事件流', () => {
     expect(s.messages.at(-1)).toMatchObject({ role: 'error', content: 'boom' })
     expect(s.running).toBe(false)
   })
-  it('file_change 事件挂到最近 tool 消息', () => {
+  it('file_change 事件挂到最近 tool 消息，且保留 path/action 供 diff 渲染文件名', () => {
     const s = useChatStore()
     applyEvent(s, { type: 'tool_call', name: 'write_file', args: { path: 'a.txt' } })
     applyEvent(s, { type: 'file_change', path: 'a.txt', action: 'create', diff: '--- a/a.txt' })
     const tool = s.messages.filter(m => m.role === 'tool').at(-1)
     expect(tool.diff).toBe('--- a/a.txt')
+    expect(tool.diff_path).toBe('a.txt')
+    expect(tool.diff_action).toBe('create')
   })
   it('上行失败（WS 非 OPEN）保留 pendingAsk/pendingConfirm，成功才清除', () => {
     const s = useChatStore()
