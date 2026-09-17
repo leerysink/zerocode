@@ -25,3 +25,15 @@ async def test_engine():
         await conn.execute(text(
             "TRUNCATE message, file_change, chat_session, workspace RESTART IDENTITY CASCADE"))
     await engine.dispose()
+
+@pytest.fixture
+async def client(test_engine):
+    from asgi_lifespan import LifespanManager
+    from httpx import AsyncClient, ASGITransport
+    from app.main import create_app
+    # str(test_engine.url) 会掩码密码（SQLAlchemy 默认 hide_password=True）导致认证失败，
+    # 故用 render_as_string(hide_password=False) 取真实连接串
+    app = create_app(test_engine.url.render_as_string(hide_password=False))
+    async with LifespanManager(app):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+            yield c
