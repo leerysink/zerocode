@@ -61,6 +61,28 @@ def create_app(database_url: str | None = None) -> FastAPI:
     app.include_router(sessions.router)
     app.include_router(files.router)
     app.include_router(ws_router)
+
+    # ---- 前端静态托管（Task 15）：挂载 frontend/dist，SPA 回退 index.html ----
+    import os
+    from pathlib import Path
+    from fastapi.responses import FileResponse, JSONResponse
+    from fastapi.staticfiles import StaticFiles
+    from starlette.exceptions import HTTPException as StarletteHTTPException
+    dist = Path(os.environ.get("ZEROCODE_FRONTEND_DIST",
+                               Path(__file__).resolve().parents[1] / "frontend" / "dist"))
+    if dist.is_dir():
+        app.mount("/", StaticFiles(directory=dist, html=True), name="spa")
+
+        # SPA 回退：非 /api、/ws 的 GET 请求未命中静态文件时回退 index.html；
+        # API/WS 路径保持 JSON 404，不吞掉后端自身的 404 语义。
+        index_file = dist / "index.html"
+
+        @app.exception_handler(404)
+        async def spa_fallback(request, exc: StarletteHTTPException):
+            if (request.method in ("GET", "HEAD") and index_file.is_file()
+                    and not request.url.path.startswith(("/api", "/ws"))):
+                return FileResponse(index_file)
+            return JSONResponse({"detail": exc.detail}, status_code=404)
     return app
 
 app = create_app()
