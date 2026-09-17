@@ -7,6 +7,7 @@ import asyncio, datetime, inspect, json
 from pathlib import Path
 from app.agent.prompts import build_system_prompt
 from app.agent.tools import ToolContext, ToolError, execute_tool
+from app.agent.mentions import expand_mentions
 from app.services.message_service import add_message
 from sqlalchemy import text
 
@@ -61,8 +62,8 @@ class AgentRunner:
     async def _history(self, session_id: int, window: int) -> list[dict]:
         async with self.sf() as s:
             rows = (await s.execute(text(
-                "SELECT role, content, tool_call_id, tool_name, tool_args, tool_result FROM message "
-                "WHERE session_id=:i ORDER BY seq DESC LIMIT :w"), {"i": session_id, "w": window})).mappings().all()
+                "SELECT role, COALESCE(context_content, content) AS content, tool_call_id, tool_name, tool_args, tool_result "
+                "FROM message WHERE session_id=:i ORDER BY seq DESC LIMIT :w"), {"i": session_id, "w": window})).mappings().all()
         msgs = []
         for r in reversed(rows):
             if r["role"] == "user":
@@ -97,7 +98,8 @@ class AgentRunner:
     async def _inner(self, session_id: int, user_text: str, cancel: asyncio.Event):
         cfg = await self.get_config()
         root = await self._root_of(session_id)
-        await add_message(self.sf, session_id, "user", content=user_text)
+        expanded = expand_mentions(root, user_text)
+        await add_message(self.sf, session_id, "user", content=user_text, context_content=expanded)
         history = await self._history(session_id, int(cfg.get("agent.history_window", 40)))
         messages = [{"role": "system", "content": build_system_prompt(root, datetime.date.today().isoformat())}] + history
         ctx = ToolContext(root=root, session_id=session_id, session_factory=self.sf, send=self.send)

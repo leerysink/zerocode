@@ -196,3 +196,22 @@ async def test_todo_write_invalid_status(test_engine, tmp_path):
     sid, status, evs, sf = await run_once(test_engine, tmp_path, turns)
     tr = next(e for e in evs if e["type"] == "tool_result")
     assert tr["result"]["ok"] is False and "非法" in tr["result"]["error"]
+
+@pytest.mark.asyncio
+async def test_mention_expanded_into_context(test_engine, tmp_path):
+    (tmp_path / "a.txt").write_text("文件内容XYZ", encoding="utf-8")
+    llm = ScriptedLLM([[{"type": "content_delta", "content": "好"},
+                        {"type": "done", "message": {"role": "assistant", "content": "好", "tool_calls": None}}]])
+    sid = await mk_session(test_engine, tmp_path)
+    sf = make_session_factory(test_engine)
+    rec = Recorder()
+    runner = AgentRunner(sf, llm, cfg_provider(), rec, lambda *a, **k: asyncio.sleep(0, None), lambda *a, **k: True)
+    await runner.run(sid, "请看 @a.txt", asyncio.Event())
+    # 模型收到的是展开后的 <file> 块
+    assert '<file path="a.txt">' in llm.received[0][1]["content"]
+    # 落库双份：content 原文、context_content 展开
+    async with sf() as s:
+        row = (await s.execute(sql(
+            "SELECT content, context_content FROM message WHERE session_id=:i AND role='user'"),
+            {"i": sid})).first()
+    assert row[0] == "请看 @a.txt" and "文件内容XYZ" in row[1]
