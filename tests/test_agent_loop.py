@@ -153,3 +153,15 @@ async def test_history_trim_keeps_tool_pairs(test_engine, tmp_path):
     # 对照：窗口=3 时对完整，user 开头的正常截断不得被误剪
     full = await runner._history(sid, 3)
     assert [m["role"] for m in full] == ["assistant", "tool", "user"]
+
+@pytest.mark.asyncio
+async def test_reasoning_forwarded_and_saved(test_engine, tmp_path):
+    turns = [[{"type": "reasoning_delta", "content": "想"}, {"type": "content_delta", "content": "答"},
+              {"type": "done", "message": {"role": "assistant", "content": "答", "tool_calls": None,
+                                           "reasoning": "想"}}]]
+    sid, status, evs, sf = await run_once(test_engine, tmp_path, turns)
+    assert any(e["type"] == "reasoning_delta" and e["content"] == "想" for e in evs)
+    async with sf() as s:
+        r = (await s.execute(sql(
+            "SELECT reasoning FROM message WHERE session_id=:i AND role='assistant'"), {"i": sid})).scalar()
+    assert r == "想"

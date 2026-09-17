@@ -35,6 +35,15 @@ TOOLS = [
                         "description": "可选项（可为空，空则用户自由输入）"}}, "required": ["question"]}}},
 ]
 
+def _reasoning_of(delta):
+    """兼容取 reasoning_content：SDK 具名属性优先，其次 model_extra（未知字段兜底）。"""
+    if delta is None:
+        return None
+    rc = getattr(delta, "reasoning_content", None)
+    if rc is None:
+        rc = (getattr(delta, "model_extra", None) or {}).get("reasoning_content")
+    return rc
+
 class OpenAICompatLLM:
     def __init__(self, base_url: str, api_key: str, model: str):
         self.client = AsyncOpenAI(base_url=base_url, api_key=api_key or "EMPTY")
@@ -42,6 +51,7 @@ class OpenAICompatLLM:
 
     async def chat_stream(self, messages: list[dict], tools: list[dict]) -> AsyncIterator[dict]:
         content_parts: list[str] = []
+        reasoning_parts: list[str] = []
         tool_calls: dict[int, dict] = {}
         stream = await self.client.chat.completions.create(
             model=self.model, messages=messages, tools=tools, stream=True)
@@ -49,6 +59,10 @@ class OpenAICompatLLM:
             if not chunk.choices:
                 continue
             delta = chunk.choices[0].delta
+            rc = _reasoning_of(delta)
+            if rc:
+                reasoning_parts.append(rc)
+                yield {"type": "reasoning_delta", "content": rc}
             if delta and delta.content:
                 content_parts.append(delta.content)
                 yield {"type": "content_delta", "content": delta.content}
@@ -64,6 +78,7 @@ class OpenAICompatLLM:
         yield {"type": "done", "message": {
             "role": "assistant",
             "content": "".join(content_parts) or None,
+            "reasoning": "".join(reasoning_parts) or None,
             "tool_calls": [tool_calls[i] for i in sorted(tool_calls)] or None}}
 
 class ScriptedLLM:

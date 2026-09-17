@@ -128,7 +128,7 @@ async def test_stream_empty_round_done_none(monkeypatch):
     ])
     evs = await _collect(llm)
     assert [e["type"] for e in evs] == ["done"]
-    assert evs[-1]["message"] == {"role": "assistant", "content": None, "tool_calls": None}
+    assert evs[-1]["message"] == {"role": "assistant", "content": None, "tool_calls": None, "reasoning": None}
 
 @pytest.mark.asyncio
 async def test_stream_create_kwargs_passthrough(monkeypatch):
@@ -143,3 +143,28 @@ async def test_stream_create_kwargs_passthrough(monkeypatch):
     assert kw["model"] == "test-model"
     assert kw["messages"] == messages
     assert kw["tools"] == TOOLS
+
+# ---------- reasoning_content 解析（Task 4） ----------
+
+def _rdelta(reasoning=None, content=None):
+    return SimpleNamespace(content=content, tool_calls=None, reasoning_content=reasoning)
+
+@pytest.mark.asyncio
+async def test_stream_reasoning_delta_and_done(monkeypatch):
+    llm, _ = _make_llm(monkeypatch, [
+        _chunk(_rdelta(reasoning="先想")),
+        _chunk(_rdelta(reasoning="清楚")),
+        _chunk(_rdelta(content="答案")),
+    ])
+    evs = await _collect(llm)
+    assert [e["type"] for e in evs] == ["reasoning_delta", "reasoning_delta", "content_delta", "done"]
+    assert evs[0]["content"] == "先想"
+    assert evs[-1]["message"]["reasoning"] == "先想清楚"
+
+@pytest.mark.asyncio
+async def test_stream_no_reasoning_no_event(monkeypatch):
+    # 既有 _delta（无 reasoning_content 属性）不产生 reasoning 事件，done.reasoning=None
+    llm, _ = _make_llm(monkeypatch, [_chunk(_delta(content="ok"))])
+    evs = await _collect(llm)
+    assert all(e["type"] != "reasoning_delta" for e in evs)
+    assert evs[-1]["message"]["reasoning"] is None

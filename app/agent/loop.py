@@ -101,7 +101,9 @@ class AgentRunner:
             async for ev in llm.chat_stream(messages, _TOOLS):
                 if cancel.is_set():
                     raise _Cancelled()
-                if ev["type"] == "content_delta":
+                if ev["type"] == "reasoning_delta":
+                    await self.send(ev)
+                elif ev["type"] == "content_delta":
                     await self.send({"type": "token", "delta": ev["content"]})
                 elif ev["type"] == "done":
                     final = ev["message"]
@@ -126,7 +128,8 @@ class AgentRunner:
                     messages.append({"role": "tool", "tool_call_id": tc.get("id"),
                                      "content": json.dumps(result, ensure_ascii=False)})
                 continue
-            await add_message(self.sf, session_id, "assistant", content=final.get("content"))
+            await add_message(self.sf, session_id, "assistant", content=final.get("content"),
+                              reasoning=final.get("reasoning"))
             await self.send({"type": "message_done", "content": final.get("content")})
             return
         raise RuntimeError(f"已达到最大工具轮数（{max_rounds}）")
