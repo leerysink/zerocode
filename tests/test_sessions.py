@@ -48,3 +48,16 @@ async def test_message_jsonb_roundtrip(client):
     assert m["tool_args"]["tool_calls"][0]["id"] == "call_1"
     assert m["tool_result"]["ok"] is True
     assert m["tool_result"]["path"] == "a.txt"
+
+@pytest.mark.asyncio
+async def test_file_changes_endpoint(client, tmp_path):
+    from sqlalchemy import text as sql
+    ws = (await client.post("/api/workspaces", json={"root_path": str(tmp_path)})).json()
+    s = (await client.post("/api/sessions", json={"workspace_id": ws["id"]})).json()
+    async with client.app.state.session_factory() as db:
+        await db.execute(sql(
+            "INSERT INTO file_change (session_id, path, action, before_content, after_content, diff) "
+            "VALUES (:sid, 'a.txt', 'create', '', 'hi', '--- a/a.txt')"), {"sid": s["id"]})
+        await db.commit()
+    rows = (await client.get(f"/api/sessions/{s['id']}/file-changes")).json()
+    assert len(rows) == 1 and rows[0]["path"] == "a.txt"

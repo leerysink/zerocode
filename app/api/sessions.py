@@ -54,3 +54,11 @@ async def get_messages(request: Request, session_id: int):
             "SELECT id, seq, role, content, tool_call_id, tool_name, tool_args, tool_result, created_at "
             "FROM message WHERE session_id=:i ORDER BY seq"), {"i": session_id})).mappings().all()
     return [dict(r) for r in rows]
+
+@router.get("/{session_id}/file-changes")
+async def list_file_changes(request: Request, session_id: int):
+    async with request.app.state.session_factory() as s:
+        rows = (await s.execute(text(
+            "SELECT id, path, action, diff, created_at FROM file_change "
+            "WHERE session_id=:i ORDER BY id DESC"), {"i": session_id})).mappings().all()
+    return [dict(r) for r in rows]

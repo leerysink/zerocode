@@ -1,6 +1,6 @@
 <script setup>
-// 对话页三栏布局：左栏 SideBar + 中栏对话流/输入区（Task 13）+ 右栏文件面板占位（Task 14 完成后
-// 替换为 <FilePanel :workspace-id="store.currentWorkspaceId" />）。
+// 对话页三栏布局：左栏 SideBar + 中栏对话流/输入区（Task 13）+ 右栏文件面板（Task 14）。
+// 右栏以 v-if="store.currentWorkspaceId" 为渲染门（无会话时整个面板不渲染）。
 // 骨架按 brief Step 1 照抄，修正两处笔误（报告留痕）：
 // ① brief 骨架多出一个 </a-layout> 闭合标签（3 闭合对 2 开启）；
 // ② 外层 a-layout 需显式 has-sider——SideBar 是普通 aside 而非 a-layout-sider，antd 不会自动加 row 方向，缺省会纵向堆叠。
@@ -9,6 +9,7 @@ import { useChatStore } from '../stores/chat'
 import SideBar from '../components/SideBar.vue'
 import ChatMessages from '../components/ChatMessages.vue'
 import ChatInput from '../components/ChatInput.vue'
+import FilePanel from '../components/FilePanel.vue'
 
 const store = useChatStore()
 onMounted(() => store.loadWorkspaces())
@@ -27,9 +28,7 @@ onMounted(() => store.loadWorkspaces())
       />
       <ChatInput :running="store.running" @send="store.send" @cancel="store.cancel" />
     </a-layout>
-    <div v-if="store.currentWorkspaceId" class="zc-file-placeholder">
-      <!-- Task 14 完成后替换为 <FilePanel :workspace-id="store.currentWorkspaceId" /> -->
-    </div>
+    <FilePanel v-if="store.currentWorkspaceId" :workspace-id="store.currentWorkspaceId" />
   </a-layout>
 </template>
 
@@ -40,10 +39,5 @@ onMounted(() => store.loadWorkspaces())
 .zc-center {
   min-width: 0;
   background: #fff;
-}
-.zc-file-placeholder {
-  flex: 0 0 320px;
-  border-left: 1px solid var(--zc-border);
-  background: var(--zc-sidebar-bg);
 }
 </style>

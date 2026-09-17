@@ -26,3 +26,20 @@ async def test_put_config_partial_and_mask_sentinel(client):
         # 避免 PUT 写入的值永久留在测试库造成用例间顺序依赖
         rf = await client.put("/api/config", json={"llm.model": "deepseek-chat", "llm.api_key": ""})
         assert rf.status_code == 200
+
+@pytest.mark.asyncio
+async def test_test_llm_endpoint(client, monkeypatch):
+    import app.api.config_api as capi
+
+    class FakeLLM:
+        def __init__(self, base_url, api_key, model): pass
+        async def chat_stream(self, messages, tools):
+            yield {"type": "content_delta", "content": "pong"}
+            yield {"type": "done", "message": {"role": "assistant", "content": "pong", "tool_calls": None}}
+
+    monkeypatch.setattr(capi, "OpenAICompatLLM", FakeLLM)
+    r = await client.post("/api/config/test-llm",
+                          json={"base_url": "http://x/v1", "api_key": "k", "model": "m"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True and body["reply"] == "pong"

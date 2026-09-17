@@ -19,9 +19,11 @@ export const createSession = (data) => http.post('/sessions', data) // {workspac
 export const renameSession = (id, title) => http.patch(`/sessions/${id}`, { title })
 export const deleteSession = (id) => http.delete(`/sessions/${id}`)
 export const getMessages = (sessionId) => http.get(`/sessions/${sessionId}/messages`)
+export const getFileChanges = (sessionId) => http.get(`/sessions/${sessionId}/file-changes`)
 export const getConfig = () => http.get('/config')
 export const putConfig = (data) => http.put('/config', data)
 export const pgStatus = () => http.get('/config/pg-status')
+export const testLLM = (data) => http.post('/config/test-llm', data) // {base_url, api_key, model}
 export const tree = (workspaceId) => http.get('/fs/tree', { params: { workspace_id: workspaceId } })
 export const readFile = (workspaceId, path) =>
   http.get('/files/read', { params: { workspace_id: workspaceId, path } })
