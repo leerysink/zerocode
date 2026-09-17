@@ -36,4 +36,6 @@ async def client(test_engine):
     app = create_app(test_engine.url.render_as_string(hide_password=False))
     async with LifespanManager(app):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+            # httpx AsyncClient 不自带 .app 属性，补挂 FastAPI 实例（同 starlette TestClient 约定），测试可取 app.state
+            c.app = app
             yield c

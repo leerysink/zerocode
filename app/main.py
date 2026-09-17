@@ -14,9 +14,11 @@ def create_app(database_url: str | None = None) -> FastAPI:
 
     from app.api.config_api import router as config_router
     from app.api import workspaces
+    from app.api import sessions
     app = FastAPI(title="zerocode", lifespan=lifespan)
     app.include_router(config_router)
     app.include_router(workspaces.router)
+    app.include_router(sessions.router)
     return app
 
 app = create_app()

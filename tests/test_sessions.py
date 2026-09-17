@@ -1,0 +1,30 @@
+import pytest
+from app.services.message_service import add_message
+
+async def _mk_ws(client):
+    import tempfile
+    tmp = tempfile.mkdtemp()
+    return (await client.post("/api/workspaces", json={"root_path": tmp})).json()
+
+@pytest.mark.asyncio
+async def test_session_lifecycle(client):
+    ws = await _mk_ws(client)
+    s = (await client.post("/api/sessions", json={"workspace_id": ws["id"]})).json()
+    assert s["title"] == "新会话"
+    assert (await client.patch(f"/api/sessions/{s['id']}", json={"title": "改个名"})).status_code == 200
+    lst = (await client.get(f"/api/sessions?workspace_id={ws['id']}")).json()
+    assert lst[0]["title"] == "改个名"
+    msgs = (await client.get(f"/api/sessions/{s['id']}/messages")).json()
+    assert msgs == []
+    assert (await client.delete(f"/api/sessions/{s['id']}")).status_code == 200
+
+@pytest.mark.asyncio
+async def test_message_seq_increments(client):
+    ws = await _mk_ws(client)
+    s = (await client.post("/api/sessions", json={"workspace_id": ws["id"]})).json()
+    sf = client.app.state.session_factory
+    m1 = await add_message(sf, s["id"], "user", content="你好")
+    m2 = await add_message(sf, s["id"], "assistant", content="你好！")
+    assert m2["seq"] == m1["seq"] + 1
+    msgs = (await client.get(f"/api/sessions/{s['id']}/messages")).json()
+    assert [m["role"] for m in msgs] == ["user", "assistant"]
