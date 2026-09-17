@@ -167,4 +167,40 @@ describe('chat store 事件流', () => {
     expect(s.messages).toEqual([{ role: 'user', content: 'B 的消息' }]) // 守卫：A 不覆盖 B
     expect(s.currentWorkspaceId).toBe('wB')
   })
+
+  it('openSession 详情拉取失败降级：不阻断打开（todo/模型置空，照常渲染历史并连接）', async () => {
+    stubWsGlobals()
+    getMessages.mockResolvedValue({ data: [{ role: 'user', content: '历史' }] })
+    getSessionDetail.mockRejectedValueOnce(new Error('detail boom'))
+    const s = useChatStore()
+    await expect(s.openSession('s1', 'w1')).resolves.toBeUndefined() // detail 失败不炸 openSession
+    expect(s.todoList).toEqual([])
+    expect(s.currentModelId).toBeNull()
+    expect(s.messages).toEqual([{ role: 'user', content: '历史' }]) // 历史照常渲染
+    expect(s._ws).toBeTruthy() // connect 照常执行
+  })
+
+  it('send/cancel 复位 streamingThinking（与 streamingContent 对齐）', () => {
+    const s = useChatStore()
+    s._ws = { readyState: 1, send: vi.fn() }
+    s.streamingThinking = '残留'
+    s.send('hi')
+    expect(s.streamingThinking).toBe('')
+    s.streamingThinking = '残留'
+    s.cancel()
+    expect(s.streamingThinking).toBe('')
+  })
+
+  it('setModel 回写会话校验：await 期间已切换会话则不得陈旧回写', async () => {
+    const s = useChatStore()
+    let resolvePatch
+    patchSessionModel.mockImplementation(() => new Promise((r) => { resolvePatch = r }))
+    s.currentSessionId = 's1'
+    s.currentModelId = 3
+    const pending = s.setModel(7)
+    s.currentSessionId = 's2' // await 期间用户切到 s2
+    resolvePatch()
+    await pending
+    expect(s.currentModelId).toBe(3) // s1 的模型不得写回 s2 的视图
+  })
 })

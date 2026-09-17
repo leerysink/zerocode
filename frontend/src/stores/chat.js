@@ -91,11 +91,17 @@ export const useChatStore = defineStore('chat', {
       // 竞态守卫：快速切换会话时，先打开会话的慢响应后到，不得覆盖新会话的 messages
       const { data } = await getMessages(id)
       if (this.currentSessionId !== id) return
-      // 会话详情：todo/模型状态（交互增强）；detail 慢响应后到同样不得覆盖新会话
-      const detail = (await getSessionDetail(id)).data
+      // 会话详情：todo/模型状态（交互增强）；detail 慢响应后到同样不得覆盖新会话。
+      // 详情拉取失败不阻断会话打开（T11 审查闭合）：todo/模型降级为空，照常渲染历史并连接
+      let detail = null
+      try {
+        detail = (await getSessionDetail(id)).data
+      } catch {
+        // 降级：detail 缺失视同空 todo / 未配置模型
+      }
       if (this.currentSessionId !== id) return
-      this.todoList = detail.todo_state || []
-      this.currentModelId = detail.model_config_id ?? null
+      this.todoList = detail?.todo_state || []
+      this.currentModelId = detail?.model_config_id ?? null
       this.streamingThinking = ''
       this.compacting = false
       // 渲染门：右栏（Task 13/14）以 currentWorkspaceId 判定；由调用方传入工作区 id
@@ -151,6 +157,7 @@ export const useChatStore = defineStore('chat', {
       if (!content || !this._ws || this._ws.readyState !== 1) return
       this.messages.push({ role: 'user', content })
       this.streamingContent = ''
+      this.streamingThinking = ''
       this.running = true
       this._uplink({ type: 'user_message', content })
     },
@@ -170,6 +177,7 @@ export const useChatStore = defineStore('chat', {
       this.pendingAsk = null
       this.pendingConfirm = null
       this.running = false
+      this.streamingThinking = ''
     },
     retry() {
       // 重发最近一条用户消息
@@ -184,8 +192,10 @@ export const useChatStore = defineStore('chat', {
       this.models = (await listModels()).data
     },
     async setModel(id) {
-      await patchSessionModel(this.currentSessionId, id)
-      this.currentModelId = id
+      const sid = this.currentSessionId
+      await patchSessionModel(sid, id)
+      // 回写会话校验（T11 审查闭合）：await 期间用户可能已切换会话，仅当前仍是发起会话才回写，防陈旧覆盖
+      if (this.currentSessionId === sid) this.currentModelId = id
     },
   },
 })
