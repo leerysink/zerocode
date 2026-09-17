@@ -7,7 +7,9 @@ message_done / error / status / file_change / compacting / compaction_done（由
 按会话分槽：同会话后连连接覆盖该会话的 emit 槽，下行事件随之切到新连接；
 断连 drop 自己的槽（防僵尸槽），跨会话互不串扰（终审修复轮2）。
 runner 的 send 为单参签名，这里经 hub 会话槽晚绑定转发；LLM 实例按 run
-解析一次（cfg 本就每 run 取一次，避免测试注入的工厂每轮重放轮次）。
+解析一次（cfg 本就每 run 取一次，避免测试注入的工厂每轮重放轮次）；
+模型来源按会话逐级回退：会话绑定 model_config → 默认模型 → 全局 llm.*
+（resolve_model，spec §4.4）。
 """
 import asyncio, json
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
@@ -38,10 +40,14 @@ async def ws_chat(ws: WebSocket, session_id: int):
         async with app.state.session_factory() as s:
             return await config_service.get_all(s)
 
-    def llm_factory(cfg):
+    def llm_factory(cfg, model_cfg=None):
         if hasattr(app.state, "llm_factory"):
             return app.state.llm_factory(cfg)
-        return OpenAICompatLLM(cfg.get("llm.base_url"), cfg.get("llm.api_key"), cfg.get("llm.model"))
+        mc = model_cfg or {}
+        return OpenAICompatLLM(
+            mc.get("base_url") or cfg.get("llm.base_url"),
+            mc.get("api_key") if mc.get("api_key") is not None else cfg.get("llm.api_key"),
+            mc.get("model") or cfg.get("llm.model"))
 
     try:
         while True:
@@ -77,7 +83,10 @@ async def ws_chat(ws: WebSocket, session_id: int):
                         # LLM 按 run 解析一次：runner 对 callable 每轮重建实例，
                         # 而测试注入工厂每次返回新 ScriptedLLM（turns 从头重放）；
                         # 生产路径 cfg 每 run 只取一次，重建 OpenAICompatLLM 语义等价
-                        llm = llm_factory(await config_getter())
+                        from app.agent.model_resolver import resolve_model
+                        cfg_now = await config_getter()
+                        model_cfg = await resolve_model(app.state.session_factory, session_id, cfg_now)
+                        llm = llm_factory(cfg_now, model_cfg)
                         runner = AgentRunner(app.state.session_factory, llm,
                                              config_getter, send, hub.ask, hub.confirm)
                         await runner.run(session_id, user_text_, cancel)
