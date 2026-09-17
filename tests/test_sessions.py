@@ -61,3 +61,37 @@ async def test_file_changes_endpoint(client, tmp_path):
         await db.commit()
     rows = (await client.get(f"/api/sessions/{s['id']}/file-changes")).json()
     assert len(rows) == 1 and rows[0]["path"] == "a.txt"
+
+# ---------- 交互增强：会话详情 / 模型切换 / messages 带 reasoning ----------
+
+async def test_session_detail(client):
+    ws = (await client.post("/api/workspaces", json={"root_path": "D:/tmp"})).json()
+    sid = (await client.post("/api/sessions", json={"workspace_id": ws["id"]})).json()["id"]
+    d = (await client.get(f"/api/sessions/{sid}")).json()
+    assert d["todo_state"] == [] and d["model_config_id"] is None
+    assert (await client.get("/api/sessions/999999")).status_code == 404
+
+async def test_patch_session_model(client):
+    ws = (await client.post("/api/workspaces", json={"root_path": "D:/tmp"})).json()
+    sid = (await client.post("/api/sessions", json={"workspace_id": ws["id"]})).json()["id"]
+    mc = (await client.post("/api/models", json={
+        "name": "m", "base_url": "http://x/v1", "model": "g"})).json()
+    r = await client.patch(f"/api/sessions/{sid}/model", json={"model_config_id": mc["id"]})
+    assert r.json()["ok"] is True
+    d = (await client.get(f"/api/sessions/{sid}")).json()
+    assert d["model_config_id"] == mc["id"]
+    # 回退默认：null
+    await client.patch(f"/api/sessions/{sid}/model", json={"model_config_id": None})
+    assert ((await client.get(f"/api/sessions/{sid}")).json())["model_config_id"] is None
+    # 不存在的模型 → 400
+    r = await client.patch(f"/api/sessions/{sid}/model", json={"model_config_id": 999})
+    assert r.status_code == 400
+
+async def test_messages_include_reasoning(client):
+    ws = (await client.post("/api/workspaces", json={"root_path": "D:/tmp"})).json()
+    sid = (await client.post("/api/sessions", json={"workspace_id": ws["id"]})).json()["id"]
+    from app.services.message_service import add_message
+    await add_message(client.app.state.session_factory, sid, "assistant",
+                      content="答", reasoning="想了想")
+    msgs = (await client.get(f"/api/sessions/{sid}/messages")).json()
+    assert msgs[0]["reasoning"] == "想了想"
