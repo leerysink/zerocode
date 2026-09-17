@@ -28,3 +28,23 @@ async def test_message_seq_increments(client):
     assert m2["seq"] == m1["seq"] + 1
     msgs = (await client.get(f"/api/sessions/{s['id']}/messages")).json()
     assert [m["role"] for m in msgs] == ["user", "assistant"]
+
+@pytest.mark.asyncio
+async def test_message_jsonb_roundtrip(client):
+    # add_message 的 json.dumps + CAST AS JSONB 写入 → 回读必须还原为等价 Python 对象
+    ws = await _mk_ws(client)
+    s = (await client.post("/api/sessions", json={"workspace_id": ws["id"]})).json()
+    sf = client.app.state.session_factory
+    await add_message(sf, s["id"], "assistant", content=None, tool_call_id="call_1",
+                      tool_name="write_file",
+                      tool_args={"tool_calls": [{"id": "call_1"}]},
+                      tool_result={"ok": True, "path": "a.txt"})
+    msgs = (await client.get(f"/api/sessions/{s['id']}/messages")).json()
+    assert len(msgs) == 1
+    m = msgs[0]
+    assert m["role"] == "assistant"
+    assert m["content"] is None
+    assert m["tool_call_id"] == "call_1"
+    assert m["tool_args"]["tool_calls"][0]["id"] == "call_1"
+    assert m["tool_result"]["ok"] is True
+    assert m["tool_result"]["path"] == "a.txt"
