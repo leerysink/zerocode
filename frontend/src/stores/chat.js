@@ -61,9 +61,14 @@ export const useChatStore = defineStore('chat', {
     async loadWorkspaces() {
       this.workspaces = (await listWorkspaces()).data
     },
-    async openSession(id) {
+    async openSession(id, workspaceId = null) {
       this.currentSessionId = id
-      this.messages = (await getMessages(id)).data
+      // 竞态守卫：快速切换会话时，先打开会话的慢响应后到，不得覆盖新会话的 messages
+      const { data } = await getMessages(id)
+      if (this.currentSessionId !== id) return
+      // 渲染门：右栏（Task 13/14）以 currentWorkspaceId 判定；由调用方传入工作区 id
+      if (workspaceId != null) this.currentWorkspaceId = workspaceId
+      this.messages = data
       this.streamingContent = ''
       this.pendingAsk = null
       this.pendingConfirm = null

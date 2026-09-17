@@ -1,6 +1,14 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { setActivePinia, createPinia } from 'pinia'
 import { useChatStore, applyEvent } from '../src/stores/chat'
+import { getMessages } from '../src/api'
+
+// 仅把 getMessages 换成可编排的 mock（openSession 依赖它）；其余导出保持真实实现，
+// 既有 connect 用例仍走真实 wsUrl（配合 window stub）。
+vi.mock('../src/api', async (importOriginal) => {
+  const actual = await importOriginal()
+  return { ...actual, getMessages: vi.fn() }
+})
 
 describe('chat store 事件流', () => {
   beforeEach(() => setActivePinia(createPinia()))
@@ -86,5 +94,43 @@ describe('chat store 事件流', () => {
     expect(s._retry).toBe(2) // 2s 未到，尚未重连
     vi.advanceTimersByTime(1000)
     expect(s._retry).toBe(2) // 已重连（keepBackoff 路径，入口未重置）
+  })
+
+  // openSession 走 connect→wsUrl 需要 window/WebSocket 全局（仅新加的两个用例需要）
+  function stubWsGlobals() {
+    vi.stubGlobal('window', { location: { protocol: 'http:', host: 'test' } })
+    vi.stubGlobal('WebSocket', class {
+      constructor() { this.readyState = 0 }
+      close() { this.readyState = 3 }
+    })
+  }
+
+  it('openSession 记录 currentWorkspaceId；不传 workspaceId 时不清空当前值', async () => {
+    stubWsGlobals()
+    getMessages.mockResolvedValue({ data: [] })
+    const s = useChatStore()
+    await s.openSession('s1', 'w1')
+    expect(s.currentWorkspaceId).toBe('w1')
+    await s.openSession('s2') // 参数缺省兜底（Task 13/14 以 currentWorkspaceId 为渲染门，不得被清）
+    expect(s.currentWorkspaceId).toBe('w1')
+    expect(s.currentSessionId).toBe('s2')
+  })
+
+  it('openSession 快速切换：后到的慢响应被守卫丢弃，不得覆盖新会话的 messages', async () => {
+    stubWsGlobals()
+    const s = useChatStore()
+    let resolveA
+    const slowA = new Promise((resolve) => { resolveA = resolve })
+    getMessages.mockImplementation((id) =>
+      id === 'sA' ? slowA : Promise.resolve({ data: [{ role: 'user', content: 'B 的消息' }] })
+    )
+    const first = s.openSession('sA', 'wA') // A 慢，挂起
+    await s.openSession('sB', 'wB') // B 快，先完成
+    expect(s.currentSessionId).toBe('sB')
+    expect(s.messages).toEqual([{ role: 'user', content: 'B 的消息' }])
+    resolveA({ data: [{ role: 'user', content: 'A 的消息' }] }) // A 的响应后到
+    await first
+    expect(s.messages).toEqual([{ role: 'user', content: 'B 的消息' }]) // 守卫：A 不覆盖 B
+    expect(s.currentWorkspaceId).toBe('wB')
   })
 })

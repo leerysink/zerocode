@@ -46,6 +46,8 @@ async function loadAll() {
         store.sessionsByWs[ws.id] = (await listSessions(ws.id)).data
       })
     )
+  } catch (e) {
+    message.error('加载失败')
   } finally {
     loading.value = false
   }
@@ -83,7 +85,7 @@ async function removeSession(wsId, s) {
             <div
               class="zc-session"
               :class="{ active: s.id === store.currentSessionId }"
-              @click="store.openSession(s.id)"
+              @click="store.openSession(s.id, ws.id)"
             >
               <span class="zc-title">{{ s.title }}</span>
               <span class="zc-time">{{ relativeTime(s.updated_at) }}</span>

@@ -75,7 +75,7 @@ async function submit() {
       }
     }
     const { data: session } = await createSession({ workspace_id: ws.id })
-    await store.openSession(session.id)
+    await store.openSession(session.id, ws.id) // 同步记录 currentWorkspaceId（渲染门，Task 13/14）
     message.success('会话已创建')
     emit('created', session)
     close()
