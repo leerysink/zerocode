@@ -7,9 +7,13 @@
 依次补发 tool_result({"cancelled": true}) → error("已取消") → status(idle)，
 读 3 条才与「tail 含 error(已取消)+status」断言自洽。
 """
-import json, tempfile
+import asyncio, json, tempfile
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import text as _sql
+from app import main as main_module
+from app.db import make_engine
+from app.hub import ChatHub
 from app.main import create_app
 from app.agent.llm import ScriptedLLM
 
@@ -87,3 +91,84 @@ def test_ws_busy_rejected(client):
             tail = [ws2.receive_json() for _ in range(3)]  # tool_result + error(已取消) + status(idle)
         assert any(e["type"] == "error" and e["message"] == "已取消" for e in tail)
         assert any(e["type"] == "status" for e in tail)
+
+# ---------- 修复轮：watchdog 激活（run_task 落库 running）与挂起问答/确认防误报 ----------
+
+def _db_status_dev(session_id: int) -> str:
+    """同步测试线程内查询开发库会话状态：自建临时 engine + 一次性事件循环，用完即释放，
+    避免与 TestClient 的 portal 事件循环交叉复用连接池。"""
+    async def _go():
+        engine = make_engine(None)  # None → app.config.database_url()（开发库，与 client fixture 同库）
+        try:
+            async with engine.connect() as conn:
+                return (await conn.execute(_sql("SELECT status FROM chat_session WHERE id=:i"),
+                                           {"i": session_id})).scalar_one()
+        finally:
+            await engine.dispose()
+    return asyncio.run(_go())
+
+async def _stale_running_session(engine, root_path: str) -> int:
+    """在测试库造一个 status='running'、updated_at 超 10 分钟的孤儿会话，返回会话 id。"""
+    async with engine.begin() as conn:
+        wid = (await conn.execute(_sql(
+            "INSERT INTO workspace (name, root_path) VALUES ('wd', :p) RETURNING id"),
+            {"p": root_path})).scalar_one()
+        return (await conn.execute(_sql(
+            "INSERT INTO chat_session (workspace_id, status, updated_at) "
+            "VALUES (:w, 'running', now() - interval '11 minutes') RETURNING id"),
+            {"w": wid})).scalar_one()
+
+async def _session_status(engine, session_id: int) -> str:
+    async with engine.connect() as conn:
+        return (await conn.execute(_sql("SELECT status FROM chat_session WHERE id=:i"),
+                                   {"i": session_id})).scalar_one()
+
+def test_run_task_marks_running(client):
+    """修复点 1：run_task 先落库 'running' 激活 watchdog；ask 挂起期间 DB status='running'，
+    结束后终态回写 'idle'（runner 终态回写未被破坏）。"""
+    client.app.state.llm_factory = lambda cfg: ScriptedLLM([
+        done(None, [{"id": "c1", "function": {
+            "name": "ask_user",
+            "arguments": json.dumps({"question": "中间态", "options": ["A"]}, ensure_ascii=False)}}]),
+        done("完成"),
+    ])
+    sid = client.zc_sid
+    with client.websocket_connect(f"/ws/chat/{sid}") as ws:
+        ws.send_json({"type": "user_message", "content": "开始"})
+        for _ in range(6):
+            ev = ws.receive_json()
+            if ev["type"] == "ask_user":
+                break
+        assert ev["type"] == "ask_user"
+        # ask 挂起中（G2 timeout=0 不限时）：执行中状态已落库，watchdog 才有匹配对象
+        assert _db_status_dev(sid) == "running"
+        ws.send_json({"type": "ask_choice", "option": "A"})
+        for _ in range(8):
+            ev = ws.receive_json()
+            if ev["type"] == "status":  # 终态 status 事件在 runner._set_status 落库之后发出
+                break
+    assert _db_status_dev(sid) == "idle"
+
+async def test_watchdog_marks_stale_running(test_engine):
+    """修复点 1（watchdog 侧）：hub 无挂起 future 的 stale running 会话被标为 error。
+    直测单次巡检 _watchdog_tick（_watchdog 循环体每 60s 调它一次）。"""
+    hub = ChatHub()
+    sid = await _stale_running_session(test_engine, tempfile.mkdtemp())
+    marked = await main_module._watchdog_tick(test_engine, hub)
+    assert sid in marked
+    assert await _session_status(test_engine, sid) == "error"
+
+async def test_watchdog_skips_pending_ask(test_engine):
+    """修复点 2：ask future 挂起（用户作答期间 updated_at 停更属正常等待）不标 error。"""
+    hub = ChatHub()
+    sid = await _stale_running_session(test_engine, tempfile.mkdtemp())
+    fut = asyncio.get_running_loop().create_future()
+    hub.ask_futures[sid] = fut
+    try:
+        marked = await main_module._watchdog_tick(test_engine, hub)
+        assert sid not in marked
+        assert await _session_status(test_engine, sid) == "running"
+    finally:
+        hub.ask_futures.pop(sid, None)
+        if not fut.done():
+            fut.cancel()

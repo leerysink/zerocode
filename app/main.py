@@ -1,22 +1,41 @@
-import asyncio
+import asyncio, logging
 from contextlib import asynccontextmanager, suppress
 from fastapi import FastAPI
-from sqlalchemy import text as _sql
+from sqlalchemy import bindparam, text as _sql
 from app.db import make_engine, make_session_factory, run_migrations
 from app.hub import ChatHub
 
-async def _watchdog(app: FastAPI):
-    """孤儿 running 会话恢复：进程崩溃重启后超过 10 分钟无活动的标记为 error（spec §7 崩溃恢复）。"""
+logger = logging.getLogger(__name__)
+
+async def _watchdog_tick(engine, hub) -> list[int]:
+    """单次巡检：将 status='running' 且超 10 分钟无活动的会话标记为 error（spec §7 崩溃恢复）。
+
+    ask/confirm future 仍挂起的会话属用户作答期间（G2 裁定 timeout=0 不限时，
+    updated_at 停更是正常等待而非崩溃），跳过不标并记录日志。返回本次标记的会话 id。
+    """
+    async with engine.begin() as conn:
+        stale = (await conn.execute(_sql(
+            "SELECT id FROM chat_session "
+            "WHERE status='running' AND updated_at < now() - interval '10 minutes'"))).scalars().all()
+        to_mark = [sid for sid in stale
+                   if sid not in hub.ask_futures and sid not in hub.confirm_futures]
+        skipped = [sid for sid in stale if sid not in to_mark]
+        if to_mark:
+            await conn.execute(_sql(
+                "UPDATE chat_session SET status='error' WHERE id IN :ids").bindparams(
+                bindparam("ids", expanding=True)), {"ids": to_mark})
+        if skipped:
+            logger.info("watchdog 跳过挂起 ask/confirm 的会话（用户作答期间，非崩溃）: %s", skipped)
+        return to_mark
+
+async def _watchdog(engine, hub):
+    """孤儿 running 会话恢复：每 60s 巡检一次，崩溃重启后超 10 分钟无活动的标记为 error。"""
     while True:
         await asyncio.sleep(60)
         try:
-            async with app.state.session_factory() as s:
-                await s.execute(_sql(
-                    "UPDATE chat_session SET status='error' "
-                    "WHERE status='running' AND updated_at < now() - interval '10 minutes'"))
-                await s.commit()
+            await _watchdog_tick(engine, hub)
         except Exception:
-            pass
+            logger.exception("watchdog 巡检失败")
 
 def create_app(database_url: str | None = None) -> FastAPI:
     @asynccontextmanager
@@ -26,7 +45,7 @@ def create_app(database_url: str | None = None) -> FastAPI:
         app.state.session_factory = make_session_factory(engine)
         app.state.hub = ChatHub()
         await run_migrations(engine)
-        watchdog = asyncio.create_task(_watchdog(app))
+        watchdog = asyncio.create_task(_watchdog(engine, app.state.hub))
         yield
         watchdog.cancel()
         with suppress(asyncio.CancelledError):

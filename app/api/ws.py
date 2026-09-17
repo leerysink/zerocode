@@ -10,6 +10,7 @@ runner 的 send 为单参签名，这里经 hub.emit 晚绑定转发；LLM 实�
 """
 import asyncio, json
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from sqlalchemy import text as _sql
 from app.agent.llm import OpenAICompatLLM
 from app.agent.loop import AgentRunner
 from app.services import config_service
@@ -63,6 +64,15 @@ async def ws_chat(ws: WebSocket, session_id: int):
                     hub.cancel_events[session_id] = cancel
                     hub.running.add(session_id)
                     try:
+                        # 落库 'running' 激活 watchdog（spec §7 崩溃恢复）：此前全仓无代码写
+                        # 'running'（schema 默认 idle，runner 终态只写 idle/error），watchdog 的
+                        # WHERE 永远空匹配；若本任务后续步骤（config/llm 解析等）即崩溃，残留的
+                        # 'running' 会在 10 分钟后被 watchdog 回收为 error
+                        async with app.state.session_factory() as s:
+                            await s.execute(_sql(
+                                "UPDATE chat_session SET status='running', updated_at=now() WHERE id=:i"),
+                                {"i": session_id})
+                            await s.commit()
                         # LLM 按 run 解析一次：runner 对 callable 每轮重建实例，
                         # 而测试注入工厂每次返回新 ScriptedLLM（turns 从头重放）；
                         # 生产路径 cfg 每 run 只取一次，重建 OpenAICompatLLM 语义等价
