@@ -53,12 +53,13 @@ def create_app(database_url: str | None = None) -> FastAPI:
         await engine.dispose()
 
     from app.api.config_api import router as config_router
-    from app.api import workspaces, sessions
+    from app.api import workspaces, sessions, files
     from app.api.ws import router as ws_router
     app = FastAPI(title="zerocode", lifespan=lifespan)
     app.include_router(config_router)
     app.include_router(workspaces.router)
     app.include_router(sessions.router)
+    app.include_router(files.router)
     app.include_router(ws_router)
     return app
 
