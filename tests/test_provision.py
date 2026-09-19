@@ -1,6 +1,6 @@
 # tests/test_provision.py
 import pytest
-from sqlalchemy import text
+from asyncpg.exceptions import InsufficientPrivilegeError, InvalidCatalogNameError
 from app.db import make_engine, make_session_factory
 from app.deploy import provision
 # 平台库连接串与测试库同实例同凭据，仅库名不同（app.config.test_database_url）
@@ -10,7 +10,8 @@ pytestmark = pytest.mark.asyncio
 SLUG = "zctask3"
 
 async def _cleanup():
-    await provision.drop_env(make_session_factory(make_engine()), SLUG, "dev")
+    for env in ("dev", "prod"):
+        await provision.drop_env(make_session_factory(make_engine()), SLUG, env)
 
 @pytest.fixture(autouse=True)
 async def _clean():
@@ -26,14 +27,18 @@ async def test_provision_creates_role_db_and_cred():
     # 幂等：再次供给返回同一凭据
     cred2 = await provision.provision_env(sf, SLUG, "dev")
     assert cred2 == cred
-    # 角色只能连自己的库：连 prod 库应失败（用 dev 凭据连 prod 库名）
+    # 角色只能连自己的库：真实供给 prod 库后，dev 凭据连 prod 应因权限被拒
+    # （库存在，InsufficientPrivilege 42501），而非旧空断言踩中的库不存在（3D000）
+    await provision.provision_env(sf, SLUG, "prod")
     from sqlalchemy.ext.asyncio import create_async_engine
     bad = f"postgresql+asyncpg://{cred['user']}:{cred['password']}@localhost:5433/{SLUG}_prod"
-    with pytest.raises(Exception):
+    with pytest.raises(Exception) as ei:
         e = create_async_engine(bad)
         async with e.connect():
             pass
         await e.dispose()
+    assert not isinstance(ei.value, InvalidCatalogNameError)  # 库存在，拒绝不得来自 catalog 缺失
+    assert isinstance(ei.value, InsufficientPrivilegeError)  # 权限拒绝（REVOKE ... FROM PUBLIC 收口）
 
 async def test_read_cred_none_when_missing():
     sf = make_session_factory(make_engine())

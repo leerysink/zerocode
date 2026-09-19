@@ -15,10 +15,6 @@ def admin_url() -> str:
     url = make_url(app_config.database_url()).set(database="postgres")
     return url.render_as_string(hide_password=False)
 
-def _pg_host_port() -> tuple[str, int]:
-    url = make_url(app_config.database_url())
-    return url.host or "localhost", url.port or 5433
-
 async def _app_config_set(session_factory, key: str, value: dict) -> None:
     async with session_factory() as s:
         await s.execute(text(
@@ -53,8 +49,15 @@ async def provision_env(session_factory, slug: str, env: str) -> dict:
             if not has_role:
                 pw = password.replace("'", "''")
                 await conn.exec_driver_sql(f"CREATE ROLE {user} LOGIN PASSWORD '{pw}'")
+            elif not existing:
+                # 部分状态自愈：角色在而凭据键缺失（旧密码不可知），必须先对齐新密码再补建库，
+                # 否则生成的密码从未应用到角色即写入 app_config，固化坏凭据
+                pw = password.replace("'", "''")
+                await conn.exec_driver_sql(f"ALTER ROLE {user} WITH LOGIN PASSWORD '{pw}'")
             if not has_db:
                 await conn.exec_driver_sql(f"CREATE DATABASE {name} OWNER {user}")
+                # 收口 PUBLIC 的 CONNECT/TEMP：角色只能连自己的库（owner 权益不受影响）
+                await conn.exec_driver_sql(f"REVOKE ALL ON DATABASE {name} FROM PUBLIC")
     finally:
         await engine.dispose()
     cred = {"db": name, "user": user, "password": password}
@@ -63,7 +66,6 @@ async def provision_env(session_factory, slug: str, env: str) -> dict:
 
 async def drop_env(session_factory, slug: str, env: str) -> None:
     name, user = f"{slug}_{env}", f"{slug}_{env}"
-    host, port = _pg_host_port()
     engine = create_async_engine(admin_url(), isolation_level="AUTOCOMMIT")
     try:
         async with engine.connect() as conn:
