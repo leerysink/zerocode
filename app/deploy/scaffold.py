@@ -1,6 +1,6 @@
 # app/deploy/scaffold.py
 """脚手架铺底（规格 01 §4.5 / 02）：复制模板 → 替换 {{KEY}} → 生成初始迁移 → 残留自检。"""
-import datetime, re, shutil
+import re
 from pathlib import Path
 from app.deploy.errors import DeployError
 
@@ -18,6 +18,12 @@ INSERT INTO demo_notes (title) VALUES ('欢迎使用 {APP_NAME}') ON CONFLICT DO
 """
 
 def render(template: Path, dst: Path, mapping: dict) -> None:
+    """把 template 目录渲染到 dst：占位符替换 + 生成初始迁移 + 残留自检。
+
+    dst 已存在时覆盖合并（调用方需自行保证为空目录）。
+    """
+    if not template.is_dir():
+        raise DeployError(f"栈模板不存在: {template}", status=500)
     required = {"SLUG", "APP_NAME", "DEV_PORT", "PROD_PORT", "DEV_DB", "PROD_DB", "TODAY"}
     missing = required - set(mapping)
     if missing:

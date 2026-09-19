@@ -26,3 +26,19 @@ def test_render_missing_key_raises(tmp_path):
     from app.deploy.errors import DeployError
     with pytest.raises(DeployError):
         scaffold.render(TEMPLATE, tmp_path, {"SLUG": "x"})  # 缺大部分键
+
+def test_render_missing_template_raises(tmp_path):
+    import pytest
+    from app.deploy.errors import DeployError
+    mapping = {"SLUG": "lailiao", "APP_NAME": "来料登记", "DEV_PORT": "8211", "PROD_PORT": "8210",
+               "DEV_DB": "lailiao_dev", "PROD_DB": "lailiao_prod", "TODAY": "20260918"}
+    with pytest.raises(DeployError) as ei:
+        scaffold.render(tmp_path / "no_such_stack", tmp_path, mapping)  # 模板目录不存在
+    assert ei.value.status == 500
+
+def test_render_init_sql_content(tmp_path):
+    mapping = {"SLUG": "lailiao", "APP_NAME": "来料登记", "DEV_PORT": "8211", "PROD_PORT": "8210",
+               "DEV_DB": "lailiao_dev", "PROD_DB": "lailiao_prod", "TODAY": "20260918"}
+    scaffold.render(TEMPLATE, tmp_path, mapping)
+    init = (tmp_path / "sqlchange" / "V20260918_01_init.sql").read_text(encoding="utf-8")
+    assert "来料登记" in init and "2026-09-18" in init  # APP_NAME 与 TODAY 转横线日期均落到演示迁移
