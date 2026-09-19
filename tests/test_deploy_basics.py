@@ -17,6 +17,11 @@ def test_suggest_slug_dedup():
     assert slugs.suggest_slug("app", {"app"}) == "app2"
     assert slugs.suggest_slug("app", {"app", "app2"}) == "app3"
 
+def test_normalize_slug():
+    assert slugs.normalize_slug("MyApp-2") == "myapp2"    # 大写转小写、符号剥离
+    assert slugs.normalize_slug("a" * 50) == "a" * 40     # 超长截 40
+    assert slugs.normalize_slug("宠物店") == ""            # 纯中文无法提取 → 空串
+
 async def test_deploy_cfg_defaults(test_engine):
     from app.db import make_session_factory
     sf = make_session_factory(test_engine)
@@ -50,15 +55,17 @@ async def test_allocate_pair_exhausted(test_engine):
     sf = make_session_factory(test_engine)
     async with sf() as s:
         await s.execute(t2("UPDATE app_config SET value='8210' WHERE key='deploy.port_base'"))
-        await s.execute(t2("UPDATE app_config SET value='8210' WHERE key='deploy.port_max'"))
+        await s.execute(t2("UPDATE app_config SET value='8212' WHERE key='deploy.port_max'"))
         await s.commit()
-        with pytest.raises(DeployError):
-            await ports.allocate_pair(s, probe=lambda p: True)
+        # 合法小区间（8210~8212 仅一对）+ 全部端口探测占用 → 409「端口段已用尽」
+        with pytest.raises(DeployError) as excinfo:
+            await ports.allocate_pair(s, probe=lambda p: False)
+        assert excinfo.value.status == 409
+        assert "已用尽" in str(excinfo.value)
         await s.execute(t2("UPDATE app_config SET value='8210' WHERE key='deploy.port_base'"))
         await s.execute(t2("UPDATE app_config SET value='8399' WHERE key='deploy.port_max'"))
         await s.commit()
 
-def test_port_free_local_udp_free_port():
-    import random
+def test_port_free_local_tcp_free_port():
     s = socket.socket(); s.bind(("127.0.0.1", 0)); free = s.getsockname()[1]; s.close()
     assert ports.port_free(free) is True
