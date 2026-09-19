@@ -3,7 +3,8 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 async def get_all(session: AsyncSession) -> dict:
-    rows = (await session.execute(text("SELECT key, value FROM app_config"))).fetchall()
+    rows = (await session.execute(text(
+        "SELECT key, value FROM app_config WHERE key NOT LIKE 'dbcred.%'"))).fetchall()
     # asyncpg 对 JSONB 默认已自动解码为 Python 对象，无需再 json.loads
     return {k: v for k, v in rows}
 
