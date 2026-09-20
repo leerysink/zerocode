@@ -264,50 +264,64 @@ async def dev_status(sf, app: dict) -> dict:
 # ---------- 预览日志（「查看日志」面板的容器侧来源） ----------
 
 _TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})?")
+# 容器内 npm/vite/pip 自己发的 ANSI 控制序列：`compose --no-color` 只管 compose 自己的前缀着色，
+# 管不到子进程；面板是 <pre>，转义字节会原样显示成 `[33m` 之类乱码，所以入口就剥掉。
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07")
 
 
-def _log_epoch(raw: str) -> tuple[float | None, str]:
-    """compose `--timestamps` 前缀 `2026-09-20T14:27:58.123456789Z` → (epoch, ISO)。
+def _split_ts(s: str) -> tuple[float | None, str, str]:
+    """剥掉开头的 ISO 时间戳，返回 (epoch, ISO, 剩余文本)；不是时间戳开头则 (None, "", 原文)。
 
-    fromisoformat 吃不上下纳秒（>6 位小数），先截到微秒；解析不出来返回 (None, "")——
+    fromisoformat 吃不上下纳秒（>6 位小数），先截到微秒；解析不出来当作没有时间戳——
     归并时这类行沉到末尾，宁可时间位置不精确，也不把用户的日志丢掉。
     """
-    m = _TS_RE.match(raw.strip())
+    t = s.strip()
+    m = _TS_RE.match(t)
     if not m:
-        return None, ""
+        return None, "", t
     frac = (m.group(2) or "")[:6]
     stamp = m.group(1) + (f".{frac}" if frac else "") + (m.group(3) or "Z")
     try:
         dt = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
     except ValueError:
-        return None, ""
+        return None, "", t
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return dt.timestamp(), dt.isoformat()
+    return dt.timestamp(), dt.isoformat(), t[m.end():].lstrip()
+
+
+def _clean_service(name: str) -> str:
+    """compose 的前缀是 `backend-1   `（副本序号 + 对齐空格）：显示成 `backend` 就够。"""
+    return re.sub(r"-\d+$", "", name.strip())
 
 
 def parse_compose_logs(out: str, tail: int = 200) -> list[dict]:
-    """容器输出转成行记录：`<ts> backend | 文本` → {source: container, service, line, ts}。
+    """容器输出转成行记录 → {source: container, service, ts, line}。
 
-    分隔符按 compose 的 ` | ` 只切一次（消息里再出现 ` | ` 不会被继续切开）。
-    没有该分隔符的行有两种：compose 自己的进度行（整行进 line），以及**非 TTY 下的容器输出**
-    ——真机实测 `docker compose logs` 在管道里会省掉 `service | ` 前缀，只留裸时间戳；这种行
-    必须把时间戳前缀也剥掉（时间已单独存进 ts，留着会在面板里重复一遍难看的纳秒串），service 留空。
+    compose 各版本前缀形态不一致，实测三种都要认（面板里既不能重复一串纳秒，也不能把
+    服务名丢进正文）：
+      A `backend-1   | 2026-09-20T16:56:16.131035319Z 文本`  ← 本机 compose 实测（时间戳在竖线**后**）
+      B `2026-09-20T14:27:58.123456789Z backend  | 文本`     ← 时间戳在竖线前
+      C `2026-...Z 文本` / 纯文本                             ← 无竖线（compose 自己的进度行等）
+    分隔符只切一次：消息正文里再出现 ` | ` 不会被继续切开。
     """
     rows: list[dict] = []
     for raw in out.splitlines():
+        raw = _ANSI_RE.sub("", raw)                        # 子进程自己的转义序列，面板不认
         if not raw.strip():
             continue
         left, sep, right = raw.partition(" | ")
-        epoch, iso = _log_epoch(left)
         if sep:
-            service = left.split(" ", 1)[1].strip() if " " in left else ""
-            body = right
+            l_epoch, l_iso, l_rest = _split_ts(left)
+            if l_epoch is not None:                       # 形态 B
+                service, epoch, iso, body = _clean_service(l_rest), l_epoch, l_iso, right.strip()
+            else:                                         # 形态 A
+                service, epoch, iso, body = _clean_service(left), None, "", right.strip()
         else:
-            service, body = "", raw.strip()
-            m = _TS_RE.match(body)
-            if m:
-                body = body[m.end():].lstrip()
+            service = ""
+            epoch, iso, body = _split_ts(raw)
+        if epoch is None:                                 # 时间戳可能还挂在正文头部（形态 A）
+            epoch, iso, body = _split_ts(body)
         rows.append({"source": "container", "service": service, "ts": iso, "epoch": epoch,
                      "line": body.rstrip()})
     return rows[-max(int(tail), 1):]

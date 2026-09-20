@@ -131,11 +131,7 @@ def test_parse_compose_logs_keeps_inner_pipe_in_message():
 
 
 def test_parse_compose_logs_strips_bare_timestamp_when_no_service_prefix():
-    """真机非 TTY 形态：compose 会省掉 `service | ` 前缀，只留裸时间戳。
-
-    时间戳已单独存进 ts/epoch，行文本里再留一份会在面板上重复一串纳秒（读起来像坏数据），
-    所以这种行要把前缀剥掉、service 留空由前端按来源兜底显示。
-    """
+    """无 ` | ` 的行：时间戳能解析就剥掉（已单独存进 ts），正文与 service 都干净。"""
     out = ("2026-09-20T16:41:38.699049423Z 2026-09-20 16:41:38 INFO    [test1] 陌如玉（test1）后端启动\n"
            "2026-09-20T16:41:37.224289062Z INFO:     Uvicorn running on http://0.0.0.0:8000\n")
     rows = eng_mod.parse_compose_logs(out, tail=10)
@@ -143,6 +139,35 @@ def test_parse_compose_logs_strips_bare_timestamp_when_no_service_prefix():
     assert rows[1]["line"] == "INFO:     Uvicorn running on http://0.0.0.0:8000"
     assert all(r["service"] == "" and r["source"] == "container" for r in rows)
     assert rows[0]["epoch"] == pytest.approx(_epoch("2026-09-20T16:41:38.699049+00:00"), abs=1)
+
+
+def test_parse_compose_logs_handles_service_prefix_before_timestamp():
+    """本机 compose 实测形态（时间戳在竖线**后**）：`backend-1   | 2026-…Z 文本`。
+
+    与老形态（时间戳在竖线前）正好相反——只认一种的话，这一整路日志既取不到时间
+    （全被判成「无时间戳」沉底、和步骤行归并时彻底乱序），正文里还混着一串纳秒。
+    副本序号 `-1` 与对齐空格一并收掉，面板上显示 `backend` 就够。
+    """
+    out = ("backend-1   | 2026-09-20T16:56:16.131035319Z Collecting typing-inspection>=0.4.2\n"
+           "frontend-1  | 2026-09-20T16:55:28.309566462Z   VITE v5.4.21 ready in 980 ms\n"
+           "frontend-1  | 2026-09-20T16:55:47.583089835Z 4:55:47 PM [vite] http proxy error\n")
+    rows = eng_mod.parse_compose_logs(out, tail=10)
+    assert [r["service"] for r in rows] == ["backend", "frontend", "frontend"]
+    assert rows[0]["line"] == "Collecting typing-inspection>=0.4.2"
+    assert rows[0]["epoch"] == pytest.approx(_epoch("2026-09-20T16:56:16.131035+00:00"), abs=1)
+    assert rows[1]["ts"].startswith("2026-09-20T16:55:28")                # 时间进 ts
+    assert "2026-09-20T16:55" not in rows[1]["line"]                       # 正文不再重复一遍
+    merged = eng_mod.merge_logs(rows)                                      # 混排能按真实时间归并
+    assert [r["ts"] for r in merged] == sorted(r["ts"] for r in merged)
+
+
+def test_parse_compose_logs_strips_ansi_sequences_from_subprocess():
+    """npm/vite/pip 自己发的 ANSI 序列要剥掉：`--no-color` 只管 compose 的前缀着色，
+    面板是 `<pre>`，留着就显示成 `[33m` 这种乱码。"""
+    raw = "frontend-1  | 2026-09-20T16:55:27.946Z \x1b[33mThe CJS build of Vite's Node API is deprecated\x1b[39m"
+    rows = eng_mod.parse_compose_logs(raw, tail=5)
+    assert rows[0]["line"] == "The CJS build of Vite's Node API is deprecated"
+    assert "\x1b" not in rows[0]["line"] and rows[0]["service"] == "frontend"
 
 
 def test_merge_logs_orders_by_time_and_hides_epoch():
