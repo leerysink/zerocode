@@ -22,3 +22,22 @@ async def test_deploy_config_seeded(test_engine):
 async def test_migrations_idempotent(test_engine):
     from app.db import run_migrations
     assert await run_migrations(test_engine) == []
+
+async def test_deploy_record_table(test_engine):
+    async with test_engine.begin() as conn:
+        r = await conn.execute(text("SELECT to_regclass('deploy_record')"))
+        assert r.scalar() is not None
+        cols = (await conn.execute(text(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'deploy_record'"))).scalars().all()
+        assert {"app_id", "kind", "version", "status", "step", "detail", "error",
+                "started_at", "finished_at"} <= set(cols)
+        idx = (await conn.execute(text(
+            "SELECT count(*) FROM pg_indexes WHERE indexname = 'ix_deploy_record_app'"))).scalar()
+        assert idx == 1
+
+async def test_default_nic_seeded(test_engine):
+    async with test_engine.begin() as conn:
+        v = (await conn.execute(text(
+            "SELECT value FROM app_config WHERE key = 'deploy.default_nic'"))).scalar()
+    assert v == ""

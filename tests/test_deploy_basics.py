@@ -120,13 +120,16 @@ async def test_allocate_pair_exhausted(test_engine):
         await s.execute(t2("UPDATE app_config SET value='8212' WHERE key='deploy.port_max'"))
         await s.commit()
         # 合法小区间（8210~8212 仅一对）+ 全部端口探测占用 → 409「端口段已用尽」
-        with pytest.raises(DeployError) as excinfo:
-            await ports.allocate_pair(s, probe=lambda p: False)
-        assert excinfo.value.status == 409
-        assert "已用尽" in str(excinfo.value)
-        await s.execute(t2("UPDATE app_config SET value='8210' WHERE key='deploy.port_base'"))
-        await s.execute(t2("UPDATE app_config SET value='8399' WHERE key='deploy.port_max'"))
-        await s.commit()
+        # 复位进 finally（本波追加项）：中途断言抛错也不把 port_max=8212 残留在共享库
+        try:
+            with pytest.raises(DeployError) as excinfo:
+                await ports.allocate_pair(s, probe=lambda p: False)
+            assert excinfo.value.status == 409
+            assert "已用尽" in str(excinfo.value)
+        finally:
+            await s.execute(t2("UPDATE app_config SET value='8210' WHERE key='deploy.port_base'"))
+            await s.execute(t2("UPDATE app_config SET value='8399' WHERE key='deploy.port_max'"))
+            await s.commit()
 
 def test_port_free_local_tcp_free_port():
     s = socket.socket(); s.bind(("127.0.0.1", 0)); free = s.getsockname()[1]; s.close()
