@@ -108,6 +108,9 @@ def create_app(database_url: str | None = None) -> FastAPI:
     # 部署发布套件（Task 6）：/api/apps 创建/校验 slug/列表/详情
     from app.api import apps as apps_api
     app.include_router(apps_api.router)
+    # 预览日志：GET /api/apps/{id}/dev/logs（页面「查看日志」的历史来源，与 apps_api 同前缀）
+    from app.api import dev_logs
+    app.include_router(dev_logs.router)
     # 部署发布套件（Task 12）：/ws/deploy/{app_id} 部署事件流（须在静态托管之前，路由不被 SPA 吞掉）
     from app.api import deploy_ws
     app.include_router(deploy_ws.router)

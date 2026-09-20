@@ -6,7 +6,8 @@
 迁移闸门（D-2）：编排顺序 迁移 → compose up，`sqlrun.run_sqlchange` 自带「sqlchange 目录缺失
 fail-closed」守卫，此处不再重复预检。
 """
-import asyncio, inspect, logging, time
+import asyncio, inspect, logging, re, time
+from datetime import datetime, timezone
 from pathlib import Path
 import httpx
 from sqlalchemy import text
@@ -258,6 +259,78 @@ async def dev_status(sf, app: dict) -> dict:
     row = await get_status_dev(sf, app["id"])
     return {"status_dev": row, "compose_ps": log if code == 0 else "",
             "url": f"http://localhost:{_dev_port(app)}"}
+
+
+# ---------- 预览日志（「查看日志」面板的容器侧来源） ----------
+
+_TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})?")
+
+
+def _log_epoch(raw: str) -> tuple[float | None, str]:
+    """compose `--timestamps` 前缀 `2026-09-20T14:27:58.123456789Z` → (epoch, ISO)。
+
+    fromisoformat 吃不上下纳秒（>6 位小数），先截到微秒；解析不出来返回 (None, "")——
+    归并时这类行沉到末尾，宁可时间位置不精确，也不把用户的日志丢掉。
+    """
+    m = _TS_RE.match(raw.strip())
+    if not m:
+        return None, ""
+    frac = (m.group(2) or "")[:6]
+    stamp = m.group(1) + (f".{frac}" if frac else "") + (m.group(3) or "Z")
+    try:
+        dt = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except ValueError:
+        return None, ""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp(), dt.isoformat()
+
+
+def parse_compose_logs(out: str, tail: int = 200) -> list[dict]:
+    """容器输出转成行记录：`<ts> backend | 文本` → {source: container, service, line, ts}。
+
+    分隔符按 compose 的 ` | ` 只切一次（消息里再出现 ` | ` 不会被继续切开）；没有该分隔符的行
+    （compose 自己的进度行等）整行进 line、service 留空。
+    """
+    rows: list[dict] = []
+    for raw in out.splitlines():
+        if not raw.strip():
+            continue
+        left, sep, right = raw.partition(" | ")
+        epoch, iso = _log_epoch(left)
+        service = left.split(" ", 1)[1].strip() if (sep and " " in left) else ""
+        rows.append({"source": "container", "service": service, "ts": iso, "epoch": epoch,
+                     "line": (right if sep else raw).rstrip()})
+    return rows[-max(int(tail), 1):]
+
+
+def merge_logs(*groups: list[dict]) -> list[dict]:
+    """多来源日志按时间归并：同刻保持组内原序（stable），无时间戳的行沉底；`epoch` 只用于排序不外传。"""
+    flat = [r for g in groups for r in g]
+    flat.sort(key=lambda r: (r.get("epoch") is None, r.get("epoch") or 0.0))
+    return [{k: v for k, v in r.items() if k != "epoch"} for r in flat]
+
+
+async def container_logs(sf, app: dict, tail: int = 200) -> tuple[list[dict], str]:
+    """dev 栈的容器输出（含应用自己打的启动 banner）。
+
+    看日志是**排障入口**，它自己不许 500：Docker 没开 / 命令失败 / 非零退出一律降级成
+    `([], 中文提示)`，让平台侧的步骤行照样返回——那正是「应用起不来时唯一看得见的东西」。
+    """
+    try:
+        root = await _app_root(sf, app)
+        code, out = await docker("compose", "-f", str(root / "deploy" / "dev-compose.yml"),
+                                 "logs", "--no-color", "--timestamps", "--tail", str(int(tail)),
+                                 cwd=str(root), timeout=60)
+    except Exception as e:        # DeployError（含 504 超时）与 FileNotFoundError（CLI 没装）都要收口
+        logger.warning("读取 dev 容器日志失败: %s", e)
+        return [], f"容器日志暂不可用：{str(e).splitlines()[0][:200]}"
+    if code != 0:
+        return [], f"容器日志暂不可用（docker compose logs 退出码 {code}）"
+    rows = parse_compose_logs(out, tail)
+    if not rows:
+        return [], "dev 栈暂无容器输出（预览未运行，或应用还没打印日志）"
+    return rows, ""
 
 
 async def get_status_dev(sf, app_id: int) -> str:

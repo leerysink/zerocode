@@ -55,4 +55,12 @@ export const devStart = (id) => http.post(`/apps/${id}/dev/start`)
 export const devStop = (id) => http.post(`/apps/${id}/dev/stop`)
 export const devRestart = (id) => http.post(`/apps/${id}/dev/restart`)
 export const devStatus = (id) => http.get(`/apps/${id}/dev/status`)
+export const devLogs = (id, tail = 200, sinceSeq = 0) =>
+  http.get(`/apps/${id}/dev/logs`, { params: { tail, since_seq: sinceSeq } })
 export const sqlFiles = (id) => http.get(`/apps/${id}/sqlchange/files`)
+
+// 部署事件流 /ws/deploy/{app_id}（dev 由 vite proxy 转发到 8100，与 wsUrl 同前缀规则）
+export function deployWsUrl(appId) {
+  const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+  return `${proto}//${window.location.host}/ws/deploy/${appId}`
+}

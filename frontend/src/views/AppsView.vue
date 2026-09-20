@@ -4,18 +4,20 @@ import { onMounted, onUnmounted, reactive, ref } from 'vue'
 import { message } from 'ant-design-vue'
 import {
   AppstoreOutlined, CloudUploadOutlined, CopyOutlined, EyeOutlined,
-  PlayCircleOutlined, PoweroffOutlined, ReloadOutlined, RocketOutlined,
+  PlayCircleOutlined, PoweroffOutlined, ProfileOutlined, ReloadOutlined, RocketOutlined,
 } from '@ant-design/icons-vue'
 import {
   createApp, devRestart, devStart, devStatus, devStop, listApps, validateAppSlug,
 } from '../api'
 import { SMALL_STACKS, slugFromName, validateForm } from '../utils/appForm'
+import DeployLogPanel from '../components/DeployLogPanel.vue'
 
 const apps = ref([])
 const loading = ref(true)
 const showWizard = ref(false)
 const current = ref(0)
 const preview = reactive({ open: false, app: null, url: '', status: '', nonce: 0 })
+const logs = reactive({ open: false, app: null })
 const form = reactive({ name: '', slug: '', slugTouched: false, scale: 'small', stack: 'vue3-fastapi' })
 let timer = null
 
@@ -125,6 +127,11 @@ async function copyUrl(url) {
   await navigator.clipboard.writeText(url)
   message.success('已复制')
 }
+// 查看日志：独立抽屉，栈没起也能打开（上一次启动失败在哪一步，只有这里看得到）
+function openLogs(a) {
+  logs.app = a
+  logs.open = true
+}
 </script>
 
 <template>
@@ -163,6 +170,7 @@ async function copyUrl(url) {
             {{ a.status_dev === 'running' ? '停止' : '启动预览' }}
           </a-button>
           <a-button size="middle" @click="restartDev(a)">重启</a-button>
+          <a-button size="middle" @click="openLogs(a)"><profile-outlined /> 查看日志</a-button>
         </a-space>
       </a-card>
     </div>
@@ -222,6 +230,12 @@ async function copyUrl(url) {
               :key="preview.nonce" :src="preview.url"
               style="width: 100%; height: calc(100vh - 160px); border: 1px solid #e5e7eb; border-radius: 4px" />
       <a-empty v-else description="预览未启动——点卡片上的「启动预览」，或稍候刷新" />
+    </a-drawer>
+
+    <a-drawer v-model:open="logs.open" :title="`日志 · ${logs.app?.name || ''}`" width="62%"
+              :body-style="{ padding: '12px 16px' }" destroy-on-close>
+      <deploy-log-panel v-if="logs.app" :app-id="logs.app.id" :app-name="logs.app.name"
+                        :active="logs.open" />
     </a-drawer>
   </div>
 </template>
