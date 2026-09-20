@@ -128,13 +128,19 @@ async def wait_frontend_health(port: int, timeout: int) -> bool:
 
 
 async def start_dev(sf, app: dict, notify=None) -> dict:
-    """启动 dev 预览栈：stopped→starting→running（任一失败 → error，异常原样上抛）。"""
+    """启动 dev 预览栈：stopped→starting→running（进入 starting 之后任一失败 → error，异常原样上抛）。
+
+    Docker 预检**前置于任何状态变更与事件**（规格 03 §5 / 裁定 task-11-report §8.1）：不可用时不发
+    starting 事件、status_dev 保持 stopped、503 中文引导原样上抛（由 REST 层映射状态码）。
+    因此 `preflight_docker()` 刻意放在 try **之外**——它抛的 DeployError 不会被下面把状态改写成
+    error 的 except 捕获（预检失败 = 状态零变更）。
+    """
     app_id = app["id"]
     app = _compose_meta(app)
+    await preflight_docker()
     await _notify(notify, app_id, {"type": "dev_status", "status": "starting"})
     try:
         await _set_status(sf, app_id, "starting")
-        await preflight_docker()
         root = await _app_root(sf, app)
         cred = await read_cred(sf, app["slug"], "dev")
         if not cred:

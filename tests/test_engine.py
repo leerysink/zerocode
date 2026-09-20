@@ -299,16 +299,19 @@ async def test_start_dev_requires_cred_before_any_container(sf, make_app, seams)
 
 
 async def test_start_dev_docker_unavailable(sf, make_app, seams):
-    """Docker 不可用 → 503 中文引导（规格 03 §5），既不渲染也不迁移更不起栈。"""
+    """Docker 不可用 → 503 中文引导，且**不进入 starting**（规格 03 §5 / 裁定 §8.1）：
+    预检前置 → 不发任何事件、status_dev 保持 stopped（不落 error），异常原样上抛供 REST 映射 503。"""
     app = await make_app("zcdock", prod_port=8288, dev_port=8289)
     seams.preflight_error = DeployError(
         "Docker 未启动或不可用：请打开 Docker Desktop（设置页「部署环境」可一键启动）", status=503)
+    hub, events = _hub_spy()
     with pytest.raises(DeployError) as ei:
-        await engine.start_dev(sf, app)
+        await engine.start_dev(sf, app, notify=hub.publish)
     assert ei.value.status == 503 and "Docker Desktop" in str(ei.value)
+    assert events == [] and _statuses(events) == []       # 零事件：starting 也不发
     assert seams.mig_calls == [] and seams.docker.keys() == []
     assert not (ROOT / "zcdock" / "deploy").exists()
-    assert await _db_status(sf, app["id"]) == "error"
+    assert await _db_status(sf, app["id"]) == "stopped"    # 状态零变更（不落 error）
 
 
 async def test_start_dev_compose_up_failure(sf, make_app, seams):
