@@ -20,6 +20,7 @@ async def _root_of(request: Request, ws_id: int) -> Path:
 @router.get("/fs/tree")
 async def fs_tree(request: Request, workspace_id: int):
     root = await _root_of(request, workspace_id)
+    from app.deploy.guard import is_secret_read  # 应用工作区隐藏平台保留区（终审 M-3），普通工作区恒 False 零影响
 
     def build(d: Path, depth: int) -> list:
         if depth > 8:
@@ -31,7 +32,7 @@ async def fs_tree(request: Request, workspace_id: int):
             return []
         for child in children[:500]:
             if child.is_dir():
-                if child.name in IGNORE_DIRS:
+                if child.name in IGNORE_DIRS or is_secret_read(root, str(child.relative_to(root))):
                     continue
                 out.append({"name": child.name, "path": str(child.relative_to(root)),
                             "type": "dir", "children": build(child, depth + 1)})
@@ -54,6 +55,9 @@ async def fs_ls(request: Request, workspace_id: int, path: str = ""):
     忽略名单与 /fs/tree 共用 IGNORE_DIRS；path 必须是工作区内相对路径，越界/绝对路径 400。
     """
     root = await _root_of(request, workspace_id)
+    from app.deploy.guard import is_secret_read
+    if is_secret_read(root, path):
+        raise HTTPException(403, "deploy/ 由平台管理，凭据不可读取")
     try:
         d = resolve_in_workspace(root, path)
     except Exception as e:
@@ -69,7 +73,7 @@ async def fs_ls(request: Request, workspace_id: int, path: str = ""):
     entries = []
     for child in children:
         is_dir = child.is_dir()
-        if is_dir and child.name in IGNORE_DIRS:
+        if is_dir and (child.name in IGNORE_DIRS or is_secret_read(root, _rel_of(child, root))):
             continue
         try:
             st = child.stat()
@@ -85,6 +89,9 @@ async def fs_ls(request: Request, workspace_id: int, path: str = ""):
 async def fs_download(request: Request, workspace_id: int, path: str):
     """单文件下载。与预览不同：这里不限二进制、不限 200KB——那两条限制只服务于文本查看。"""
     root = await _root_of(request, workspace_id)
+    from app.deploy.guard import is_secret_read
+    if is_secret_read(root, path):
+        raise HTTPException(403, "deploy/ 由平台管理，凭据不可下载")
     try:
         f = resolve_in_workspace(root, path)
     except Exception as e:
@@ -132,6 +139,9 @@ async def fs_open_folder(request: Request, body: OpenFolderIn):
 @router.get("/files/read")
 async def files_read(request: Request, workspace_id: int, path: str):
     root = await _root_of(request, workspace_id)
+    from app.deploy.guard import is_secret_read
+    if is_secret_read(root, path):
+        raise HTTPException(403, "deploy/ 由平台管理，凭据不可读取")
     try:
         f = resolve_in_workspace(root, path)
     except Exception as e:

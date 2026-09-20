@@ -147,3 +147,40 @@ async def test_open_folder_maps_launch_failure_to_500(client, tmp_path, monkeypa
     r = await client.post("/api/fs/open-folder", json={"workspace_id": ws["id"]})
     assert r.status_code == 500 and "打开文件夹失败" in r.json()["detail"]  # 前端据此降级到内置文件管理器
 
+
+@pytest.mark.asyncio
+async def test_app_workspace_deploy_denied_read_hidden_tree_ls(client, tmp_path):
+    """终审 M-3 残余收口：应用工作区的 deploy/** UI 读面拒读，树/单层列表隐藏；app.json 读放行。"""
+    (tmp_path / "app.json").write_text('{"schema": "zc-app/1"}', encoding="utf-8")
+    (tmp_path / "deploy").mkdir()
+    (tmp_path / "deploy" / ".env").write_text("DEV_PASSWORD=sekret", encoding="utf-8")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "a.py").write_text("x=1", encoding="utf-8")
+    ws = await _ws(client, tmp_path)
+    # 读禁：精确、大小写与折叠变形都拒
+    for p in ("deploy/.env", "DEPLOY/.env", "src/../deploy/.env"):
+        r = await client.get(f"/api/files/read?workspace_id={ws['id']}&path={p}")
+        assert r.status_code == 403 and "平台" in r.json()["detail"], p
+    # 下载是第二读通道——同样必须拒（fail-closed）
+    for p in ("deploy/.env", "deploy%2Fdev-compose.yml"):
+        r = await client.get(f"/api/fs/download?workspace_id={ws['id']}&path={p}")
+        assert r.status_code == 403, p
+    # app.json（无口令的清单）读仍放行
+    r = await client.get(f"/api/files/read?workspace_id={ws['id']}&path=app.json")
+    assert r.status_code == 200
+    # 树与单层列表隐藏保留区目录
+    r = await client.get(f"/api/fs/tree?workspace_id={ws['id']}")
+    names = [n["name"] for n in r.json()]
+    assert "src" in names and "deploy" not in names
+    r = await client.get(f"/api/fs/ls?workspace_id={ws['id']}&path=")
+    assert "deploy" not in [e["name"] for e in r.json()["entries"]]
+    # 普通工作区（无 app.json）里的 deploy 目录零影响
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    (plain / "deploy").mkdir()
+    ws2 = await _ws(client, str(plain))
+    r = await client.get(f"/api/fs/tree?workspace_id={ws2['id']}")
+    assert "deploy" in [n["name"] for n in r.json()]
+    r = await client.get(f"/api/files/read?workspace_id={ws2['id']}&path=deploy/.env")
+    assert r.status_code == 404  # 不存在≠被禁，普通工作区走原有语义
+
