@@ -46,6 +46,10 @@ export const patchSessionModel = (id, modelConfigId) =>
 // ---- 部署发布套件（应用管理） ----
 export const listApps = () => http.get('/apps')
 export const createApp = (data) => http.post('/apps', data) // {name, slug, scale, stack}
+// 侧栏分组行的两个入口：改名只动显示名（slug 是目录/库/镜像名的锚点，不可改）；
+// 删除只删平台记录，工程目录与应用数据库保留（M1 裁定），响应 kept 里带回保留位置。
+export const renameApp = (id, name) => http.patch(`/apps/${id}`, { name })
+export const deleteApp = (id) => http.delete(`/apps/${id}`)
 export const validateAppSlug = (slug) => http.post('/apps/validate-slug', { slug })
 export const devStart = (id) => http.post(`/apps/${id}/dev/start`)
 export const devStop = (id) => http.post(`/apps/${id}/dev/stop`)

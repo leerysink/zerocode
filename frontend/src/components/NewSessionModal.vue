@@ -1,88 +1,52 @@
 <script setup>
-// 新会话弹窗：选择已有工作区，或输入/浏览新目录路径 → createWorkspace(如新) + createSession → openSession。
-// 目录已存在时后端返回 409「该目录已存在」：重拉工作区列表按 root_path 匹配复用，绝不重复建工作区。
-import { computed, ref, watch } from 'vue'
+// 新会话弹窗（2026-09-20 改版）：以后只有应用——手动挂目录建工作区的入口整体下线，
+// 只能从已有应用里选一个来开会话。应用列表由父级 SideBar 传入（同一次 /api/apps 的结果，
+// 不再自己发第二个请求），选项值就是应用关联的 workspace_id：会话表的外键仍是 workspace，
+// 「应用 = 一个带工程目录的工作区」这层关系由 app_service 建应用时一并插入。
+import { computed, reactive, watch } from 'vue'
 import { message } from 'ant-design-vue'
-import { createSession, createWorkspace } from '../api'
+import { createSession } from '../api'
 import { useChatStore } from '../stores/chat'
-import DirBrowseModal from './DirBrowseModal.vue'
 
-const props = defineProps({ open: Boolean })
+const props = defineProps({ open: Boolean, apps: { type: Array, default: () => [] } })
 const emit = defineEmits(['update:open', 'created'])
 
 const store = useChatStore()
-const wsId = ref(null) // 选中的已有工作区 id
-const path = ref('') // 新工作区目录路径（与 wsId 二选一）
-const submitting = ref(false)
-const showBrowse = ref(false)
+const form = reactive({ wsId: null, title: '' })
 
-const wsOptions = computed(() => store.workspaces.map((w) => ({ label: w.name, value: w.id })))
+const options = computed(() => props.apps.map((a) => ({ label: a.name, value: a.workspace_id })))
+const canSubmit = computed(() => !!form.wsId)
 
-// 每次打开重置表单
+// 每次打开重置表单；只有一个应用时直接选中，省掉一次点击
 watch(
   () => props.open,
   (v) => {
-    if (v) {
-      wsId.value = null
-      path.value = ''
-      showBrowse.value = false // 防御：重开时内层目录弹窗不残留
-    }
-  }
+    if (!v) return
+    form.title = ''
+    form.wsId = props.apps.length === 1 ? props.apps[0].workspace_id : null
+  },
+  { immediate: true }
 )
-
-// 两栏互斥：选了已有工作区就清路径，填了路径就清选择
-function onWsChange(v) {
-  if (v) path.value = ''
-}
-function onPathInput() {
-  if (path.value) wsId.value = null
-}
-function onBrowseSelect(p) {
-  path.value = p
-  wsId.value = null
-}
 
 function close() {
   emit('update:open', false)
 }
 
 async function submit() {
-  if (!wsId.value && !path.value.trim()) {
-    message.warning('请选择已有工作区或填写目录路径')
+  if (!canSubmit.value) {
+    message.warning('请先选择一个应用')
     return
   }
-  submitting.value = true
+  const title = form.title.trim()
   try {
-    let ws = null
-    if (wsId.value) {
-      ws = store.workspaces.find((w) => w.id === wsId.value)
-    } else {
-      const p = path.value.trim()
-      ws = store.workspaces.find((w) => w.root_path === p)
-      if (!ws) {
-        try {
-          ws = (await createWorkspace({ root_path: p })).data
-        } catch (e) {
-          if (e?.response?.status !== 409) throw e
-          // 409：该目录已存在（后端对 root_path 规范化后判重）——重拉列表按路径匹配复用
-          await store.loadWorkspaces()
-          ws = store.workspaces.find((w) => w.root_path === p)
-          if (!ws) {
-            message.error('该目录已存在，请在「已有工作区」中选择')
-            return
-          }
-        }
-      }
-    }
-    const { data: session } = await createSession({ workspace_id: ws.id })
-    await store.openSession(session.id, ws.id) // 同步记录 currentWorkspaceId（渲染门，Task 13/14）
+    const { data: session } = await createSession(
+      title ? { workspace_id: form.wsId, title } : { workspace_id: form.wsId })
+    await store.openSession(session.id, form.wsId) // 同步记录 currentWorkspaceId（渲染门，Task 13/14）
     message.success('会话已创建')
     emit('created', session)
     close()
   } catch (e) {
     message.error(e?.response?.data?.detail || '创建失败')
-  } finally {
-    submitting.value = false
   }
 }
 </script>
@@ -92,39 +56,32 @@ async function submit() {
     :open="open"
     title="新会话"
     width="40%"
-    :confirm-loading="submitting"
     ok-text="创建"
     cancel-text="取消"
+    :ok-button-props="{ disabled: !canSubmit }"
     @ok="submit"
     @cancel="close"
   >
-    <div class="zc-ns-field">
-      <div class="zc-ns-label">已有工作区</div>
-      <a-select
-        v-model:value="wsId"
-        :options="wsOptions"
-        placeholder="选择已有工作区"
-        allow-clear
-        show-search
-        option-filter-prop="label"
-        class="zc-ns-select"
-        @change="onWsChange"
-      />
+    <div v-if="!apps.length" class="zc-ns-empty">
+      还没有应用，请先去 <router-link to="/apps">「应用」页</router-link> 新建一个应用，再回来开会话。
     </div>
-    <a-divider plain>或新建工作区</a-divider>
-    <div class="zc-ns-field">
-      <div class="zc-ns-label">目录路径</div>
-      <div class="zc-ns-row">
-        <a-input
-          v-model:value="path"
-          placeholder="输入工作区目录，如 D:\work\demo"
-          allow-clear
-          @update:value="onPathInput"
+    <template v-else>
+      <div class="zc-ns-field">
+        <div class="zc-ns-label">选择应用</div>
+        <a-select
+          v-model:value="form.wsId"
+          :options="options"
+          placeholder="选择要在哪个应用里聊"
+          show-search
+          option-filter-prop="label"
+          class="zc-ns-select"
         />
-        <a-button @click="showBrowse = true">浏览目录</a-button>
       </div>
-    </div>
-    <DirBrowseModal v-model:open="showBrowse" @select="onBrowseSelect" />
+      <div class="zc-ns-field">
+        <div class="zc-ns-label">会话名称（可留空）</div>
+        <a-input v-model:value="form.title" placeholder="留空即为「新会话」，创建后可在会话列表改名" />
+      </div>
+    </template>
   </a-modal>
 </template>
 
@@ -140,8 +97,12 @@ async function submit() {
 .zc-ns-select {
   width: 100%;
 }
-.zc-ns-row {
-  display: flex;
-  gap: 8px;
+.zc-ns-empty {
+  color: var(--zc-text-sub);
+  font-size: 13px;
+  line-height: 1.7;
+}
+.zc-ns-empty a {
+  color: var(--zc-primary);
 }
 </style>

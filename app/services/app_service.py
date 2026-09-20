@@ -21,6 +21,22 @@ STACKS = SMALL_STACKS + (LARGE_STACK,)
 TEMPLATES = REPO_ROOT / "app" / "templates"   # 仓库根/app/templates（同 scaffold 测试的 TEMPLATE 常量）
 HEALTH_BY_STACK = {"vue3-fastapi": "/api/health", "vue3-node": "/api/health",
                    "vue3-springboot": "/actuator/health", "static": ""}
+NAME_MAX = 100    # workspace.name / app_project.name 同为 VARCHAR(100)
+STOPPABLE = ("running", "starting")   # 删除前需要收口的 dev 状态：这两态 Docker 里可能有真容器
+
+
+def check_name(name: str) -> str:
+    """应用名统一入口校验：strip 后 1..NAME_MAX，返回落库用的干净值。
+
+    创建与改名共用一处（M-2① 终审 F-02 的延伸）：超限直接中文 400，不穿透到 asyncpg 的
+    StringDataRightTruncation 冒 500 外露驱动原文。
+    """
+    stripped = (name or "").strip()
+    if not stripped:
+        raise DeployError("应用名称不能为空")
+    if len(stripped) > NAME_MAX:
+        raise DeployError(f"应用名称过长（上限 {NAME_MAX} 字），请缩短后重试")
+    return stripped
 
 
 def to_dict(row) -> dict:
@@ -98,13 +114,7 @@ async def _delete_rows(session_factory, app_id: int) -> None:
 async def create_app_project(session_factory, *, name: str, slug: str, scale: str,
                              stack: str, root: str | None = None) -> dict:
     """原子创建一个应用工程：任一步失败即回滚（平台记录 + 供给 + 目录），抛 DeployError。"""
-    name_stripped = (name or "").strip()
-    if not name_stripped:
-        raise DeployError("应用名称不能为空")
-    # M-2①（终审 F-02）：app_project.name VARCHAR(100)——入口即校验 strip 后 1..100，
-    # 超限/空直接中文 400，不再穿透到 asyncpg StringDataRightTruncation 冒 500 外露驱动原文。
-    if len(name_stripped) > 100:
-        raise DeployError("应用名称过长（上限 100 字），请缩短后重试")
+    name_stripped = check_name(name)
     validate_slug(slug)
     _check_scale_stack(scale, stack)
     cfg = await deploy_cfg(session_factory)
@@ -116,7 +126,7 @@ async def create_app_project(session_factory, *, name: str, slug: str, scale: st
     async with session_factory() as s:
         prod_port, dev_port = await allocate_pair(s)
     today = datetime.date.today().strftime("%Y%m%d")
-    mapping = {"SLUG": slug, "APP_NAME": name.strip(),
+    mapping = {"SLUG": slug, "APP_NAME": name_stripped,
                "DEV_PORT": str(dev_port), "PROD_PORT": str(prod_port),
                "DEV_DB": f"{slug}_dev", "PROD_DB": f"{slug}_prod", "TODAY": today}
     app_id = None
@@ -124,12 +134,12 @@ async def create_app_project(session_factory, *, name: str, slug: str, scale: st
     provisioned_ok = False   # 本流是否真的供给过 dev 库：回滚只允许删本流自己建的东西（I-1）
     try:
         scaffold.render(TEMPLATES / stack, root_path, mapping)   # R-C 已保证模板目录存在
-        app = await _insert_rows(session_factory, name=name.strip(), slug=slug, scale=scale,
+        app = await _insert_rows(session_factory, name=name_stripped, slug=slug, scale=scale,
                                  stack=stack, root=root_path, prod_port=prod_port, dev_port=dev_port)
         app_id = app["id"]
         workspace_id = app["workspace_id"]
         # app.json：不含密码；端口来自同一次分配，与库内登记一致
-        meta = {"schema": "zc-app/1", "name": name.strip(), "slug": slug, "scale": scale,
+        meta = {"schema": "zc-app/1", "name": name_stripped, "slug": slug, "scale": scale,
                 "stack": stack, "ports": {"prod": app["prod_port"], "dev": app["dev_port"]},
                 "database": {"dev": {"name": f"{slug}_dev", "user": f"{slug}_dev"},
                              "prod": {"name": f"{slug}_prod", "user": f"{slug}_prod"}},
@@ -182,11 +192,14 @@ async def _rollback(session_factory, root_path: Path, slug: str, app_id: int | N
 
 
 async def list_apps(session_factory) -> list[dict]:
+    """应用列表（应用页与侧栏分组共用）。带上 workspace.root_path：
+    侧栏一行就是一个应用，确认删除时要当场把「工程目录还在哪儿」说清楚。"""
     async with session_factory() as s:
         rows = (await s.execute(text(
-            "SELECT id, workspace_id, name, slug, scale, stack, prod_port, dev_port, "
-            "status_dev, status_prod, current_version, created_at, updated_at "
-            "FROM app_project ORDER BY id DESC"))).mappings().all()
+            "SELECT a.id, a.workspace_id, a.name, a.slug, a.scale, a.stack, a.prod_port, a.dev_port, "
+            "a.status_dev, a.status_prod, a.current_version, a.created_at, a.updated_at, w.root_path "
+            "FROM app_project a LEFT JOIN workspace w ON w.id = a.workspace_id "
+            "ORDER BY a.id DESC"))).mappings().all()
     return [to_dict(r) for r in rows]
 
 
@@ -199,3 +212,51 @@ async def get_app(session_factory, app_id: int) -> dict:
     if not row:
         raise DeployError("应用不存在", status=404)
     return to_dict(row)
+
+
+async def rename_app(session_factory, app_id: int, name: str) -> dict:
+    """应用改名：app_project.name 与 workspace.name 同事务更新，slug/端口/目录不动。
+
+    两张表都写是这里唯一的非显然处：应用页读 app_project.name，侧栏分组名与文件面板面包屑读
+    workspace.name（GET /workspaces 直接取自该列），只改一边就会出现「应用页新名、侧栏旧名」。
+    """
+    new_name = check_name(name)
+    async with session_factory() as s:
+        wid = (await s.execute(text("SELECT workspace_id FROM app_project WHERE id = :i"),
+                              {"i": app_id})).scalar()
+        if wid is None:
+            raise DeployError("应用不存在", status=404)
+        await s.execute(text("UPDATE app_project SET name = :n, updated_at = now() WHERE id = :i"),
+                        {"n": new_name, "i": app_id})
+        await s.execute(text("UPDATE workspace SET name = :n WHERE id = :i"), {"n": new_name, "i": wid})
+        await s.commit()
+    return await get_app(session_factory, app_id)
+
+
+def ensure_deletable(app: dict) -> None:
+    """删除闸门（规格 08 §5.4）：发布进行中不允许删记录，否则留下半成品版本目录与在跑容器。"""
+    if (app.get("status_prod") or "") == "publishing":
+        raise DeployError("该应用正在发布中，请等发布结束后再删除", status=409)
+
+
+async def delete_app(session_factory, app_id: int) -> dict:
+    """删除应用的平台记录，返回被删应用快照（含 root_path / slug，供前端说明「什么还留着」）。
+
+    M1 裁定：只删记录，**不删磁盘工程目录、不 drop 数据库**（01 FR1-07 的全删链含删容器/镜像/
+    删库勾选项，留给 M2）。删的是 workspace 行——app_project 的 FK 与 chat_session 都是
+    ON DELETE CASCADE，一次删除即清掉应用 + 会话 + 消息 + 文件变更，不留孤儿；
+    prod_port/dev_port 的 UNIQUE 行随之消失，端口对即被释放（规格 05）。
+    """
+    async with session_factory() as s:
+        row = (await s.execute(text(
+            "SELECT a.id, a.workspace_id, a.name, a.slug, a.status_dev, a.status_prod, w.root_path "
+            "FROM app_project a JOIN workspace w ON w.id = a.workspace_id WHERE a.id = :i"),
+            {"i": app_id})).mappings().first()
+        if not row:
+            raise DeployError("应用不存在", status=404)
+        snap = dict(row)
+        ensure_deletable(snap)
+        await s.execute(text("DELETE FROM workspace WHERE id = :i"), {"i": snap["workspace_id"]})
+        await s.commit()
+    snap["databases"] = [f"{snap['slug']}_dev", f"{snap['slug']}_prod"]
+    return snap

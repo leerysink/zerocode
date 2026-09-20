@@ -39,8 +39,23 @@ class SlugIn(BaseModel):
     slug: str
 
 
+class AppRenameIn(BaseModel):
+    name: str
+
+
 def _http(e: DeployError) -> HTTPException:
     return HTTPException(e.status, str(e))
+
+
+def _reject_if_task_running(request: Request, app_id: int) -> None:
+    """与 `_spawn` 同一条「同应用同时只允许一个部署任务」的契约，用在删除入口上。
+
+    删记录时后台起栈/迁移任务还在跑，会留下一只没人认领的容器（行没了，状态回执无处可写），
+    所以直接 409 让用户等一等，而不是在这里发明一套取消协议。
+    """
+    task: asyncio.Task | None = getattr(request.app.state, "dev_tasks", {}).get(app_id)
+    if task and not task.done():
+        raise DeployError("该应用有部署任务进行中，请稍候", status=409)
 
 
 @router.post("", status_code=201)   # brief Interfaces：创建成功返回 201（示例代码漏写，测试为契约）
@@ -76,6 +91,40 @@ async def detail(request: Request, app_id: int):
         return await app_service.get_app(request.app.state.session_factory, app_id)
     except DeployError as e:
         raise _http(e)
+
+
+@router.patch("/{app_id}")
+async def rename(request: Request, app_id: int, body: AppRenameIn):
+    """应用改名（只改显示名）：slug 不可改——它是工程目录名、库名与镜像名的共同锚点。"""
+    try:
+        return await app_service.rename_app(request.app.state.session_factory, app_id, body.name)
+    except DeployError as e:
+        raise _http(e)
+
+
+@router.delete("/{app_id}")
+async def remove(request: Request, app_id: int):
+    """删除应用（侧栏「⋯ → 删除应用」的落点）：尽力停 dev 栈 + 删平台记录。
+
+    M1 裁定：磁盘工程目录与应用数据库**保留**，响应把保留位置回给前端写进确认文案（kept）。
+    停栈按「尽力而为」处理——Docker 没开或 compose 失败都只记 warning，不把应用永久钉在列表里：
+    记录删不掉才是用户真正没法自救的状态。发布中 / 有部署任务在跑则 409 拒删（规格 08 §5.4）。
+    """
+    sf = request.app.state.session_factory
+    try:
+        app = await app_service.get_app(sf, app_id)
+        app_service.ensure_deletable(app)
+        _reject_if_task_running(request, app_id)
+        if app["status_dev"] in app_service.STOPPABLE:
+            try:
+                await engine.stop_dev(sf, app, notify=request.app.state.deploy_hub.publish)
+            except Exception as e:
+                logger.warning("删除应用时停止 dev 栈失败（继续删记录）: app_id=%s %s", app_id, e)
+        snap = await app_service.delete_app(sf, app_id)
+    except DeployError as e:
+        raise _http(e)
+    return {"ok": True, "kept": {"root_path": snap["root_path"], "slug": snap["slug"],
+                                 "databases": snap["databases"]}}
 
 
 # ---------- dev 生命周期（Task 12 / 规格 03 §4.4）：202 受理 + 后台执行，进度走 WS ----------
