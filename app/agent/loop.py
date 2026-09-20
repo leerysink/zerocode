@@ -3,7 +3,7 @@
 事件协议（send 下发）：token/tool_call/tool_result/file_change/message_done/error，
 另有 confirm_request（写入确认请求）、status（终态回执）与 compaction_done（自动压缩完成）。
 """
-import asyncio, datetime, inspect, json
+import asyncio, datetime, inspect, itertools, json
 from pathlib import Path
 from app.agent.prompts import build_system_prompt
 from app.agent.tools import ToolContext, ToolError, execute_tool
@@ -123,6 +123,15 @@ class AgentRunner:
                                           app_contract=build_app_contract(root))
         if summary:
             system_text += f"\n\n<context_summary>\n{summary}\n</context_summary>"
+        # 当前任务清单回灌：todo_write 调用会被历史窗口截掉，模型跨运行就"看不见"清单，
+        # 无从"随做随更"；todo_state 是为 UI 持久化的，这里同一事实喂回模型
+        async with self.sf() as s:
+            todos = (await s.execute(text(
+                "SELECT todo_state FROM chat_session WHERE id=:i"), {"i": session_id})).scalar()
+        if todos:
+            system_text += ("\n\n<current_todos>\n"
+                            + json.dumps(todos, ensure_ascii=False)
+                            + "\n</current_todos>")
         return [{"role": "system", "content": system_text}] + history
 
     async def _inner(self, session_id: int, user_text: str, cancel: asyncio.Event):
@@ -133,7 +142,9 @@ class AgentRunner:
         messages = await self._build_messages(session_id, root, cfg, self.send)
         ctx = ToolContext(root=root, session_id=session_id, session_factory=self.sf, send=self.send)
         max_rounds = int(cfg.get("agent.max_tool_rounds", 30))
-        for _round in range(max_rounds):
+        # <=0 = 不限工具轮数（与超时参数 <=0 不限制的约定一致），不再 range(0) 零轮即错
+        rounds = itertools.count() if max_rounds <= 0 else range(max_rounds)
+        for _round in rounds:
             if cancel.is_set():
                 raise _Cancelled()
             llm = await self._llm_for(cfg)

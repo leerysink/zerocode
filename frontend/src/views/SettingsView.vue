@@ -224,7 +224,7 @@ async function save() {
             <a-form-item label="提问等待超时（秒）" extra="0=不限制">
               <a-input-number v-model:value="store.form.askTimeoutSeconds" :min="0" style="width: 180px" />
             </a-form-item>
-            <a-form-item label="最大工具轮数">
+            <a-form-item label="最大工具轮数" extra="0=不限制">
               <a-input-number v-model:value="store.form.maxToolRounds" :min="0" style="width: 180px" />
             </a-form-item>
             <a-form-item label="历史窗口（条数）">

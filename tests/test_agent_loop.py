@@ -275,3 +275,43 @@ async def test_no_app_contract_without_app_json(test_engine, tmp_path):
     status = await runner.run(sid, "写个页面", asyncio.Event())
     assert status == "idle"
     assert "【应用契约】" not in llm.received[0][0]["content"]
+
+@pytest.mark.asyncio
+async def test_max_rounds_zero_means_unlimited(test_engine, tmp_path):
+    # 0/负数 = 不限工具轮数（与超时参数 <=0 不限制的约定一致），而非 range(0) 零轮即错
+    turns = [done(None, [tool_call(f"c{i}", "write_file", path=f"f{i}.txt", content="x")])
+             for i in range(5)] + [done("完成了")]
+    sid, status, evs, sf = await run_once(test_engine, tmp_path, turns, max_rounds=0)
+    assert status == "idle"
+    assert (tmp_path / "f4.txt").read_text(encoding="utf-8") == "x"
+
+@pytest.mark.asyncio
+async def test_current_todos_injected_into_system(test_engine, tmp_path):
+    # 跨运行历史窗口会截掉旧 todo_write 调用，todo_state 必须回灌 system 尾部，
+    # 否则模型第二轮起根本看不见清单，"随做随更"无从谈起
+    sid = await mk_session(test_engine, tmp_path)
+    sf = make_session_factory(test_engine)
+    todos = [{"content": "实现模块A", "status": "in_progress"},
+             {"content": "补A的测试", "status": "pending"}]
+    async with sf() as s:
+        await s.execute(sql("UPDATE chat_session SET todo_state = CAST(:j AS JSONB) WHERE id=:i"),
+                        {"j": json.dumps(todos, ensure_ascii=False), "i": sid})
+        await s.commit()
+    llm = ScriptedLLM([[delta("好的"), *done("好的")]])
+    runner = AgentRunner(sf, llm, cfg_provider(), Recorder(),
+                         lambda *a, **k: asyncio.sleep(0, None), lambda *a, **k: True)
+    await runner.run(sid, "继续", asyncio.Event())
+    sysmsg = llm.received[0][0]["content"]
+    # 锚定注入块形态（空行+数组），与规则6文本里提及的标签名区分
+    assert "\n\n<current_todos>\n[" in sysmsg and "实现模块A" in sysmsg
+
+@pytest.mark.asyncio
+async def test_no_current_todos_block_when_empty(test_engine, tmp_path):
+    # 反例守卫：无清单会话不注入空块（省 token，也避免模型对空块瞎更新）
+    sid = await mk_session(test_engine, tmp_path)
+    sf = make_session_factory(test_engine)
+    llm = ScriptedLLM([[delta("好的"), *done("好的")]])
+    runner = AgentRunner(sf, llm, cfg_provider(), Recorder(),
+                         lambda *a, **k: asyncio.sleep(0, None), lambda *a, **k: True)
+    await runner.run(sid, "你好", asyncio.Event())
+    assert "\n\n<current_todos>" not in llm.received[0][0]["content"]

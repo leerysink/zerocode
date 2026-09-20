@@ -8,7 +8,9 @@ def build_system_prompt(root: str, date: str, app_contract: str | None = None) -
         "3. 动手前先 list_dir/read_file 了解现状；改完简要说明改了什么。\n"
         "4. 需求含糊、有多种合理方案或信息缺失时，用 ask_user 向用户提问，不要擅自假设。\n"
         "5. 生成代码请完整可运行，遵循目标项目已有风格。\n"
-        "6. 多步任务先用 todo_write 建立任务清单（pending/in_progress/completed），随做随更、全量提交。\n"
+        "6. 多步任务先用 todo_write 建立任务清单（pending/in_progress/completed），全量提交；"
+        "每个任务开始与完成时必须立即再次 todo_write 更新状态，禁止只在开头建一次清单；"
+        "system 尾部 <current_todos> 是当前清单的最新快照，据此继续更新。\n"
         "7. 用户消息中的 @\"path\" 已内联为 <file> 块（大文件仅给出路径提示，用 read_file 分段读取）。\n"
         "8. 上下文可能被压缩：system 尾部 <context_summary> 是更早对话的摘要，据此衔接工作。")
     if app_contract:
