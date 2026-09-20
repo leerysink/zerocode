@@ -8,6 +8,18 @@ from app.hub import ChatHub
 
 logger = logging.getLogger(__name__)
 
+
+def _harden_console_streams() -> None:
+    """中文 Windows 控制台（GBK）打不出 `✓ ✗ ▶`：默认 strict 编码会让整条日志被 logging
+    吞成「--- Logging error ---」，用户看到的是一坨 traceback 而不是启动步骤。
+    把 errors 降级成 replace（那几个字符变 `?`，行不丢）；UTF-8 终端里仍然是原样字形。"""
+    for stream in (sys.stdout, sys.stderr):
+        with suppress(Exception):        # pytest/uvicorn 可能换成不支持 reconfigure 的对象
+            stream.reconfigure(errors="replace")
+
+
+_harden_console_streams()
+
 # 部署流程的步骤日志（app.deploy.engine 里 INFO 级的「▶ 启动预览 / ✓ 迁移完成 / ✗ 失败」）要在
 # backend 控制台窗口真的看得见：Python 的 lastResort handler 只放行 WARNING 及以上。
 # 刻意不用 force——宿主（测试、uvicorn --log-config）已配置根 logger 时保持原样。
