@@ -1,8 +1,47 @@
 # tests/test_deploy_basics.py
 import socket
 import pytest
+from sqlalchemy import text
 from app.deploy.errors import DeployError
 from app.deploy import slugs, settings, ports
+
+
+def _always_free(port: int) -> bool:
+    """探测替身：端口可用性只由 app_project 的登记状态决定，真实 TCP 占用不参与期望推导。"""
+    return True
+
+
+async def _port_base(s) -> int:
+    return int((await s.execute(text(
+        "SELECT value FROM app_config WHERE key='deploy.port_base'"))).scalar() or 8210)
+
+
+async def _registered_ports(s) -> set[int]:
+    """当前 app_project 已登记的全部端口——共享库里可能含并行会话/冒烟残留的他方应用行。"""
+    return {p for pair in (await s.execute(text(
+        "SELECT prod_port, dev_port FROM app_project"))).fetchall() for p in pair}
+
+
+async def _reserve_pair(s, wid: int, slug: str, prod: int, dev: int) -> None:
+    """在调用方的事务里登记一对端口（用例结束统一 rollback，不留残留行）。"""
+    await s.execute(text(
+        "INSERT INTO app_project (workspace_id, name, slug, scale, stack, prod_port, dev_port) "
+        "VALUES (:w, :n, :sl, 'static', 'static', :p, :d)"),
+        {"w": wid, "n": slug, "sl": slug, "p": prod, "d": dev})
+
+
+async def _assert_earliest_available(s, prod: int, occupied: set[int] = frozenset()) -> None:
+    """钉「取最早可用对」：段首到 prod 之前的每一对，必须已被登记或被探测占用。
+
+    这是相对化断言的核心——期望值来自当前登记状态，而不是「空库下第 N 对等于某个字面量」。
+    后者在共享环境里只要有他方应用行就必然假红（M1 执行/冒烟三次踩坑，本波 Task 1 硬化）。
+    """
+    base = await _port_base(s)
+    used = await _registered_ports(s)
+    for q in range(base if base % 2 == 0 else base + 1, prod, 2):
+        assert q in used or q + 1 in used or q in occupied or q + 1 in occupied, \
+            f"端口对 {q}/{q + 1} 更早且可用，却被 allocate_pair 跳过"
+
 
 def test_slug_rules():
     assert slugs.SLUG_RE.fullmatch("lailiao2")
@@ -31,24 +70,46 @@ async def test_deploy_cfg_defaults(test_engine):
     assert settings.resolve_apps_root(cfg).name == "apps"
 
 async def test_allocate_pair_skips_used(test_engine):
+    """已登记的端口对必须被跳过，且取到的是紧随其后的最早可用对。
+
+    硬化（本波 Task 1）：原写法「插 8210/8211 → 期望 (8212, 8213)」隐含「共享库为空」假设，
+    并行会话/冒烟残留的 app_project 行会让他假红（插桩撞 UNIQUE 或期望对错位）。
+    现在先按当前登记状态取真实可用对并占住两对，再从登记状态推导期望。
+    """
     from app.db import make_session_factory
-    from sqlalchemy import text
     sf = make_session_factory(test_engine)
     async with sf() as s:
         wid = (await s.execute(text(
-            "INSERT INTO workspace (name, root_path) VALUES ('t', 'D:/__zc_basic__') RETURNING id"))).scalar()
-        await s.execute(text(
-            "INSERT INTO app_project (workspace_id, name, slug, scale, stack, prod_port, dev_port) "
-            "VALUES (:w, 't', 'zcbasic', 'small', 'static', 8210, 8211)"), {"w": wid})
-        await s.commit()
-        assert await ports.allocate_pair(s, probe=lambda p: True) == (8212, 8213)
+            "INSERT INTO workspace (name, root_path) VALUES ('guard', 'D:/__zc_guard_ports__') "
+            "RETURNING id"))).scalar()
+        reserved = []
+        for slug in ("zcg1", "zcg2"):
+            p, d = await ports.allocate_pair(s, probe=_always_free)   # 当前真实可用对（含他方行在内）
+            await _reserve_pair(s, wid, slug, p, d)
+            reserved.append((p, d))
+        prod, dev = await ports.allocate_pair(s, probe=_always_free)
+        assert prod % 2 == 0 and dev == prod + 1                      # prod=偶 / dev=奇 成对不变式
+        assert not {prod, dev} & await _registered_ports(s)           # 已登记的一律跳过
+        assert prod > reserved[-1][1]                                 # 排在刚登记的两对之后
+        await _assert_earliest_available(s, prod)                     # 且不放过更早的可用对
+        await s.rollback()                                             # 守卫行不落库（双保险：conftest 也 TRUNCATE）
 
 async def test_allocate_pair_skips_occupied(test_engine):
+    """空闲登记但 TCP 探测不通（被别的程序占用）的端口对也要跳过。
+
+    硬化：占用哪一对、跳过之后得到哪一对，都由当前登记状态推导——不再钉死「8210/8211 占用 →
+    期望 8212/8213」（他方行占住段首时该期望必然假红）。
+    """
     from app.db import make_session_factory
     sf = make_session_factory(test_engine)
     async with sf() as s:
-        # 8210/8211 空闲登记但 TCP 探测失败（被其他程序占用）→ 跳到下一对
-        assert await ports.allocate_pair(s, probe=lambda p: p not in (8210, 8211)) == (8212, 8213)
+        first_prod, first_dev = await ports.allocate_pair(s, probe=_always_free)
+        occupied = {first_prod, first_dev}                            # 唯一被探测拒掉的那一（对）
+        prod, dev = await ports.allocate_pair(s, probe=lambda p: p not in occupied)
+        assert (prod, dev) != (first_prod, first_dev)
+        assert prod % 2 == 0 and dev == prod + 1
+        assert not {prod, dev} & await _registered_ports(s)
+        await _assert_earliest_available(s, prod, occupied=occupied)
 
 async def test_allocate_pair_exhausted(test_engine):
     from app.db import make_session_factory

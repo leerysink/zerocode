@@ -22,15 +22,31 @@ from sqlalchemy import text
 from starlette.testclient import TestClient
 
 from app.db import make_session_factory
-from app.deploy import engine as eng_mod, provision, sqlrun
+from app.deploy import engine as eng_mod, ports, provision, sqlrun
 from app.deploy.errors import DeployError
 from app.deploy.hub import DeployHub
 from app.main import create_app
+from app.services import app_service
 
 pytestmark = pytest.mark.asyncio
 
 SLUG = "zcapi"
 ROOT = Path("D:/__zc_task12__")        # 应用工作区根（仓库外，沿用 Task 9/11 约定），fixture 收尾删掉
+
+
+async def _free_pair(sf) -> tuple[int, int]:
+    """当前登记状态下真实可用的一对端口（prod 偶 / dev 奇）。
+
+    端口无关化（本波 Task 1）：插桩行不再写死 8294/8295——共享库里只要存在他方应用行占住那一对，
+    插桩自己就撞 app_project_prod_port_key 假红（造干扰实测：Key (prod_port)=(8294) already exists）。
+    """
+    async with sf() as s:
+        return await ports.allocate_pair(s)
+
+
+async def _app_row(client, app_id: int) -> dict:
+    """回读库内登记行：断言用 app["dev_port"]，而不是与插桩同步维护的端口字面量。"""
+    return await app_service.get_app(client.app.state.session_factory, app_id)
 
 
 @pytest.fixture(autouse=True)
@@ -53,20 +69,21 @@ def _docks_stubbed(monkeypatch):
 
 @pytest.fixture
 async def dev_app(client, test_engine):
-    """在测试库造一个应用（workspace + app_project，端口对 8294/8295 对齐 brief），收尾连目录一起清。
+    """在测试库造一个应用（workspace + app_project），端口对由当前登记状态推导（不写字面量）。
 
     依赖 `client` 以保证顺序：app 的 lifespan 启动清理先跑完，再插本用例的行
     （否则 startup 的孤儿清理会去 docker compose 一个还不存在的应用）。
     """
     sf = make_session_factory(test_engine)
     ROOT.mkdir(parents=True, exist_ok=True)
+    prod_port, dev_port = await _free_pair(sf)
     async with sf() as s:
         wid = (await s.execute(text("INSERT INTO workspace (name, root_path) VALUES ('api', :r) "
                                     "RETURNING id"), {"r": str(ROOT)})).scalar()
         aid = (await s.execute(text(
             "INSERT INTO app_project (workspace_id, name, slug, scale, stack, prod_port, dev_port) "
-            "VALUES (:w, 'api', :sl, 'small', 'vue3-fastapi', 8294, 8295) RETURNING id"),
-            {"w": wid, "sl": SLUG})).scalar()
+            "VALUES (:w, 'api', :sl, 'small', 'vue3-fastapi', :pp, :dp) RETURNING id"),
+            {"w": wid, "sl": SLUG, "pp": prod_port, "dp": dev_port})).scalar()
         await s.commit()
     yield aid
     async with sf() as s:
@@ -99,16 +116,21 @@ def _drain(q: asyncio.Queue) -> list[dict]:
 # ---------- dev 生命周期：202 + 后台任务 + 状态 ----------
 
 async def test_dev_start_202_and_status(client, dev_app, monkeypatch):
-    """202 立即返回（引擎在后台任务里跑完，D-4），进度事件经 hub 走 WS；status 由引擎给预览地址。"""
+    """202 立即返回（引擎在后台任务里跑完，D-4），进度事件经 hub 走 WS；status 由引擎给预览地址。
+
+    预览地址里的端口取自库内登记行（本波 Task 1 端口无关化）：插桩端口是推导出来的，
+    写死 8295 会在共享库他方行占位时假红，也会让断言退化成「替身返回了它自己写的字面量」。
+    """
     app = client.app
     started = asyncio.Event()
     captured = {}
+    registered = await _app_row(client, dev_app)        # 本应用登记的端口对
 
     async def fake_start(sf, a, notify=None):
         captured["notify"] = notify
         captured["slug"] = a["slug"]
         started.set()
-        return {"status": "running", "url": "http://localhost:8295"}
+        return {"status": "running", "url": f"http://localhost:{a['dev_port']}"}
 
     async def no_docker(*args, **kwargs):        # dev_status 的 compose ps 不打真 Docker
         return 0, ""
@@ -126,7 +148,8 @@ async def test_dev_start_202_and_status(client, dev_app, monkeypatch):
     r2 = await client.get(f"/api/apps/{dev_app}/dev/status")
     assert r2.status_code == 200
     body = r2.json()
-    assert body["url"] == "http://localhost:8295"
+    assert body["url"] == f"http://localhost:{registered['dev_port']}"
+    assert registered["prod_port"] % 2 == 0 and registered["dev_port"] == registered["prod_port"] + 1
     assert body["status_dev"] == "stopped"        # 替身不写库：状态是引擎/真链路的职责
 
 
