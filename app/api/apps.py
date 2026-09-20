@@ -4,8 +4,13 @@
 薄层：只做请求体解析 + 状态码映射，校验/创建/回滚等业务一律在 app.services.app_service。
 Task 12 追加 dev 生命周期与 sqlchange 端点：长任务（起栈/迁移）一律 **202 受理 + 后台执行**，
 进度经 DeployHub → /ws/deploy/{app_id} 下发（规格 03 §4.4）；同应用同时只允许一个部署任务。
+预览启动（start/restart）在受理前**同步**预检 Docker：Task 11 的契约是「预检异常零事件、原样上抛
+供 REST 映射 503」，异步化会让这个映射点消失——用户 Docker 没开就会拿到 202 + WS 全程静默（审查 I-1）。
 """
 import asyncio
+import logging
+from functools import partial
+
 from fastapi import APIRouter, Request, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import text
@@ -17,6 +22,8 @@ from app.deploy.errors import DeployError
 from app.deploy.provision import read_cred
 from app.deploy.slugs import suggest_slug, validate_slug
 from app.services import app_service
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/apps")
 
@@ -73,24 +80,52 @@ async def detail(request: Request, app_id: int):
 
 # ---------- dev 生命周期（Task 12 / 规格 03 §4.4）：202 受理 + 后台执行，进度走 WS ----------
 
+def _log_task_crash(app_id: int, task: asyncio.Task) -> None:
+    """`_spawn` 的 done 回调：只记真抛了异常的任务，取消与正常返回（exception() is None）一律不动。
+
+    先 `task.cancelled()` 再取 `exception()`：对已取消的任务调 `exception()` 会抛 CancelledError，
+    在回调里再抛一次只会给日志添乱。
+    """
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is None:
+        return
+    logger.exception("部署后台任务异常退出（app_id=%s）", app_id, exc_info=exc)
+
+
 def _spawn(request: Request, app_id: int, coro_factory) -> None:
-    """长任务句柄表：同一应用同时只允许一个部署任务（重复受理 → 409，而不是排队双跑）。"""
+    """长任务句柄表：同一应用同时只允许一个部署任务（重复受理 → 409，而不是排队双跑）。
+
+    202 之后任务异常没有 HTTP 出口，done 回调负责 retrieve + 记堆栈：既消掉 asyncio 的
+    「Task exception was never retrieved」噪音（审查 I-1 配套 / Minor-3），也给「引擎事件之后才失败」
+    的路子（如 CLI 缺失时的后台 stop）留下一条可读现场。
+    """
     tasks: dict[int, asyncio.Task] = request.app.state.dev_tasks
     old = tasks.get(app_id)
     if old and not old.done():
         raise DeployError("该应用有部署任务进行中，请稍候", status=409)
-    tasks[app_id] = asyncio.create_task(coro_factory())
+    task = asyncio.create_task(coro_factory())
+    task.add_done_callback(partial(_log_task_crash, app_id))
+    tasks[app_id] = task
 
 
-async def _dev_task(request: Request, app_id: int, action) -> dict:
-    """dev 端点共用一条链：取应用 → 起后台任务（引擎自己发 starting/running/error 事件）→ 202。
+async def _dev_task(request: Request, app_id: int, action, *, docker_gate: bool = False) -> dict:
+    """dev 端点共用一条链：取应用 →（启动类）同步 Docker 预检 → 起后台任务 → 202。
 
     `action` 在**请求时**按模块属性取出（engine.start_dev 等），monkeypatch 才拦得住。
+
+    `docker_gate`（start/restart 开）：Task 11 的预检契约是「零事件、异常原样上抛**供 REST 映射 503**」，
+    这个映射点只在同步调用时存在——放进 create_task 后用户只会看到 202 + WS 静默（审查 I-1，探针实证）。
+    stop 关闸门：Docker 缺失时 `compose down` 本就无意义，更不该挡住用户关栈的意图
+    （失败交后台 done 回调留痕 + 平台启动清理兜底）。
     """
     sf = request.app.state.session_factory
     hub = request.app.state.deploy_hub
     try:
         app = await app_service.get_app(sf, app_id)
+        if docker_gate:
+            await engine.preflight_docker()
         _spawn(request, app_id, lambda: action(sf, app, notify=hub.publish))
     except DeployError as e:
         raise _http(e)
@@ -99,7 +134,7 @@ async def _dev_task(request: Request, app_id: int, action) -> dict:
 
 @router.post("/{app_id}/dev/start", status_code=202)
 async def dev_start(request: Request, app_id: int):
-    return await _dev_task(request, app_id, engine.start_dev)
+    return await _dev_task(request, app_id, engine.start_dev, docker_gate=True)
 
 
 @router.post("/{app_id}/dev/stop", status_code=202)
@@ -109,7 +144,7 @@ async def dev_stop(request: Request, app_id: int):
 
 @router.post("/{app_id}/dev/restart", status_code=202)
 async def dev_restart(request: Request, app_id: int):
-    return await _dev_task(request, app_id, engine.restart_dev)
+    return await _dev_task(request, app_id, engine.restart_dev, docker_gate=True)
 
 
 @router.get("/{app_id}/dev/status")

@@ -36,12 +36,17 @@ ROOT = Path("D:/__zc_task12__")        # 应用工作区根（仓库外，沿用
 @pytest.fixture(autouse=True)
 def _docks_stubbed(monkeypatch):
     """本文件的每个用例都在 app 起来之前把「Docker 侧启动/退出动作」收口成替身：
-    部署 REST/WS 接线与 Docker 真调用是两件事，后者已有专项单测（且 Docker Desktop 可能没开）。"""
+    部署 REST/WS 接线与 Docker 真调用是两件事，后者已有专项单测（且 Docker Desktop 可能没开）。
+
+    微修 I-1 后 dev/start、dev/restart 会在受理前**同步**预检 Docker，故 `preflight_docker` 同样
+    要收成替身：本文件验接线（新用例①专门把它换成必抛 503 的版本），真预检语义由 test_engine.py 钉。
+    """
     async def _noop(*args, **kwargs):
         return None
 
     monkeypatch.setattr(eng_mod, "cleanup_orphans", _noop)
     monkeypatch.setattr(eng_mod, "stop_all_dev_on_exit", _noop)
+    monkeypatch.setattr(eng_mod, "preflight_docker", _noop)
     monkeypatch.setattr(sqlrun, "build_if_missing", _noop)
     monkeypatch.setattr(provision, "ensure_zcnet", _noop)
 
@@ -123,6 +128,82 @@ async def test_dev_start_202_and_status(client, dev_app, monkeypatch):
     body = r2.json()
     assert body["url"] == "http://localhost:8295"
     assert body["status_dev"] == "stopped"        # 替身不写库：状态是引擎/真链路的职责
+
+
+async def test_dev_start_and_restart_gate_docker_synchronously(client, dev_app, monkeypatch):
+    """微修 I-1：Docker 没开是最高频故障——start/restart 在**受理前**同步预检，用户当场拿到 503 中文引导。
+
+    引擎侧契约（Task 11 / 610a943）是「预检失败零事件、异常原样上抛供 REST 映射 503」，前提是调用方
+    还在请求线程里；一旦进了 create_task，映射点就消失了（202 + WS 静默 + 日志一条 never retrieved）。
+    所以断言两件事：**同步 503**，且**后台任务压根没登记**（dev_tasks 无该 app_id）。
+    stop 不吃这道闸门：daemon 挂着时 compose down 本就无意义，仍 202 尽力而为（平台启动清理兜底）。
+    """
+    async def down(*args, **kwargs):
+        raise DeployError("Docker 未启动或不可用：请打开 Docker Desktop（设置页「部署环境」可一键启动）",
+                          status=503)
+
+    async def fake_stop(sf, a, notify=None):
+        return {"status": "stopped"}
+
+    monkeypatch.setattr(eng_mod, "preflight_docker", down)
+    monkeypatch.setattr(eng_mod, "stop_dev", fake_stop)
+
+    for action in ("start", "restart"):
+        r = await client.post(f"/api/apps/{dev_app}/dev/{action}")
+        assert r.status_code == 503, action                     # 同步可见，不是 202 + 静默
+        assert "Docker Desktop" in r.json()["detail"]           # 中文引导原样进 detail
+        assert dev_app not in client.app.state.dev_tasks, action  # 没有后台任务被登记
+
+    assert (await client.post(f"/api/apps/{dev_app}/dev/stop")).status_code == 202
+    await client.app.state.dev_tasks[dev_app]                   # stop 照常被受理并跑完
+
+
+async def test_dev_spawned_task_crash_is_logged(client, dev_app, monkeypatch, caplog):
+    """微修 I-1 配套（审查 Minor-3）：`_spawn` 的 done 回调要 retrieve 后台异常并记 exception 日志。
+
+    不 retrieve 的后果不是「日志少了」而是日志脏了：asyncio 只在任务被 GC 时甩一条
+    「Task exception was never retrieved」，既没有上下文也拦不住任何东西。
+    反向同样要钉：成功与被取消的任务必须**沉默**——无脑记 ERROR 等于把正常链路刷成满屏堆栈，
+    而对已取消的 task 调 `exception()` 会再抛一次 CancelledError（回调里抛 = 新噪音）。
+    """
+    def _errors() -> list[logging.LogRecord]:
+        return [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+    async def boom(sf, a, notify=None):
+        raise RuntimeError("预览任务内部炸了")
+
+    async def ok(sf, a, notify=None):
+        return {"status": "running"}
+
+    async def blocking(sf, a, notify=None):
+        await asyncio.Event().wait()                      # 永远跑不完 → 由用例取消
+
+    with caplog.at_level(logging.ERROR):
+        monkeypatch.setattr(eng_mod, "start_dev", boom)
+        assert (await client.post(f"/api/apps/{dev_app}/dev/start")).status_code == 202
+        with pytest.raises(RuntimeError):
+            await client.app.state.dev_tasks[dev_app]
+        await asyncio.sleep(0)                            # done 回调经 call_soon 排队：让 loop 转一圈
+        recs = _errors()
+        assert len(recs) == 1 and isinstance(recs[0].exc_info[1], RuntimeError)
+        assert "预览任务内部炸了" in caplog.text and str(dev_app) in caplog.text
+
+        caplog.clear()                                    # 成功收口：一条 ERROR 都不该有
+        monkeypatch.setattr(eng_mod, "start_dev", ok)
+        assert (await client.post(f"/api/apps/{dev_app}/dev/start")).status_code == 202
+        await client.app.state.dev_tasks[dev_app]
+        await asyncio.sleep(0)
+        assert _errors() == []
+
+        caplog.clear()                                    # 取消收口：同样沉默
+        monkeypatch.setattr(eng_mod, "start_dev", blocking)
+        assert (await client.post(f"/api/apps/{dev_app}/dev/start")).status_code == 202
+        task = client.app.state.dev_tasks[dev_app]
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.sleep(0)
+        assert _errors() == []
 
 
 async def test_dev_start_duplicate_task_is_409(client, dev_app, monkeypatch):
