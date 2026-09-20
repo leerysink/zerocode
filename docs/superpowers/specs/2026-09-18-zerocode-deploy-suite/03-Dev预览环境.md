@@ -34,6 +34,7 @@
 ```yaml
 name: zc-lailiao-dev
 networks:
+  default: {}                          # 项目内网：服务名互访（frontend→backend）
   zcnet: { external: true }            # 平台外部网络，zerocode-pg16 已接入（06 §4.4）
 services:
   migrate:
@@ -42,30 +43,37 @@ services:
       TARGET_DB: ${DEV_DB}
       TARGET_USER: ${DEV_USER}
       TARGET_PASSWORD: ${DEV_PASSWORD}
-    env_file: .env
-    volumes: [ ../../sqlchange:/sql:ro ]
+    volumes: [ ../sqlchange:/sql:ro ]
+    networks: [zcnet]
     restart: "no"
   backend:
     image: node:20-alpine / python:3.12-slim / maven:3.9-…   # 按栈
     working_dir: /src
     volumes:
-      - ../../backend:/src
-      - backend_deps:/src/…             # 依赖目录匿名卷，避免宿主 node_modules/venv 冲突
-    environment: [ DATABASE_URL=…lailiao_dev…, APP_PORT=8000 ]
+      - ../backend:/src
+      - backend_deps:/src/…             # 依赖目录匿名卷（node/spring 栈落地；fastapi 栈无此行），避免宿主 node_modules/venv 冲突
+    environment:                        # ${DEV_*} 由 compose 自动读同目录 deploy/.env 插值（06）
+      DATABASE_URL: postgresql+asyncpg://${DEV_USER}:${DEV_PASSWORD}@zerocode-pg16:5432/${DEV_DB}
+      APP_PORT: "8000"
     command: <热重载命令，见 4.2>
+    networks: [default, zcnet]
+    depends_on: { migrate: { condition: service_completed_successfully } }
   frontend:
     image: node:20-alpine
     working_dir: /src
-    volumes: [ ../../frontend:/src, fe_node_modules:/src/node_modules ]
-    command: npm run dev -- --host 0.0.0.0 --port 5173
+    volumes: [ ../frontend:/src, fe_node_modules:/src/node_modules ]
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0 --port 5173"
     ports: [ "8211:5173" ]
     depends_on: [ backend ]
-volumes: { fe_node_modules: {}, backend_deps: {} }
+volumes: { fe_node_modules: {} }        # backend_deps 随 node/spring 栈按栈追加
 ```
 
 - **仅前端端口对外**（D5）；容器网络内部互访用服务名（frontend 代理 `/api → http://backend:<容器端口>`，模板已配好）。
-- `static` 栈无 backend/migrate 服务，仅 frontend。
+- `static` 栈无 backend/migrate 服务，仅 frontend（渲染产物不含 networks 声明，落项目默认网络即可——无 DB 依赖不接 zcnet，Task 10 审查裁定 N-2）。
+- 挂载相对路径以 **compose 文件所在目录（`deploy/`）为项目目录**解析：`../backend` 即应用根下 `backend/`（原示例 `../../` 会跳出应用根，系笔误）。
 - `.env` 由引擎生成：`DEV_PORT/PROD_PORT/DEV_DB/DEV_USER/DEV_PASSWORD/PROD_DB/…`（06），app 目录内随目录可迁移。
+
+> 修订记录（Task 14B 勘误波，依 Task 10 审查裁定 N-3「实现正确、应改规格」，以 `app/deploy/compose.py` 渲染产物为准）：① 三处挂载深度 `../../`→`../`；② 删除 `migrate.env_file: .env`（compose 自动读取同目录 `.env` 完成 `${DEV_*}` 插值，省略属功能等价），migrate 的 `environment` 三行映射、顶层 `name: zc-<slug>-dev` 与 `zcnet: {external: true}` 落位、backend `DATABASE_URL/APP_PORT` 映射写法、`networks` 服务级指派与 `depends_on migrate` 门控、frontend 命令与顶层 `volumes` 声明，均已与渲染结果逐字段对齐。
 
 ### 4.2 各栈热重载命令（dev 容器内）
 
