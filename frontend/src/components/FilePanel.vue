@@ -1,25 +1,33 @@
 <script setup>
 // 右栏文件面板（Task 14）：可折叠 a-layout-sider（宽 300 / collapsedWidth 0）。
-// 「文件」tab：工作区文件树（GET /api/fs/tree → treeData）+ 顶部刷新按钮；
+// 「文件」tab：工作区文件树（GET /fs/tree → treeData）+ 顶部刷新按钮 + 打开文件夹按钮；
 //   点击文件 → 内容预览（pre）；后端对二进制/超 200KB 文件拒读（400），错误详情展示在预览区即「>200KB 提示」；
 //   「编辑」切 textarea + 保存（PUT /api/files/save），保存后刷新文件树（可能新增文件）。
+// 「打开文件夹」按 fs.open_folder_mode 分流：同机访问调后端本机文件管理器（POST /api/fs/open-folder），
+//   远端访问或直开失败则打开内置 WorkspaceExplorer（网页里的「类桌面」文件管理器），见 utils/openFolder.js。
 // 「变更记录」tab：GET /api/sessions/{id}/file-changes（id 倒序），逐条 DiffBlock 显示 path+action+diff。
-import { onMounted, ref, watch } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { message } from 'ant-design-vue'
-import { ReloadOutlined } from '@ant-design/icons-vue'
-import { getFileChanges, readFile, saveFile, tree } from '../api'
+import { FolderOpenOutlined, ReloadOutlined } from '@ant-design/icons-vue'
+import { getFileChanges, openFolder, readFile, saveFile, tree } from '../api'
 import { useChatStore } from '../stores/chat'
+import { useConfigStore } from '../stores/config'
+import { resolveOpenFolderMode } from '../utils/openFolder'
 import DiffBlock from './DiffBlock.vue'
+import WorkspaceExplorer from './WorkspaceExplorer.vue'
 
 const props = defineProps({
   workspaceId: { type: Number, required: true },
 })
 
 const store = useChatStore()
+const cfg = useConfigStore()
 const tab = ref('files')
 const treeData = ref([])
 const treeLoading = ref(false)
 const expandedKeys = ref([])
+const explorerOpen = ref(false)
+const opening = ref(false)
 
 // 预览状态：previewError 非空表示读失败（二进制/超 200KB/越界等）
 const selectedPath = ref('')
@@ -119,12 +127,41 @@ function onTabClick(key) {
   if (key === 'changes') loadChanges()
 }
 
-// 工作区切换：清空预览状态并重拉文件树
+// 内置文件管理器的面包屑根用工作区名；没加载到名字时 WorkspaceExplorer 自己兜底显示「工作区」
+const workspaceName = computed(
+  () => store.workspaces.find((w) => w.id === props.workspaceId)?.name || '',
+)
+
+// 「打开文件夹」：能直开就直开——同机访问时 explorer 的窗口就开在用户眼前；
+// 远端 / 远端桌面访问时服务端开窗口用户根本看不见，直接给内置文件管理器。
+// 直开请求失败（容器里没有 explorer/xdg-open、目录被移走等）也算"打不开"：当场降级，不把用户卡在原地。
+async function openWorkspaceFolder() {
+  if (opening.value) return
+  opening.value = true
+  try {
+    await cfg.ensureLoaded()
+    if (resolveOpenFolderMode(cfg.form.openFolderMode, window.location.hostname) === 'web') {
+      explorerOpen.value = true
+      return
+    }
+    await openFolder(props.workspaceId)
+    message.success('已在系统文件管理器中打开工作区目录')
+  } catch {
+    explorerOpen.value = true
+    message.info('无法直接打开文件夹，已改用内置文件管理器')
+  } finally {
+    opening.value = false
+  }
+}
+
+// 工作区切换：清空预览状态、关掉内置文件管理器并重拉文件树
+// （不关掉的话，props 换了工作区而 open 仍为 true，管理器会拿着旧 path 显示旧目录）
 watch(() => props.workspaceId, () => {
   selectedPath.value = ''
   content.value = ''
   previewError.value = ''
   editing.value = false
+  explorerOpen.value = false
   loadTree()
 })
 
@@ -139,6 +176,10 @@ onMounted(loadTree)
           <a-button size="small" :loading="treeLoading" @click="loadTree">
             <template #icon><reload-outlined /></template>
             刷新
+          </a-button>
+          <a-button size="small" :loading="opening" @click="openWorkspaceFolder">
+            <template #icon><folder-open-outlined /></template>
+            打开文件夹
           </a-button>
         </div>
         <a-spin v-if="treeLoading" class="zc-fp-loading" />
@@ -184,6 +225,11 @@ onMounted(loadTree)
         </div>
       </a-tab-pane>
     </a-tabs>
+    <WorkspaceExplorer
+      v-model:open="explorerOpen"
+      :workspace-id="workspaceId"
+      :workspace-name="workspaceName"
+    />
   </a-layout-sider>
 </template>
 

@@ -28,6 +28,11 @@ export const tree = (workspaceId) => http.get('/fs/tree', { params: { workspace_
 export const readFile = (workspaceId, path) =>
   http.get('/files/read', { params: { workspace_id: workspaceId, path } })
 export const saveFile = (data) => http.put('/files/save', data) // {workspace_id, path, content}
+// 内置「类桌面」文件管理器：单层列目录（相对 posix 路径，根为空串）与调起后端本机文件管理器。
+// 下载不走 axios，直接拼 <a href>（见 utils/fsNav.downloadUrl）。
+export const listDir = (workspaceId, path) =>
+  http.get('/fs/ls', { params: { workspace_id: workspaceId, path: path || '' } })
+export const openFolder = (workspaceId) => http.post('/fs/open-folder', { workspace_id: workspaceId })
 
 // ---- 模型库与会话级模型（交互增强） ----
 export const listModels = () => http.get('/models')

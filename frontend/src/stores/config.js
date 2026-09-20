@@ -11,6 +11,7 @@ const FIELD_TO_KEY = {
   askTimeoutSeconds: 'agent.ask_timeout_seconds',
   maxToolRounds: 'agent.max_tool_rounds',
   historyWindow: 'agent.history_window',
+  openFolderMode: 'fs.open_folder_mode', // auto | system | web，见 utils/openFolder.js
 }
 
 export const useConfigStore = defineStore('config', {
@@ -23,8 +24,10 @@ export const useConfigStore = defineStore('config', {
       askTimeoutSeconds: 0, // 0 = 不限制
       maxToolRounds: 30,
       historyWindow: 40,
+      openFolderMode: 'auto', // 老库里没这个键时的默认：按访问地址自动判定
     },
     saving: false,
+    loaded: false, // 是否已从后端拉到过配置（ensureLoaded 的去重依据）
   }),
   actions: {
     async loadConfig() {
@@ -32,6 +35,12 @@ export const useConfigStore = defineStore('config', {
       for (const [field, key] of Object.entries(FIELD_TO_KEY)) {
         if (data[key] !== undefined) this.form[field] = data[key]
       }
+      this.loaded = true
+    },
+    // 聊天页也要认这个配置，但没人会在打开文件夹前先访问设置页：
+    // 按需拉一次（拿到过就不再打接口），保存过直接用内存里的新值 —— 改值即时生效。
+    async ensureLoaded() {
+      if (!this.loaded) await this.loadConfig()
     },
     async save() {
       this.saving = true

@@ -1,5 +1,8 @@
+import subprocess
+import sys
 from pathlib import Path
 from fastapi import APIRouter, Request, HTTPException
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from app.agent.tools import BINARY_EXTS, MAX_READ_BYTES, resolve_in_workspace
 
@@ -37,6 +40,94 @@ async def fs_tree(request: Request, workspace_id: int):
         return out
 
     return build(root, 0)
+
+
+def _rel_of(p: Path, root: Path) -> str:
+    """相对工作区根的 posix 路径（根自身为空串）。前端面包屑按 / 逐级切，不吃 Windows 反斜杠。"""
+    return "" if p == root else p.relative_to(root).as_posix()
+
+
+@router.get("/fs/ls")
+async def fs_ls(request: Request, workspace_id: int, path: str = ""):
+    """内置「类桌面」文件管理器的数据源：只列单层（不递归、不拉全树），目录优先 + 名称升序。
+
+    忽略名单与 /fs/tree 共用 IGNORE_DIRS；path 必须是工作区内相对路径，越界/绝对路径 400。
+    """
+    root = await _root_of(request, workspace_id)
+    try:
+        d = resolve_in_workspace(root, path)
+    except Exception as e:
+        raise HTTPException(400, str(e))
+    if not d.exists():
+        raise HTTPException(404, "目录不存在")
+    if not d.is_dir():
+        raise HTTPException(400, "不是目录")
+    try:
+        children = sorted(d.iterdir(), key=lambda x: (x.is_file(), x.name.lower()))
+    except (PermissionError, OSError):
+        children = []  # 无权读时给空列表，与 /fs/tree 同口径（不抛 500）
+    entries = []
+    for child in children:
+        is_dir = child.is_dir()
+        if is_dir and child.name in IGNORE_DIRS:
+            continue
+        try:
+            st = child.stat()
+        except OSError:
+            continue  # 悬空软链等读不到元信息的条目直接跳过，不让一行坏数据打挂整页
+        entries.append({"name": child.name, "path": _rel_of(child, root), "is_dir": is_dir,
+                        "size": 0 if is_dir else st.st_size, "mtime": st.st_mtime})
+    return {"path": _rel_of(d, root), "parent": None if d == root else _rel_of(d.parent, root),
+            "entries": entries}
+
+
+@router.get("/fs/download")
+async def fs_download(request: Request, workspace_id: int, path: str):
+    """单文件下载。与预览不同：这里不限二进制、不限 200KB——那两条限制只服务于文本查看。"""
+    root = await _root_of(request, workspace_id)
+    try:
+        f = resolve_in_workspace(root, path)
+    except Exception as e:
+        raise HTTPException(400, str(e))
+    if not f.is_file():  # 目录与不存在统一 404，不给探测留差异
+        raise HTTPException(404, "文件不存在")
+    return FileResponse(f, filename=f.name)
+
+
+def open_in_file_manager(target: Path) -> None:
+    """分平台调起本机文件管理器。
+
+    刻意用 Popen 且不等退出码：explorer.exe 即便打开成功也返回非 0，等退出码只会把成功判成失败。
+    单独成函数是为了让端点测试可替换（见 tests/test_files_api.py），不必真开窗口。
+    """
+    if sys.platform.startswith("win"):
+        subprocess.Popen(["explorer", str(target)])
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", str(target)])
+    else:
+        subprocess.Popen(["xdg-open", str(target)])
+
+
+class OpenFolderIn(BaseModel):
+    workspace_id: int
+
+
+@router.post("/fs/open-folder")
+async def fs_open_folder(request: Request, body: OpenFolderIn):
+    """在后端本机的文件管理器里打开工作区根目录。
+
+    只认 workspace_id（不接受任意路径入参），能打开的目录限于平台已登记的工作区根。
+    前提是浏览器与后端同机——这点由前端判定（frontend/src/utils/openFolder.js），
+    判错或本机没有图形会话时，前端据本端点的非 2xx 降级到内置文件管理器。
+    """
+    root = await _root_of(request, body.workspace_id)
+    if not root.is_dir():
+        raise HTTPException(400, "工作区目录不存在或已被移除")
+    try:
+        open_in_file_manager(root)
+    except OSError as e:
+        raise HTTPException(500, f"打开文件夹失败：{e}")
+    return {"ok": True, "path": str(root)}
 
 @router.get("/files/read")
 async def files_read(request: Request, workspace_id: int, path: str):

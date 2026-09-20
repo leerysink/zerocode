@@ -1,7 +1,7 @@
 <script setup>
 // 设置页（Task 14 充实，Task 16 分页签）：页签「模型库」= 多模型配置 CRUD（列表/新增/编辑/删除确认/设默认），
 // 页签「基础配置」= 原分组表单——模型接入（base_url / model / api_key(password) + 测试连接）、
-// 执行参数（write_confirm / ask_timeout_seconds / max_tool_rounds / history_window）、环境状态（PG 版本）。
+// 执行参数（write_confirm / ask_timeout_seconds / max_tool_rounds / history_window / fs.open_folder_mode）、环境状态（PG 版本）。
 // 基础配置字段映射与保存走 config store（loadConfig / save），api_key 掩码哨兵 sk-*** 由后端 PUT 过滤、不会覆盖真实密钥。
 // 模型库 api_key 契约（后端 app/api/models.py）：编辑留空 = 不改（提交时填哨兵 sk-***），新建必填；GET 永远掩码回显。
 import { createVNode, onMounted, ref } from 'vue'
@@ -14,6 +14,13 @@ import { buildModelPayload, emptyModelForm, validateModelForm } from '../utils/m
 const store = useConfigStore()
 const pg = ref(null) // {ok, version|error}
 const testing = ref(false)
+
+// 「打开文件夹」三态，取值与 frontend/src/utils/openFolder.js 的常量一一对应
+const openFolderModeOptions = [
+  { value: 'auto', label: '自动判定（推荐）' },
+  { value: 'system', label: '强制系统资源管理器' },
+  { value: 'web', label: '强制内置文件管理器' },
+]
 
 // ---- 模型库管理 ----
 const activeTab = ref('models')
@@ -229,6 +236,12 @@ async function save() {
             </a-form-item>
             <a-form-item label="历史窗口（条数）">
               <a-input-number v-model:value="store.form.historyWindow" :min="0" style="width: 180px" />
+            </a-form-item>
+            <a-form-item
+              label="打开文件夹方式"
+              extra="自动：本机访问直接调起系统资源管理器，远端/远端桌面访问改用内置文件管理器；强制项留给容器等自动判不准的场合"
+            >
+              <a-select v-model:value="store.form.openFolderMode" :options="openFolderModeOptions" style="width: 260px" />
             </a-form-item>
           </a-form>
         </a-card>
