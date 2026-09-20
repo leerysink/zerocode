@@ -24,13 +24,16 @@ def _normalize_questions(args: dict) -> list[dict]:
     raise ToolError("缺少 question(s)")
 
 class AgentRunner:
-    def __init__(self, session_factory, llm, config_provider, send, ask, confirm):
+    def __init__(self, session_factory, llm, config_provider, send, ask, confirm, pop_pending=None):
         self.sf = session_factory
         self.llm = llm
         self.get_config = config_provider
         self.send = send
         self.ask = ask
         self.confirm = confirm
+        # 执行中用户插话（steering）的取空回调：async (session_id) -> list[str]，
+        # 缺省 None = 不支持插话（旧调用方与单测保持原签名可用）
+        self.pop_pending = pop_pending
 
     async def _root_of(self, session_id: int):
         async with self.sf() as s:
@@ -134,9 +137,36 @@ class AgentRunner:
                             + "\n</current_todos>")
         return [{"role": "system", "content": system_text}] + history
 
+    async def _drain_steering(self, session_id: int, root: Path, messages: list[dict]) -> int:
+        """注入执行中的用户插话（steering）：落库为普通 user 消息 + 追加到本轮 messages。
+
+        只在**工具边界**调用（一轮开始时工具结果已全部入列），绝不能插在 assistant(tool_calls)
+        与它的 tool 结果之间 —— 拆散那一对会让 OpenAI 兼容接口直接 400。
+        注入后回 steering_done，前端据此摘掉「排队中」角标（气泡本身是发送时就乐观落下的）。
+        返回注入条数（调用方据此判断"还要不要再走一轮"）。
+        """
+        if not self.pop_pending:
+            return 0
+        injected = 0
+        for raw in await self.pop_pending(session_id):
+            text_ = (raw or "").strip()
+            if not text_:
+                continue
+            # expand_mentions 无 @ 标记时返回 None（不是原文！）——直接塞给模型就等于把
+            # 用户这句话丢掉，必须回落到原文
+            expanded = expand_mentions(root, text_) or text_
+            await add_message(self.sf, session_id, "user", content=text_, context_content=expanded)
+            messages.append({"role": "user", "content": expanded})
+            await self.send({"type": "steering_done", "content": text_})
+            injected += 1
+        return injected
+
     async def _inner(self, session_id: int, user_text: str, cancel: asyncio.Event):
         cfg = await self.get_config()
         root = await self._root_of(session_id)
+        # 先消费上一次 run 停止/收尾前没来得及注入的插话，再落本次新问题：
+        # 保证 DB seq 与对话顺序一致（插话发生在先，新问题在后）
+        await self._drain_steering(session_id, root, [])
         expanded = expand_mentions(root, user_text)
         await add_message(self.sf, session_id, "user", content=user_text, context_content=expanded)
         messages = await self._build_messages(session_id, root, cfg, self.send)
@@ -147,6 +177,8 @@ class AgentRunner:
         for _round in rounds:
             if cancel.is_set():
                 raise _Cancelled()
+            # 边界注入：用户在我们跑工具时说的话，模型下一轮就看得见
+            await self._drain_steering(session_id, root, messages)
             llm = await self._llm_for(cfg)
             final = None
             async for ev in llm.chat_stream(messages, _TOOLS):
@@ -182,6 +214,11 @@ class AgentRunner:
             await add_message(self.sf, session_id, "assistant", content=final.get("content"),
                               reasoning=final.get("reasoning"))
             await self.send({"type": "message_done", "content": final.get("content")})
+            # 答复已出，但期间用户还在说话：不能等下一次提问才被看见 —— 答复先落库/入列，
+            # 插话紧随其后，再走一轮让模型回应（队列空了就正常收工）
+            messages.append({"role": "assistant", "content": final.get("content")})
+            if await self._drain_steering(session_id, root, messages):
+                continue
             return
         raise RuntimeError(f"已达到最大工具轮数（{max_rounds}）")
 

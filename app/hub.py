@@ -3,6 +3,8 @@
 - ask/confirm：挂起等待前端上行（ask_submit/confirm），cancel 时统一复位；
   confirm_request 下行事件由 AgentRunner._dispatch 统一下发（Task 7 裁定：runner 唯一
   发出方），hub.confirm 只负责挂 future 等待，避免前端收到重复卡片。
+- pending：执行中用户插话（steering）的待注入队列，runner 在下一个工具边界 pop 并落库；
+  cancel 时一并丢弃（未送达的插话不得偷偷活到下一次 run）。
 - emits：按会话分槽的下行发送器（session_id → async (session_id, event) -> None），
   同会话后连覆盖；断连 drop 清槽（仅清自己注入的槽，防误删后连者的槽），
   跨会话互不串扰（终审修复轮2：原全局单槽会被任意会话的连接覆盖导致事件串线）。
@@ -15,7 +17,21 @@ class ChatHub:
         self.confirm_futures: dict[int, asyncio.Future] = {}
         self.cancel_events: dict[int, asyncio.Event] = {}
         self.running: set[int] = set()
+        self.compacting: set[int] = set()  # 压缩占位（无工具边界可注入，插话要区别对待）
+        self.pending: dict[int, list[str]] = {}  # 执行中插话队列：session_id → 待注入 user 文本
         self.emits: dict[int, callable] = {}  # session_id → 下行发送器: async (session_id, event) -> None
+
+    def queue(self, session_id, text, max_pending) -> bool:
+        """插话入队（保序）。队列满则拒收，由 ws 侧回 busy 非终态提示。"""
+        q = self.pending.setdefault(session_id, [])
+        if len(q) >= int(max_pending):
+            return False
+        q.append(text)
+        return True
+
+    async def pop_pending(self, session_id) -> list[str]:
+        """取空即清：注入权在 runner，避免同一句被重复注入。"""
+        return self.pending.pop(session_id, None) or []
 
     def set_emit(self, session_id, emit):
         """注入/覆盖同会话的下行发送器（WS 连接建立时调用，同会话后连覆盖）。"""
@@ -64,5 +80,7 @@ class ChatHub:
         ev = self.cancel_events.get(session_id)
         if ev:
             ev.set()
+        # 未送达的插话随取消一并丢弃：它们没落库，留着会让下一次 run 莫名收到上一次的半句话
+        self.pending.pop(session_id, None)
         self._resolve(self.ask_futures, session_id, None)
         self._resolve(self.confirm_futures, session_id, False)

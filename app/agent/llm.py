@@ -99,12 +99,17 @@ class OpenAICompatLLM:
             "tool_calls": [tool_calls[i] for i in sorted(tool_calls)] or None}}
 
 class ScriptedLLM:
-    """测试用：按轮次重放事件；received 记录每轮收到的 messages。"""
+    """测试用：按轮次重放事件；received 记录每轮收到的 messages。
+
+    received 必须存**快照**而不是 messages 的引用：runner 全程复用同一个 list 并往里追加，
+    直接 append(messages) 会让每一轮的记录都变成同一份"最终状态"，任何按轮次断言顺序的
+    测试都会自我感觉良好地通过（实测骗过一次注入位置断言）。
+    """
     def __init__(self, turns: list[list[dict]]):
         self.turns = list(turns)
         self.received: list[list[dict]] = []
 
     async def chat_stream(self, messages: list[dict], tools: list[dict]) -> AsyncIterator[dict]:
-        self.received.append(messages)
+        self.received.append([dict(m) for m in messages])
         for ev in self.turns.pop(0):
             yield ev

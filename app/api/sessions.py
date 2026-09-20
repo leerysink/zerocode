@@ -42,7 +42,12 @@ async def session_detail(request: Request, session_id: int):
             "FROM chat_session WHERE id=:i"), {"i": session_id})).mappings().first()
     if not row:
         raise HTTPException(404, "会话不存在")
-    return dict(row)
+    out = dict(row)
+    # 执行中排队、尚未注入的插话只活在 hub.pending（没落库）：带上它，刷新才不会
+    # 把用户刚说出去的话变没（前端还原成「排队中」气泡）
+    hub = getattr(request.app.state, "hub", None)
+    out["pending_steering"] = list(hub.pending.get(session_id, [])) if hub else []
+    return out
 
 @router.patch("/{session_id}")
 async def rename_session(request: Request, session_id: int, body: TitleIn):

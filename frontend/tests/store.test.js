@@ -245,22 +245,17 @@ describe('chat store 事件流', () => {
     expect(s.running).toBe(true)
   })
 
-  it('running/compacting 时 send 本地拦截：不上行、不落 user 气泡、保留草稿并提示', () => {
+  it('压缩中 send 本地拦截：不上行、不落 user 气泡、保留草稿并提示', () => {
     const s = useChatStore()
     const send = vi.fn()
     s._ws = { readyState: 1, send }
-    s.running = true
-    expect(s.send('结束语')).toBe(false)
-    expect(send).not.toHaveBeenCalled()
-    expect(s.messages.some((m) => m.role === 'user')).toBe(false)
-    expect(s.rejectedDraft).toBe('结束语')
-    expect(s.hint).toContain('正在执行')
-    s.running = false
     s.compacting = true
     expect(s.send('再试')).toBe(false)
-    expect(s.hint).toContain('压缩')
     expect(send).not.toHaveBeenCalled()
-    // 空闲后重发同一句：上行成功、落气泡、上一条提示与草稿一并清掉（不留残留）
+    expect(s.messages.some((m) => m.role === 'user')).toBe(false)
+    expect(s.rejectedDraft).toBe('再试')
+    expect(s.hint).toContain('压缩')
+    // 压缩结束后重发同一句：上行成功、落气泡、上一条提示与草稿一并清掉（不留残留）
     s.compacting = false
     expect(s.send('再试')).toBe(true)
     expect(s.hint).toBe('')
@@ -280,6 +275,53 @@ describe('chat store 事件流', () => {
     expect(s.running).toBe(false)
     expect(s.rejectedDraft).toBe('还没连上')
     expect(s.hint).toContain('重连')
+  })
+
+  it('执行中再发消息 = 插话：照常上行并落「排队中」气泡，不再本地拒发', () => {
+    const s = useChatStore()
+    const send = vi.fn()
+    s._ws = { readyState: 1, send }
+    s.running = true
+    expect(s.send('改成用 SQLite')).toBe(true)
+    expect(send).toHaveBeenCalledWith(JSON.stringify({ type: 'user_message', content: '改成用 SQLite' }))
+    expect(s.messages.at(-1)).toMatchObject({ role: 'user', content: '改成用 SQLite', queued: true })
+    expect(s.running).toBe(true) // 插话不另起一轮，执行态当然保持
+    expect(s.hint).toBe('')
+    // 注入完成：角标摘掉，气泡原地转正（不重复追加）
+    applyEvent(s, { type: 'steering_done', content: '改成用 SQLite' })
+    expect(s.messages.filter((m) => m.role === 'user')).toHaveLength(1)
+    expect(s.messages.at(-1).queued).toBeFalsy()
+  })
+
+  it('停止：未送达的插话从消息流摘掉，文本按原顺序退回输入框并说明条数', () => {
+    const s = useChatStore()
+    s._ws = { readyState: 1, send: vi.fn() }
+    s.running = true
+    s.send('第一句插话')
+    s.send('第二句插话')
+    applyEvent(s, { type: 'steering_done', content: '第一句插话' }) // 只有第二句还没送达
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    s.cancel()
+    expect(s.messages.some((m) => m.role === 'user' && m.queued)).toBe(false)
+    expect(s.messages.some((m) => m.content === '第二句插话')).toBe(false)
+    expect(s.rejectedDraft).toBe('第二句插话')
+    expect(s.hint).toContain('1 条插话未送达')
+    expect(s.running).toBe(false)
+  })
+
+  it('openSession 还原「排队中」的插话气泡：刷新不丢刚说出去还没被读到的话', async () => {
+    stubWsGlobals()
+    getMessages.mockResolvedValue({ data: [{ role: 'user', content: '原问题' }] })
+    getSessionDetail.mockResolvedValue({
+      data: { todo_state: [], model_config_id: null, status: 'running', pending_steering: ['补一句A', '补一句B'] },
+    })
+    const s = useChatStore()
+    await s.openSession('s1', 'w1')
+    expect(s.messages).toEqual([
+      { role: 'user', content: '原问题' },
+      { role: 'user', content: '补一句A', queued: true },
+      { role: 'user', content: '补一句B', queued: true },
+    ])
   })
 
   it('setModel 回写会话校验：await 期间已切换会话则不得陈旧回写', async () => {

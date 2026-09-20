@@ -3,7 +3,8 @@
 // 下行事件类型与后端 loop.py / hub.py 协议一致：
 // token / reasoning_delta / tool_call / tool_result / ask_user(多问题) / confirm_request / message_done
 // / error / status / file_change / todo_sync / compacting / compaction_done / notice(压缩 skip 终态)
-// / busy(执行中被拒的非终态提示)；终态 = error / status(idle|error)，busy 与 status(running) 都不是。
+// / busy(执行中被拒的非终态提示) / steering_done(插话已在工具边界被模型看见)；
+// 终态 = error / status(idle|error)，busy、status(running) 与 steering_done 都不是。
 import { defineStore } from 'pinia'
 import { getMessages, getSessionDetail, listModels, listWorkspaces, patchSessionModel, wsUrl } from '../api'
 
@@ -62,6 +63,17 @@ export function applyEvent(store, ev) {
       }
       store.pendingEcho = ''
       store.hint = ev.message || BUSY_HINT
+      break
+    }
+    case 'steering_done': { // 插话已在工具边界被模型看见：摘掉「排队中」角标（非终态）
+      for (let i = store.messages.length - 1; i >= 0; i--) {
+        const m = store.messages[i]
+        if (m.role === 'user' && m.queued && m.content === ev.content) {
+          m.queued = false
+          break
+        }
+      }
+      if (store.pendingEcho === ev.content) store.pendingEcho = '' // 已落库，不再是待回滚的乐观气泡
       break
     }
     case 'error':
@@ -143,6 +155,11 @@ export const useChatStore = defineStore('chat', {
       // 渲染门：右栏（Task 13/14）以 currentWorkspaceId 判定；由调用方传入工作区 id
       if (workspaceId != null) this.currentWorkspaceId = workspaceId
       this.messages = data
+      // 已排队但还没被注入的插话没落库（只在 hub.pending），刷新/切回来时由详情带回复原，
+      // 否则用户刚说出去的话会凭空消失
+      for (const c of detail?.pending_steering || []) {
+        this.messages.push({ role: 'user', content: c, queued: true })
+      }
       this.streamingContent = ''
       this.pendingAsk = null
       this.pendingConfirm = null
@@ -194,15 +211,17 @@ export const useChatStore = defineStore('chat', {
     send(text) {
       const content = (text || '').trim()
       if (!content) return false
-      // 执行中/压缩中：本地就拦下，不再"发了再撞后端拒绝"——那句 error 曾被前端当终态，
-      // 清掉 running 后「停止」按钮消失，用户进退两难。文本留在框里，用户看得到原因。
-      if (this.running || this.compacting) {
+      // 压缩中没有"下一轮边界"可注入，后端也只会回 busy —— 本地先拦下，文本留在框里
+      if (this.compacting) {
         this.rejectedDraft = content
-        this.hint = this.running ? BUSY_HINT : COMPACT_HINT
+        this.hint = COMPACT_HINT
         return false
       }
-      this.messages.push({ role: 'user', content })
-      this.pendingEcho = content // busy 时按它回滚这条乐观气泡（后端可能根本没收下）
+      // 执行中发出 = 插话（steering）：照样上行，气泡先挂「排队中」角标，
+      // 后端在下一个工具边界落库注入并回 steering_done 时摘掉
+      const steering = this.running
+      this.messages.push(steering ? { role: 'user', content, queued: true } : { role: 'user', content })
+      this.pendingEcho = content // busy 时按它回滚这条乐观气泡（后端可能没收下）
       this.streamingContent = ''
       this.streamingThinking = ''
       this.hint = ''
@@ -235,6 +254,15 @@ export const useChatStore = defineStore('chat', {
       this._uplink({ type: 'cancel' })
       this.pendingAsk = null
       this.pendingConfirm = null
+      // 后端 hub.cancel 会一并丢弃未注入的插话（不落库）：本地同步摘掉那些「排队中」气泡，
+      // 文本按原顺序退回输入框，别让用户以为说出去了
+      const stranded = this.messages.filter((m) => m.role === 'user' && m.queued).map((m) => m.content)
+      if (stranded.length) {
+        this.messages = this.messages.filter((m) => !(m.role === 'user' && m.queued))
+        this.rejectedDraft = stranded.join('\n\n')
+        this.hint = `本轮已停止：${stranded.length} 条插话未送达，文本已退回输入框`
+      }
+      this.pendingEcho = ''
       this.running = false
       this.streamingThinking = ''
     },

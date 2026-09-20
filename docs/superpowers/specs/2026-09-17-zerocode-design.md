@@ -116,6 +116,18 @@ PostgreSQL 16（Docker 专用容器，宿主端口 5433，库 zerocode）
 - 重连状态自洽：连接建立时若该会话仍在执行（刷新页面/断线重连/另开标签页），后端补发一帧
   `status(running)` 快照，前端据此把执行态与「停止」按钮立回来；执行态以 `hub.running` 为唯一
   真相源，不用 DB `chat_session.status` 猜（崩溃残留最长 10 分钟才被 watchdog 收，会造出「假在跑」）。
+- **插话（steering）**：执行中再发 `user_message` 不再被拒 —— 进 `hub.pending` 队列，runner 在
+  **下一个工具边界**（一轮开始、工具结果已全部入列之处）把它作为普通 user 消息落库并注入本次对话，
+  注入时回 `steering_done`；前端发送即乐观挂「排队中」角标，收到 `steering_done` 摘掉。
+  - 模型已给出最终答复时仍有插话：答复先落库/入列，插话紧随其后，**再走一轮**让模型回应它，
+    不等下一次提问（否则用户会觉得话掉进了洞里）。
+  - 只在工具边界注入，绝不插在 `assistant(tool_calls)` 与它的 `tool` 结果之间（拆散那一对会让
+    OpenAI 兼容接口 400）。
+  - `cancel` 时未注入的排队插话一并丢弃（不落库）；前端同步摘气泡并把文本退回输入框。
+  - 仍在跑的排队文本只活在 `hub.pending`，故 `GET /api/sessions/{id}` 带 `pending_steering`，
+    前端 `openSession` 据此还原「排队中」气泡，刷新不丢刚说出去的话。
+  - 仍回 `busy`（非终态、不落库）的两条路径：压缩中发消息（没有工具边界可注入）、
+    队列排满（上限 `agent.steering_queue_max`，默认 20，改配置即时生效）。
 - 断线重连：前端指数退避重连，重连后拉取 `/sessions/{id}/messages` 增量（按 seq）。
 
 ## 6. 前端界面（对齐 DSH 截图）

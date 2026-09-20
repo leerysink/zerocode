@@ -70,9 +70,12 @@ onMounted(scrollToBottom)
       </div>
 
       <template v-for="(m, i) in messages" :key="i">
-        <!-- user：右侧浅蓝气泡 -->
+        <!-- user：右侧浅蓝气泡（queued = 执行中发出的插话，等下一个工具边界注入） -->
         <div v-if="m.role === 'user'" class="zc-msg is-user">
-          <div class="zc-bubble">{{ m.content }}</div>
+          <div class="zc-bubble">
+            {{ m.content }}
+            <span v-if="m.queued" class="zc-queued">排队中</span>
+          </div>
         </div>
         <!-- assistant：思考块（reasoning）+ Markdown 渲染（MarkdownView 按 content 缓存，
              空内容但有思考的历史消息也渲染；纯 tool_calls 空内容行仍不渲染） -->
@@ -208,7 +211,17 @@ onMounted(scrollToBottom)
   color: var(--zc-text);
 }
 
-/* error 红气泡 + 重试 */
+/* 插话排队中的角标：低饱和暖色小标签，只表状态不抢内容 */
+.zc-queued {
+  margin-left: 8px;
+  padding: 1px 6px;
+  border-radius: 8px;
+  font-size: 11px;
+  color: #a17c5b;
+  background: rgba(161, 124, 91, 0.1);
+  white-space: nowrap;
+}
+
 .zc-error {
   display: flex;
   align-items: center;

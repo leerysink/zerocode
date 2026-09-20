@@ -127,7 +127,7 @@ function requestCompact() {
         ref="textareaRef"
         v-model:value="text"
         :auto-size="{ minRows: 2, maxRows: 6 }"
-        :placeholder="running ? '会话执行中：可点右侧「停止」结束当前执行，或等它跑完再发言' : '输入消息，@ 引用文件，Enter 发送，Shift+Enter 换行'"
+        :placeholder="running ? '执行中发的消息会作为插话，在当前这步做完后生效（Enter 发送）' : '输入消息，@ 引用文件，Enter 发送，Shift+Enter 换行'"
         @keydown="onKeydown"
         @input="onInput"
       />
@@ -157,13 +157,14 @@ function requestCompact() {
           <template #icon><scissor-outlined /></template>
           压缩上下文
         </a-button>
+        <a-button type="primary" :disabled="!text.trim() || chatStore.compacting" @click="doSend">
+          <template #icon><send-outlined /></template>
+          <!-- 执行中这条就是插话入口，别只留一个 Enter 的隐性出路 -->
+          {{ running ? '插话' : '发送' }}
+        </a-button>
         <a-button v-if="running" danger @click="emit('cancel')">
           <template #icon><stop-outlined /></template>
           停止
-        </a-button>
-        <a-button v-else type="primary" :disabled="!text.trim() || chatStore.compacting" @click="doSend">
-          <template #icon><send-outlined /></template>
-          发送
         </a-button>
       </div>
     </div>

@@ -2,9 +2,12 @@
 
 上行：user_message / ask_submit / confirm / cancel / compact；
 下行：token / tool_call / tool_result / ask_user / confirm_request /
-message_done / error / status / file_change / compacting / compaction_done / busy
-（由 runner 与 hub 经 emit 下发）。error 与 status 是**本轮终态**；busy 是执行中被拒的
-非终态提示（不得据此复位前端执行态，否则「停止」按钮消失 → 发不出也停不掉的死循环）。
+message_done / error / status / file_change / compacting / compaction_done / busy /
+steering_done（由 runner 与 hub 经 emit 下发）。error 与 status 是**本轮终态**；busy 是
+执行中被拒的非终态提示（不得据此复位前端执行态，否则「停止」按钮消失 → 发不出也停不掉的死循环）。
+
+执行中再发 user_message = 插话（steering）：进 hub.pending 队列，由 runner 在下一个
+工具边界落库注入并回 steering_done；压缩中或队列排满仍回 busy（两条路径都不落库）。
 
 按会话分槽：同会话后连连接覆盖该会话的 emit 槽，下行事件随之切到新连接；
 断连 drop 自己的槽（防僵尸槽），跨会话互不串扰（终审修复轮2）。
@@ -61,13 +64,22 @@ async def ws_chat(ws: WebSocket, session_id: int):
             msg = json.loads(await ws.receive_text())
             t = msg.get("type")
             if t == "user_message":
-                if session_id in hub.running:
-                    # busy（非终态）而非 error：error 会被前端当本轮终态清掉 running，
-                    # 「停止」按钮随之消失，用户既发不出也停不掉（重试再撞同一拒绝）
-                    await emit(session_id, {"type": "busy", "message": "会话正在执行中，请稍候或点「停止」"})
-                    continue
                 text_ = (msg.get("content") or "").strip()
                 if not text_:
+                    continue
+                if session_id in hub.running:
+                    # 执行中再发一句 = **插话（steering）**：入队等下一个工具边界注入，
+                    # 不另起一轮 run、也不再当错误拒收（历史上回 error 造成过
+                    # 「发不出也停不掉」的死循环，见 a0cecb1）。
+                    if session_id in hub.compacting:
+                        # 压缩没有工具边界可注入，也没有模型会读它 —— 仍然拒收（非终态）
+                        await emit(session_id, {"type": "busy", "message": "上下文压缩中，请稍候"})
+                        continue
+                    cfg_now = await config_getter()
+                    cap = int(cfg_now.get("agent.steering_queue_max", 20) or 20)
+                    if not hub.queue(session_id, text_, cap):
+                        await emit(session_id, {"type": "busy",
+                                                "message": f"插话已排满（上限 {cap} 条），请等本轮跑完或点「停止」"})
                     continue
 
                 async def send(event: dict):
@@ -97,7 +109,8 @@ async def ws_chat(ws: WebSocket, session_id: int):
                         model_cfg = await resolve_model(app.state.session_factory, session_id, cfg_now)
                         llm = llm_factory(cfg_now, model_cfg)
                         runner = AgentRunner(app.state.session_factory, llm,
-                                             config_getter, send, hub.ask, hub.confirm)
+                                             config_getter, send, hub.ask, hub.confirm,
+                                             hub.pop_pending)
                         await runner.run(session_id, user_text_, cancel)
                     finally:
                         hub.running.discard(session_id)
@@ -122,6 +135,7 @@ async def ws_chat(ws: WebSocket, session_id: int):
 
                 async def do_compact():
                     hub.running.add(session_id)
+                    hub.compacting.add(session_id)  # 压缩无工具边界，插话要区别拒绝
                     try:
                         await send_local({"type": "compacting"})
                         cfg = await config_getter()
@@ -131,6 +145,7 @@ async def ws_chat(ws: WebSocket, session_id: int):
                             app.state.session_factory, llm, session_id, send_local, keep)
                     finally:
                         hub.running.discard(session_id)
+                        hub.compacting.discard(session_id)
 
                 asyncio.create_task(do_compact())
     except WebSocketDisconnect:

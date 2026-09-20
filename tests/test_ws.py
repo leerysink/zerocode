@@ -106,29 +106,35 @@ def test_ws_multi_question_submit(client):
             if ev["type"] == "message_done":
                 break
 
-def test_ws_busy_rejected(client):
+def test_ws_steer_while_running_then_cancel(client):
+    """契约更新（steering 上线后）：执行中再发消息**不再被拒**，而是入队等边界注入；
+    取消时队列一并丢弃，runner 的收尾链不变。
+
+    本用例同时盯着「同会话后连覆盖 emit 槽」与取消后的
+    tool_result → error(已取消) → status(idle) 三帧次序（brief 原文读 2 帧漏计 tool_result）。
+    """
     client.app.state.llm_factory = lambda cfg: ScriptedLLM([
         done(None, [{"id": "c1", "function": {
             "name": "ask_user", "arguments": json.dumps({"question": "?", "options": []})}}])])
-    with client.websocket_connect(f"/ws/chat/{client.zc_sid}") as ws:
+    hub = client.app.state.hub
+    sid = client.zc_sid
+    with client.websocket_connect(f"/ws/chat/{sid}") as ws:
         ws.send_json({"type": "user_message", "content": "先挂着"})
         for _ in range(6):
             if ws.receive_json()["type"] == "ask_user":
                 break
-        # 第二个连接：并发消息被拒；同会话后连覆盖该会话的 emit 槽（per-session 语义），
-        # 取消后的事件都发给 ws2。
-        # 读 2 帧再断言（而非逐帧直等）：连入首帧可能是 running 快照（重连补发），
-        # 而 TestClient 的 receive 无超时，逐帧等类型会挂死。
-        with client.websocket_connect(f"/ws/chat/{client.zc_sid}") as ws2:
-            ws2.send_json({"type": "user_message", "content": "并发消息"})
-            ev = _reject_event(ws2)
-            assert ev["type"] == "busy" and "正在执行" in ev["message"]  # 修复前是 error → 快速 RED
+        # 第二个连接：并发消息入队；同会话后连覆盖该会话的 emit 槽（per-session 语义），
+        # 取消后的事件都发给 ws2。后连首帧是 running 快照（重连状态自洽），不是拒绝。
+        with client.websocket_connect(f"/ws/chat/{sid}") as ws2:
+            assert ws2.receive_json() == {"type": "status", "status": "running"}
+            # 同连接上行严格 FIFO：插话先入队，cancel 后到 —— 不必（也不能）读 hub.pending 抢时序
+            ws2.send_json({"type": "user_message", "content": "插一句"})
             ws2.send_json({"type": "cancel"})
-            # 裁定：取消后 runner 依次发 tool_result(已取消)、error(已取消)、status(idle)，
-            # 读 3 条（brief 原文读 2 条漏计 tool_result）
             tail = [ws2.receive_json() for _ in range(3)]  # tool_result + error(已取消) + status(idle)
         assert any(e["type"] == "error" and e["message"] == "已取消" for e in tail)
         assert any(e["type"] == "status" for e in tail)
+        assert not any(e["type"] == "steering_done" for e in tail)  # 停止后不再注入
+        assert not hub.pending.get(sid)  # 未送达插话一并丢弃，不许偷偷活到下一次 run
 
 def test_ws_cross_session_emit_isolation(client):
     """终审修复轮2回归网：hub 下行 emit 必须按会话分槽（多标签页/多浏览器串扰修复）。
@@ -289,36 +295,38 @@ def _reject_event(ws):
 
 
 def test_ws_busy_is_non_terminal(client):
-    """执行中再发消息：回 busy 而非 error。
+    """插话排满时回 busy（**非终态**），且不打断正在跑的这一轮。
 
-    回归的是「会话正在执行中 + 重试」死循环——error 被前端当终态处理清掉 running，
-    红色「停止」按钮随之消失，此后再发还是撞拒绝、点重试也还是 error，用户既发不出
-    也停不掉。busy 语义上是「稍后再试」的提示，不是本轮终态：runner 照常挂起在 ask 上，
-    随后应答仍能跑完（本用例尾段即验证这一点）。
+    盯的是 a0cecb1 那个死循环的根：拒绝一旦被发成 error，前端就当本轮终态清掉 running，
+    红色「停止」按钮随之消失，用户既发不出也停不掉。user_message 路径现在只在
+    「队列排满 / 压缩中」两种情况下拒绝，这里取队列排满（默认上限 20，直接预置占位）。
     """
     client.app.state.llm_factory = lambda cfg: ScriptedLLM([
         done(None, [{"id": "c1", "function": {
             "name": "ask_user", "arguments": json.dumps({"question": "?", "options": []})}}]),
         done("应答后继续"),
     ])
-    with client.websocket_connect(f"/ws/chat/{client.zc_sid}") as ws:
+    sid = client.zc_sid
+    hub = client.app.state.hub
+    with client.websocket_connect(f"/ws/chat/{sid}") as ws:
         ws.send_json({"type": "user_message", "content": "先挂着"})
         for _ in range(6):
             if ws.receive_json()["type"] == "ask_user":
                 break
-        ws.send_json({"type": "user_message", "content": "插一句结束语"})
-        ev = ws.receive_json()
-        assert ev["type"] == "busy" and "正在执行" in ev["message"]
-        # busy 不是终态：不发 status，ask 仍挂起，应答后这一轮照常收尾
+        hub.pending[sid] = [f"占位{i}" for i in range(20)]  # 顶到默认上限
+        ws.send_json({"type": "user_message", "content": "第 21 句"})
+        assert _reject_event(ws)["type"] == "busy"
+        # busy 不是终态：ask 仍挂起，应答后这一轮照常收尾
+        # （预置的 20 条占位插话会在边界被一并注入 → 先来 20 帧 steering_done，读够再找 message_done）
         ws.send_json({"type": "ask_submit", "answers": [{"answer": "随便"}]})
-        for _ in range(8):
+        for _ in range(60):
             if ws.receive_json()["type"] == "message_done":
                 break
         else:
             pytest.fail("busy 之后应答，runner 应跑到 message_done")
-    # 被拒的那句话不落库（仍是丢弃语义，只是不再伪装成终态错误）
-    contents = [m["content"] for m in client.get(f"/api/sessions/{client.zc_sid}/messages").json()]
-    assert "插一句结束语" not in contents
+    # 被拒的那句话不落库（丢弃语义不变，只是不再伪装成终态错误）
+    contents = [m["content"] for m in client.get(f"/api/sessions/{sid}/messages").json()]
+    assert "第 21 句" not in contents
 
 
 def test_ws_compact_busy_is_non_terminal(client):
@@ -361,6 +369,156 @@ def test_ws_reconnect_replays_running_status(client):
     with client.websocket_connect(f"/ws/chat/{sid}") as ws3:
         ws3.send_json({"type": "user_message", "content": "hi"})
         assert ws3.receive_json()["type"] == "message_done"
+
+
+# ---------- 插话（steering）：执行中的新消息排队，下一轮工具边界注入 ----------
+
+def _ask_tool_call(cid="c1", q="?"):
+    return {"id": cid, "function": {"name": "ask_user",
+            "arguments": json.dumps({"question": q, "options": []})}}
+
+
+def test_ws_steering_injected_at_round_boundary(client):
+    """执行中再发一句：不再被拒，也不另起一轮 run —— 它在**下一个工具边界**作为 user 消息
+    落库并注入本次对话，模型下一轮就看得见（用户要的"中途补一句结束语/改方向"）。
+
+    顺序契约走**可观察事实**（落库 seq + 下行事件次序），不看 ScriptedLLM.received：
+    runner 全程复用同一个 messages list，received 的每个元素都是同一对象的别名，
+    拿它断"注入在哪一步之间"等于没断（调试期就是这么骗过自己的）。
+    """
+    cap = {}
+    def factory(cfg):
+        cap["llm"] = ScriptedLLM([
+            done(None, [_ask_tool_call()]),
+            done("收到，按新方向继续"),
+        ])
+        return cap["llm"]
+    client.app.state.llm_factory = factory
+    steer = "插一句：改成用 SQLite"
+    with client.websocket_connect(f"/ws/chat/{client.zc_sid}") as ws:
+        ws.send_json({"type": "user_message", "content": "先挂着"})
+        for _ in range(6):
+            if ws.receive_json()["type"] == "ask_user":
+                break
+        # 同一连接上行严格 FIFO：插话一定排在 ask_submit 之前被处理
+        ws.send_json({"type": "user_message", "content": steer})
+        ws.send_json({"type": "ask_submit", "answers": [{"answer": "都行"}]})
+        evs = []
+        for _ in range(10):
+            ev = ws.receive_json()
+            evs.append(ev)
+            if ev["type"] == "status":
+                break
+    types = [e["type"] for e in evs]
+    assert "steering_done" in types, types
+    assert types.index("steering_done") < types.index("message_done"), types  # 先注入，后答复
+    rows = [(r["role"], r["content"]) for r in client.get(f"/api/sessions/{client.zc_sid}/messages").json()]
+    i = next(k for k, (role, c) in enumerate(rows) if role == "user" and c == steer)
+    assert rows[i - 1][0] == "tool", rows  # 落在工具结果之后（没拆散 assistant(tool_calls)/tool 对）
+    assert rows[i + 1][0] == "assistant", rows  # 模型答复在它之后：这句确实被看见了
+    assert sum(1 for role, _ in rows if role == "user") == 2  # 原问题 + 插话
+    # 模型**真的看见了这句话**（不是落库了却给模型塞了个 None：expand_mentions 无 @ 时返回 None）
+    assert cap["llm"].received[-1][-1] == {"role": "user", "content": steer}
+
+
+def test_ws_steering_dropped_on_cancel(client):
+    """点「停止」后队列里未送达的插话一并丢弃：不落库、不留到下一次 run
+    （否则会出现「我以为停了，下一条新消息却被旧队列抢先注入」的错位）。"""
+    client.app.state.llm_factory = lambda cfg: ScriptedLLM([done(None, [_ask_tool_call()])])
+    hub = client.app.state.hub
+    sid = client.zc_sid
+    steer = "停止前想补的一句"
+    with client.websocket_connect(f"/ws/chat/{sid}") as ws:
+        ws.send_json({"type": "user_message", "content": "挂着"})
+        for _ in range(6):
+            if ws.receive_json()["type"] == "ask_user":
+                break
+        # 同连接严格 FIFO：插话先入队，cancel 后到（不去抢读 hub.pending 的中间态）
+        ws.send_json({"type": "user_message", "content": steer})
+        ws.send_json({"type": "cancel"})
+        evs = []
+        for _ in range(5):
+            ev = ws.receive_json()
+            evs.append(ev)
+            if ev["type"] == "status":
+                break
+    assert not any(e["type"] == "steering_done" for e in evs)  # 停止后没被偷偷注入
+    assert not hub.pending.get(sid)
+    contents = [m["content"] for m in client.get(f"/api/sessions/{sid}/messages").json()]
+    assert steer not in contents
+
+
+class _SteerAfterStream(ScriptedLLM):
+    """让"最终答复产出的那一刻用户正好插一句"可确定性复现。
+
+    chat_stream 的最后一个事件被消费后，`async for` 还会再推一次生成器才结束，
+    所以 after 钩子恰好跑在 runner 的「最终答复分支」之前 —— 正是那条分支要处理的时机。
+    """
+    def __init__(self, turns, after=None):
+        super().__init__(turns)
+        self.after = after
+
+    async def chat_stream(self, messages, tools):
+        async for ev in super().chat_stream(messages, tools):
+            yield ev
+        if self.after:
+            hook, self.after = self.after, None
+            hook()
+
+
+def test_ws_steering_arriving_with_final_answer_gets_a_round(client):
+    """模型已经给出最终答复时插话：不能等下一次提问才被看见 —— 答复照常落库/下发，
+    插话紧随其后，再走一轮让模型回应它（顺序必须是「答复在前、插话在后」，否则历史错位）。
+    """
+    hub = client.app.state.hub
+    steer = "补一句：再加个导出按钮"
+
+    def factory(cfg):
+        return _SteerAfterStream(
+            [done("第一段答复"), done("好，导出按钮加上")],
+            after=lambda: hub.queue(client.zc_sid, steer, 20))
+    client.app.state.llm_factory = factory
+    with client.websocket_connect(f"/ws/chat/{client.zc_sid}") as ws:
+        ws.send_json({"type": "user_message", "content": "开始"})
+        evs = []
+        for _ in range(10):
+            ev = ws.receive_json()
+            evs.append(ev)
+            if ev["type"] == "status":
+                break
+    types = [e["type"] for e in evs]
+    dones = [k for k, t in enumerate(types) if t == "message_done"]
+    assert len(dones) == 2, types  # 原答复 + 因插话多走的一轮
+    assert "steering_done" in types
+    assert dones[0] < types.index("steering_done") < dones[1], types  # 夹在两次答复之间
+    rows = [(r["role"], r["content"])
+            for r in client.get(f"/api/sessions/{client.zc_sid}/messages").json()]
+    i = next(k for k, (role, c) in enumerate(rows) if role == "user" and c == steer)
+    assert rows[i - 1] == ("assistant", "第一段答复"), rows  # 顺序：答复在前、插话在后，历史不错位
+    assert rows[i + 1][0] == "assistant", rows  # 多出来的一轮确实回应了它
+
+
+def test_hub_queue_cap_and_drain():
+    """hub 队列：入队保序、drain 取空、超上限拒收（ws 侧按 sys_config 传上限）。"""
+    hub = ChatHub()
+    assert hub.queue(1, "第一句", 2) is True
+    assert hub.queue(1, "第二句", 2) is True
+    assert hub.queue(1, "第三句", 2) is False  # 满 → ws 回 busy 非终态提示
+    assert asyncio.run(hub.pop_pending(1)) == ["第一句", "第二句"]
+    assert asyncio.run(hub.pop_pending(1)) == []  # drain 即清空，不重复注入
+
+
+def test_session_detail_exposes_queued_steering(client):
+    """刷新时「已排队、尚未注入」的插话不能凭空消失：会话详情带上 hub.pending，
+    前端据此把「排队中」气泡还原（否则用户说了话，刷新一下就没了，跟丢消息没区别）。"""
+    hub = client.app.state.hub
+    sid = client.zc_sid
+    hub.queue(sid, "还在排队的一句", 20)
+    hub.queue(sid, "排第二句", 20)
+    detail = client.get(f"/api/sessions/{sid}").json()
+    assert detail["pending_steering"] == ["还在排队的一句", "排第二句"]
+    hub.pending.pop(sid, None)
+    assert client.get(f"/api/sessions/{sid}").json()["pending_steering"] == []
 
 
 def test_ws_manual_compact(client):
