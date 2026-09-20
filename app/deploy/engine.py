@@ -6,7 +6,7 @@
 迁移闸门（D-2）：编排顺序 迁移 → compose up，`sqlrun.run_sqlchange` 自带「sqlchange 目录缺失
 fail-closed」守卫，此处不再重复预检。
 """
-import asyncio, inspect, logging
+import asyncio, inspect, logging, time
 from pathlib import Path
 import httpx
 from sqlalchemy import text
@@ -124,6 +124,25 @@ async def _notify(notify, app_id, event) -> None:
         notify(app_id, {"app_id": app_id, **event})
 
 
+LOG_PREFIX = "[zerocode]"
+
+
+async def _step(app_id, notify, message: str, *, since: float | None = None,
+                level: int = logging.INFO) -> None:
+    """预览启动/停止流程的步骤日志。
+
+    双通道：① 平台日志（backend 控制台，start.bat/dev.bat 窗口看得见）；② `dev_log` 事件，
+    与容器输出走同一条预览日志流，前端按行渲染即可——用户点「启动预览」后不再只对着
+    starting 转圈，而是能看到「预检/渲染/迁移/起栈/健康检查」走到哪一步、各花了多久。
+    `since` 给出时附「+秒数」的累计耗时（时间相关，测试只断言前缀与关键字）。
+    """
+    line = f"{LOG_PREFIX} {message}"
+    if since is not None:
+        line += f"（+{time.monotonic() - since:.1f}s）"
+    logger.log(level, "%s", line)
+    await _notify(notify, app_id, {"type": "dev_log", "line": line})
+
+
 async def wait_frontend_health(port: int, timeout: int) -> bool:
     """前端健康判定（规格 03 §4.3）：GET http://localhost:<port>/ 拿到 200 即就绪。"""
     async with httpx.AsyncClient(timeout=2.0) as c:
@@ -146,43 +165,65 @@ async def start_dev(sf, app: dict, notify=None) -> dict:
     error 的 except 捕获（预检失败 = 状态零变更）。
     """
     app_id = app["id"]
+    slug = app.get("slug") or f"app#{app_id}"
     app = _compose_meta(app)
     await preflight_docker()
-    await _notify(notify, app_id, {"type": "dev_status", "status": "starting"})
+    t0 = time.monotonic()
+    await _step(app_id, notify, f"▶ 启动预览 {slug}（dev）")
+    await _step(app_id, notify, "✓ Docker 预检通过", since=t0)
     try:
+        await _notify(notify, app_id, {"type": "dev_status", "status": "starting"})
         await _set_status(sf, app_id, "starting")
         root = await _app_root(sf, app)
         cred = await read_cred(sf, app["slug"], "dev")
         if not cred:
             raise DeployError("dev 数据库凭据缺失，请删除应用后重建（或检查 dbcred 配置）", status=409)
         compose_mod.ensure_deploy_files(root, app, {"dev": cred})
+        port = _dev_port(app)
+        await _step(app_id, notify, f"✓ 已渲染 deploy/（dev-compose.yml + .env），dev 端口 {port}",
+                    since=t0)
         on_log = None
         if notify:
             async def on_log(line):
                 await _notify(notify, app_id, {"type": "dev_log", "line": line})
+        await _step(app_id, notify, f"→ 执行 sqlchange 迁移（dev 库 {cred.get('db', '?')}）")
         mig = await run_sqlchange(root, "dev", cred, on_log=on_log)
+        if not mig["ok"]:
+            await _step(app_id, notify, "✗ 迁移失败，dev 栈不启动", since=t0, level=logging.WARNING)
+        else:
+            await _step(app_id, notify, "✓ 迁移完成", since=t0)
         await _notify(notify, app_id, {"type": "migrate_result",
                                        "env": "dev", "ok": mig["ok"], "log": mig["log"]})
         if not mig["ok"]:
             raise DeployError(f"dev 迁移失败（sqlrunner 退出码 {mig['code']}），详情见迁移日志")
+        await _step(app_id, notify, "→ docker compose up -d 启动 dev 栈")
         code, log = await docker(
             "compose", "-f", str(root / "deploy" / "dev-compose.yml"), "up", "-d",
             cwd=str(root), on_line=on_log)
         if code != 0:
             raise DeployError(f"dev 栈启动失败:\n{log[-800:]}")
-        ok = await wait_frontend_health(_dev_port(app),
-                                        int((await deploy_cfg(sf)).get("deploy.health_timeout", 60)))
+        await _step(app_id, notify, "✓ 容器已启动", since=t0)
+        timeout = int((await deploy_cfg(sf)).get("deploy.health_timeout", 60))
+        await _step(app_id, notify, f"→ 等待前端就绪 http://localhost:{port}（最长 {timeout}s）")
+        ok = await wait_frontend_health(port, timeout)
         if not ok:
-            raise DeployError(f"dev 前端在健康等待期内未就绪（端口 {_dev_port(app)}）")
+            raise DeployError(f"dev 前端在健康等待期内未就绪（端口 {port}）")
         await _set_status(sf, app_id, "running")
+        await _step(app_id, notify,
+                    f"✓ 预览已就绪 http://localhost:{port}，总耗时 {time.monotonic() - t0:.1f}s")
         await _notify(notify, app_id, {"type": "dev_status", "status": "running"})
-        return {"status": "running", "url": f"http://localhost:{_dev_port(app)}"}
+        return {"status": "running", "url": f"http://localhost:{port}"}
     except DeployError as e:
+        await _step(app_id, notify,
+                    f"✗ 启动预览失败：{str(e).splitlines()[0][:200]}"
+                    f"（已耗时 {time.monotonic() - t0:.1f}s）", level=logging.WARNING)
         await _set_status(sf, app_id, "error")
         await _notify(notify, app_id, {"type": "dev_status", "status": "error",
                                        "message": str(e)})
         raise
     except Exception as e:
+        await _step(app_id, notify, f"✗ 启动预览失败：{e}（已耗时 {time.monotonic() - t0:.1f}s）",
+                    level=logging.WARNING)
         await _set_status(sf, app_id, "error")
         await _notify(notify, app_id, {"type": "dev_status", "status": "error", "message": str(e)})
         raise DeployError(f"启动预览失败: {e}") from e
@@ -190,14 +231,18 @@ async def start_dev(sf, app: dict, notify=None) -> dict:
 
 async def stop_dev(sf, app: dict, notify=None) -> dict:
     """停止 dev 栈（幂等：栈本就不在时 compose 返回 0，状态同样落 stopped）。"""
+    app_id = app["id"]
+    t0 = time.monotonic()
+    await _step(app_id, notify, f"▶ 停止预览 {app.get('slug') or f'app#{app_id}'}（dev）")
     root = await _app_root(sf, app)
-    await _notify(notify, app["id"], {"type": "dev_status", "status": "stopping"})
+    await _notify(notify, app_id, {"type": "dev_status", "status": "stopping"})
     code, log = await docker("compose", "-f", str(root / "deploy" / "dev-compose.yml"), "down",
                              cwd=str(root))
     if code != 0:
         logger.warning("dev 栈停止命令返回非零（仍按 stopped 收口）: %s\n%s", app.get("slug"), log[-300:])
-    await _set_status(sf, app["id"], "stopped")
-    await _notify(notify, app["id"], {"type": "dev_status", "status": "stopped"})
+    await _set_status(sf, app_id, "stopped")
+    await _notify(notify, app_id, {"type": "dev_status", "status": "stopped"})
+    await _step(app_id, notify, "✓ 预览已停止", since=t0)
     return {"status": "stopped"}
 
 

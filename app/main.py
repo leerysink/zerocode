@@ -1,4 +1,4 @@
-import asyncio, logging
+import asyncio, logging, os, sys
 from contextlib import asynccontextmanager, suppress
 from fastapi import FastAPI
 from sqlalchemy import bindparam, text as _sql
@@ -7,6 +7,14 @@ from app.deploy.hub import DeployHub
 from app.hub import ChatHub
 
 logger = logging.getLogger(__name__)
+
+# 部署流程的步骤日志（app.deploy.engine 里 INFO 级的「▶ 启动预览 / ✓ 迁移完成 / ✗ 失败」）要在
+# backend 控制台窗口真的看得见：Python 的 lastResort handler 只放行 WARNING 及以上。
+# 刻意不用 force——宿主（测试、uvicorn --log-config）已配置根 logger 时保持原样。
+logging.basicConfig(level=os.environ.get("ZEROCODE_LOG_LEVEL", "INFO").upper(),
+                    stream=sys.stdout,
+                    format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+                    datefmt="%Y-%m-%d %H:%M:%S")
 
 async def _watchdog_tick(engine, hub) -> list[int]:
     """单次巡检：将 status='running' 且超 10 分钟无活动的会话标记为 error（spec §7 崩溃恢复）。

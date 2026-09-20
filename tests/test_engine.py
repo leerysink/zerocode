@@ -263,25 +263,86 @@ async def test_migrate_gate_blocks_stack_and_emits_result(sf, make_app, seams):
 
 
 async def test_dev_log_lines_forwarded_and_migrate_seam(sf, make_app, seams):
-    """迁移与启动的每行输出都经 notify 的 dev_log 事件转发；无 notify 时不注入日志回调。"""
+    """迁移与启动的每行输出都经 notify 的 dev_log 事件转发；无 notify 时不注入日志回调。
+
+    引擎自己的步骤日志（`[zerocode] …`）与转发的原始输出同流，断言时先剔掉步骤行，
+    保证「每行都转发、顺序不变」这条契约仍然单独可验。
+    """
     app = await make_app("zclog", prod_port=8292, dev_port=8293)
     hub, events = _hub_spy()
     seams.mig_result = {"ok": True, "code": 0, "log": "OK V20260918_01_init.sql\nSKIP old"}
     seams.docker.script["compose up"] = (0, "Container backend Started\nContainer frontend Started")
     await engine.start_dev(sf, app, notify=hub.publish)
-    assert _dev_logs(events) == ["OK V20260918_01_init.sql", "SKIP old",
-                                 "Container backend Started", "Container frontend Started"]
+    logs = _dev_logs(events)
+    forwarded = [l for l in logs if not l.startswith(engine.LOG_PREFIX)]
+    assert forwarded == ["OK V20260918_01_init.sql", "SKIP old",
+                         "Container backend Started", "Container frontend Started"]
+    assert logs[0] == f"{engine.LOG_PREFIX} ▶ 启动预览 zclog（dev）"   # 步骤行首尾夹住转发行
+    assert logs[-1].startswith(f"{engine.LOG_PREFIX} ✓ 预览已就绪")
     assert _statuses(events) == ["starting", "running"]
     m = seams.mig_calls[0]
     assert m["env"] == "dev" and m["app_dir"] == ROOT / "zclog"    # 迁移跑在应用根的 dev 库上
     assert m["cred"] == {"db": "zclog_dev", "user": "zclog_dev", "password": "fake-pw"}
     assert m["on_log"] is not None
     assert _events_of(events, "migrate_result")[0]["ok"] is True    # 成功同样必发
-    # notify 缺席时引擎不注入日志回调（on_log=None），迁移入口仍被正常调用
+    # notify 缺席时引擎不注入日志回调（on_log=None），迁移入口仍被正常调用；步骤事件同样为零
     events.clear()
     seams.mig_calls.clear()
     await engine.start_dev(sf, app)
     assert seams.mig_calls[0]["on_log"] is None and events == []
+
+
+async def test_start_dev_step_logs_cover_every_phase(sf, make_app, seams):
+    """预览启动逐步留痕：预检 → 渲染 → 迁移 → 起栈 → 健康检查，收口一行总耗时。"""
+    app = await make_app("zcstep", prod_port=8280, dev_port=8281)
+    hub, events = _hub_spy()
+    await engine.start_dev(sf, app, notify=hub.publish)
+    steps = [l for l in _dev_logs(events) if l.startswith(engine.LOG_PREFIX)]
+    joined = "\n".join(steps)
+    for key in ("▶ 启动预览 zcstep", "✓ Docker 预检通过", "已渲染 deploy/", "执行 sqlchange 迁移",
+                "✓ 迁移完成", "docker compose up -d", "✓ 容器已启动", "等待前端就绪", "✓ 预览已就绪"):
+        assert key in joined, key
+    assert "端口 8281" in joined                                  # 用户最关心的两件事：端口、URL
+    assert "http://localhost:8281" in steps[-1]
+    assert "总耗时" in steps[-1]                                   # 慢在哪一步，一行看出来
+    # 顺序即编排顺序：迁移在起栈之前（闸门 D-2），健康检查在起栈之后
+    assert (joined.index("✓ 迁移完成") < joined.index("docker compose up -d")
+            < joined.index("等待前端就绪") < joined.index("✓ 预览已就绪"))
+
+
+async def test_start_dev_failure_leaves_error_step(sf, make_app, seams):
+    """失败也要有一行 ✗：写明原因与已耗时，且仍在 dev_status(error) 之前落到日志流。"""
+    app = await make_app("zcstepfail", prod_port=8278, dev_port=8279)
+    seams.health_ok = False
+    hub, events = _hub_spy()
+    with pytest.raises(DeployError):
+        await engine.start_dev(sf, app, notify=hub.publish)
+    fail = [l for l in _dev_logs(events) if "✗" in l]
+    assert len(fail) == 1 and "未就绪" in fail[0] and "已耗时" in fail[0]
+    assert _statuses(events) == ["starting", "error"]
+
+
+async def test_migrate_failure_logs_step_before_error_event(sf, make_app, seams):
+    """迁移闸门失败：先打「✗ 迁移失败，dev 栈不启动」，再起栈动作一概不发生。"""
+    app = await make_app("zcstepmig", prod_port=8276, dev_port=8277)
+    seams.mig_result = {"ok": False, "code": 2, "log": "FAIL V20260918_03_bad.sql"}
+    hub, events = _hub_spy()
+    with pytest.raises(DeployError):
+        await engine.start_dev(sf, app, notify=hub.publish)
+    joined = "\n".join(_dev_logs(events))
+    assert "✗ 迁移失败，dev 栈不启动" in joined and "docker compose up -d" not in joined
+    assert "compose up" not in seams.docker.keys()
+
+
+async def test_stop_dev_step_logs(sf, make_app, seams):
+    """停止预览同样有首尾两行，便于和启动行对账。"""
+    app = await make_app("zcstepstop", prod_port=8274, dev_port=8275)
+    hub, events = _hub_spy()
+    await engine.stop_dev(sf, app, notify=hub.publish)
+    steps = [l for l in _dev_logs(events) if l.startswith(engine.LOG_PREFIX)]
+    assert steps[0] == f"{engine.LOG_PREFIX} ▶ 停止预览 zcstepstop（dev）"
+    assert steps[-1].startswith(f"{engine.LOG_PREFIX} ✓ 预览已停止")
+
 
 
 async def test_start_dev_requires_cred_before_any_container(sf, make_app, seams):
