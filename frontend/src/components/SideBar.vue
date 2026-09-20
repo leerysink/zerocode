@@ -271,16 +271,18 @@ async function doDelete() {
   font-size: 12px;
   flex-shrink: 0;
 }
-/* 行尾操作：hover 到组头才显形，与既有会话删除图标同一套交互 */
+/* 行尾操作常驻但压暗（用户要的是「看得见 + 和 ⋯」，纯 hover 显形容易被当成没做），
+   hover 到组头才提亮；与既有会话删除图标的 hover 语言同一套。 */
 .zc-add,
 .zc-menu-btn {
   flex-shrink: 0;
-  opacity: 0;
+  opacity: 0.45;
   transition: opacity 0.15s;
   color: var(--zc-text-sub);
 }
 .zc-add:hover,
 .zc-menu-btn:hover {
+  opacity: 1;
   color: var(--zc-primary);
 }
 .zc-group-head:hover .zc-add,
