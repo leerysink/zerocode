@@ -84,6 +84,9 @@ async def run_sqlchange(app_dir: Path, env: str, cred: dict, on_log=None) -> dic
         return {"ok": False, "code": 2,
                 "log": f"sqlchange 目录不存在: {sql_dir}（迁移闸门拒绝空跑）"}
     await ensure_zcnet()
+    # M-1（终审 F-01）：镜像只在平台启动构建一次，Docker 晚启动即永久缺失——main.py 注释承诺
+    # 「首次预览时会重试」，这里兑现：网络自愈旁补镜像自愈（build_if_missing 幂等，inspect 命中即返回）。
+    await build_if_missing()
     code, log = await _docker(
         "run", "--rm", "--network", "zcnet",
         "-e", f"TARGET_DB={cred['db']}",

@@ -128,6 +128,34 @@ async def test_missing_sqlchange_dir_fails_closed(cred, monkeypatch):
     assert calls == []  # 守卫在起容器之前，docker 面零接触
 
 
+async def test_run_sqlchange_self_heals_image(cred, monkeypatch):
+    """M-1（终审 F-01）：镜像只在平台启动构建一次，Docker 晚启动即永久缺失 → 预览永久 error。
+
+    main.py 注释承诺「首次预览时会重试」：run_sqlchange 必须在 zcnet 自愈旁补镜像自愈，
+    且必须先于起容器完成（否则 docker run 仍报 No such image）。build_if_missing 本已幂等
+    （image inspect 命中即 return），seam 断言方式同 I-1 用例：不真删镜像，只钉调用路径。
+    """
+    calls: list[str] = []
+
+    async def _spy_build():
+        calls.append("build_if_missing")
+
+    async def _spy_net():
+        calls.append("ensure_zcnet")
+
+    async def _no_docker(*args, **kw):
+        calls.append("docker run")
+        return 0, ""
+
+    monkeypatch.setattr(sqlrun, "build_if_missing", _spy_build)
+    monkeypatch.setattr(sqlrun, "ensure_zcnet", _spy_net)
+    monkeypatch.setattr(sqlrun, "_docker", _no_docker)
+    _write({"V20260918_01_init.sql": GOOD1})
+    r = await sqlrun.run_sqlchange(SQL_DIR.parent, "dev", cred)
+    assert r["ok"] is True
+    assert calls == ["ensure_zcnet", "build_if_missing", "docker run"]
+
+
 async def test_run_sh_record_failure_guard():
     """N-3：成功分支 history UPSERT 的返回码不得丢弃——记账失败宁可闸门红（exit 2），不绿色假成功。
 

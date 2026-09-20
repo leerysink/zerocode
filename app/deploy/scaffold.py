@@ -42,10 +42,12 @@ def render(template: Path, dst: Path, mapping: dict) -> None:
     today = mapping["TODAY"]
     init = dst / "sqlchange" / f"V{today}_01_init.sql"
     init.parent.mkdir(parents=True, exist_ok=True)
+    # M-2②（终审 F-03）：APP_NAME 进 SQL 字面量前做 PG 标准转义 `'`→`''`（对照探针：含引号名称
+    # 原值渲染出引号不闭合的 INSERT，psql --single-transaction 整文件回滚 → 首预览必红且 M1 无删除入口）。
     init.write_text(INIT_SQL.format(
         TODAY=today,
         TODAY_DASH=f"{today[:4]}-{today[4:6]}-{today[6:]}",
-        APP_NAME=mapping["APP_NAME"]), encoding="utf-8", newline="")
+        APP_NAME=str(mapping["APP_NAME"]).replace("'", "''")), encoding="utf-8", newline="")
     # 残留自检：任何文件不得残留 {{
     for p in dst.rglob("*"):
         if p.is_file() and "{{" in p.read_text(encoding="utf-8", errors="replace"):

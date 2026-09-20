@@ -98,8 +98,13 @@ async def _delete_rows(session_factory, app_id: int) -> None:
 async def create_app_project(session_factory, *, name: str, slug: str, scale: str,
                              stack: str, root: str | None = None) -> dict:
     """原子创建一个应用工程：任一步失败即回滚（平台记录 + 供给 + 目录），抛 DeployError。"""
-    if not (name or "").strip():
+    name_stripped = (name or "").strip()
+    if not name_stripped:
         raise DeployError("应用名称不能为空")
+    # M-2①（终审 F-02）：app_project.name VARCHAR(100)——入口即校验 strip 后 1..100，
+    # 超限/空直接中文 400，不再穿透到 asyncpg StringDataRightTruncation 冒 500 外露驱动原文。
+    if len(name_stripped) > 100:
+        raise DeployError("应用名称过长（上限 100 字），请缩短后重试")
     validate_slug(slug)
     _check_scale_stack(scale, stack)
     cfg = await deploy_cfg(session_factory)

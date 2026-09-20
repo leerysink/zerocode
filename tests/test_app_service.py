@@ -77,6 +77,24 @@ async def test_create_app_rejects_bad_scale_stack():
     assert ei.value.status == 400 and "尚未开放" in str(ei.value)
     assert not ROOT.exists()
 
+async def test_create_app_rejects_name_over_100():
+    """M-2（终审 F-02）：150 字名此前穿透 VARCHAR(100) 抛 DBAPIError、被兜底包装成「创建应用失败: <SQLAlchemy 原文>」；
+    入口必须按 strip 后 1..100 校验，中文 400 且不做任何渲染/落库动作（ROOT 不得出现半成品目录）。"""
+    sf = make_session_factory(make_engine())
+    with pytest.raises(DeployError) as ei:
+        await app_service.create_app_project(
+            sf, name="长" * 150, slug=SLUG, scale="small", stack="vue3-fastapi", root=str(ROOT))
+    assert ei.value.status == 400
+    msg = str(ei.value)
+    assert "名称" in msg and "100" in msg and "VARCHAR" not in msg   # 中文引导，不外露驱动原文
+    assert not ROOT.exists()
+    # 空白名（strip 后为空）同样拒：长度判定基于 strip 后的值
+    with pytest.raises(DeployError) as ei2:
+        await app_service.create_app_project(
+            sf, name="   ", slug=SLUG, scale="small", stack="vue3-fastapi", root=str(ROOT))
+    assert ei2.value.status == 400
+
+
 async def test_create_app_duplicate_slug():
     sf = make_session_factory(make_engine())
     await app_service.create_app_project(
