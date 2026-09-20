@@ -74,9 +74,16 @@ async def run_sqlchange(app_dir: Path, env: str, cred: dict, on_log=None) -> dic
 
     dev/prod 的差异只体现在传入的 cred（同一入口两条发布线复用），故 env 暂不参与容器参数。
     Windows 下 -v 传 D:\\... 形式，Docker Desktop 自行转换挂载路径。
+
+    fail-closed 闸门（审查 I-1）：挂载源目录缺失时 Docker Desktop 会静默补一个空 /sql，run.sh 走
+    「空目录=成功」分支退 0 → 绿色空跑击穿 depends_on: migrate 闸门；宿主侧才分得清「缺失 vs 空」，
+    故在起任何 docker 命令之前先拒绝（空目录仍合法，按现路径 exit 0）。
     """
-    await ensure_zcnet()
     sql_dir = app_dir / "sqlchange"
+    if not sql_dir.is_dir():
+        return {"ok": False, "code": 2,
+                "log": f"sqlchange 目录不存在: {sql_dir}（迁移闸门拒绝空跑）"}
+    await ensure_zcnet()
     code, log = await _docker(
         "run", "--rm", "--network", "zcnet",
         "-e", f"TARGET_DB={cred['db']}",

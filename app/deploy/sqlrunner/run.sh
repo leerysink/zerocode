@@ -39,10 +39,15 @@ for f in $(ls /sql/V*.sql 2>/dev/null | sort); do
   start=$(date +%s)
   if $PSQL --single-transaction -q -f "$f"; then
     dur=$(( ($(date +%s) - start) * 1000 ))
-    $PSQL -q -c "INSERT INTO sqlchange_history (filename, checksum, success, duration_ms)
+    # 坑（审查 N-3）：迁移成功但 history UPSERT 失败时，丢弃返回码 = 容器退 0、UI 报绿、行却不存在，
+    #     下次执行会重跑同一文件（契约未强制幂等，种子数据类 INSERT 翻倍）。宁可闸门红一次不给假成功。
+    if ! $PSQL -q -c "INSERT INTO sqlchange_history (filename, checksum, success, duration_ms)
       VALUES ('$base', '$sum', true, $dur)
       ON CONFLICT (filename) DO UPDATE SET checksum=EXCLUDED.checksum, success=true, error=NULL,
-        duration_ms=EXCLUDED.duration_ms, applied_at=now()"
+        duration_ms=EXCLUDED.duration_ms, applied_at=now()"; then
+      echo "FAIL RECORD $base"
+      exit 2
+    fi
     echo "OK $base"
   else
     $PSQL -q -c "INSERT INTO sqlchange_history (filename, checksum, success, error)

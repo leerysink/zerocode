@@ -1,4 +1,5 @@
 # tests/test_sqlrunner.py
+import re
 import shutil
 import pytest
 from pathlib import Path
@@ -11,6 +12,7 @@ pytestmark = [pytest.mark.asyncio,
 SLUG = "zctask9"
 ROOT = Path("D:/__zc_task9__")            # 试验目录根（仓库外，docker bind mount 用）
 SQL_DIR = ROOT / SLUG / "sqlchange"
+RUN_SH = Path(sqlrun.__file__).resolve().parent / "sqlrunner" / "run.sh"
 
 GOOD1 = """-- V20260918_01_init.sql
 -- 用途：t1 表  影响：t1
@@ -97,3 +99,44 @@ async def test_empty_dir_ok(cred):
     _write({})
     r = await _apply(cred)
     assert r["ok"] is True
+
+
+# ---- 收尾修复（审查报告 I-1 / N-3）----
+
+async def test_missing_sqlchange_dir_fails_closed(cred, monkeypatch):
+    """I-1：sqlchange/ 缺失时 Docker 会补空挂载 → 绿色空跑击穿 migrate 闸门，宿主侧必须 fail-closed。
+
+    「未启动任何容器」用 _docker/ensure_zcnet 模块级 seam 断言（比 docker ps -a 计数更强的轻量方式：
+    run 用了 --rm，容器退出即消失，计数恒 0 属真空断言；seam 断言则钉死「一条 docker 命令都不下发」）。
+    """
+    calls: list[tuple] = []
+
+    async def _no_docker(*args, **kw):
+        calls.append(tuple(args))
+        return 0, ""
+
+    async def _no_net():
+        calls.append(("ensure_zcnet",))
+
+    monkeypatch.setattr(sqlrun, "_docker", _no_docker)
+    monkeypatch.setattr(sqlrun, "ensure_zcnet", _no_net)
+    shutil.rmtree(ROOT, ignore_errors=True)
+    (ROOT / SLUG).mkdir(parents=True)  # app_dir 在，sqlchange/ 不在
+    r = await sqlrun.run_sqlchange(ROOT / SLUG, "dev", cred)
+    assert r["ok"] is False and r["code"] == 2
+    assert "目录不存在" in r["log"]
+    assert calls == []  # 守卫在起容器之前，docker 面零接触
+
+
+async def test_run_sh_record_failure_guard():
+    """N-3：成功分支 history UPSERT 的返回码不得丢弃——记账失败宁可闸门红（exit 2），不绿色假成功。
+
+    集成层注入「连得上但写不进 history」需打挂表权限且与迁移同库同角色（owner 必可写），
+    稳定构造成本过高，故退为脚本层静态断言（审查报告已授权该取舍）。
+    """
+    src = RUN_SH.read_text(encoding="utf-8")
+    assert re.search(
+        r'if ! \$PSQL -q -c "INSERT INTO sqlchange_history.*?FAIL RECORD \$base.*?exit 2',
+        src, re.S), "成功分支 UPSERT 未做返回码守卫（FAIL RECORD + exit 2）"
+    # OK 行必须在守卫之后：防「先 OK 后 exit 2」的自相矛盾回退
+    assert src.index('echo "OK $base"') > src.index("FAIL RECORD")
