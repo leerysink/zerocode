@@ -432,6 +432,18 @@ async def test_stop_all_dev_on_exit_only_running_stacks(sf, make_app, seams):
     assert await _db_status(sf, a["id"]) == "running"    # 退出清理不改台账状态（进程即结束）
 
 
+async def test_preflight_docker_cli_missing_raises_503(monkeypatch):
+    """D-1（Task 11 审查遗留）：docker CLI 完全不在 PATH 时 asyncio 抛的是 FileNotFoundError，
+    不是「子进程非零退出」；预检必须同样收口成 503 中文引导，否则 REST 层冒 500（Task 12 端点的入口）。"""
+    async def raise_fnf(*args, **kwargs):
+        raise FileNotFoundError(2, "The system cannot find the file specified.")
+
+    monkeypatch.setattr(engine, "docker", raise_fnf)
+    with pytest.raises(DeployError) as ei:
+        await engine.preflight_docker()
+    assert ei.value.status == 503 and "Docker CLI 未安装" in str(ei.value)
+
+
 async def test_stop_all_dev_on_exit_skipped_when_disabled(sf, make_app, seams):
     a = await make_app("zcexit3", prod_port=8264, dev_port=8265)
     await _set_db_status(sf, a["id"], "running")

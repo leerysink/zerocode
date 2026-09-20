@@ -18,7 +18,20 @@ from app.main import create_app
 from app.agent.llm import ScriptedLLM
 
 @pytest.fixture
-def client():
+def client(monkeypatch):
+    # Task 12 起 create_app 的 lifespan 要做部署侧启动清理（把库里所有 dev 栈 compose down，
+    # 退出时再停一遍 running 的）：本 fixture 连的是**开发库 zerocode**，不打桩就会停掉开发者
+    # 正在预览的应用栈，并且每个用例白敲几次 docker CLI。部署链路由
+    # tests/test_apps_dev_api.py + tests/test_engine.py 覆盖，这里只测聊天 WS。
+    from app.deploy import engine as deploy_engine, provision, sqlrun
+
+    async def _noop(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(deploy_engine, "cleanup_orphans", _noop)
+    monkeypatch.setattr(deploy_engine, "stop_all_dev_on_exit", _noop)
+    monkeypatch.setattr(provision, "ensure_zcnet", _noop)
+    monkeypatch.setattr(sqlrun, "build_if_missing", _noop)
     app = create_app()  # 开发库；lifespan 负责迁移
     with TestClient(app) as c:
         tmp = tempfile.mkdtemp()

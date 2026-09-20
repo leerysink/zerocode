@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager, suppress
 from fastapi import FastAPI
 from sqlalchemy import bindparam, text as _sql
 from app.db import make_engine, make_session_factory, run_migrations
+from app.deploy.hub import DeployHub
 from app.hub import ChatHub
 
 logger = logging.getLogger(__name__)
@@ -37,6 +38,28 @@ async def _watchdog(engine, hub):
         except Exception:
             logger.exception("watchdog 巡检失败")
 
+async def _deploy_startup(app: FastAPI) -> None:
+    """部署环境的启动准备（Task 12 / 裁定 D-3）：孤儿 dev 栈清理 → zcnet → sqlrunner 镜像。
+
+    三步各自兜底、全部非致命：Docker Desktop 没开只意味着「预览暂不可用」，绝不能把平台启动卡死
+    或带崩——所以只在模块内按**属性名**取用（deploy_engine.cleanup_orphans 等），测试替身可拦。
+    """
+    from app.deploy import engine as deploy_engine, provision, sqlrun
+    try:
+        await deploy_engine.cleanup_orphans(app.state.session_factory,
+                                            notify=app.state.deploy_hub.publish)
+    except Exception:
+        logger.exception("部署环境启动清理失败（Docker 未启动？）")
+    try:
+        await provision.ensure_zcnet()
+    except Exception:
+        logger.exception("部署环境启动准备失败：docker 网络 zcnet（首次预览时会重试）")
+    try:
+        await sqlrun.build_if_missing()
+    except Exception:
+        logger.exception("sqlrunner 镜像构建失败（首次预览时会重试）")
+
+
 def create_app(database_url: str | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -44,12 +67,25 @@ def create_app(database_url: str | None = None) -> FastAPI:
         app.state.engine = engine
         app.state.session_factory = make_session_factory(engine)
         app.state.hub = ChatHub()
+        # 部署发布套件（Task 12）：事件总线（WS /ws/deploy/{app_id} 的订阅源）+ 长任务句柄表
+        app.state.deploy_hub = DeployHub()
+        app.state.dev_tasks = {}
         await run_migrations(engine)
+        await _deploy_startup(app)
         watchdog = asyncio.create_task(_watchdog(engine, app.state.hub))
         yield
         watchdog.cancel()
         with suppress(asyncio.CancelledError):
             await watchdog  # 等取消落地，避免事件循环关闭时报 pending task 警告
+        # 优雅退出：停掉仍在跑的 dev 栈（prod 不受影响，FR3-04）；同样不得因 Docker 侧异常而卡住关闭
+        try:
+            from app.deploy import engine as deploy_engine
+            from app.deploy.settings import deploy_cfg
+            cfg = await deploy_cfg(app.state.session_factory)
+            await deploy_engine.stop_all_dev_on_exit(app.state.session_factory, cfg,
+                                                     notify=app.state.deploy_hub.publish)
+        except Exception:
+            logger.exception("退出清理 dev 栈失败")
         await engine.dispose()
 
     from app.api.config_api import router as config_router
@@ -64,6 +100,9 @@ def create_app(database_url: str | None = None) -> FastAPI:
     # 部署发布套件（Task 6）：/api/apps 创建/校验 slug/列表/详情
     from app.api import apps as apps_api
     app.include_router(apps_api.router)
+    # 部署发布套件（Task 12）：/ws/deploy/{app_id} 部署事件流（须在静态托管之前，路由不被 SPA 吞掉）
+    from app.api import deploy_ws
+    app.include_router(deploy_ws.router)
     app.include_router(ws_router)
 
     # ---- 前端静态托管（Task 15）：挂载 frontend/dist，SPA 回退 index.html ----

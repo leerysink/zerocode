@@ -62,8 +62,18 @@ async def docker(*args, cwd=None, on_line=None, timeout=600) -> tuple[int, str]:
 
 
 async def preflight_docker() -> None:
-    """Docker 引擎可用性前置检查：不可用抛 503 中文引导（规格 03 §5 / D9）。"""
-    code, log = await docker("info", "--format", "ok")
+    """Docker 引擎可用性前置检查：不可用抛 503 中文引导（规格 03 §5 / D9）。
+
+    D-1（Task 11 审查遗留）：docker CLI 根本不在 PATH 时，`create_subprocess_exec` 抛的是
+    FileNotFoundError（不是「子进程退出码非零」），这里同样收口成 503——REST 层才能给出
+    可执行的中文引导，而不是冒 500。
+    """
+    try:
+        code, log = await docker("info", "--format", "ok")
+    except FileNotFoundError as e:
+        raise DeployError(
+            "Docker CLI 未安装：请安装并启动 Docker Desktop（设置页「部署环境」可一键启动）",
+            status=503) from e
     if code != 0:
         raise DeployError(
             "Docker 未启动或不可用：请打开 Docker Desktop（设置页「部署环境」可一键启动）"
