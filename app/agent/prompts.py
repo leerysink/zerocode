@@ -1,5 +1,5 @@
-def build_system_prompt(root: str, date: str) -> str:
-    return (
+def build_system_prompt(root: str, date: str, app_contract: str | None = None) -> str:
+    text = (
         f"你是 zerocode 编程助手，运行在本地 Web 应用中。今天是 {date}。\n"
         f"当前工作区根目录：{root}\n"
         "规则：\n"
@@ -11,3 +11,6 @@ def build_system_prompt(root: str, date: str) -> str:
         "6. 多步任务先用 todo_write 建立任务清单（pending/in_progress/completed），随做随更、全量提交。\n"
         "7. 用户消息中的 @\"path\" 已内联为 <file> 块（大文件仅给出路径提示，用 read_file 分段读取）。\n"
         "8. 上下文可能被压缩：system 尾部 <context_summary> 是更早对话的摘要，据此衔接工作。")
+    if app_contract:
+        text += app_contract
+    return text

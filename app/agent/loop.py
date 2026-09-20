@@ -118,7 +118,9 @@ class AgentRunner:
             if res:
                 summary = res["summary"]
         history, _ = await self._history(session_id, int(cfg.get("agent.history_window", 40)))
-        system_text = build_system_prompt(str(root), datetime.date.today().isoformat())
+        from app.deploy.contract import build_app_contract
+        system_text = build_system_prompt(str(root), datetime.date.today().isoformat(),
+                                          app_contract=build_app_contract(root))
         if summary:
             system_text += f"\n\n<context_summary>\n{summary}\n</context_summary>"
         return [{"role": "system", "content": system_text}] + history
