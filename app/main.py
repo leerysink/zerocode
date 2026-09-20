@@ -61,6 +61,9 @@ def create_app(database_url: str | None = None) -> FastAPI:
     app.include_router(sessions.router)
     app.include_router(files.router)
     app.include_router(models.router)
+    # 部署发布套件（Task 6）：/api/apps 创建/校验 slug/列表/详情
+    from app.api import apps as apps_api
+    app.include_router(apps_api.router)
     app.include_router(ws_router)
 
     # ---- 前端静态托管（Task 15）：挂载 frontend/dist，SPA 回退 index.html ----
