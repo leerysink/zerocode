@@ -130,6 +130,21 @@ def test_parse_compose_logs_keeps_inner_pipe_in_message():
     assert rows[0]["line"] == "a | b" and rows[0]["service"] == "backend"    # 只按首个分隔符切一次
 
 
+def test_parse_compose_logs_strips_bare_timestamp_when_no_service_prefix():
+    """真机非 TTY 形态：compose 会省掉 `service | ` 前缀，只留裸时间戳。
+
+    时间戳已单独存进 ts/epoch，行文本里再留一份会在面板上重复一串纳秒（读起来像坏数据），
+    所以这种行要把前缀剥掉、service 留空由前端按来源兜底显示。
+    """
+    out = ("2026-09-20T16:41:38.699049423Z 2026-09-20 16:41:38 INFO    [test1] 陌如玉（test1）后端启动\n"
+           "2026-09-20T16:41:37.224289062Z INFO:     Uvicorn running on http://0.0.0.0:8000\n")
+    rows = eng_mod.parse_compose_logs(out, tail=10)
+    assert rows[0]["line"].startswith("2026-09-20 16:41:38 INFO")            # 容器自己的日志行完整保留
+    assert rows[1]["line"] == "INFO:     Uvicorn running on http://0.0.0.0:8000"
+    assert all(r["service"] == "" and r["source"] == "container" for r in rows)
+    assert rows[0]["epoch"] == pytest.approx(_epoch("2026-09-20T16:41:38.699049+00:00"), abs=1)
+
+
 def test_merge_logs_orders_by_time_and_hides_epoch():
     platform = [{"seq": 1, "ts": "t1", "epoch": 100.0, "source": "platform", "line": "a"},
                 {"seq": 2, "ts": "t2", "epoch": 300.0, "source": "platform", "line": "b"}]

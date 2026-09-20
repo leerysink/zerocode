@@ -289,8 +289,10 @@ def _log_epoch(raw: str) -> tuple[float | None, str]:
 def parse_compose_logs(out: str, tail: int = 200) -> list[dict]:
     """容器输出转成行记录：`<ts> backend | 文本` → {source: container, service, line, ts}。
 
-    分隔符按 compose 的 ` | ` 只切一次（消息里再出现 ` | ` 不会被继续切开）；没有该分隔符的行
-    （compose 自己的进度行等）整行进 line、service 留空。
+    分隔符按 compose 的 ` | ` 只切一次（消息里再出现 ` | ` 不会被继续切开）。
+    没有该分隔符的行有两种：compose 自己的进度行（整行进 line），以及**非 TTY 下的容器输出**
+    ——真机实测 `docker compose logs` 在管道里会省掉 `service | ` 前缀，只留裸时间戳；这种行
+    必须把时间戳前缀也剥掉（时间已单独存进 ts，留着会在面板里重复一遍难看的纳秒串），service 留空。
     """
     rows: list[dict] = []
     for raw in out.splitlines():
@@ -298,9 +300,16 @@ def parse_compose_logs(out: str, tail: int = 200) -> list[dict]:
             continue
         left, sep, right = raw.partition(" | ")
         epoch, iso = _log_epoch(left)
-        service = left.split(" ", 1)[1].strip() if (sep and " " in left) else ""
+        if sep:
+            service = left.split(" ", 1)[1].strip() if " " in left else ""
+            body = right
+        else:
+            service, body = "", raw.strip()
+            m = _TS_RE.match(body)
+            if m:
+                body = body[m.end():].lstrip()
         rows.append({"source": "container", "service": service, "ts": iso, "epoch": epoch,
-                     "line": (right if sep else raw).rstrip()})
+                     "line": body.rstrip()})
     return rows[-max(int(tail), 1):]
 
 
