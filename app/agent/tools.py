@@ -72,6 +72,9 @@ async def execute_tool(ctx: ToolContext, name: str, args: dict) -> dict:
     if name == "write_file":
         rel = args.get("path")
         f = resolve_in_workspace(ctx.root, rel)
+        from app.deploy.guard import is_protected
+        if is_protected(Path(ctx.root), rel):
+            raise ToolError("app.json 与 deploy/ 由平台管理，AI 不可修改")
         if f == Path(ctx.root).resolve() or f.is_dir():
             raise ToolError(f"路径必须是文件: {args.get('path')}")
         content = str(args.get("content") or "")
@@ -89,6 +92,9 @@ async def execute_tool(ctx: ToolContext, name: str, args: dict) -> dict:
     if name == "edit_file":
         rel = args.get("path")
         f = resolve_in_workspace(ctx.root, rel)
+        from app.deploy.guard import is_protected
+        if is_protected(Path(ctx.root), rel):
+            raise ToolError("app.json 与 deploy/ 由平台管理，AI 不可修改")
         if not f.is_file():
             raise ToolError(f"文件不存在: {args.get('path')}")
         if f.suffix.lower() in BINARY_EXTS:

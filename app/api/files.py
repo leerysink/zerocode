@@ -63,6 +63,9 @@ async def files_save(request: Request, body: SaveIn):
         f = resolve_in_workspace(root, body.path)
     except Exception as e:
         raise HTTPException(400, str(e))
+    from app.deploy.guard import is_protected
+    if is_protected(root, body.path):
+        raise HTTPException(403, "app.json 与 deploy/ 由平台管理，请在应用页操作")
     f.parent.mkdir(parents=True, exist_ok=True)
     # newline='' 字节保真，避免 Windows 行尾翻转污染目标文件
     f.write_text(body.content, encoding="utf-8", newline="")
