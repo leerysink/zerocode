@@ -41,3 +41,29 @@ def test_contract_lists_databases(tmp_path):
     c = build_app_contract(tmp_path)
     assert c and "lailiao_dev" in c and "lailiao_prod" in c
     assert "用户 lailiao_dev" in c and "用户 lailiao_prod" in c
+
+VALID_META = {"schema": "zc-app/1", "name": "来料登记", "slug": "lailiao", "scale": "small",
+              "stack": "vue3-fastapi", "ports": {"prod": 8210, "dev": 8211},
+              "database": {"dev": {"name": "lailiao_dev", "user": "lailiao_dev"},
+                           "prod": {"name": "lailiao_prod", "user": "lailiao_prod"}},
+              "health": {"frontend": "/", "backend": "/api/health"}}
+
+def test_contract_gate_requires_zc_app_manifest(tmp_path):
+    """M-1 准入闸门收紧：非 zc-app/1 清单（含外来 app.json）或缺 slug → 不注入，杜绝占位文本。"""
+    foreign = {"name": "小程序", "pages": ["pages/index"]}   # 小程序/Electron 同名配置，无 schema
+    (tmp_path / "app.json").write_text(json.dumps(foreign, ensure_ascii=False), encoding="utf-8")
+    assert build_app_contract(tmp_path) is None
+    for tampered in ({**VALID_META, "schema": "zc-app/2"},      # 版本漂移不盲渲染
+                     {k: v for k, v in VALID_META.items() if k != "schema"},   # 缺清单标识
+                     {**VALID_META, "slug": ""}):               # slug 空 → 不再出「」（，…）占位
+        (tmp_path / "app.json").write_text(json.dumps(tampered, ensure_ascii=False), encoding="utf-8")
+        assert build_app_contract(tmp_path) is None
+    (tmp_path / "app.json").write_text(json.dumps(VALID_META, ensure_ascii=False), encoding="utf-8")
+    assert build_app_contract(tmp_path)          # 对照：合法清单照常注入，闸门不误伤
+
+def test_contract_sql_and_db_fact_bans(tmp_path):
+    """I-2/M-2 文本锚：第 3 条含单事务建索引禁令；库事实段含库名/用户引用禁令。"""
+    (tmp_path / "app.json").write_text(json.dumps(VALID_META, ensure_ascii=False), encoding="utf-8")
+    c = build_app_contract(tmp_path)
+    assert "sqlchange 文件在单事务内执行，建索引写普通 CREATE INDEX，不得使用 CREATE INDEX CONCURRENTLY" in c
+    assert "仅供理解，代码与 SQL 不得引用库名/用户名" in c

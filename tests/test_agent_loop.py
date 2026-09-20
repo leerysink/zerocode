@@ -239,3 +239,39 @@ async def test_auto_compaction_triggers(test_engine, tmp_path):
     system_msg = llm.received[1][0]
     assert system_msg["role"] == "system" and "<context_summary>" in system_msg["content"]
     assert "摘要：历史已压缩" in system_msg["content"]
+
+# 平台清单合法形态（app_service 写入方的全字段产物），供契约注入用例复用
+APP_META = {"schema": "zc-app/1", "name": "来料登记", "slug": "lailiao", "scale": "small",
+            "stack": "vue3-fastapi", "ports": {"prod": 8210, "dev": 8211},
+            "database": {"dev": {"name": "lailiao_dev", "user": "lailiao_dev"},
+                         "prod": {"name": "lailiao_prod", "user": "lailiao_prod"}},
+            "health": {"frontend": "/", "backend": "/api/health"}}
+
+@pytest.mark.asyncio
+async def test_app_contract_injected_into_system(test_engine, tmp_path):
+    # I-1 回归保护：应用工作区的契约必须经 loop 真实消息构建路径进 system（删掉注入该行此例即红）
+    (tmp_path / "app.json").write_text(json.dumps(APP_META, ensure_ascii=False), encoding="utf-8")
+    llm = ScriptedLLM([[delta("好"), *done("好了")]])
+    sid = await mk_session(test_engine, tmp_path)
+    sf = make_session_factory(test_engine)
+    runner = AgentRunner(sf, llm, cfg_provider(), Recorder(),
+                         lambda *a, **k: asyncio.sleep(0, None), lambda *a, **k: True)
+    status = await runner.run(sid, "写个页面", asyncio.Event())
+    assert status == "idle"
+    assert llm.received[0][0]["role"] == "system"
+    c = llm.received[0][0]["content"]
+    # 锚用契约内的 slug/端口事实，不只断言标题字符串
+    assert "【应用契约】" in c and "lailiao" in c and "8211" in c
+    assert c.index("8. 上下文可能被压缩") < c.index("【应用契约】")   # 钉住顺序：v1 规则在前
+
+@pytest.mark.asyncio
+async def test_no_app_contract_without_app_json(test_engine, tmp_path):
+    # 反例：无 app.json 的普通工作区，system 不含契约段（v1 零影响钉到行为层）
+    llm = ScriptedLLM([[delta("好"), *done("好了")]])
+    sid = await mk_session(test_engine, tmp_path)
+    sf = make_session_factory(test_engine)
+    runner = AgentRunner(sf, llm, cfg_provider(), Recorder(),
+                         lambda *a, **k: asyncio.sleep(0, None), lambda *a, **k: True)
+    status = await runner.run(sid, "写个页面", asyncio.Event())
+    assert status == "idle"
+    assert "【应用契约】" not in llm.received[0][0]["content"]
