@@ -70,10 +70,11 @@ async def _insert_rows(session_factory, *, name, slug, scale, stack, root,
                                     {"s": slug})).first()
         if dup_slug:
             raise DeployError(f"slug 已存在: {slug}", status=409)
-        wid = (await s.execute(text(
-            "INSERT INTO workspace (name, root_path) VALUES (:n, :p) RETURNING id"),
-            {"n": name, "p": str(root)})).scalar()
         try:
+            # workspace 与 app_project 同一条 UNIQUE 兜底路径：并发抢走同目录时同样映射 409（m2）
+            wid = (await s.execute(text(
+                "INSERT INTO workspace (name, root_path) VALUES (:n, :p) RETURNING id"),
+                {"n": name, "p": str(root)})).scalar()
             row = (await s.execute(text(
                 "INSERT INTO app_project (workspace_id, name, slug, scale, stack, prod_port, dev_port) "
                 "VALUES (:w, :n, :s, :sc, :st, :pp, :dp) "
@@ -83,8 +84,8 @@ async def _insert_rows(session_factory, *, name, slug, scale, stack, root,
                  "pp": prod_port, "dp": dev_port})).mappings().first()
             await s.commit()
         except IntegrityError as e:
-            # 只读探测与插入之间的竞态（另一路创建占走同一端口/slug）：事务已废，交给上层回滚
-            raise DeployError("端口或标识已被占用，请重试", status=409) from e
+            # 只读探测与插入之间的竞态（另一路创建占走同一目录/端口/slug）：事务已废，交给上层回滚
+            raise DeployError("工作区目录、端口或标识已被占用，请重试", status=409) from e
     return to_dict(row)
 
 
@@ -114,11 +115,14 @@ async def create_app_project(session_factory, *, name: str, slug: str, scale: st
                "DEV_PORT": str(dev_port), "PROD_PORT": str(prod_port),
                "DEV_DB": f"{slug}_dev", "PROD_DB": f"{slug}_prod", "TODAY": today}
     app_id = None
+    workspace_id = None
+    provisioned_ok = False   # 本流是否真的供给过 dev 库：回滚只允许删本流自己建的东西（I-1）
     try:
         scaffold.render(TEMPLATES / stack, root_path, mapping)   # R-C 已保证模板目录存在
         app = await _insert_rows(session_factory, name=name.strip(), slug=slug, scale=scale,
                                  stack=stack, root=root_path, prod_port=prod_port, dev_port=dev_port)
         app_id = app["id"]
+        workspace_id = app["workspace_id"]
         # app.json：不含密码；端口来自同一次分配，与库内登记一致
         meta = {"schema": "zc-app/1", "name": name.strip(), "slug": slug, "scale": scale,
                 "stack": stack, "ports": {"prod": app["prod_port"], "dev": app["dev_port"]},
@@ -130,6 +134,7 @@ async def create_app_project(session_factory, *, name: str, slug: str, scale: st
         (root_path / "app.json").write_text(
             json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="")
         cred = await provision.provision_env(session_factory, slug, "dev")
+        provisioned_ok = True   # 自此本流才是 dev 库的建造者；此后任何失败才允许 drop_env
         # 台账裁定（Task 10 审查遗留）：调用方守卫——凭据不全自动即回滚，不静默产出坏栈
         if not (cred or {}).get("db") or not (cred or {}).get("password"):
             raise DeployError("数据库供给结果不完整", status=500)
@@ -137,23 +142,32 @@ async def create_app_project(session_factory, *, name: str, slug: str, scale: st
         ensure_deploy_files(root_path, meta, {"dev": cred})
         return app
     except DeployError:
-        await _rollback(session_factory, root_path, slug, app_id, provisioned=True)
+        await _rollback(session_factory, root_path, slug, app_id, workspace_id,
+                        provisioned=provisioned_ok)
         raise
     except Exception as e:
-        await _rollback(session_factory, root_path, slug, app_id, provisioned=True)
+        await _rollback(session_factory, root_path, slug, app_id, workspace_id,
+                        provisioned=provisioned_ok)
         raise DeployError(f"创建应用失败: {e}") from e
 
 
 async def _rollback(session_factory, root_path: Path, slug: str, app_id: int | None,
-                    provisioned: bool) -> None:
+                    workspace_id: int | None, provisioned: bool) -> None:
+    """失败回滚：各步互不阻断。删除范围严格限定本流自己的产物——
+    app_project 按 id、workspace 按本流登记的 workspace_id（不按 root_path，避免删掉
+    并发窗口内他人插入的同路径行）、库/角色/凭据仅在本流真的供给过时才 drop_env。"""
     if app_id:
         try:
             await _delete_rows(session_factory, app_id)
         except Exception:
             pass
-    async with session_factory() as s:
-        await s.execute(text("DELETE FROM workspace WHERE root_path = :p"), {"p": str(root_path)})
-        await s.commit()
+    if workspace_id:
+        try:
+            async with session_factory() as s:
+                await s.execute(text("DELETE FROM workspace WHERE id = :i"), {"i": workspace_id})
+                await s.commit()
+        except Exception:
+            pass
     if provisioned:
         try:
             await provision.drop_env(session_factory, slug, "dev")

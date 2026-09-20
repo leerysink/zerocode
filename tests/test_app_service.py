@@ -12,6 +12,7 @@ pytestmark = pytest.mark.asyncio
 
 SLUG = "zctask5"
 ROOT = Path(f"D:/__zc_task5__/{SLUG}")   # 隔离目录：不落仓库 apps/（裁定 R-B：create 调用一律显式传 root）
+ROOT2 = Path(f"D:/__zc_task5_b__/{SLUG}")  # 同 slug 的另一个空目录：用于绕过目录预检、精确命中 _insert_rows 分支
 
 async def _wipe():
     sf = make_session_factory(make_engine())
@@ -21,9 +22,11 @@ async def _wipe():
         pass
     async with sf() as s:
         await s.execute(text("DELETE FROM app_project WHERE slug=:s"), {"s": SLUG})
-        await s.execute(text("DELETE FROM workspace WHERE root_path=:p"), {"p": str(ROOT)})
+        await s.execute(text("DELETE FROM workspace WHERE root_path=:a OR root_path=:b"),
+                        {"a": str(ROOT), "b": str(ROOT2)})
         await s.commit()
     shutil.rmtree(ROOT.parent, ignore_errors=True)
+    shutil.rmtree(ROOT2.parent, ignore_errors=True)
 
 @pytest.fixture(autouse=True)
 async def _clean():
@@ -129,3 +132,38 @@ async def test_create_app_port_race_falls_back_to_unique(monkeypatch):
             await s.execute(text("DELETE FROM app_project WHERE slug='zctask5seed'"))
             await s.execute(text("DELETE FROM workspace WHERE root_path=:p"), {"p": seed_root})
             await s.commit()
+
+async def test_create_app_duplicate_slug_insert_row():
+    """I-1：dup_slug 命中 _insert_rows 分支时（目录预检被不同空目录绕过），回滚绝不得销毁既有应用的库与凭据。"""
+    sf = make_session_factory(make_engine())
+    app = await app_service.create_app_project(
+        sf, name="既有应用", slug=SLUG, scale="small", stack="vue3-fastapi", root=str(ROOT))
+    cred = await provision.read_cred(sf, SLUG, "dev")
+    assert cred and cred["db"] == f"{SLUG}_dev"            # 前置：A 的凭据键与 dev 库真实存在
+
+    async def _select1():                                  # 用 A 自己的凭据连它的 dev 库
+        from sqlalchemy.ext.asyncio import create_async_engine
+        e = create_async_engine(
+            f"postgresql+asyncpg://{cred['user']}:{cred['password']}@localhost:5433/{cred['db']}")
+        try:
+            async with e.connect() as c:
+                return (await c.execute(text("SELECT 1"))).scalar()
+        finally:
+            await e.dispose()
+
+    assert await _select1() == 1
+
+    with pytest.raises(DeployError) as ei:                 # 同 slug、不同空目录 → 必进 _insert_rows
+        await app_service.create_app_project(
+            sf, name="撞车应用", slug=SLUG, scale="small", stack="vue3-fastapi", root=str(ROOT2))
+    assert ei.value.status == 409 and "slug 已存在" in str(ei.value)
+    # 关键断言：A 零损伤（回滚只允许删本流自己建的东西）
+    assert (ROOT / "app.json").is_file()                   # A 的目录未被 rmtree
+    assert await provision.read_cred(sf, SLUG, "dev") == cred   # dbcred 键未被 drop_env 抹掉
+    assert await _select1() == 1                           # A 的 dev 库未被 DROP
+    rows = await app_service.list_apps(sf)
+    assert len(rows) == 1 and rows[0]["id"] == app["id"]   # 恰 1 行：既没误删 A，也没留下撞车行
+    assert not ROOT2.exists()                              # 本次半成品目录仍应被清理
+    async with sf() as s:                                  # 本次未提交任何 workspace 行
+        assert (await s.execute(text(
+            "SELECT count(*) FROM workspace WHERE root_path=:p"), {"p": str(ROOT2)})).scalar() == 0
