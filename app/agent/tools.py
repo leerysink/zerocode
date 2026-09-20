@@ -59,7 +59,13 @@ async def execute_tool(ctx: ToolContext, name: str, args: dict) -> dict:
         return {"path": args.get("path") or ".", "entries": entries[:200]}
 
     if name == "read_file":
-        f = resolve_in_workspace(ctx.root, args.get("path"))
+        rel = args.get("path")
+        f = resolve_in_workspace(ctx.root, rel)
+        # M-3（终审 M43）：deploy/** 含凭据明文，AI 读面同样收口（口令不得进模型上下文/对话历史外发 LLM）；
+        # 调用顺序与 write/edit 一致：先 resolve 拒越界，后 guard。app.json 读放行（契约要求 AI 看清单）。
+        from app.deploy.guard import is_secret_read
+        if is_secret_read(Path(ctx.root), rel):
+            raise ToolError("deploy/ 为平台保留区，凭据不可读取")
         if not f.is_file():
             raise ToolError(f"文件不存在: {args.get('path')}")
         if f.suffix.lower() in BINARY_EXTS:

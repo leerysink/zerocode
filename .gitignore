@@ -18,5 +18,9 @@ frontend/dist/
 *.log
 .DS_Store
 
+# App workspaces
+apps/
+.pnpm-store/
+
 # SDD workspace
 .superpowers/
