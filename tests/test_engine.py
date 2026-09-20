@@ -234,8 +234,8 @@ async def test_start_dev_happy_path(sf, make_app, seams):
     yml = (deploy_dir / "dev-compose.yml").read_text(encoding="utf-8")
     assert "8299:5173" in yml and "name: zc-zceng-dev" in yml
     assert "DEV_PASSWORD=fake-pw" in (deploy_dir / ".env").read_text(encoding="utf-8")
-    # 健康等待参数取自 deploy.health_timeout 配置（默认 60），端口为 dev 端口
-    assert seams.health_calls == [(8299, 60)]
+    # 健康等待参数取自 deploy.health_timeout 配置（默认 240），端口为 dev 端口
+    assert seams.health_calls == [(8299, 240)]
 
 
 async def test_start_dev_migrate_failure(sf, make_app, seams):

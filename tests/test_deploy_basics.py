@@ -27,6 +27,7 @@ async def test_deploy_cfg_defaults(test_engine):
     sf = make_session_factory(test_engine)
     cfg = await settings.deploy_cfg(sf)
     assert cfg["deploy.port_base"] == 8210
+    assert cfg["deploy.health_timeout"] == 240      # 默认 240s：首次冷启动需在容器内安装依赖
     assert settings.resolve_apps_root(cfg).name == "apps"
 
 async def test_allocate_pair_skips_used(test_engine):

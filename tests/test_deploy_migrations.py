@@ -15,7 +15,7 @@ async def test_deploy_config_seeded(test_engine):
     assert cfg["deploy.port_base"] == 8210
     assert cfg["deploy.port_max"] == 8399
     assert cfg["deploy.keep_versions"] == 5
-    assert cfg["deploy.health_timeout"] == 60
+    assert cfg["deploy.health_timeout"] == 240
     assert cfg["deploy.auto_stop_dev_on_exit"] is True
     assert cfg["deploy.apps_root"] == ""
 

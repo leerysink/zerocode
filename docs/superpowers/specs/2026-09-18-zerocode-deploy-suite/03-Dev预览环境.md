@@ -128,7 +128,7 @@ WS `/ws/deploy/{app_id}` 下行事件（本域）：`dev_status`（状态机变�
 
 ## 6. 验收标准
 
-1. 新建应用 → 点预览 → ≤60s 内 running，iframe 出现模板首页，`/api/health` 探测通过。
+1. 新建应用 → 点预览 → ≤240s 内 running（健康等待默认 240 秒：首次启动需在容器内安装 pip/npm 依赖，60 秒常误判超时），iframe 出现模板首页，`/api/health` 探测通过。
 2. AI 用 edit_file 改前端组件文案，预览中 ≤3s 自动更新，无需手动刷新。
 3. AI 新增 `sqlchange/V…_02_xxx.sql` 后重启预览：新表在 dev 库存在，`sqlchange_history` 有记录。
 4. 修改 requirements.txt → dev 栈自动重建重启，服务恢复 running。
