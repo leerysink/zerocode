@@ -37,3 +37,13 @@ export const deleteModel = (id) => http.delete(`/models/${id}`)
 export const getSessionDetail = (id) => http.get(`/sessions/${id}`)
 export const patchSessionModel = (id, modelConfigId) =>
   http.patch(`/sessions/${id}/model`, { model_config_id: modelConfigId })
+
+// ---- 部署发布套件（应用管理） ----
+export const listApps = () => http.get('/apps')
+export const createApp = (data) => http.post('/apps', data) // {name, slug, scale, stack}
+export const validateAppSlug = (slug) => http.post('/apps/validate-slug', { slug })
+export const devStart = (id) => http.post(`/apps/${id}/dev/start`)
+export const devStop = (id) => http.post(`/apps/${id}/dev/stop`)
+export const devRestart = (id) => http.post(`/apps/${id}/dev/restart`)
+export const devStatus = (id) => http.get(`/apps/${id}/dev/status`)
+export const sqlFiles = (id) => http.get(`/apps/${id}/sqlchange/files`)

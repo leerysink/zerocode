@@ -4,7 +4,7 @@
 // 组头点击折叠/展开成员（默认展开）；成员默认显 5 条，「展开其余 N 个会话」放开全部；hover 出删除。
 import { onMounted, reactive, ref } from 'vue'
 import { message } from 'ant-design-vue'
-import { DeleteOutlined, FolderOutlined, SettingOutlined } from '@ant-design/icons-vue'
+import { AppstoreOutlined, DeleteOutlined, FolderOutlined, SettingOutlined } from '@ant-design/icons-vue'
 import { deleteSession, listSessions } from '../api'
 import { useChatStore } from '../stores/chat'
 import { relativeTime } from '../utils/time'
@@ -101,7 +101,10 @@ async function removeSession(wsId, s) {
       </div>
     </div>
     <div class="zc-footer">
-      <router-link to="/settings"><setting-outlined /> 设置</router-link>
+      <div class="zc-footer-row">
+        <router-link to="/apps"><appstore-outlined /> 应用</router-link>
+        <router-link to="/settings"><setting-outlined /> 设置</router-link>
+      </div>
     </div>
     <NewSessionModal v-model:open="showNew" @created="loadAll" />
   </aside>
@@ -217,6 +220,10 @@ async function removeSession(wsId, s) {
 .zc-footer {
   border-top: 1px solid var(--zc-border);
   padding-top: 10px;
+}
+.zc-footer-row {
+  display: flex;
+  justify-content: space-between;
 }
 .zc-footer a {
   display: inline-flex;
