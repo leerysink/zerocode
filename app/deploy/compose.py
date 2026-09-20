@@ -36,6 +36,8 @@ __MIGRATE_SVC__
       - "__DEV_PORT__:5173"
     depends_on:
       - backend
+volumes:
+  fe_node_modules: {}
 """
 
 _MIGRATE_SVC = """  migrate:
@@ -61,6 +63,8 @@ services:
     command: sh -c "npm install && npm run dev -- --host 0.0.0.0 --port 5173"
     ports:
       - "__DEV_PORT__:5173"
+volumes:
+  fe_node_modules: {}
 """
 
 _ENV_TMPL = """DEV_PORT=__DEV_PORT__
