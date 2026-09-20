@@ -29,7 +29,8 @@ onMounted(() => store.loadWorkspaces())
         :has-session="!!store.currentSessionId"
       />
       <TodoBar v-if="store.todoList.length" :todos="store.todoList" />
-      <ChatInput :running="store.running" @send="store.send" @cancel="store.cancel" />
+      <!-- 发送决策在 chat store（被拦时保留输入框文本 + 给 hint），故不再冒泡 send -->
+      <ChatInput :running="store.running" @cancel="store.cancel" />
     </a-layout>
     <FilePanel v-if="store.currentWorkspaceId" :workspace-id="store.currentWorkspaceId" />
   </a-layout>

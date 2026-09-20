@@ -3,8 +3,14 @@
 // 下行事件类型与后端 loop.py / hub.py 协议一致：
 // token / reasoning_delta / tool_call / tool_result / ask_user(多问题) / confirm_request / message_done
 // / error / status / file_change / todo_sync / compacting / compaction_done / notice(压缩 skip 终态)
+// / busy(执行中被拒的非终态提示)；终态 = error / status(idle|error)，busy 与 status(running) 都不是。
 import { defineStore } from 'pinia'
 import { getMessages, getSessionDetail, listModels, listWorkspaces, patchSessionModel, wsUrl } from '../api'
+
+// 「执行中被拦下」的三条文案：单点定义，本地拦截与后端 busy 回包共用同一口径
+const BUSY_HINT = '会话正在执行中：点右侧「停止」结束当前执行后即可继续发言'
+const COMPACT_HINT = '上下文压缩中，请稍候'
+const OFFLINE_HINT = '连接未就绪，正在重连，请稍候再发'
 
 export function applyEvent(store, ev) {
   switch (ev.type) {
@@ -45,16 +51,35 @@ export function applyEvent(store, ev) {
       store.compacting = false
       store.messages.push({ role: 'notice', content: ev.text })
       break
+    case 'busy': {
+      // 执行中被拒（并发发消息 / 压缩中发消息）的**非终态**提示：绝不得清 running/compacting。
+      // 一清红色「停止」按钮就消失，用户既发不出也停不掉，点「重试」再撞同一拒绝 ——
+      // 这正是「会话正在执行中 + 重试」死循环的成因（后端因此把这类拒绝发成 busy 而非 error）。
+      const last = store.messages[store.messages.length - 1]
+      if (last && last.role === 'user' && last.content === store.pendingEcho) {
+        store.messages.pop() // 后端根本没落库：回滚乐观气泡，免得刷新后凭空消失更迷惑
+        store.rejectedDraft = store.pendingEcho // 文本交回输入框，用户不必重打
+      }
+      store.pendingEcho = ''
+      store.hint = ev.message || BUSY_HINT
+      break
+    }
     case 'error':
       store.messages.push({ role: 'error', content: ev.message })
       store.running = false
       store.streamingThinking = ''
       store.compacting = false // 压缩失败也是终态：复位压缩按钮 loading
+      store.pendingEcho = ''
       break
-    case 'status': // 终态回执（idle/error），复位执行态
+    case 'status': // 终态回执（idle/error）复位执行态；status=running 是重连补发的非终态快照
+      if (ev.status === 'running') {
+        store.running = true // 后端仍在跑（刷新/重连/另开标签页）：把「停止」按钮立回来
+        break
+      }
       store.running = false
       store.streamingThinking = ''
       store.compacting = false
+      store.pendingEcho = ''
       break
     case 'file_change': // 挂到最近一条 tool 消息，供 diff 渲染（Task 13 最小扩展：补存 path/action 供文件名显示）
       for (let i = store.messages.length - 1; i >= 0; i--) {
@@ -86,6 +111,9 @@ export const useChatStore = defineStore('chat', {
     models: [],
     currentModelId: null,
     compacting: false,
+    hint: '', // 执行中被拦下的一次性提示（非终态，不进气泡、不带「重试」）
+    rejectedDraft: '', // busy 交还给输入框的草稿：后端没收下这句话，文本不能丢
+    pendingEcho: '', // 最近一次本地乐观上行的 user 文本，busy 时按它回滚气泡
   }),
   actions: {
     async loadWorkspaces() {
@@ -109,12 +137,18 @@ export const useChatStore = defineStore('chat', {
       this.currentModelId = detail?.model_config_id ?? null
       this.streamingThinking = ''
       this.compacting = false
+      this.hint = ''
+      this.rejectedDraft = ''
+      this.pendingEcho = ''
       // 渲染门：右栏（Task 13/14）以 currentWorkspaceId 判定；由调用方传入工作区 id
       if (workspaceId != null) this.currentWorkspaceId = workspaceId
       this.messages = data
       this.streamingContent = ''
       this.pendingAsk = null
       this.pendingConfirm = null
+      // 执行态一律以服务端为准，不在这里猜：DB 的 status='running' 在进程崩溃后会滞留
+      // 最多 10 分钟（watchdog 周期），拿它立 running=true 会造出「假在跑、又停不掉」的新死结。
+      // connect 之后后端若真在跑，会补发一帧 status(running) 把执行态与「停止」按钮立回来。
       this.running = false
       this.connect(id)
     },
@@ -159,12 +193,32 @@ export const useChatStore = defineStore('chat', {
     },
     send(text) {
       const content = (text || '').trim()
-      if (!content || !this._ws || this._ws.readyState !== 1) return
+      if (!content) return false
+      // 执行中/压缩中：本地就拦下，不再"发了再撞后端拒绝"——那句 error 曾被前端当终态，
+      // 清掉 running 后「停止」按钮消失，用户进退两难。文本留在框里，用户看得到原因。
+      if (this.running || this.compacting) {
+        this.rejectedDraft = content
+        this.hint = this.running ? BUSY_HINT : COMPACT_HINT
+        return false
+      }
       this.messages.push({ role: 'user', content })
+      this.pendingEcho = content // busy 时按它回滚这条乐观气泡（后端可能根本没收下）
       this.streamingContent = ''
       this.streamingThinking = ''
+      this.hint = ''
+      this.rejectedDraft = ''
       this.running = true
-      this._uplink({ type: 'user_message', content })
+      if (!this._uplink({ type: 'user_message', content })) {
+        // 上行即失败（readyState 检查后瞬间断线）：气泡与执行态一并回滚，
+        // 不留「已发出」的假象；文本回到 rejectedDraft 供连接恢复后再发
+        this.messages.pop()
+        this.pendingEcho = ''
+        this.running = false
+        this.rejectedDraft = content
+        this.hint = OFFLINE_HINT
+        return false
+      }
+      return true
     },
     submitAsk(answers) {
       // 旧 ask_answer/ask_choice 已随后端删除；ask_submit 一次提交全部答案。

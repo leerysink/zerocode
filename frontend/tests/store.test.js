@@ -204,6 +204,84 @@ describe('chat store 事件流', () => {
     expect(s.streamingThinking).toBe('')
   })
 
+  // ---- 死循环修复：执行中不得把 UI 打进「发不出也没停止按钮」的状态 ----
+
+  it('busy 是非终态提示：不清 running，回滚乐观 user 气泡并把文本交回草稿', () => {
+    const s = useChatStore()
+    const send = vi.fn()
+    s._ws = { readyState: 1, send }
+    s.send('结束语') // 前端本地没在跑（脱钩场景），正常上行并落乐观气泡
+    expect(send).toHaveBeenCalledTimes(1)
+    expect(s.messages.at(-1)).toMatchObject({ role: 'user', content: '结束语' })
+    s.running = true // 后端仍在跑（重连快照已把执行态立回来）
+    applyEvent(s, { type: 'busy', message: '会话正在执行中' })
+    expect(s.running).toBe(true) // 修复前收到的是 error → running 被清 → 「停止」按钮消失
+    expect(s.messages.some((m) => m.role === 'user')).toBe(false) // 后端没落库的幻影气泡回滚
+    expect(s.rejectedDraft).toBe('结束语') // 文本交回输入框，不让用户重打
+    expect(s.hint).toBe('会话正在执行中')
+  })
+
+  it('status(running) 快照置回执行态；status(idle) 仍是终态复位', () => {
+    const s = useChatStore()
+    applyEvent(s, { type: 'status', status: 'running' }) // 刷新/重连时后端补发的在跑快照
+    expect(s.running).toBe(true)
+    applyEvent(s, { type: 'status', status: 'idle' })
+    expect(s.running).toBe(false)
+  })
+
+  it('刷新重开会话：执行态不靠 DB status 猜，由后端 status(running) 快照立回来', async () => {
+    stubWsGlobals()
+    getMessages.mockResolvedValue({ data: [{ role: 'user', content: '历史' }] })
+    // DB 里 status='running' 可能是崩溃残留（watchdog 最长 10 分钟才收），拿它立执行态
+    // 会造出「假在跑、停不掉」的新死结：openSession 一律先置空闲
+    getSessionDetail.mockResolvedValue({
+      data: { todo_state: [], model_config_id: null, status: 'running' },
+    })
+    const s = useChatStore()
+    await s.openSession('s1', 'w1')
+    expect(s.running).toBe(false)
+    // 真在跑的话，connect 上后端补发一帧快照，「停止」按钮随即可见
+    applyEvent(s, { type: 'status', status: 'running' })
+    expect(s.running).toBe(true)
+  })
+
+  it('running/compacting 时 send 本地拦截：不上行、不落 user 气泡、保留草稿并提示', () => {
+    const s = useChatStore()
+    const send = vi.fn()
+    s._ws = { readyState: 1, send }
+    s.running = true
+    expect(s.send('结束语')).toBe(false)
+    expect(send).not.toHaveBeenCalled()
+    expect(s.messages.some((m) => m.role === 'user')).toBe(false)
+    expect(s.rejectedDraft).toBe('结束语')
+    expect(s.hint).toContain('正在执行')
+    s.running = false
+    s.compacting = true
+    expect(s.send('再试')).toBe(false)
+    expect(s.hint).toContain('压缩')
+    expect(send).not.toHaveBeenCalled()
+    // 空闲后重发同一句：上行成功、落气泡、上一条提示与草稿一并清掉（不留残留）
+    s.compacting = false
+    expect(s.send('再试')).toBe(true)
+    expect(s.hint).toBe('')
+    expect(s.rejectedDraft).toBe('')
+    expect(s.messages.at(-1)).toMatchObject({ role: 'user', content: '再试' })
+    expect(send).toHaveBeenCalledWith(JSON.stringify({ type: 'user_message', content: '再试' }))
+  })
+
+  it('连接未就绪时 send：先落的气泡与执行态一并回滚，文本进草稿并提示重连', () => {
+    const s = useChatStore()
+    const send = vi.fn()
+    vi.spyOn(console, 'warn').mockImplementation(() => {}) // 静音 _uplink 的未就绪告警
+    s._ws = { readyState: 0, send } // 断线→重连窗口期（指数退避中）
+    expect(s.send('还没连上')).toBe(false)
+    expect(send).not.toHaveBeenCalled()
+    expect(s.messages.some((m) => m.role === 'user')).toBe(false) // 后端没收到，不留假气泡
+    expect(s.running).toBe(false)
+    expect(s.rejectedDraft).toBe('还没连上')
+    expect(s.hint).toContain('重连')
+  })
+
   it('setModel 回写会话校验：await 期间已切换会话则不得陈旧回写', async () => {
     const s = useChatStore()
     let resolvePatch

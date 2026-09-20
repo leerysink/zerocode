@@ -2,7 +2,9 @@
 
 上行：user_message / ask_submit / confirm / cancel / compact；
 下行：token / tool_call / tool_result / ask_user / confirm_request /
-message_done / error / status / file_change / compacting / compaction_done（由 runner 与 hub 经 emit 下发）。
+message_done / error / status / file_change / compacting / compaction_done / busy
+（由 runner 与 hub 经 emit 下发）。error 与 status 是**本轮终态**；busy 是执行中被拒的
+非终态提示（不得据此复位前端执行态，否则「停止」按钮消失 → 发不出也停不掉的死循环）。
 
 按会话分槽：同会话后连连接覆盖该会话的 emit 槽，下行事件随之切到新连接；
 断连 drop 自己的槽（防僵尸槽），跨会话互不串扰（终审修复轮2）。
@@ -35,6 +37,11 @@ async def ws_chat(ws: WebSocket, session_id: int):
 
     # 按会话分槽注入：同会话后连覆盖，跨会话互不影响（终审修复轮2）
     hub.set_emit(session_id, emit)
+    # 重连状态自洽：连入时该会话仍在跑（刷新页面/断线重连/另开标签页），补发一帧
+    # status(running) 快照，让前端把「停止」按钮亮回来。不补则前端 openSession 一律
+    # 视为空闲 → 输入框解锁而后端仍在执行，用户每发一句都撞拒绝（死循环根因之一）。
+    if session_id in hub.running:
+        await emit(session_id, {"type": "status", "status": "running"})
 
     async def config_getter():
         async with app.state.session_factory() as s:
@@ -55,7 +62,9 @@ async def ws_chat(ws: WebSocket, session_id: int):
             t = msg.get("type")
             if t == "user_message":
                 if session_id in hub.running:
-                    await emit(session_id, {"type": "error", "message": "会话正在执行中"})
+                    # busy（非终态）而非 error：error 会被前端当本轮终态清掉 running，
+                    # 「停止」按钮随之消失，用户既发不出也停不掉（重试再撞同一拒绝）
+                    await emit(session_id, {"type": "busy", "message": "会话正在执行中，请稍候或点「停止」"})
                     continue
                 text_ = (msg.get("content") or "").strip()
                 if not text_:
@@ -103,7 +112,7 @@ async def ws_chat(ws: WebSocket, session_id: int):
                 hub.cancel(session_id)
             elif t == "compact":
                 if session_id in hub.running:
-                    await emit(session_id, {"type": "error", "message": "会话正在执行中，无法压缩"})
+                    await emit(session_id, {"type": "busy", "message": "会话正在执行中，无法压缩"})
                     continue
 
                 async def send_local(event: dict):

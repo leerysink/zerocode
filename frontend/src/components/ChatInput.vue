@@ -1,19 +1,32 @@
 <script setup>
 // 输入区：工作区/模型元信息条 + a-textarea（Enter 发送）+ 操作行（压缩/发送|停止）。
 // @ 触发文件补全（/api/fs/tree 展平过滤 top8，Enter/点击选中）；模型下拉按会话记忆。
-import { computed, onMounted, ref } from 'vue'
+// 发送决策（能不能发、被拦时留不留文本）全在 chat store.send 里，本组件只负责
+// 「成功才清空输入框」+「busy 回填草稿」+「把 hint 摊在操作行上」，避免执行中静默吞输入。
+import { computed, onMounted, ref, watch } from 'vue'
 import { FolderOutlined, ScissorOutlined, SendOutlined, StopOutlined } from '@ant-design/icons-vue'
 import { useChatStore } from '../stores/chat'
 import { tree } from '../api'
 import { activeMentionToken, applyMention } from '../utils/mentions'
 import { flattenTree } from '../utils/tree'
 
-const props = defineProps({ running: { type: Boolean, default: false } })
-const emit = defineEmits(['send', 'cancel'])
+// running 只驱动「停止/发送」切换与占位文案；能不能发由 store.send 判定（并回 hint/草稿）
+defineProps({ running: { type: Boolean, default: false } })
+const emit = defineEmits(['cancel'])
 
 const chatStore = useChatStore()
 const text = ref('')
 const textareaRef = ref(null)
+
+// busy（后端拒收）或被拦的一句话：文本交还给输入框，用户改改就能再发，不必重打
+watch(
+  () => chatStore.rejectedDraft,
+  (draft) => {
+    if (!draft) return
+    if (!text.value.trim()) text.value = draft
+    chatStore.rejectedDraft = ''
+  }
+)
 
 const wsName = computed(
   () => chatStore.workspaces.find((w) => w.id === chatStore.currentWorkspaceId)?.name || ''
@@ -75,10 +88,10 @@ function onKeydown(e) {
 
 function doSend() {
   const content = text.value.trim()
-  if (!content || props.running) return
+  if (!content) return
   mention.value = null
-  emit('send', content)
-  text.value = ''
+  // 只有后端真收下才清空输入框；被拦（执行中/未就绪）时文本原样留着，store 已备好 hint
+  if (chatStore.send(content)) text.value = ''
 }
 
 async function onModelChange(id) {
@@ -114,7 +127,7 @@ function requestCompact() {
         ref="textareaRef"
         v-model:value="text"
         :auto-size="{ minRows: 2, maxRows: 6 }"
-        placeholder="输入消息，@ 引用文件，Enter 发送，Shift+Enter 换行"
+        :placeholder="running ? '会话执行中：可点右侧「停止」结束当前执行，或等它跑完再发言' : '输入消息，@ 引用文件，Enter 发送，Shift+Enter 换行'"
         @keydown="onKeydown"
         @input="onInput"
       />
@@ -131,7 +144,9 @@ function requestCompact() {
       </div>
     </div>
     <div class="zc-input-actions">
-      <span class="zc-input-hint">Enter 发送 / Shift+Enter 换行</span>
+      <span class="zc-input-hint" :class="{ 'is-busy': !!chatStore.hint }">
+        {{ chatStore.hint || 'Enter 发送 / Shift+Enter 换行' }}
+      </span>
       <div class="zc-input-buttons">
         <a-button
           size="small"
@@ -146,7 +161,7 @@ function requestCompact() {
           <template #icon><stop-outlined /></template>
           停止
         </a-button>
-        <a-button v-else type="primary" :disabled="!text.trim()" @click="doSend">
+        <a-button v-else type="primary" :disabled="!text.trim() || chatStore.compacting" @click="doSend">
           <template #icon><send-outlined /></template>
           发送
         </a-button>
@@ -214,6 +229,10 @@ function requestCompact() {
 .zc-input-hint {
   font-size: 12px;
   color: var(--zc-text-sub);
+}
+/* 执行中被拦下的一次性提示：低饱和暖色，只点状态，不抢错误级的红 */
+.zc-input-hint.is-busy {
+  color: #a17c5b;
 }
 .zc-input-buttons {
   display: flex;

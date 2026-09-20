@@ -108,7 +108,14 @@ PostgreSQL 16（Docker 专用容器，宿主端口 5433，库 zerocode）
 
 ### WS `/ws/chat/{session_id}`
 - 上行：`{"type":"user_message","content":...}`、`{"type":"ask_answer","text":...}`、`{"type":"confirm","approved":bool}`、`{"type":"cancel"}`
-- 下行：`token`（流式增量）、`tool_call`（名称+参数）、`tool_result`、`ask_user`、`confirm_request`、`message_done`、`error`、`status`（会话状态变化）
+- 下行：`token`（流式增量）、`tool_call`（名称+参数）、`tool_result`、`ask_user`、`confirm_request`、`message_done`、`error`、`status`（会话状态变化）、`busy`
+- 终态语义：`error` 与 `status(idle|error)` 是**本轮终态**（前端据此复位执行态）；`busy` 与 `status(running)` 都是**非终态**，前端不得据此清 `running`。
+  会话执行中再发 `user_message`（或压缩中发 `compact`）→ 回 `busy`（该句不落库、不入队），
+  早期实现回的是 `error`，前端把「被拒」当终态清掉执行态 → 红色「停止」按钮消失，
+  用户既发不出也停不掉、点「重试」再撞同一拒绝（死循环，2026-09 修复）。
+- 重连状态自洽：连接建立时若该会话仍在执行（刷新页面/断线重连/另开标签页），后端补发一帧
+  `status(running)` 快照，前端据此把执行态与「停止」按钮立回来；执行态以 `hub.running` 为唯一
+  真相源，不用 DB `chat_session.status` 猜（崩溃残留最长 10 分钟才被 watchdog 收，会造出「假在跑」）。
 - 断线重连：前端指数退避重连，重连后拉取 `/sessions/{id}/messages` 增量（按 seq）。
 
 ## 6. 前端界面（对齐 DSH 截图）

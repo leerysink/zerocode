@@ -116,11 +116,13 @@ def test_ws_busy_rejected(client):
             if ws.receive_json()["type"] == "ask_user":
                 break
         # 第二个连接：并发消息被拒；同会话后连覆盖该会话的 emit 槽（per-session 语义），
-        # 取消后的事件都发给 ws2
+        # 取消后的事件都发给 ws2。
+        # 读 2 帧再断言（而非逐帧直等）：连入首帧可能是 running 快照（重连补发），
+        # 而 TestClient 的 receive 无超时，逐帧等类型会挂死。
         with client.websocket_connect(f"/ws/chat/{client.zc_sid}") as ws2:
             ws2.send_json({"type": "user_message", "content": "并发消息"})
-            ev = ws2.receive_json()
-            assert ev["type"] == "error" and "正在执行" in ev["message"]
+            ev = _reject_event(ws2)
+            assert ev["type"] == "busy" and "正在执行" in ev["message"]  # 修复前是 error → 快速 RED
             ws2.send_json({"type": "cancel"})
             # 裁定：取消后 runner 依次发 tool_result(已取消)、error(已取消)、status(idle)，
             # 读 3 条（brief 原文读 2 条漏计 tool_result）
@@ -264,6 +266,102 @@ async def test_watchdog_skips_pending_ask(test_engine):
         hub.ask_futures.pop(sid, None)
         if not fut.done():
             fut.cancel()
+
+# ---------- 死循环修复：执行中拒绝必须是非终态 busy，不得回 error ----------
+
+def _busy_hanging_llm():
+    """单轮：ask_user 挂起（timeout=0 不限时），把会话钉在 running 态。"""
+    return ScriptedLLM([
+        done(None, [{"id": "c1", "function": {
+            "name": "ask_user", "arguments": json.dumps({"question": "?", "options": []})}}])])
+
+
+def _reject_event(ws):
+    """取「并发消息被拒」那一帧；跳过连入补发的 running 快照（实现后首帧是它）。
+
+    TestClient 的 receive 无超时：只读确定会来的帧（快照 1 帧 + 拒绝 1 帧），
+    不得盲读定长 N 帧——少一帧就挂死（RED 阶段的 hang 即此）。
+    """
+    ev = ws.receive_json()
+    if ev["type"] == "status" and ev.get("status") == "running":
+        ev = ws.receive_json()
+    return ev
+
+
+def test_ws_busy_is_non_terminal(client):
+    """执行中再发消息：回 busy 而非 error。
+
+    回归的是「会话正在执行中 + 重试」死循环——error 被前端当终态处理清掉 running，
+    红色「停止」按钮随之消失，此后再发还是撞拒绝、点重试也还是 error，用户既发不出
+    也停不掉。busy 语义上是「稍后再试」的提示，不是本轮终态：runner 照常挂起在 ask 上，
+    随后应答仍能跑完（本用例尾段即验证这一点）。
+    """
+    client.app.state.llm_factory = lambda cfg: ScriptedLLM([
+        done(None, [{"id": "c1", "function": {
+            "name": "ask_user", "arguments": json.dumps({"question": "?", "options": []})}}]),
+        done("应答后继续"),
+    ])
+    with client.websocket_connect(f"/ws/chat/{client.zc_sid}") as ws:
+        ws.send_json({"type": "user_message", "content": "先挂着"})
+        for _ in range(6):
+            if ws.receive_json()["type"] == "ask_user":
+                break
+        ws.send_json({"type": "user_message", "content": "插一句结束语"})
+        ev = ws.receive_json()
+        assert ev["type"] == "busy" and "正在执行" in ev["message"]
+        # busy 不是终态：不发 status，ask 仍挂起，应答后这一轮照常收尾
+        ws.send_json({"type": "ask_submit", "answers": [{"answer": "随便"}]})
+        for _ in range(8):
+            if ws.receive_json()["type"] == "message_done":
+                break
+        else:
+            pytest.fail("busy 之后应答，runner 应跑到 message_done")
+    # 被拒的那句话不落库（仍是丢弃语义，只是不再伪装成终态错误）
+    contents = [m["content"] for m in client.get(f"/api/sessions/{client.zc_sid}/messages").json()]
+    assert "插一句结束语" not in contents
+
+
+def test_ws_compact_busy_is_non_terminal(client):
+    """执行中点「压缩上下文」同理回 busy，不得回 error 解锁 UI。"""
+    client.app.state.llm_factory = lambda cfg: _busy_hanging_llm()
+    with client.websocket_connect(f"/ws/chat/{client.zc_sid}") as ws:
+        ws.send_json({"type": "user_message", "content": "跑着"})
+        for _ in range(6):
+            if ws.receive_json()["type"] == "ask_user":
+                break
+        ws.send_json({"type": "compact"})
+        assert _reject_event(ws)["type"] == "busy"  # 修复前是 error → 快速 RED
+        ws.send_json({"type": "cancel"})  # 收口，免留挂起任务
+
+
+def test_ws_reconnect_replays_running_status(client):
+    """刷新/重连后状态自洽：连入时会话仍在跑 → 首帧补发 status(running)，
+    前端据此把「停止」按钮亮回来，不再出现「前端解锁 + 后端在跑」的脱钩死循环。
+
+    写法约束：TestClient 的 receive 无超时，直等补帧会挂死。故连入后立即 cancel，
+    让「有实现」与「无实现」都有确定性产出——有则首帧必为 status 快照（connect 时同步
+    下发，排在 cancel 引发的收尾事件之前），无则首帧是取消链路的 tool_result/error。
+    """
+    client.app.state.llm_factory = lambda cfg: _busy_hanging_llm()
+    sid = client.zc_sid
+    with client.websocket_connect(f"/ws/chat/{sid}") as ws:
+        ws.send_json({"type": "user_message", "content": "挂着"})
+        for _ in range(6):
+            if ws.receive_json()["type"] == "ask_user":
+                break
+        with client.websocket_connect(f"/ws/chat/{sid}") as ws2:
+            ws2.send_json({"type": "cancel"})
+            head = ws2.receive_json()
+            assert head == {"type": "status", "status": "running"}
+            for _ in range(4):  # 收尾链：tool_result / error(已取消) / status(idle)
+                if ws2.receive_json()["type"] == "status":
+                    break
+    # 空闲会话连入不得补发 status 快照（否则每次连接多一帧噪声，且掩盖真实终态）
+    client.app.state.llm_factory = lambda cfg: ScriptedLLM([done("正常回复")])
+    with client.websocket_connect(f"/ws/chat/{sid}") as ws3:
+        ws3.send_json({"type": "user_message", "content": "hi"})
+        assert ws3.receive_json()["type"] == "message_done"
+
 
 def test_ws_manual_compact(client):
     import asyncio as _aio
