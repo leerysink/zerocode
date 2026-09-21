@@ -67,16 +67,30 @@ async def app_urls(sf, app: dict) -> dict:
             "lanCandidates": lan_candidates(),
             "defaultNic": await default_nic(sf)}
 
+def _dominant_eol(text_: str) -> str:
+    """首行探测文件主导行尾：第一个 LF 若被 CR 前导即 CRLF 文件（空文件/裸 LF 回落 "\\n"）。
+    README 在应用工作区里，AI 与用户都可能按 Windows 习惯写成 CRLF，块内行尾必须跟着文件走。"""
+    i = text_.find("\n")
+    return "\r\n" if i > 0 and text_[i - 1] == "\r" else "\n"
+
 def update_readme(root: Path, url: str, version: str) -> None:
-    """README 顶部发布块（05 §4.2）：标记对之间整体替换，幂等；无 README 不报错（只跳过）。"""
+    """README 顶部发布块（05 §4.2）：标记对之间整体替换，幂等；无 README 不报错（只跳过）。
+
+    行尾全程字节保真（T5 审查 I-1）：读端 `newline=""` 关掉通用换行归一，块内行尾按主导行尾生成，
+    正则边界同时吃 \\r\\n 与 \\n —— 否则读端归一 + 写端 `newline=""` 的净效果是把整份 README 翻成 LF，
+    发布一次就给应用仓库带来全文件 diff 噪音（与 app/api/files.py、app/agent/tools.py 的 newline="" 同法）。
+    读端用 `f.open(...)` 而非 `Path.read_text(...)`：后者到 3.13 才有 newline 形参，本仓跑 3.12。
+    """
     f = root / "README.md"
-    block = (f"{MARK_START}\n> 正式发布地址：{url}（版本 {version}，平台每次发布刷新）\n{MARK_END}\n")
     if not f.is_file():
         return
-    text_ = f.read_text(encoding="utf-8")
-    pat = re.compile(re.escape(MARK_START) + r".*?" + re.escape(MARK_END) + r"\n?", re.S)
+    with f.open("r", encoding="utf-8", newline="") as fh:
+        text_ = fh.read()
+    eol = _dominant_eol(text_)
+    block = (f"{MARK_START}{eol}> 正式发布地址：{url}（版本 {version}，平台每次发布刷新）{eol}{MARK_END}{eol}")
+    pat = re.compile(re.escape(MARK_START) + r".*?" + re.escape(MARK_END) + r"(?:\r\n|\n)?", re.S)
     if pat.search(text_):
         text_ = pat.sub(block, text_, count=1)
     else:
-        text_ = block + "\n" + text_
+        text_ = block + eol + text_
     f.write_text(text_, encoding="utf-8", newline="")
