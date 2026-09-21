@@ -202,13 +202,30 @@ def test_render_prod_compose_static_and_unknown_stack_raise():
         assert stack in str(ei.value)
         assert ei.value.status == 400
 
-def test_ensure_deploy_files_no_prod_write_without_prod_creds(tmp_path):
-    """创建流程（无 prod creds）行为与 M1 完全一致：不落 prod-compose.yml、不写 PROD_VERSION。"""
+def test_ensure_deploy_files_prod_compose_gated_on_stack_only(tmp_path):
+    """T4 波裁定（欠账）：prod-compose.yml 的落盘条件放宽为 **stack=vue3-fastapi 即渲染**。
+
+    理由：该文件内容只依赖 meta（凭据全走 .env 的 `${}` 插值），旧门要求
+    `creds.prod.password` 非空——首次发布 build 时 prod 凭据尚未供给，按旧门就没有
+    compose 文件可 build（发布流水线必挂）。放宽后创建流程多落一份 prod-compose.yml，
+    与 dev 产物一样是可重放的渲染件；`.env` 的 PROD_* 留空语义不变。
+    """
     compose.ensure_deploy_files(tmp_path, META, {"dev": CRED["dev"]})
     assert (tmp_path / "deploy" / "dev-compose.yml").is_file()
-    assert not (tmp_path / "deploy" / "prod-compose.yml").exists()
+    assert (tmp_path / "deploy" / "prod-compose.yml").is_file()        # 无 prod 凭据也渲染
+    assert "image: zc-lailiao-frontend:prod-${PROD_VERSION}" in \
+        (tmp_path / "deploy" / "prod-compose.yml").read_text(encoding="utf-8")
     env = (tmp_path / "deploy" / ".env").read_text(encoding="utf-8")
-    assert "PROD_VERSION" not in env and "PROD_PASSWORD=\n" in env
+    assert "PROD_VERSION" not in env and "PROD_PASSWORD=\n" in env      # 留空/不写版本照旧
+
+
+def test_ensure_deploy_files_static_stack_writes_no_prod_compose(tmp_path):
+    """static 栈不发布（M3）：不落 prod-compose.yml——放宽后闸门只剩栈判定，须钉住另一半。"""
+    m = copy.deepcopy(META)
+    m["stack"] = "static"
+    compose.ensure_deploy_files(tmp_path, m, {"dev": CRED["dev"]})
+    assert (tmp_path / "deploy" / "dev-compose.yml").is_file()
+    assert not (tmp_path / "deploy" / "prod-compose.yml").exists()
 
 def test_ensure_deploy_files_dev_bytes_unchanged(tmp_path):
     """dev 产物逐字节不变（向后兼容硬门槛）：新签名不改动 dev-compose.yml 一个字符。"""

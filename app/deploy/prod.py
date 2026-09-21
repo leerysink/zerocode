@@ -7,7 +7,8 @@ D-1 模块级名字纪律（同 engine）：对 engine/compose/provision 的复�
 `from ... import name` 后以 bare name 调用，测试 monkeypatch prod.<name> 才生效；
 `_docker` 是 engine.docker 的薄包装（模块级可替身）。
 """
-import asyncio, logging, time
+import asyncio, logging, re as _re, time
+from datetime import datetime
 from pathlib import Path
 import httpx
 from sqlalchemy import text
@@ -16,8 +17,9 @@ from app.deploy.compose import ensure_deploy_files
 from app.deploy.errors import DeployError
 from app.deploy.engine import (preflight_docker, _app_root, _compose_meta, _notify,
                                LOG_PREFIX)
-from app.deploy.provision import read_cred
+from app.deploy.provision import read_cred, provision_env
 from app.deploy.settings import deploy_cfg
+from app.deploy.sqlrun import run_sqlchange
 
 logger = logging.getLogger(__name__)
 
@@ -187,3 +189,282 @@ async def reconcile(sf, notify=None) -> None:
         new = "running" if up else "stopped"
         await set_status(sf, app_id, new)
         await _notify(notify, app_id, {"type": "prod_status", "status": new})
+
+
+# ===================== Task 7：发布流水线（publish 七步 / 自动回退 / rollback / keep-5）=====================
+
+# 04 §4.1 状态机进度（前端进度条按此顺序点亮；record 收口在记账之后，故最后一步是记账）
+STEPLIST = ("preflight", "build", "provision", "migrate", "deploy", "health", "record")
+# 迁移文件名规范（07 迁移闸门 + 全局约束「注释不得含分号」）：安全名=词/连字符/点/汉字，不含分号
+_SQL_NAME = _re.compile(r"^V\d{8}_\d{2}_[\w\-.\u4e00-\u9fff]+\.sql$")
+
+
+def next_version() -> str:
+    """版本号 `b<本地 YYYYMMDDHHmmss>`：字符串字典序即时间序（04 §4.5）。"""
+    return datetime.now().strftime("b%Y%m%d%H%M%S")
+
+
+def scan_sqlchange(root: Path) -> list[str]:
+    """sqlchange 目录里不合命名规范的文件名清单（preflight 闸门的数据源；目录不存在=无违规）。"""
+    d = root / "sqlchange"
+    if not d.is_dir():
+        return []
+    return sorted(p.name for p in d.iterdir()
+                  if p.suffix == ".sql" and not _SQL_NAME.match(p.name))
+
+
+async def _step_ev(app_id, notify, rid_step_cb, step: str, state: str) -> None:
+    """publish_step 事件（04 §5 逐字 {step,state}）+ 记账游标推进。
+
+    state 只发 running|ok：失败统一由 publish_done 收口（③裁定——事件精简，
+    前端不必在两条通道上各自判定失败）。
+    """
+    await _notify(notify, app_id, {"type": "publish_step", "step": step, "state": state})
+    if rid_step_cb:
+        await rid_step_cb(step)
+
+
+async def _ensure_prod_proxy_conf(root: Path) -> bool:
+    """存量应用补齐 frontend/nginx.conf（T3b 之前创建的工程没有它，build 必挂）。
+
+    模板源取 `app_service.TEMPLATES`——平台唯一写入方就地补文件，不造 parents 链（控制者裁定）。
+    """
+    from app.services.app_service import TEMPLATES
+    fe = root / "frontend"
+    conf = fe / "nginx.conf"
+    if not fe.is_dir() or conf.is_file():
+        return False
+    src = TEMPLATES / "vue3-fastapi" / "frontend" / "nginx.conf"
+    if not src.is_file():
+        raise DeployError(f"生产反代模板缺失：{src}", status=500)
+    conf.write_text(src.read_text(encoding="utf-8"), encoding="utf-8", newline="")
+    return True
+
+
+async def publish(sf, app: dict, notify=None, *, force: bool = False) -> dict:
+    """七步发布（04 §4.1）：旧容器全程不动，体检过了才切 current_version（§4.3 失败自动回退）。
+
+    force 是端点层 chat 闸门（FR4-09）的透传位——引擎不查 hub，「发布进行中/有活跃会话」的 409
+    由端点判（分层干净）；这里保留形参以免端点侧出现签名漂移。
+    """
+    app_id = app["id"]
+    slug = app["slug"]
+    await preflight_docker()          # 预检前置于一切状态与事件（Task 11/12：零事件、503 立答）
+    app = _compose_meta(app)
+    root = await _app_root(sf, app)
+    version = next_version()
+    from app.services import app_service
+    prev_version = (await app_service.get_app(sf, app_id)).get("current_version")
+    rid = await records.begin(sf, app_id, "publish", version)
+    t0 = time.monotonic()
+
+    async def rst(step):
+        await records.set_step(sf, rid, step)
+
+    def done_payload(ok: bool, error: str = "") -> dict:
+        # 失败时 version 回指 prev_version：前端卡片继续显示「在服务的版本」，不虚报新版本
+        return {"type": "publish_done", "ok": ok, "version": version if ok else prev_version,
+                "url": f"http://localhost:{_prod_port(app)}", "error": error}
+
+    try:
+        await set_status(sf, app_id, "publishing")
+        await _notify(notify, app_id, {"type": "prod_status", "status": "publishing"})
+        # 1 preflight：命名规范 + 工程件齐备（旧栈原样在跑，此时失败=零影响）
+        await _step_ev(app_id, notify, rst, "preflight", "running")
+        bad = scan_sqlchange(root)
+        if bad:
+            raise DeployError(f"sqlchange 文件名不规范：{bad}（应为 V<日期>_<两位序号>_<说明>.sql）")
+        if not (root / "app.json").is_file():
+            raise DeployError("app.json 缺失，无法发布")
+        if await _ensure_prod_proxy_conf(root):
+            await _step(app_id, notify, "✓ 已为存量应用补齐 frontend/nginx.conf（生产反代）")
+        await _step_ev(app_id, notify, rst, "preflight", "ok")
+        # 2 build（旧容器不动——04 §4.1；渲染先于 build：prod-compose.yml 的落盘条件已放宽为栈判定）
+        await _step_ev(app_id, notify, rst, "build", "running")
+
+        async def blog(line):
+            await _notify(notify, app_id, {"type": "build_log", "line": line})
+
+        compose_file = str(root / "deploy" / "prod-compose.yml")
+        # D-T4：dev 侧凭据真读再传（渲染器对「没带」的语义是保留既有 DEV_*，谎称没带会错位）；
+        # 读空=数据异常（provision 从未跑过或被清），显式 500，不静默传空 dict 让发布继续吃灰。
+        cred_dev = await read_cred(sf, slug, "dev")
+        if cred_dev is None:
+            raise DeployError("dev 凭据异常：应用缺 dev 数据库凭据（未供给或已被清理），"
+                              "请先在预览环境启动一次再发布", status=500)
+        cred0 = await read_cred(sf, slug, "prod")
+        ensure_deploy_files(root, app, {"dev": cred_dev, "prod": cred0 or {}}, version=version)
+        code, log = await _docker("compose", "-f", compose_file, "build", cwd=str(root), on_line=blog)
+        if code != 0:
+            raise DeployError(f"镜像构建失败:\n{log[-1500:]}")
+        await _step_ev(app_id, notify, rst, "build", "ok")
+        # 3 provision（幂等复用 M1 供给；prod 凭据在这里补齐，随后重渲染把真值写进 .env）
+        await _step_ev(app_id, notify, rst, "provision", "running")
+        cred = await provision_env(sf, slug, "prod")
+        ensure_deploy_files(root, app, {"dev": cred_dev, "prod": cred}, version=version)
+        await _step_ev(app_id, notify, rst, "provision", "ok")
+        # 4 migrate（prod 库自有 sqlchange_history，增量语义同 dev；不过应用不起）
+        await _step_ev(app_id, notify, rst, "migrate", "running")
+        mig = await run_sqlchange(root, "prod", cred, on_log=blog)
+        if not mig["ok"]:
+            raise DeployError(f"prod 迁移失败（退出码 {mig['code']}），旧版本继续服务")
+        sql_applied = [ln.split()[1] for ln in mig["log"].splitlines()
+                       if ln.startswith("OK ") and len(ln.split()) > 1]
+        await _step_ev(app_id, notify, rst, "migrate", "ok")
+        # 5 deploy：同 tag 已在 build 产出，up -d 只做切换（migrate 闸门已在 compose 内）
+        await _step_ev(app_id, notify, rst, "deploy", "running")
+        code, log = await _docker("compose", "-f", compose_file, "up", "-d", cwd=str(root),
+                                  on_line=blog)
+        if code != 0:
+            raise DeployError(f"切换新版本失败:\n{log[-800:]}")
+        await _step_ev(app_id, notify, rst, "deploy", "ok")
+        # 6 health：失败自动回退旧 tag（04 §4.3 / S-04-2）——程序回退，数据库永不回滚
+        await _step_ev(app_id, notify, rst, "health", "running")
+        timeout = int((await deploy_cfg(sf)).get("deploy.health_timeout", 240))
+        ok, checks = await wait_prod_health(root, _prod_port(app), timeout, app.get("stack", ""))
+        if not ok:
+            has_prev = bool(prev_version)
+            rolled_back = has_prev and await image_exists(
+                f"zc-{slug}-frontend:prod-{prev_version}")
+            if rolled_back:
+                await _step(app_id, notify, "✗ 新版本体检未通过，自动回退上一版本", level=logging.WARNING)
+                # 回退=按旧版本号重渲染（PROD_VERSION 落回旧 tag）后再 up：顺序反了就起错栈
+                ensure_deploy_files(root, app, {"dev": cred_dev, "prod": cred},
+                                    version=prev_version)
+                await _docker("compose", "-f", compose_file, "up", "-d", cwd=str(root))
+                await set_status(sf, app_id, "running")
+                await _notify(notify, app_id, {"type": "prod_status", "status": "running"})
+            else:
+                # 无回退目标（首版，或旧版镜像已被 keep-5 清掉）：新容器留着供排查，标 unhealthy
+                await set_status(sf, app_id, "unhealthy")
+                await _notify(notify, app_id, {"type": "prod_status", "status": "unhealthy"})
+            why = ("已回退上一版本" if rolled_back
+                   else "上一版本镜像已清理，无回退目标" if has_prev
+                   else "首次发布无旧版可回退")
+            await records.finish(sf, rid, "failed", step="health",
+                                 error=f"体检未通过 {checks}；{why}")
+            await _notify(notify, app_id, done_payload(
+                False, f"新版本体检未通过（{checks}），"
+                       + ("已回退并保持上一版本运行" if rolled_back else f"无回退目标（{why}），标 unhealthy 供排查")))
+            return {"status": "running" if rolled_back else "unhealthy",
+                    "version": prev_version, "url": "", "recordId": rid}
+        await _step_ev(app_id, notify, rst, "health", "ok")
+        # 7 record：体检通过才推进 current_version（版本闸门的另一半含义），随后 keep-5 清镜像
+        await _step_ev(app_id, notify, rst, "record", "running")
+        async with sf() as s:
+            await s.execute(text(
+                "UPDATE app_project SET current_version=:v, status_prod='running', "
+                "updated_at=now() WHERE id=:i"), {"v": version, "i": app_id})
+            await s.commit()
+        from app.deploy import nics
+        urls = await nics.app_urls(sf, app)
+        url = urls["lan"] or urls["localhost"]
+        nics.update_readme(root, url, version)
+        await records.finish(sf, rid, "success", step="record", detail={
+            "images": [f"zc-{slug}-frontend:prod-{version}", f"zc-{slug}-backend:prod-{version}"],
+            "sqlApplied": sql_applied, "durationMs": int((time.monotonic() - t0) * 1000),
+            "url": url})
+        await cleanup_images(sf, app_id, slug, notify=notify)   # keep-N：发布收尾顺手清旧镜像
+        await _step_ev(app_id, notify, None, "record", "ok")
+        await _notify(notify, app_id, {"type": "prod_status", "status": "running"})
+        await _step(app_id, notify, f"✓ 发布完成 {version}，访问 {url}"
+                    f"（耗时 {time.monotonic() - t0:.1f}s）")
+        out = done_payload(True)
+        out["url"] = url
+        await _notify(notify, app_id, out)
+        return {"status": "running", "version": version, "url": url, "recordId": rid}
+    except DeployError as e:
+        # 一切失败收口：记账 failed → publishing 残留复位 error → 播报 → publish_done(ok=false)
+        await records.finish(sf, rid, "failed", error=str(e)[:2000])
+        if await get_status(sf, app_id) == "publishing":
+            await set_status(sf, app_id, "error")
+            await _notify(notify, app_id, {"type": "prod_status", "status": "error",
+                                           "message": str(e)})
+        await _step(app_id, notify, f"✗ 发布失败：{str(e).splitlines()[0][:200]}",
+                    level=logging.WARNING)
+        await _notify(notify, app_id, done_payload(False, str(e)[:500]))
+        raise
+    except Exception as e:
+        await records.finish(sf, rid, "failed", error=f"{type(e).__name__}: {e}")
+        await set_status(sf, app_id, "error")
+        await _notify(notify, app_id, {"type": "prod_status", "status": "error", "message": str(e)})
+        await _notify(notify, app_id, done_payload(False, str(e)[:500]))
+        raise DeployError(f"发布失败: {e}") from e
+
+
+async def rollback(sf, app: dict, version: str, notify=None) -> dict:
+    """一键回滚（FR4-04）：只切程序（旧 tag 重渲染 + up -d），**数据库永不回滚**（07/D8）。"""
+    app_id = app["id"]
+    slug = app["slug"]
+    await preflight_docker()
+    app = _compose_meta(app)
+
+    async def _reject(message: str, status: int):
+        """记账与状态变更之前的闸门失败（400/409 由端点立答）：引擎侧也收口 publish_done，
+        避免端点把它放后台执行时留下 202 黑洞（与「不留悬空态」同一条纪律）。"""
+        await _notify(notify, app_id, {"type": "publish_done", "ok": False, "version": version,
+                                       "url": "", "error": message})
+        raise DeployError(message, status=status)
+
+    for role in ("frontend", "backend"):
+        if not await image_exists(f"zc-{slug}-{role}:prod-{version}"):
+            await _reject(f"该版本镜像已清理（{role}），无法回滚", 400)
+    root = await _app_root(sf, app)
+    cred = await read_cred(sf, slug, "prod")
+    if not cred:
+        await _reject("prod 凭据缺失，无法回滚", 409)
+    cred_dev = await read_cred(sf, slug, "dev") or {}       # D-T4：dev 侧真读，缺位才交空
+    rid = await records.begin(sf, app_id, "rollback", version)
+    try:
+        await set_status(sf, app_id, "publishing")
+        await _notify(notify, app_id, {"type": "prod_status", "status": "publishing"})
+        ensure_deploy_files(root, app, {"dev": cred_dev, "prod": cred}, version=version)
+        code, log = await _docker(*_prod_compose_args(root), "up", "-d", cwd=str(root))
+        if code != 0:
+            raise DeployError(f"回滚起栈失败:\n{log[-800:]}")
+        timeout = int((await deploy_cfg(sf)).get("deploy.health_timeout", 240))
+        ok, checks = await wait_prod_health(root, _prod_port(app), timeout, app.get("stack", ""))
+        async with sf() as s:
+            await s.execute(text("UPDATE app_project SET current_version=:v, status_prod=:st, "
+                                 "updated_at=now() WHERE id=:i"),
+                            {"v": version, "st": "running" if ok else "unhealthy", "i": app_id})
+            await s.commit()
+        await records.finish(sf, rid, "success" if ok else "failed", step="health",
+                             error=None if ok else f"回滚后体检未通过 {checks}")
+        await _notify(notify, app_id, {"type": "prod_status",
+                                       "status": "running" if ok else "unhealthy"})
+        from app.deploy import nics
+        urls = await nics.app_urls(sf, app)
+        await _notify(notify, app_id, {"type": "publish_done", "ok": ok, "version": version,
+                                       "url": urls["lan"] or urls["localhost"],
+                                       "error": "" if ok else f"体检未通过 {checks}"})
+        return {"status": "running" if ok else "unhealthy", "version": version,
+                "url": urls["lan"] or urls["localhost"], "recordId": rid}
+    except DeployError as e:
+        await records.finish(sf, rid, "failed", error=str(e)[:2000])
+        await set_status(sf, app_id, "error")
+        await _notify(notify, app_id, {"type": "prod_status", "status": "error", "message": str(e)})
+        await _notify(notify, app_id, {"type": "publish_done", "ok": False, "version": version,
+                                       "url": "", "error": str(e)[:500]})
+        raise
+    except Exception as e:
+        await records.finish(sf, rid, "failed", error=f"{type(e).__name__}: {e}")
+        await set_status(sf, app_id, "error")
+        await _notify(notify, app_id, {"type": "publish_done", "ok": False, "version": version,
+                                       "url": "", "error": str(e)[:500]})
+        raise DeployError(f"回滚失败: {e}") from e
+
+
+async def cleanup_images(sf, app_id: int, slug: str, notify=None) -> list[str]:
+    """keep-N 镜像清理（FR4-05）：rmi 尽力而为，返回**实删** tag（删失败不算数）。"""
+    keep = int((await deploy_cfg(sf)).get("deploy.keep_versions", 5))
+    removed: list[str] = []
+    for v in await records.versions_for_cleanup(sf, app_id, keep):
+        for role in ("frontend", "backend"):
+            tag = f"zc-{slug}-{role}:prod-{v}"
+            code, _ = await _docker("image", "rm", tag, timeout=120)
+            if code == 0:
+                removed.append(tag)
+    if removed:
+        await _step(app_id, notify, f"✓ 已清理旧镜像 {len(removed)} 个（保留最近 {keep} 版）")
+    return removed

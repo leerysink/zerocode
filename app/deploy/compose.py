@@ -209,11 +209,15 @@ def _write_if_changed(f: Path, content: str) -> None:
         f.write_text(content, encoding="utf-8", newline="")
 
 def ensure_deploy_files(app_root: Path, meta: dict, creds: dict, version: str | None = None) -> None:
-    """渲染并落盘 deploy/{dev-compose.yml,.env}；prod creds 齐时追加 prod-compose.yml。
+    """渲染并落盘 deploy/{dev-compose.yml,.env}；栈支持发布时追加 prod-compose.yml。
 
     .env 的凭据是「单向推进」的（D-T4）：本次没带/带空的一侧（creds.dev 或 creds.prod）
     保留既有非空值，不冲空——创建流程只传 dev 不冲 PROD_*，发布流程 dev 供给缺位也不冲 DEV_*。
-    version=None 时保留既有 PROD_VERSION（发布流程显式传新值才更新）。"""
+    version=None 时保留既有 PROD_VERSION（发布流程显式传新值才更新）。
+
+    prod-compose.yml 的落盘条件只看栈（T4 波裁定）：文件内容只依赖 meta，凭据全走 .env 的
+    `${}` 插值——首次发布 build 时 prod 凭据还没供给，也必须已经有这份文件可 build。
+    """
     d = app_root / "deploy"
     d.mkdir(parents=True, exist_ok=True)
     y = render_dev_compose(meta)
@@ -231,6 +235,5 @@ def ensure_deploy_files(app_root: Path, meta: dict, creds: dict, version: str | 
             e = _env_set(e, k, old)
     _write_if_changed(d / "dev-compose.yml", y)
     _write_if_changed(ef, e)
-    if (meta.get("stack") == "vue3-fastapi"
-            and (creds.get("prod") or {}).get("password")):
+    if meta.get("stack") == "vue3-fastapi":
         _write_if_changed(d / "prod-compose.yml", render_prod_compose(meta))
