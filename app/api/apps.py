@@ -21,6 +21,7 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
 from app import config as app_config
 from app.deploy import engine, prod, records, sqlrun
+from app.deploy import provision
 from app.deploy.errors import DeployError
 from app.deploy.provision import read_cred
 from app.deploy.slugs import suggest_slug, validate_slug
@@ -290,6 +291,39 @@ async def sql_apply(request: Request, app_id: int):
     try:
         app = await app_service.get_app(sf, app_id)
         _spawn(request, app_id, lambda: _run_sqlchange(sf, app, hub))
+    except DeployError as e:
+        raise _http(e)
+    return {"ok": True}
+
+
+async def _reset_dev(sf, app: dict, hub) -> None:
+    """重建 dev 库：drop → 重新 provision → 从 sqlchange 文件全量 fold。
+    用于消除 dev 漂移，使其重新等于 fold(文件)；失败以 dev_reset_result 事件收口。"""
+    app_id = app["id"]
+    slug = app["slug"]
+
+    def on_log(line: str) -> None:
+        hub.publish(app_id, {"app_id": app_id, "type": "dev_log", "line": line})
+
+    try:
+        await provision.drop_env(sf, slug, "dev")
+        cred = await provision.provision_env(sf, slug, "dev")
+        root = await engine._app_root(sf, app)
+        res = await sqlrun.run_sqlchange(root, "dev", cred, on_log=on_log)
+        ok = res["ok"]
+    except Exception as e:
+        ok, res = False, {"code": -1, "log": str(e)}
+    hub.publish(app_id, {"app_id": app_id, "type": "dev_reset_result", "env": "dev", "ok": ok, **res})
+
+
+@router.post("/{app_id}/dev/reset", status_code=202)
+async def dev_reset(request: Request, app_id: int):
+    """一键重建 dev 库（drop+provision+fold sqlchange）：202 受理 + 后台执行，进度走 dev_log/dev_reset_result。"""
+    sf = request.app.state.session_factory
+    hub = request.app.state.deploy_hub
+    try:
+        app = await app_service.get_app(sf, app_id)
+        _spawn(request, app_id, lambda: _reset_dev(sf, app, hub))
     except DeployError as e:
         raise _http(e)
     return {"ok": True}
