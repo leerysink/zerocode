@@ -69,10 +69,24 @@ async def mark_interrupted(sf) -> int:
 
 
 async def versions_for_cleanup(sf, app_id: int, keep: int) -> list[str]:
-    """可清理的旧版本 tag 清单：只数 publish 过的版本（字典序=时间序），rollback/start 记录不算数。"""
+    """可清理的旧版本 tag 清单（字典序=时间序）：只数 publish 过的版本，rollback/start 记录不算数。
+
+    口径（审查 I-1 裁定）：`keep` 名额**只给发布成功过的版本**——失败版若占名额，每个
+    「preflight 就失败、从没 build 出镜像」的版本都会挤掉一个真实可回滚的镜像；只有失败
+    记录的发布版本**无条件入清理清单**（镜像无用）。同一版本可能既有 failed 又有 success
+    （重发），以「是否有 success 记录」为准归好版本（取并语义）。
+    仍在 running 的版本既不占名额也不交出去（镜像可能正在 build）；它终会收口成 success/
+    failed——崩溃遗留由 mark_interrupted 兜底为 failed，之后即可被清理。
+    """
     async with sf() as s:
         rows = (await s.execute(text(
-            "SELECT DISTINCT version FROM deploy_record "
+            "SELECT DISTINCT version, status FROM deploy_record "
             "WHERE app_id = :a AND kind = 'publish' AND version IS NOT NULL "
-            "ORDER BY version DESC"), {"a": app_id})).scalars().all()
-    return [v for v in rows[max(int(keep), 1):]]
+            "ORDER BY version DESC"), {"a": app_id})).all()
+    statuses: dict[str, set[str]] = {}          # 按 version DESC 插入，迭代序即时间倒序
+    for version, status in rows:
+        statuses.setdefault(version, set()).add(status)
+    good = [v for v, st in statuses.items() if "success" in st]
+    kept = set(good[:max(int(keep), 1)])        # keep<=0 仍至少留一版，永不清光
+    in_flight = {v for v, st in statuses.items() if "running" in st}
+    return [v for v in statuses if v not in kept and v not in in_flight]

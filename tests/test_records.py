@@ -88,6 +88,37 @@ async def test_versions_for_cleanup(test_engine):
     assert out == ["b20260920120000"]                             # 三个 publish 版本只留最新 2
 
 
+async def test_cleanup_failed_publish_does_not_consume_keep_quota(test_engine):
+    """I-1 裁定：keep 名额只给「成功过」的版本；纯 failed 的版本无条件入清理清单（镜像无用）。"""
+    sf = make_session_factory(test_engine)
+    aid = await _mk_app(sf)
+    for v in ["b20260920150000", "b20260920150100", "b20260920150200"]:
+        rid = await records.begin(sf, aid, "publish", v)
+        await records.finish(sf, rid, "success")
+    rid = await records.begin(sf, aid, "publish", "b20260920150300")
+    await records.finish(sf, rid, "failed", error="build 阶段失败")
+    out = await records.versions_for_cleanup(sf, aid, keep=3)
+    assert out == ["b20260920150300"]        # 失败版不占名额且必清，三个成功版全留
+
+
+async def test_cleanup_same_version_failed_then_success_counts_as_good(test_engine):
+    """同版本双记录取并：先 failed 后重发 success → 该版本归好版本并占 keep 名额；
+    另放一个纯 failed 版本，钉住「失败版必清」不因按 status 过滤而被漏掉。"""
+    sf = make_session_factory(test_engine)
+    aid = await _mk_app(sf)
+    rid = await records.begin(sf, aid, "publish", "b20260920160000")
+    await records.finish(sf, rid, "success")
+    rid = await records.begin(sf, aid, "publish", "b20260920160100")   # 同版本首发失败
+    await records.finish(sf, rid, "failed", error="migrate 超时")
+    rid = await records.begin(sf, aid, "publish", "b20260920160100")   # 重发成功
+    await records.finish(sf, rid, "success")
+    rid = await records.begin(sf, aid, "publish", "b20260920160200")
+    await records.finish(sf, rid, "failed", error="build 阶段失败")
+    out = await records.versions_for_cleanup(sf, aid, keep=1)
+    assert "b20260920160100" not in out      # 最新的好版本必须留在服务里
+    assert out == ["b20260920160200", "b20260920160000"]
+
+
 async def test_finish_detail_two_merges_keep_keys(test_engine):
     """控制者裁定钉（字面序列）：begin → finish 不传 detail → finish 再传 detail，读回键完整非 NULL。"""
     sf = make_session_factory(test_engine)

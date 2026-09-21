@@ -21,10 +21,12 @@ async def test_engine():
     await run_migrations(engine)
     yield engine
     # 测试间清库（全局约束），保留 schema_migration 与 app_config 种子
+    # deploy_record 显式点名：此前只靠 app_project 的 FK ON DELETE CASCADE 隐式带掉，
+    # 一旦历史表改成「应用删了历史仍留」就会静默漏表（审查 M-9）。
     async with engine.begin() as conn:
         await conn.execute(text(
-            "TRUNCATE message, file_change, compaction, chat_session, workspace, app_project, model_config "
-            "RESTART IDENTITY CASCADE"))
+            "TRUNCATE message, file_change, compaction, chat_session, workspace, app_project, model_config, "
+            "deploy_record RESTART IDENTITY CASCADE"))
     await engine.dispose()
 
 @pytest.fixture
