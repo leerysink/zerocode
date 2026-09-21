@@ -75,3 +75,14 @@ def test_rendered_backend_has_startup_banner(tmp_path):
     for field in ("后端启动", "监听地址", "健康检查", "数据库", "连通性", "就绪耗时"):
         assert field in main, field
     assert "lifespan=lifespan" in main                              # banner 挂在应用生命周期上
+
+
+def test_template_nginx_prod_proxy(tmp_path):
+    from app.deploy import scaffold
+    mapping = {"SLUG": "lailiao", "APP_NAME": "来料登记", "DEV_PORT": "8211", "PROD_PORT": "8210",
+               "DEV_DB": "lailiao_dev", "PROD_DB": "lailiao_prod", "TODAY": "20260920"}
+    scaffold.render(TEMPLATE, tmp_path, mapping)
+    ng = (tmp_path / "frontend" / "nginx.conf").read_text(encoding="utf-8")
+    assert "proxy_pass http://backend:8000" in ng and "try_files" in ng
+    dk = (tmp_path / "frontend" / "Dockerfile").read_text(encoding="utf-8")
+    assert "COPY nginx.conf /etc/nginx/conf.d/default.conf" in dk
