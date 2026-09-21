@@ -111,6 +111,9 @@ def create_app(database_url: str | None = None) -> FastAPI:
     # 部署发布套件（Task 12）：/ws/deploy/{app_id} 部署事件流（须在静态托管之前，路由不被 SPA 吞掉）
     from app.api import deploy_ws
     app.include_router(deploy_ws.router)
+    # 部署发布套件（Task 5）：/api/system/nics 网卡候选（局域网地址选择的数据源）
+    from app.api import system
+    app.include_router(system.router)
     app.include_router(ws_router)
 
     # ---- 前端静态托管（Task 15）：挂载 frontend/dist，SPA 回退 index.html ----

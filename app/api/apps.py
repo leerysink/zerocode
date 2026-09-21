@@ -206,6 +206,18 @@ async def dev_status(request: Request, app_id: int):
         raise _http(e)
 
 
+@router.get("/{app_id}/urls")
+async def app_urls(request: Request, app_id: int):
+    """应用访问地址（规格 05 §5）：本机 + 局域网 + 网卡候选，无副作用只读。"""
+    sf = request.app.state.session_factory
+    try:
+        app = await app_service.get_app(sf, app_id)
+        from app.deploy import nics
+        return await nics.app_urls(sf, app)
+    except DeployError as e:
+        raise _http(e)
+
+
 # ---------- sqlchange（Task 12 / 规格 07）：应用侧迁移的执行、记账与待办清单 ----------
 
 def _app_db_url(cred: dict) -> str:
