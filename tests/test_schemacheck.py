@@ -1,5 +1,5 @@
 # tests/test_schemacheck.py
-from app.deploy.schemacheck import normalize_dump, schema_diff, is_parity
+from app.deploy.schemacheck import normalize_dump, schema_diff, is_parity, parity_block_message
 
 DUMP_A = """
 -- comment line
@@ -45,3 +45,19 @@ def test_normalize_strips_pg_dump_restrict_meta():
     b = "\\restrict OTHERTOKEN\nCREATE TABLE public.t1 (\n    id integer\n);\n\\unrestrict OTHERTOKEN\n"
     assert is_parity(schema_diff(normalize_dump(a), normalize_dump(b))) is True
     assert "restrict" not in normalize_dump(a)
+
+
+def test_parity_block_message_none_when_ok():
+    assert parity_block_message({"ok": True, "diff": {}}) is None
+
+
+def test_parity_block_message_lists_drift_when_mismatch():
+    vp = {"ok": False, "diff": {"objects_only_in_dev": ["stray"],
+                                 "objects_only_in_files": ["t2"]}}
+    msg = parity_block_message(vp)
+    assert msg and "stray" in msg and "t2" in msg
+
+
+def test_parity_block_message_surfaces_error():
+    msg = parity_block_message({"ok": False, "diff": {}, "error": "dev 凭据缺失"})
+    assert msg and "dev 凭据缺失" in msg

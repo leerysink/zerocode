@@ -20,6 +20,7 @@ from app.deploy.engine import (preflight_docker, _app_root, _compose_meta, _noti
 from app.deploy.provision import read_cred, provision_env
 from app.deploy.settings import deploy_cfg
 from app.deploy.sqlrun import run_sqlchange
+from app.deploy.schemacheck import verify_dev_matches_files, parity_block_message
 
 logger = logging.getLogger(__name__)
 
@@ -311,6 +312,17 @@ async def publish(sf, app: dict, notify=None, *, force: bool = False) -> dict:
             raise DeployError("app.json 缺失，无法发布")
         if await _ensure_prod_proxy_conf(root):
             await _step(app_id, notify, "✓ 已为存量应用补齐 frontend 生产反代（nginx.conf / Dockerfile COPY 接线）")
+        # 1.x dev/prod 结构等价校验（P1 止血；并入 preflight，不改步序）：
+        #     dev 实际结构必须等于 fold(sqlchange 文件)，否则视为漂移，硬阻断发布。
+        _skip_verify = str((await deploy_cfg(sf)).get("deploy.skip_schema_parity", "")).lower() in ("1", "true", "yes")
+        if _skip_verify:
+            await _step(app_id, notify, "⚠ 已跳过 dev/prod 结构等价校验（deploy.skip_schema_parity）")
+        else:
+            _vp = await verify_dev_matches_files(sf, root, slug)
+            _block = parity_block_message(_vp)
+            if _block:
+                raise DeployError(_block)
+            await _step(app_id, notify, "✓ dev 结构与 sqlchange 文件等价校验通过")
         await _step_ev(app_id, notify, rst, "preflight", "ok")
         # 2 build（旧容器不动——04 §4.1；渲染先于 build：prod-compose.yml 的落盘条件已放宽为栈判定）
         await _step_ev(app_id, notify, rst, "build", "running")

@@ -63,6 +63,19 @@ def is_parity(diff: dict) -> bool:
     return not diff["only_in_dev"] and not diff["only_in_files"]
 
 
+def parity_block_message(vp: dict) -> str | None:
+    """ok=True → None（放行）；否则返回人读的漂移阻断文案（含缺失/多余对象或 error）。"""
+    if vp.get("ok"):
+        return None
+    if vp.get("error"):
+        return f"结构等价校验无法完成：{vp['error']}"
+    diff = vp.get("diff", {})
+    return ("dev 结构与 sqlchange 文件不一致（疑似 dev 漂移），已阻断发布。"
+            f"仅存在于 dev: {diff.get('objects_only_in_dev', [])}；"
+            f"仅存在于文件: {diff.get('objects_only_in_files', [])}。"
+            "请点「重建 dev」补齐，或修正迁移文件后重试")
+
+
 async def _docker(*args) -> tuple[int, str]:
     p = await asyncio.create_subprocess_exec(
         "docker", *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)

@@ -444,12 +444,13 @@ class PubSeams(Seams):
     """
 
     def __init__(self, monkeypatch, root, *, build_code=0, up_codes=(0,), health_results=(True,),
-                 mig_ok=True, dev_cred=True, prod_cred=True, images=True, rm_code=0):
+                 mig_ok=True, dev_cred=True, prod_cred=True, images=True, rm_code=0, parity_ok=True):
         super().__init__(monkeypatch)
         self.root = Path(root)
         self.up_codes, self.health_results = tuple(up_codes), tuple(health_results)
         self.build_code, self.mig_ok, self.images = build_code, mig_ok, images
         self.rm_code = rm_code
+        self.parity_ok = parity_ok
         self.n_up = self.n_health = 0
         calls = self.calls
 
@@ -512,11 +513,20 @@ class PubSeams(Seams):
         async def app_root(sf_, app_):
             return self.root
 
+        async def verify(sf_, root_, slug_):
+            # P1 结构等价校验：默认放行（ok=True）；parity_ok=False 时模拟 dev 漂移阻断
+            calls.append(("verify", slug_))
+            if self.parity_ok:
+                return {"ok": True, "diff": {}}
+            return {"ok": False, "diff": {"objects_only_in_dev": ["stray"],
+                                          "objects_only_in_files": []}}
+
         # preflight_docker 与 set_status 由基座 Seams 负责（基座已记录 ("preflight",) 与 ("status", st)）
         for name, fn in (("_docker", docker),
                          ("read_cred", cred), ("provision_env", prov), ("run_sqlchange", mig),
                          ("wait_prod_health", health), ("ensure_deploy_files", ensure),
-                         ("image_exists", image_exists), ("_app_root", app_root)):
+                         ("image_exists", image_exists), ("_app_root", app_root),
+                         ("verify_dev_matches_files", verify)):
             monkeypatch.setattr(prod, name, fn)
 
     @property
@@ -716,6 +726,34 @@ async def test_publish_blocks_on_bad_sqlchange_name(monkeypatch, sf, seed, pub_r
         kind, st, step = (await s.execute(t(
             "SELECT kind, status, step FROM deploy_record WHERE app_id=:i"), {"i": aid})).first()
     assert (kind, st, step) == ("publish", "failed", "preflight")
+
+
+async def test_publish_blocks_on_dev_drift(monkeypatch, sf, seed, pub_root):
+    """P1 结构等价闸门（并入 preflight）：dev 与文件漂移 → 不起栈、不收口 ok、阻断发布。"""
+    wid, aid = await seed(slug="zcpub", prod_port=8982, dev_port=8983,
+                          status_prod="running", current_version=PREV_VER)
+    seams = PubSeams(monkeypatch, pub_root, parity_ok=False)
+
+    with pytest.raises(DeployError) as ei:
+        await prod.publish(sf, _pub_app(aid), notify=seams.notify, force=True)
+    assert "不一致" in str(ei.value) and "stray" in str(ei.value)
+    assert seams.step_seq == [("preflight", "running")]          # 校验在 preflight 内、ok 之前
+    assert "compose build" not in seams.verbs and not seams.ups()
+    assert seams.dones[-1]["ok"] is False and "漂移" in seams.dones[-1]["error"]
+    assert seams.statuses == ["publishing", "error"]
+
+
+async def test_publish_can_skip_schema_parity_check(monkeypatch, sf, seed, pub_root):
+    """兑底开关：置 deploy.skip_schema_parity=true 时即使漂移也放行（不写库，monkeypatch 配置）。"""
+    async def _cfg(_s):
+        return {"deploy.skip_schema_parity": "true"}
+    monkeypatch.setattr(prod, "deploy_cfg", _cfg)
+    wid, aid = await seed(slug="zcpub", prod_port=8982, dev_port=8983)
+    seams = PubSeams(monkeypatch, pub_root, parity_ok=False)      # 即便模拟漂移…
+
+    res = await prod.publish(sf, _pub_app(aid), notify=seams.notify, force=True)   # …仍应发布成功
+    assert res["status"] == "running" and seams.steps_ok == list(PUB_STEPS)
+    assert not any(c[0] == "verify" for c in seams.calls)          # 开关生效：根本没调校验
 
 
 async def test_publish_requires_dev_cred(monkeypatch, sf, seed, pub_root):
