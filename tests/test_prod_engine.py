@@ -1,11 +1,13 @@
 # tests/test_prod_engine.py
 """Task 6：prod 生命周期（启停/状态/联合体检/镜像存在性/启动对账）。全替身，无真 Docker 依赖。"""
 import asyncio
+import logging
 from pathlib import Path
 
 import pytest
 from sqlalchemy import text as t
 
+from app.db import make_session_factory
 from app.deploy import prod, sqlrun
 from app.deploy.errors import DeployError
 
@@ -26,20 +28,27 @@ class Seams:
     调用真实现（真写库）的同时记录调用序。事件与调用序完整，且「真写库断言」不恒真。
     docker 替身按 brief 原稿只匹配 ("compose","-f","x")，对真实渲染参数（prod-compose.yml
     全路径）永不命中、up_code 失效——改为 compose+up 判定，up_code 才有观测意义。
+    Task 6 微修（I-2）扩展：down_code / preflight_exc 仍是同一替身营的开关参数，
+    不新增打桩框架。
     """
 
-    def __init__(self, monkeypatch, up_code=0):
+    def __init__(self, monkeypatch, up_code=0, down_code=0, preflight_exc=None):
         self.calls, self.events = [], []
         self.up_code = up_code
+        self.down_code = down_code
 
         async def docker(*a, **k):
             self.calls.append(("docker",) + a)
             if a[0] == "compose" and "up" in a:
                 return self.up_code, "compose up boom"
+            if a[0] == "compose" and "down" in a:
+                return self.down_code, "compose down boom"
             return 0, "ok"
 
         async def preflight():
             self.calls.append(("preflight",))
+            if preflight_exc is not None:
+                raise preflight_exc
 
         async def app_root(sf, app):
             return Path("D:/__zc_prod_test__")
@@ -76,28 +85,49 @@ def _app(app_id, slug="zcdemo", prod_port=8998, dev_port=8999, stack="vue3-fasta
             "prod_port": prod_port, "dev_port": dev_port}
 
 
-async def _seed(sf, slug="zcdemo", prod_port=8998, dev_port=8999, status_prod="stopped",
-                current_version=CV):
-    """真实种子行：workspace + app_project（prod 状态/版本可控）。返回 (wid, aid)。"""
-    async with sf() as s:
-        wid = (await s.execute(t(
-            "INSERT INTO workspace (name, root_path) VALUES (:n, :r) RETURNING id"),
-            {"n": slug, "r": "D:/__zc_prod_test__"})).scalar()
-        aid = (await s.execute(t(
-            "INSERT INTO app_project (workspace_id, name, slug, scale, stack, prod_port,"
-            " dev_port, status_prod, current_version) VALUES (:w, :n, :sl, 'small',"
-            " 'vue3-fastapi', :pp, :dp, :st, :cv) RETURNING id"),
-            {"w": wid, "n": slug, "sl": slug, "pp": prod_port, "dp": dev_port,
-             "st": status_prod, "cv": current_version})).scalar()
-        await s.commit()
-    return wid, aid
+@pytest.fixture
+async def sf(test_engine):
+    return make_session_factory(test_engine)
 
 
-async def _drop(sf, wid, aid):
+@pytest.fixture
+async def seed(sf):
+    """真实种子行：workspace + app_project（prod 状态/版本可控），返回 (wid, aid)。
+
+    I-3 清理纪律：插行登记进 fixture，teardown 必删——**断言失败也不泄漏**
+    （替代用例尾内联 _drop；dev 引擎在 Task 11 审查中已就同一问题修成此形态）。
+    """
+    made = []
+
+    async def _seed(slug="zcdemo", prod_port=8998, dev_port=8999, status_prod="stopped",
+                    current_version=CV):
+        async with sf() as s:
+            wid = (await s.execute(t(
+                "INSERT INTO workspace (name, root_path) VALUES (:n, :r) RETURNING id"),
+                {"n": slug, "r": "D:/__zc_prod_test__"})).scalar()
+            aid = (await s.execute(t(
+                "INSERT INTO app_project (workspace_id, name, slug, scale, stack, prod_port,"
+                " dev_port, status_prod, current_version) VALUES (:w, :n, :sl, 'small',"
+                " 'vue3-fastapi', :pp, :dp, :st, :cv) RETURNING id"),
+                {"w": wid, "n": slug, "sl": slug, "pp": prod_port, "dp": dev_port,
+                 "st": status_prod, "cv": current_version})).scalar()
+            await s.commit()
+        made.append((wid, aid))
+        return wid, aid
+
+    yield _seed
     async with sf() as s:
-        await s.execute(t("DELETE FROM app_project WHERE id=:i"), {"i": aid})
-        await s.execute(t("DELETE FROM workspace WHERE id=:i"), {"i": wid})
+        for wid, aid in made:
+            await s.execute(t("DELETE FROM app_project WHERE id=:i"), {"i": aid})
+            await s.execute(t("DELETE FROM workspace WHERE id=:i"), {"i": wid})
         await s.commit()
+
+
+async def _status_prod(sf, aid):
+    """真库回读（set_status 未被替换的落库证据）。"""
+    async with sf() as s:
+        return (await s.execute(t(
+            "SELECT status_prod FROM app_project WHERE id=:i"), {"i": aid})).scalar()
 
 
 def _cred_and_ensure(monkeypatch, seams):
@@ -112,10 +142,8 @@ def _cred_and_ensure(monkeypatch, seams):
     monkeypatch.setattr(prod, "ensure_deploy_files", ensure)
 
 
-async def test_start_stop_events_and_sequence(monkeypatch, test_engine):
-    from app.db import make_session_factory
-    sf = make_session_factory(test_engine)
-    wid, aid = await _seed(sf)
+async def test_start_stop_events_and_sequence(monkeypatch, sf, seed):
+    wid, aid = await seed()
     app = _app(aid)
     seams = Seams(monkeypatch)
     _cred_and_ensure(monkeypatch, seams)
@@ -139,24 +167,16 @@ async def test_start_stop_events_and_sequence(monkeypatch, test_engine):
     assert ens[1] == CV                                         # version=current_version
     assert ens[2]["prod"]["db"] == "zcdemo_prod"
     assert ens[2]["dev"]["db"] == "zcdemo_dev"                  # D-T4：dev 侧传真凭据，不是空 dict
-    async with sf() as s:
-        st = (await s.execute(t("SELECT status_prod FROM app_project WHERE id=:i"), {"i": aid})).scalar()
-    assert st == "running"                                      # 真写库（set_status 未被替换）
+    assert await _status_prod(sf, aid) == "running"             # 真写库（set_status 未被替换）
 
     await prod.prod_stop(sf, app, notify=seams.notify)
     down = next(c for c in seams.calls if c[0] == "docker" and "down" in c)
     assert down[1:4] == ("compose", "-f", str(Path("D:/__zc_prod_test__") / "deploy" / "prod-compose.yml"))
     assert seams.statuses[-1] == "stopped"
-    async with sf() as s:
-        st = (await s.execute(t("SELECT status_prod FROM app_project WHERE id=:i"), {"i": aid})).scalar()
-    assert st == "stopped"
-    await _drop(sf, wid, aid)
+    assert await _status_prod(sf, aid) == "stopped"
 
 
-async def test_start_requires_prod_cred(monkeypatch, test_engine):
-    from app.db import make_session_factory
-    sf = make_session_factory(test_engine)
-
+async def test_start_requires_prod_cred(monkeypatch, sf):
     async def no_cred(sf, slug, env):
         return None
 
@@ -171,12 +191,56 @@ async def test_start_requires_prod_cred(monkeypatch, test_engine):
     assert ei.value.status == 409 and "凭据" in str(ei.value)
 
 
-async def test_start_up_failure_sets_error(monkeypatch, test_engine):
+async def test_start_preflight_failure_zero_change_zero_event(monkeypatch, sf, seed):
+    """I-2①（对位 dev 的 test_start_dev_docker_unavailable；03 §5 prod 同构、Task 11/12 立约点）：
+    预检失败先于任何状态变更与事件——status_prod 零变更、零事件（连 dev_log ▶ 都不发）、503 原样上抛。"""
+    wid, aid = await seed(status_prod="stopped")
+    app = _app(aid)
+    seams = Seams(monkeypatch, preflight_exc=DeployError("Docker 引擎不可用", status=503))
+    _cred_and_ensure(monkeypatch, seams)
+    with pytest.raises(DeployError) as ei:
+        await prod.prod_start(sf, app, notify=seams.notify)
+    assert ei.value.status == 503
+    assert seams.calls == [("preflight",)]                  # 预检之外什么都没发生
+    assert seams.events == []                               # 零事件（dev_log ▶ 亦不得发）
+    assert await _status_prod(sf, aid) == "stopped"         # 真库零变更
+
+
+async def test_start_requires_current_version(monkeypatch, sf, seed):
+    """I-2②（04 §4.2 版本闸门）：cred 齐但未发布过版本 → 409 引导文案含「发布」，
+    starting 之后按通用失败路径收口 error + 带 message 事件，不留悬空。"""
+    wid, aid = await seed(current_version=None)
+    app = _app(aid)
+    seams = Seams(monkeypatch)
+    _cred_and_ensure(monkeypatch, seams)
+    with pytest.raises(DeployError) as ei:
+        await prod.prod_start(sf, app, notify=seams.notify)
+    assert ei.value.status == 409 and "发布" in str(ei.value)
+    assert [c[1] for c in seams.calls if c[0] == "status"] == ["starting", "error"]
+    assert seams.statuses == ["starting", "error"]
+    err = [e for e in seams.events if e["type"] == "prod_status" and e["status"] == "error"]
+    assert err and "发布" in err[0]["message"]              # error 态事件必带 message（T9/T10 契约）
+    assert await _status_prod(sf, aid) == "error"
+
+
+async def test_stop_down_nonzero_still_stopped(monkeypatch, sf, seed, caplog):
+    """I-2③（与 dev stop_dev 逐行同口径）：compose down 非零退出（栈半死/停不干净）
+    仍记 warning 后收口 stopped、不抛——停语义必须幂等，否则前端永远卡 running。"""
+    wid, aid = await seed(status_prod="running")
+    app = _app(aid)
+    seams = Seams(monkeypatch, down_code=1)
+    with caplog.at_level(logging.WARNING):
+        res = await prod.prod_stop(sf, app, notify=seams.notify)
+    assert res == {"status": "stopped"}
+    assert seams.statuses == ["stopped"]
+    assert seams.events[-1]["type"] == "dev_log" and "已停止" in seams.events[-1]["line"]
+    assert any("非零" in r.getMessage() for r in caplog.records)   # 失败可见但不改收口
+    assert await _status_prod(sf, aid) == "stopped"
+
+
+async def test_start_up_failure_sets_error(monkeypatch, sf, seed):
     """compose up 非零 → 400 上抛且状态收口 error（starting 之后的失败必须 error+事件，不留悬空）。"""
-    from app.db import make_session_factory
-    from sqlalchemy import text as t
-    sf = make_session_factory(test_engine)
-    wid, aid = await _seed(sf)
+    wid, aid = await seed()
     app = _app(aid)
     seams = Seams(monkeypatch, up_code=1)
     _cred_and_ensure(monkeypatch, seams)
@@ -186,24 +250,12 @@ async def test_start_up_failure_sets_error(monkeypatch, test_engine):
     assert [c[1] for c in seams.calls if c[0] == "status"] == ["starting", "error"]
     assert seams.statuses == ["starting", "error"]
     assert seams.events[-1]["type"] == "dev_log" and "启动失败" in seams.events[-1]["line"]
-    async with sf() as s:
-        st = (await s.execute(t("SELECT status_prod FROM app_project WHERE id=:i"), {"i": aid})).scalar()
-    assert st == "error"
-    await _drop(sf, wid, aid)
+    assert await _status_prod(sf, aid) == "error"
 
 
-async def test_reconcile_marks_publishing_and_matches_docker(monkeypatch, test_engine):
-    from app.db import make_session_factory
-    from sqlalchemy import text as t
-    sf = make_session_factory(test_engine)
-    async with sf() as s:
-        wid = (await s.execute(t("INSERT INTO workspace (name, root_path) "
-                                 "VALUES ('r','D:/__zc_rec2__') RETURNING id"))).scalar()
-        aid = (await s.execute(t("INSERT INTO app_project (workspace_id, name, slug, scale, stack,"
-                                 " prod_port, dev_port, status_prod) VALUES (:w,'r','zcrec2','small',"
-                                 " 'vue3-fastapi', 8996, 8997, 'publishing') RETURNING id"),
-                                 {"w": wid})).scalar()
-        await s.commit()
+async def test_reconcile_marks_publishing_and_matches_docker(monkeypatch, sf, seed):
+    wid, aid = await seed(slug="zcrec2", prod_port=8996, dev_port=8997,
+                          status_prod="publishing", current_version=None)
     calls = []
 
     async def docker(*a, **k):
@@ -220,18 +272,12 @@ async def test_reconcile_marks_publishing_and_matches_docker(monkeypatch, test_e
     await prod.reconcile(sf, notify=None)
     assert calls[0] == ("mark_interrupted",)                     # 中断发布标记先于容器核对
     assert ("compose", "-p", "zc-zcrec2-prod", "ps", "-q") in calls  # 项目名 = zc-<slug>-prod
-    async with sf() as s:
-        st = (await s.execute(t("SELECT status_prod FROM app_project WHERE id=:i"), {"i": aid})).scalar()
-    assert st == "stopped"           # publishing 且无容器 → stopped（发布要重发）
-    await _drop(sf, wid, aid)
+    assert await _status_prod(sf, aid) == "stopped"    # publishing 且无容器 → stopped（发布要重发）
 
 
-async def test_reconcile_keeps_running_when_containers_up(monkeypatch, test_engine):
+async def test_reconcile_keeps_running_when_containers_up(monkeypatch, sf, seed):
     """对账正向：running 且容器在 → 维持 running（04 §6：running 以 docker 实际容器态核对）。"""
-    from app.db import make_session_factory
-    from sqlalchemy import text as t
-    sf = make_session_factory(test_engine)
-    wid, aid = await _seed(sf, slug="zcrec3", prod_port=8994, dev_port=8995, status_prod="running")
+    wid, aid = await seed(slug="zcrec3", prod_port=8994, dev_port=8995, status_prod="running")
 
     async def docker(*a, **k):
         return 0, "3f2a1b9c\n"       # ps -q 有输出 = 容器在跑
@@ -243,10 +289,30 @@ async def test_reconcile_keeps_running_when_containers_up(monkeypatch, test_engi
 
     monkeypatch.setattr(prod.records, "mark_interrupted", no_int)
     await prod.reconcile(sf, notify=None)
-    async with sf() as s:
-        st = (await s.execute(t("SELECT status_prod FROM app_project WHERE id=:i"), {"i": aid})).scalar()
-    assert st == "running"
-    await _drop(sf, wid, aid)
+    assert await _status_prod(sf, aid) == "running"
+
+
+async def test_reconcile_docker_unreachable_resets_stopped(monkeypatch, sf, seed):
+    """I-1 回归钉 + I-2④：daemon 失联 = **exit 1 且错误文本非空**（engine.docker 以
+    stderr=STDOUT 合流进 out，审查探针 DOCKER_HOST=tcp://127.0.0.1:1 实证）——
+    只看输出会把五态残留误升 running；对账以退出码为准，非零视为无容器复位 stopped，
+    与异常分支同向（失联时宁可停、不可谎报在跑）。"""
+    wid, aid = await seed(slug="zcrec4", prod_port=8992, dev_port=8993, status_prod="running")
+    seen = []
+
+    async def docker(*a, **k):
+        seen.append(a)
+        return 1, "Cannot connect to the Docker daemon at tcp://127.0.0.1:1. Is the docker daemon running?"
+
+    monkeypatch.setattr(prod, "_docker", docker)
+
+    async def no_int(sf_):
+        return 0
+
+    monkeypatch.setattr(prod.records, "mark_interrupted", no_int)
+    await prod.reconcile(sf, notify=None)
+    assert ("compose", "-p", "zc-zcrec4-prod", "ps", "-q") in seen
+    assert await _status_prod(sf, aid) == "stopped"              # 而非误升 running
 
 
 async def test_image_exists(monkeypatch):
@@ -278,10 +344,8 @@ async def test_wait_prod_health_static_api_always_true():
     assert checks == {"frontend": False, "api": True}
 
 
-async def test_prod_status_reads_db_and_compose_text(monkeypatch, test_engine):
-    from app.db import make_session_factory
-    sf = make_session_factory(test_engine)
-    wid, aid = await _seed(sf, status_prod="running")
+async def test_prod_status_reads_db_and_compose_text(monkeypatch, sf, seed):
+    wid, aid = await seed(status_prod="running")
 
     async def app_root(sf, app):
         return Path("D:/__zc_prod_test__")
@@ -299,13 +363,10 @@ async def test_prod_status_reads_db_and_compose_text(monkeypatch, test_engine):
     assert res["compose_ps"] == '{"State":"running"}'            # 文本仅经端点回（不进事件）
     assert res["localhost"] == "http://localhost:8998"
     assert seen and seen[0][0] == "compose" and "ps" in seen[0]
-    await _drop(sf, wid, aid)
 
 
-async def test_prod_restart_stops_then_starts(monkeypatch, test_engine):
-    from app.db import make_session_factory
-    sf = make_session_factory(test_engine)
-    wid, aid = await _seed(sf, status_prod="running")
+async def test_prod_restart_stops_then_starts(monkeypatch, sf, seed):
+    wid, aid = await seed(status_prod="running")
     app = _app(aid)
     seams = Seams(monkeypatch)
     _cred_and_ensure(monkeypatch, seams)
@@ -316,4 +377,3 @@ async def test_prod_restart_stops_then_starts(monkeypatch, test_engine):
     assert verbs == ["down", "up"]                               # 先停后起
     assert [c[1] for c in seams.calls if c[0] == "status"] == ["stopped", "starting", "running"]
     assert seams.statuses == ["stopped", "starting", "running"]
-    await _drop(sf, wid, aid)

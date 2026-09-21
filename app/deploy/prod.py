@@ -179,7 +179,9 @@ async def reconcile(sf, notify=None) -> None:
     for app_id, slug in rows:
         try:
             code, out = await _docker("compose", "-p", f"zc-{slug}-prod", "ps", "-q", timeout=60)
-            up = bool(out.strip())
+            # I-1：engine.docker 以 stderr=STDOUT 合流——daemon 失联时 exit 1 且 out 是错误文本。
+            # 只看输出会把五态残留误升 running；以退出码为准，非零视为无容器（与异常分支同向）。
+            up = code == 0 and bool(out.strip())
         except Exception:
             up = False
         new = "running" if up else "stopped"
