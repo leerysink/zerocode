@@ -3,10 +3,11 @@ import axios from 'axios'
 
 const http = axios.create({ baseURL: '/api' })
 
-// WS 聊天端点 /ws/chat/{session_id}（不在 /api 前缀下，dev 由 vite proxy 转发到 8100）
-export function wsUrl(sessionId) {
+// WS 地址构造：传从 /api 前缀起算的路径（/ws/chat/{id}、/ws/deploy/{id}…，T9 泛化）；
+// 不在 /api 前缀下，dev 由 vite proxy 转发到 8100。
+export function wsUrl(path) {
   const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-  return `${proto}//${window.location.host}/ws/chat/${sessionId}`
+  return `${proto}//${window.location.host}${path}`
 }
 
 export const listWorkspaces = () => http.get('/workspaces')
@@ -56,3 +57,16 @@ export const devStop = (id) => http.post(`/apps/${id}/dev/stop`)
 export const devRestart = (id) => http.post(`/apps/${id}/dev/restart`)
 export const devStatus = (id) => http.get(`/apps/${id}/dev/status`)
 export const sqlFiles = (id) => http.get(`/apps/${id}/sqlchange/files`)
+
+// ---- 部署发布套件 M2（发布/回滚/prod 生命周期/发布历史/访问地址） ----
+export const publishApp = (id, force = false) => http.post(`/apps/${id}/publish`, { force })
+export const rollbackApp = (id, version) => http.post(`/apps/${id}/rollback`, { version })
+export const prodStart = (id) => http.post(`/apps/${id}/prod/start`)
+export const prodStop = (id) => http.post(`/apps/${id}/prod/stop`)
+export const prodRestart = (id) => http.post(`/apps/${id}/prod/restart`)
+export const prodStatus = (id) => http.get(`/apps/${id}/prod/status`)
+export const appRecords = (id, limit = 50) => http.get(`/apps/${id}/records`, { params: { limit } })
+export const deleteRecord = (id, rid) => http.delete(`/apps/${id}/records/${rid}`)
+export const appUrls = (id) => http.get(`/apps/${id}/urls`)
+export const systemNics = () => http.get('/system/nics')
+
