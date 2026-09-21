@@ -246,6 +246,14 @@ async def publish(sf, app: dict, notify=None, *, force: bool = False) -> dict:
 
     force 是端点层 chat 闸门（FR4-09）的透传位——引擎不查 hub，「发布进行中/有活跃会话」的 409
     由端点判（分层干净）；这里保留形参以免端点侧出现签名漂移。
+
+    **publish_done.version 语义（M-c 钉死，T10 契约以此为准，勿再各自猜）**：本字段只回答
+    「库里晋升在服的是哪一版」，不回答「容器里物理跑着哪一版」——
+      · 成功 → 新版本（此刻二者一致，晋升已发生）；
+      · 失败 → prev_version（失败路径一律不晋升，故回指仍登记在服的旧版；回退成功亦是它）；
+      · 首版失败（prev 为空）→ None：从来没有过在服版本，物理上跑着的那个不健康新容器
+        由 status=unhealthy 承载、由 records.detail 承载，不借 version 字段虚报「已晋升」。
+    即：version 与 current_version 同源同值，前端可无条件用它刷新卡片。
     """
     app_id = app["id"]
     slug = app["slug"]
@@ -326,27 +334,45 @@ async def publish(sf, app: dict, notify=None, *, force: bool = False) -> dict:
             has_prev = bool(prev_version)
             rolled_back = has_prev and await image_exists(
                 f"zc-{slug}-frontend:prod-{prev_version}")
+            rb_fail = ""
             if rolled_back:
                 await _step(app_id, notify, "✗ 新版本体检未通过，自动回退上一版本", level=logging.WARNING)
                 # 回退=按旧版本号重渲染（PROD_VERSION 落回旧 tag）后再 up：顺序反了就起错栈
                 ensure_deploy_files(root, app, {"dev": cred_dev, "prod": cred},
                                     version=prev_version)
-                await _docker("compose", "-f", compose_file, "up", "-d", cwd=str(root))
-                await set_status(sf, app_id, "running")
-                await _notify(notify, app_id, {"type": "prod_status", "status": "running"})
+                code2, log2 = await _docker("compose", "-f", compose_file, "up", "-d", cwd=str(root))
+                rolled_back = code2 == 0
+                if rolled_back:
+                    await set_status(sf, app_id, "running")
+                    await _notify(notify, app_id, {"type": "prod_status", "status": "running"})
+                else:
+                    # 04 §6「若回退也失败 → error，展示两个版本的日志入口」：新旧两版都不可服务，
+                    # 既不能谎报 running 也不能只标 unhealthy（那是「旧版还在跑」的口径）——标 error，
+                    # 两版号并列进文案，日志入口收敛到同一条记账（rid，含各自 up/build 尾行）。
+                    rb_fail = (f"回退也失败：新版本 {version} 体检未通过、"
+                               f"旧版本 {prev_version} 起栈退出码 {code2}，两版日志入口见记录 {rid}")
+                    await set_status(sf, app_id, "error")
+                    await _notify(notify, app_id, {"type": "prod_status", "status": "error",
+                                                   "message": f"{rb_fail}（体检 {checks}）"})
+                    await _step(app_id, notify, rb_fail, level=logging.WARNING)
             else:
                 # 无回退目标（首版，或旧版镜像已被 keep-5 清掉）：新容器留着供排查，标 unhealthy
                 await set_status(sf, app_id, "unhealthy")
                 await _notify(notify, app_id, {"type": "prod_status", "status": "unhealthy"})
             why = ("已回退上一版本" if rolled_back
+                   else rb_fail if rb_fail
                    else "上一版本镜像已清理，无回退目标" if has_prev
                    else "首次发布无旧版可回退")
             await records.finish(sf, rid, "failed", step="health",
-                                 error=f"体检未通过 {checks}；{why}")
+                                 error=f"体检未通过 {checks}；{why}"
+                                       + (f"；回退输出尾：{log2[-400:]}" if rb_fail else ""))
             await _notify(notify, app_id, done_payload(
                 False, f"新版本体检未通过（{checks}），"
-                       + ("已回退并保持上一版本运行" if rolled_back else f"无回退目标（{why}），标 unhealthy 供排查")))
-            return {"status": "running" if rolled_back else "unhealthy",
+                       + ("已回退并保持上一版本运行" if rolled_back
+                          else f"自动回退失败（{version} / {prev_version}），两版日志入口见记录 {rid}"
+                          if rb_fail
+                          else f"无回退目标（{why}），标 unhealthy 供排查")))
+            return {"status": "running" if rolled_back else "error" if rb_fail else "unhealthy",
                     "version": prev_version, "url": "", "recordId": rid}
         await _step_ev(app_id, notify, rst, "health", "ok")
         # 7 record：体检通过才推进 current_version（版本闸门的另一半含义），随后 keep-5 清镜像
@@ -363,7 +389,7 @@ async def publish(sf, app: dict, notify=None, *, force: bool = False) -> dict:
         await records.finish(sf, rid, "success", step="record", detail={
             "images": [f"zc-{slug}-frontend:prod-{version}", f"zc-{slug}-backend:prod-{version}"],
             "sqlApplied": sql_applied, "durationMs": int((time.monotonic() - t0) * 1000),
-            "url": url})
+            "health": checks, "url": url})
         await cleanup_images(sf, app_id, slug, notify=notify)   # keep-N：发布收尾顺手清旧镜像
         await _step_ev(app_id, notify, None, "record", "ok")
         await _notify(notify, app_id, {"type": "prod_status", "status": "running"})
@@ -430,7 +456,8 @@ async def rollback(sf, app: dict, version: str, notify=None) -> dict:
                             {"v": version, "st": "running" if ok else "unhealthy", "i": app_id})
             await s.commit()
         await records.finish(sf, rid, "success" if ok else "failed", step="health",
-                             error=None if ok else f"回滚后体检未通过 {checks}")
+                             error=None if ok else f"回滚后体检未通过 {checks}",
+                             detail={"health": checks} if ok else None)
         await _notify(notify, app_id, {"type": "prod_status",
                                        "status": "running" if ok else "unhealthy"})
         from app.deploy import nics
@@ -450,6 +477,7 @@ async def rollback(sf, app: dict, version: str, notify=None) -> dict:
     except Exception as e:
         await records.finish(sf, rid, "failed", error=f"{type(e).__name__}: {e}")
         await set_status(sf, app_id, "error")
+        await _notify(notify, app_id, {"type": "prod_status", "status": "error", "message": str(e)})
         await _notify(notify, app_id, {"type": "publish_done", "ok": False, "version": version,
                                        "url": "", "error": str(e)[:500]})
         raise DeployError(f"回滚失败: {e}") from e

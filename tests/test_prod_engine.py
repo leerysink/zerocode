@@ -644,6 +644,7 @@ async def test_publish_success_sequence(monkeypatch, sf, seed, pub_root):
     assert row[4]["images"] == [f"zc-zcpub-frontend:prod-{res['version']}",
                                 f"zc-zcpub-backend:prod-{res['version']}"]
     assert row[4]["durationMs"] >= 0 and "8982" in row[4]["url"]
+    assert row[4]["health"] == {"frontend": True, "api": True}   # M-b：04 §4.5 detail 形态含 health
     # ⑧ keep-5：只挤掉最老一版（前后端各一个 tag），近 5 版镜像不碰
     assert sorted(seams.rms()) == sorted([f"zc-zcpub-frontend:prod-{olds[0]}",
                                           f"zc-zcpub-backend:prod-{olds[0]}"])
@@ -805,6 +806,8 @@ async def test_publish_health_fail_autorollback(monkeypatch, sf, seed, pub_root)
     assert ("image_exists", f"zc-zcpub-frontend:prod-{PREV_VER}") in seams.calls
     # 事件收口：体检未通过 + 已回退，最后一条 publish_done(ok=false)；状态机回 running
     assert seams.dones[-1]["ok"] is False and "已回退" in seams.dones[-1]["error"]
+    # version 语义（M-c）：publish docstring 钉死「失败回指仍登记在服的 prev_version」——
+    # 回退成功即旧版在服，本例正是该约定的「失败→prev」主路径
     assert seams.dones[-1]["version"] == PREV_VER and seams.statuses == ["publishing", "running"]
     assert seams.steps_ok == ["preflight", "build", "provision", "migrate", "deploy"]
     assert any("自动回退" in ln for ln in seams.logs)          # 播报回退（日志面板可见）
@@ -813,6 +816,36 @@ async def test_publish_health_fail_autorollback(monkeypatch, sf, seed, pub_root)
     assert await _db_pair(sf, aid) == (PREV_VER, "running")
     row = await _record(sf, aid, "publish", newv)
     assert (row[1], row[2]) == ("failed", "health") and "已回退上一版本" in row[3]
+
+
+async def test_publish_health_fail_rollback_up_also_fails(monkeypatch, sf, seed, pub_root):
+    """I-1（04 §6 行4「若回退也失败 → error，展示两个版本的日志入口」）：回退的第二次 up 也
+    非零退出时**不得虚报已回退**——标 error、事件带 message、记账并列新旧两版信息。"""
+    wid, aid = await seed(slug="zcpub", prod_port=8982, dev_port=8983,
+                          status_prod="running", current_version=PREV_VER)
+    seams = PubSeams(monkeypatch, pub_root, health_results=(False,), up_codes=(0, 1))
+
+    res = await prod.publish(sf, _pub_app(aid), notify=seams.notify, force=True)
+
+    newv = seams.ensures()[0][1]
+    assert res["status"] == "error" and res["version"] == PREV_VER
+    # 回退动作真发生过（按旧版重渲染 + 第二次 up 带旧 PROD_VERSION），只是没起来
+    assert [c[1] for c in seams.ensures()] == [newv, newv, PREV_VER]
+    ups = seams.ups()
+    assert len(ups) == 2 and ups[1][-1] == f"PROD_VERSION={PREV_VER}"
+    # 状态机收口 error（不是 running、也不是 unhealthy）；error 态事件必带 message
+    assert seams.statuses == ["publishing", "error"]
+    err = [e for e in seams.events if e["type"] == "prod_status" and e["status"] == "error"]
+    assert err and "回退也失败" in err[0]["message"]
+    assert seams.dones[-1]["ok"] is False and "回退失败" in seams.dones[-1]["error"]
+    assert seams.dones[-1]["version"] == PREV_VER     # 约定见 publish docstring：失败回指在服版
+    assert seams.steps_ok == ["preflight", "build", "provision", "migrate", "deploy"]
+    assert await _db_pair(sf, aid) == (PREV_VER, "error")   # 版本零推进（新版本从未晋升）
+    # 记账：failed/step=health，error 并列两版信息（新旧日志入口同指这条记录）
+    row = await _record(sf, aid, "publish", newv)
+    assert (row[1], row[2]) == ("failed", "health") and row[0] == res["recordId"]
+    assert "回退也失败" in row[3] and newv in row[3] and PREV_VER in row[3]
+    assert all(_PW not in s for s in seams.bare_events)
 
 
 async def test_publish_health_fail_first_version_marks_unhealthy(monkeypatch, sf, seed, pub_root):
@@ -824,6 +857,9 @@ async def test_publish_health_fail_first_version_marks_unhealthy(monkeypatch, sf
 
     assert res["status"] == "unhealthy" and res["version"] is None
     assert len(seams.ups()) == 1                        # 没有第二次 up（无旧版可回退）
+    # version 语义（M-c，见 publish docstring 约定）：首版从来没有过「仍登记在服的版本」，
+    # 失败一律回指 prev_version（此即 None）——物理上跑着的不健康新容器由 status=unhealthy
+    # 承载，不借 version 虚报晋升（审查报告 B.3 同一口径）。
     assert seams.dones[-1]["ok"] is False and seams.dones[-1]["version"] is None
     assert seams.statuses == ["publishing", "unhealthy"]
     assert await _db_pair(sf, aid) == (None, "unhealthy")   # 版本零推进（首版没成）
@@ -904,6 +940,30 @@ async def test_rollback_switches_version_without_migrating(monkeypatch, sf, seed
     assert await _db_pair(sf, aid) == (PREV_VER, "running")
     row = await _record(sf, aid, "rollback", PREV_VER)
     assert (row[1], row[2]) == ("success", "health")
+    assert row[4]["health"] == {"frontend": True, "api": True}   # M-b：回滚成功 detail 也带 health
+    assert all(_PW not in s for s in seams.bare_events)
+
+
+async def test_rollback_unexpected_error_also_emits_prod_status(monkeypatch, sf, seed, pub_root):
+    """M-a（收口对称）：rollback 体内的**意外异常**（非 DeployError）也要发 prod_status
+    {status:error, message}——修前只发 publish_done，状态列已 error 而事件流少一条，
+    前端按事件流刷新的话会卡在 publishing。publish 侧两分支本就都发，此处补齐。"""
+    wid, aid = await seed(slug="zcpub", prod_port=8982, dev_port=8983,
+                          status_prod="running", current_version=PREV_VER)
+    seams = PubSeams(monkeypatch, pub_root)
+
+    def boom(root_, meta, creds, version=None):
+        raise RuntimeError("渲染器炸了")
+
+    monkeypatch.setattr(prod, "ensure_deploy_files", boom)   # try 体内、版本 UPDATE 之前
+    with pytest.raises(DeployError) as ei:
+        await prod.rollback(sf, _pub_app(aid), PREV_VER, notify=seams.notify)
+    assert "回滚失败" in str(ei.value) and "渲染器炸了" in str(ei.value)
+    assert seams.statuses == ["publishing", "error"]          # 补发的那一条
+    err = [e for e in seams.events if e["type"] == "prod_status" and e["status"] == "error"]
+    assert err and "渲染器炸了" in err[0]["message"]           # error 态事件必带 message（T9/T10）
+    assert seams.dones[-1]["ok"] is False                     # 收口仍是最后一条
+    assert await _db_pair(sf, aid) == (PREV_VER, "error")      # 意外异常不晋升版本
     assert all(_PW not in s for s in seams.bare_events)
 
 
