@@ -91,6 +91,45 @@ async def drop_env(session_factory, slug: str, env: str) -> None:
                         {"k": f"dbcred.{slug}.{env}"})
         await s.commit()
 
+async def create_db_with_role(sf, name: str) -> dict:
+    """建一个以平台超级角色(默认连接串的 username，通常是 zerocode)为 owner 的库，返回可连 cred；幂等。
+
+    供发布校验的临时库使用，不动 dev/prod 语义。密码直接复用平台连接串（超级角色跨库可连）。
+    """
+    url = make_url(app_config.database_url())
+    admin_user = url.username or "zerocode"
+    admin_pw = url.password or ""
+    engine = create_async_engine(admin_url(), isolation_level="AUTOCOMMIT")
+    try:
+        async with engine.connect() as conn:
+            has_db = (await conn.execute(text(
+                "SELECT 1 FROM pg_database WHERE datname = :n"), {"n": name})).first()
+            if not has_db:
+                await conn.exec_driver_sql(f'CREATE DATABASE "{name}" OWNER "{admin_user}"')
+    finally:
+        await engine.dispose()
+    return {"db": name, "user": admin_user, "password": admin_pw}
+
+
+async def drop_db(sf, name: str) -> None:
+    """强断连后删库；幂等。仅删库，不动角色（临时库复用超级角色，无专属角色需回收）。"""
+    engine = create_async_engine(admin_url(), isolation_level="AUTOCOMMIT")
+    try:
+        async with engine.connect() as conn:
+            for _ in range(3):
+                r = await conn.execute(text(
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                    "WHERE datname = :n AND pid <> pg_backend_pid()"), {"n": name})
+                if r.rowcount == 0:
+                    break
+            has_db = (await conn.execute(text(
+                "SELECT 1 FROM pg_database WHERE datname = :n"), {"n": name})).first()
+            if has_db:
+                await conn.exec_driver_sql(f'DROP DATABASE "{name}"')
+    finally:
+        await engine.dispose()
+
+
 async def ensure_zcnet() -> None:
     """创建外部网络 zcnet 并把 zerocode-pg16 接入（幂等；docker 不可用报 503）。"""
     async def docker(*args, ok=(0,)):
