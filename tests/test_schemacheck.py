@@ -37,3 +37,11 @@ def test_diff_reports_missing_and_extra_objects():
     assert diff["only_in_dev"] and "stray" in "\n".join(diff["only_in_dev"])
     assert not diff["only_in_files"]
     assert is_parity(diff) is False
+
+
+def test_normalize_strips_pg_dump_restrict_meta():
+    # pg_dump 16 的 \restrict/\unrestrict 带随机 token，必须被丢弃，否则同结构会误报漂移
+    a = "\\restrict TOKENXYZ\nCREATE TABLE public.t1 (\n    id integer\n);\n\\unrestrict TOKENXYZ\n"
+    b = "\\restrict OTHERTOKEN\nCREATE TABLE public.t1 (\n    id integer\n);\n\\unrestrict OTHERTOKEN\n"
+    assert is_parity(schema_diff(normalize_dump(a), normalize_dump(b))) is True
+    assert "restrict" not in normalize_dump(a)

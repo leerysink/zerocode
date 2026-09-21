@@ -8,7 +8,9 @@
 - 按 `;` 切成语句块，逐块压缩空白后排序，得到与语句输出顺序无关的稳定集合。
 """
 from __future__ import annotations
+import asyncio
 import re
+from pathlib import Path
 
 _DROP_PATTERNS = (
     re.compile(r"^--"), re.compile(r"^SET\b", re.I),
@@ -16,6 +18,7 @@ _DROP_PATTERNS = (
     re.compile(r"^ALTER \w+ .*OWNER TO\b", re.I),
     re.compile(r"^(GRANT|REVOKE)\b", re.I),
     re.compile(r"^COMMENT ON\b", re.I),
+    re.compile(r"^\\"),   # psql 元命令：\restrict/\unrestrict(带随机token)/\connect/\echo 等，非 DDL
 )
 
 
@@ -58,3 +61,45 @@ def schema_diff(dev_norm: str, files_norm: str) -> dict:
 
 def is_parity(diff: dict) -> bool:
     return not diff["only_in_dev"] and not diff["only_in_files"]
+
+
+async def _docker(*args) -> tuple[int, str]:
+    p = await asyncio.create_subprocess_exec(
+        "docker", *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+    out, _ = await p.communicate()
+    return p.returncode, out.decode(errors="replace")
+
+
+async def dump_schema(cred: dict, container: str = "zerocode-pg16") -> str:
+    """容器内 pg_dump（--no-owner --no-privileges 去角色差异）。连接走容器本地 socket。"""
+    code, out = await _docker(
+        "exec", "-e", f"PGPASSWORD={cred['password']}", container,
+        "pg_dump", "--schema-only", "--no-owner", "--no-privileges",
+        "-U", cred["user"], "-d", cred["db"])
+    if code != 0:
+        raise RuntimeError(f"pg_dump 失败({cred['db']}):\n{out[-800:]}")
+    return out
+
+
+async def verify_dev_matches_files(sf, app_dir: Path, slug: str) -> dict:
+    """P1 校验闸门：把 sqlchange 全量 fold 进 scratch，比对 dev 实际结构。
+
+    返回 {"ok": bool, "diff": {...}} 或 {"ok": False, "error": ...}；scratch 用后即删。
+    ok=False 表示 dev 与文件不一致（漂移），发布须阻断。
+    """
+    from app.deploy.provision import read_cred
+    from app.deploy import sqlrun, scratch
+    cred_dev = await read_cred(sf, slug, "dev")
+    if not cred_dev:
+        return {"ok": False, "diff": {}, "error": "dev 凭据缺失，无法校验等价性"}
+    scratch_cred = await scratch.ensure_scratch(sf, slug)
+    try:
+        mig = await sqlrun.run_sqlchange(app_dir, "verify", scratch_cred)
+        if not mig["ok"]:
+            return {"ok": False, "diff": {}, "error": f"scratch fold 失败: {mig['log'][-500:]}"}
+        dev_norm = normalize_dump(await dump_schema(cred_dev))
+        files_norm = normalize_dump(await dump_schema(scratch_cred))
+        diff = schema_diff(dev_norm, files_norm)
+        return {"ok": is_parity(diff), "diff": diff}
+    finally:
+        await scratch.cleanup_scratch(sf, slug)
