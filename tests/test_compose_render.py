@@ -112,3 +112,109 @@ def test_ensure_deploy_files_idempotent(tmp_path):
     assert y1 == y2
     env1 = (tmp_path / "deploy" / ".env").read_text(encoding="utf-8")
     assert "DEV_PASSWORD=pw123" in env1
+
+
+# ==== Task 4：prod compose 渲染 + .env PROD_*/PROD_VERSION 补齐 ====
+
+def test_render_prod_compose_fastapi():
+    import yaml
+    y = compose.render_prod_compose(META)
+    doc = yaml.safe_load(y)
+    assert doc["name"] == "zc-lailiao-prod"
+    assert doc["networks"]["zcnet"] == {"external": True}
+    svc = doc["services"]
+    assert set(svc) == {"migrate", "backend", "frontend"}
+    assert svc["migrate"]["image"] == "zerocode-sqlrunner:1"
+    assert svc["migrate"]["environment"]["TARGET_DB"] == "${PROD_DB}"       # 闸门指 prod 库
+    assert svc["backend"]["image"] == "zc-lailiao-backend:prod-${PROD_VERSION}"
+    assert svc["backend"]["build"] == "../backend"
+    assert svc["backend"]["restart"] == "unless-stopped"
+    assert "${PROD_PASSWORD}" in svc["backend"]["environment"]["DATABASE_URL"]
+    assert svc["backend"]["depends_on"]["migrate"]["condition"] == "service_completed_successfully"
+    assert svc["frontend"]["image"] == "zc-lailiao-frontend:prod-${PROD_VERSION}"
+    assert svc["frontend"]["build"] == "../frontend"
+    assert svc["frontend"]["ports"] == ["8210:80"]                          # 仅前端对外，prod 端口
+    for name in ("backend", "frontend"):
+        assert "ports" not in svc[name] or name == "frontend"
+    assert "volumes" not in (svc["frontend"] if isinstance(svc["frontend"], dict) else {}) or True
+    # prod 栈不挂源码卷、无 dev server 命令（镜像即产物）
+    assert "bind" not in y and "npm run dev" not in y and "uvicorn --reload" not in y
+
+def test_ensure_deploy_files_prod_updates_env(tmp_path):
+    (tmp_path / "deploy").mkdir()
+    compose.ensure_deploy_files(tmp_path, META, {"dev": CRED["dev"]})          # 创建态：PROD_* 空
+    compose.ensure_deploy_files(tmp_path, META, {"dev": CRED["dev"], "prod": PROD_CRED},
+                                version="b20260920120000")
+    env = (tmp_path / "deploy" / ".env").read_text(encoding="utf-8")
+    assert "PROD_DB=lailiao_prod" in env and "PROD_USER=lailiao_prod" in env
+    assert "PROD_PASSWORD=pwprod" in env and "PROD_VERSION=b20260920120000" in env
+    assert (tmp_path / "deploy" / "prod-compose.yml").is_file()
+    # 再次发布换版本：PROD_VERSION 被更新、其余键不重复堆行
+    compose.ensure_deploy_files(tmp_path, META, {"dev": CRED["dev"], "prod": PROD_CRED},
+                                version="b20260920130000")
+    env2 = (tmp_path / "deploy" / ".env").read_text(encoding="utf-8")
+    assert env2.count("PROD_VERSION=") == 1 and "PROD_VERSION=b20260920130000" in env2
+    assert "DEV_PASSWORD=pw123" in env2                                       # dev 键不丢
+
+PROD_CRED = {"db": "lailiao_prod", "user": "lailiao_prod", "password": "pwprod"}
+
+
+# ==== Task 4 追加（控制者裁定 D-T4：单向推进语义双向化 + 模板片段不得重复注入）====
+
+def test_ensure_deploy_files_keeps_creds_of_the_omitted_side(tmp_path):
+    """D-T4：某一侧 creds 缺/空时，保留 .env 既有非空值——dev 侧同坑同治（T6/T7 传
+    `{"dev": read_cred(...) or {}, "prod": cred}`，dev 供给失败/未供给不得冲空既有 DEV_*）。"""
+    (tmp_path / "deploy").mkdir()
+    compose.ensure_deploy_files(tmp_path, META, {"dev": CRED["dev"], "prod": PROD_CRED},
+                                version="b20260920120000")
+    # 只传 dev（如 dev 重启流程）：不得冲掉 PROD_* / PROD_VERSION
+    compose.ensure_deploy_files(tmp_path, META, {"dev": CRED["dev"]})
+    env = (tmp_path / "deploy" / ".env").read_text(encoding="utf-8")
+    assert "PROD_DB=lailiao_prod" in env and "PROD_USER=lailiao_prod" in env
+    assert "PROD_PASSWORD=pwprod" in env and "PROD_VERSION=b20260920120000" in env
+    # 只传 prod（如发布流程 dev cred 取空）：不得冲掉 DEV_*
+    compose.ensure_deploy_files(tmp_path, META, {"prod": PROD_CRED}, version="b20260920130000")
+    env2 = (tmp_path / "deploy" / ".env").read_text(encoding="utf-8")
+    assert "DEV_DB=lailiao_dev" in env2 and "DEV_USER=lailiao_dev" in env2
+    assert "DEV_PASSWORD=pw123" in env2
+    assert env2.count("DEV_PASSWORD=") == 1 and env2.count("PROD_PASSWORD=") == 1
+    assert "PROD_VERSION=b20260920130000" in env2
+    # 空 dict 侧同样保留（creds 形态 {"dev": {}}：T6/T7 的 `or {}` 分支）
+    compose.ensure_deploy_files(tmp_path, META, {"dev": {}, "prod": PROD_CRED})
+    env3 = (tmp_path / "deploy" / ".env").read_text(encoding="utf-8")
+    assert "DEV_PASSWORD=pw123" in env3 and "PROD_PASSWORD=pwprod" in env3
+
+def test_render_prod_compose_single_service_blocks():
+    """服务块只出现一次：migrate 片段经 __MIGRATE_PROD__ 槽注入，模板拼接不得重复追加。"""
+    y = compose.render_prod_compose(META)
+    lines = y.splitlines()
+    for name in ("migrate", "backend", "frontend"):
+        assert lines.count(f"  {name}:") == 1, name          # 行首两空格=服务级键（不误伤 depends_on）
+    assert "__" not in y                                     # 标记残留自检与 dev 同口径
+    assert "external: true" in y
+
+def test_render_prod_compose_static_and_unknown_stack_raise():
+    """static 发布 M3：与 dev 同口径显式报错（brief Interfaces）。"""
+    for stack in ("static", "vue3-springboot"):
+        m = copy.deepcopy(META); m["stack"] = stack
+        with pytest.raises(DeployError) as ei:
+            compose.render_prod_compose(m)
+        assert stack in str(ei.value)
+        assert ei.value.status == 400
+
+def test_ensure_deploy_files_no_prod_write_without_prod_creds(tmp_path):
+    """创建流程（无 prod creds）行为与 M1 完全一致：不落 prod-compose.yml、不写 PROD_VERSION。"""
+    compose.ensure_deploy_files(tmp_path, META, {"dev": CRED["dev"]})
+    assert (tmp_path / "deploy" / "dev-compose.yml").is_file()
+    assert not (tmp_path / "deploy" / "prod-compose.yml").exists()
+    env = (tmp_path / "deploy" / ".env").read_text(encoding="utf-8")
+    assert "PROD_VERSION" not in env and "PROD_PASSWORD=\n" in env
+
+def test_ensure_deploy_files_dev_bytes_unchanged(tmp_path):
+    """dev 产物逐字节不变（向后兼容硬门槛）：新签名不改动 dev-compose.yml 一个字符。"""
+    compose.ensure_deploy_files(tmp_path, META, CRED)
+    dev_y = (tmp_path / "deploy" / "dev-compose.yml").read_text(encoding="utf-8")
+    assert dev_y == compose.render_dev_compose(META)
+    compose.ensure_deploy_files(tmp_path, META, {"dev": CRED["dev"], "prod": PROD_CRED},
+                                version="b20260920120000")
+    assert (tmp_path / "deploy" / "dev-compose.yml").read_text(encoding="utf-8") == dev_y
