@@ -183,11 +183,17 @@ async def _dev_task(request: Request, app_id: int, action, *, docker_gate: bool 
 
     `env`（Task 8）：prod 端点复用同一条链，但预检走 `prod.preflight_docker`——prod.py 的 D-1
     模块级名字纪律让测试替身拦得住这个属性；dev 行为（默认值）不动。
+
+    终审 I-2：prod 启动类动作（start/restart，即 docker_gate 开的那批）加 publish 同款状态二次闸——
+    `_spawn` 只挡本进程，`publishing` 可能是另一进程在跑/遗留，此时插一次 up 会互踩 current_version
+    与容器；stop 不挡（停栈是逃生通道，发布卡死时用户总关得掉）。409 立答于 _spawn 之前，零事件。
     """
     sf = request.app.state.session_factory
     hub = request.app.state.deploy_hub
     try:
         app = await app_service.get_app(sf, app_id)
+        if docker_gate and env == "prod" and app["status_prod"] == "publishing":
+            raise DeployError("发布/回滚进行中，请等待完成", status=409)
         if docker_gate:
             if env == "prod":
                 await prod.preflight_docker()
@@ -382,6 +388,10 @@ async def rollback(request: Request, app_id: int, body: RollbackIn):
     try:
         app = await app_service.get_app(sf, app_id)
         _reject_if_task_running(request, app_id)
+        if app["status_prod"] == "publishing":
+            # 终审 I-2：与 publish 端点同款二次闸——_spawn 只挡本进程，publishing 可能是
+            # 另一进程在跑/遗留，回滚插队会与在跑的发布互踩 current_version 与容器
+            raise DeployError("发布/回滚进行中，请等待完成", status=409)
         await prod.preflight_docker()
         _spawn(request, app_id, lambda: prod.rollback(sf, app, body.version, notify=hub.publish))
     except DeployError as e:

@@ -98,6 +98,18 @@ describe('PublishHistory 列表渲染', () => {
     await mountHistory()
     expect(mocks.api.appRecords).toHaveBeenCalledWith(7)
   })
+
+  it('failed+step=interrupted 收口为「已中断」（终审 Minor-1：与普通失败可分辨）', async () => {
+    const wrapper = await mountHistory([
+      { id: 9, app_id: 7, kind: 'publish', version: 'b20260921080000', status: 'failed',
+        step: 'interrupted', started_at: '2026-09-21T08:00:00', finished_at: null,
+        error: '平台重启中断', detail: {} },
+      ...RECORDS,
+    ])
+    expect(wrapper.findAll('.stub-row')[0].text()).toContain('已中断')
+    expect(wrapper.find('.dot-interrupted').exists()).toBe(true)
+    expect(wrapper.findAll('.dot-failed')).toHaveLength(1)   // 普通失败行不受影响
+  })
 })
 
 describe('PublishHistory 回滚入口', () => {

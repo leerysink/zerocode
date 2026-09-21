@@ -15,6 +15,9 @@ const STEP_LABELS = {
   deploy: '正式栈启动', health: '联合体检', record: '发布记账',
 }
 const STATUS_TEXT = { success: '成功', failed: '失败', running: '进行中', interrupted: '已中断' }
+// 终审 Minor-1：中断收口的记录是 failed+step=interrupted（mark_interrupted 写库形状），
+// 不是独立 status——普通失败与平台重启中断在历史表里要能分辨（README 对用户承诺了这一点）。
+const statusText = (r) => (r.status === 'failed' && r.step === 'interrupted' ? '已中断' : STATUS_TEXT[r.status] || r.status)
 const ROLLBACK_WARN = '回滚只恢复程序版本，数据库结构与数据保持当前状态；'
   + '若新版本改过表结构，旧程序可能读写异常，请联系 AI 生成兼容处理。'
 
@@ -86,8 +89,9 @@ async function remove(r) {
         <template v-if="column.key === 'time'">{{ fmtTime(record.started_at) }}</template>
         <template v-else-if="column.key === 'kind'">{{ record.kind === 'publish' ? '发布' : '回滚' }}</template>
         <template v-else-if="column.key === 'status'">
-          <span class="zc-rdot" :class="'dot-' + record.status" />
-          {{ STATUS_TEXT[record.status] || record.status }}
+          <span class="zc-rdot" :class="record.status === 'failed' && record.step === 'interrupted'
+                ? 'dot-interrupted' : 'dot-' + record.status" />
+          {{ statusText(record) }}
           <template v-if="record.status === 'running' && record.step">
             · {{ STEP_LABELS[record.step] || record.step }}
           </template>

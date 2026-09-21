@@ -36,7 +36,10 @@ async def finish(sf, rid: int, status: str, *, step: str | None = None,
             "step = COALESCE(:stp, step), error = COALESCE(:err, error), "
             "detail = CASE WHEN CAST(:dt AS jsonb) = '{}'::jsonb THEN detail "
             "ELSE COALESCE(detail, '{}'::jsonb) || CAST(:dt AS jsonb) END "
-            "WHERE id = :i"),
+            # 终审 I-1 记账层守卫：已 success 的行不可被降级为 failed——keep-N 名额只认「有 success
+            # 记录」，success 被 failed 覆盖会让在服版本的镜像被当失败版清掉（晋升是不可撤销点）。
+            # 但 success→success 的 detail 再合并（如补写 health/url）仍合法，故只挡降级方向。
+            "WHERE id = :i AND (status <> 'success' OR :st = 'success')"),
             {"st": status, "stp": step, "err": error,
              "dt": json.dumps(detail or {}), "i": rid})
         await s.commit()

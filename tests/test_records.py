@@ -162,3 +162,24 @@ async def test_finish_without_detail_keeps_accumulated_detail(test_engine):
     await records.finish(sf, rid, "success", step="record")
     d = (await records.list_for(sf, aid))[0]["detail"]
     assert d == {"images": ["img:1"], "durationMs": 7}
+
+
+# ---- 终审 I-1 记账层守卫 ----
+
+
+async def test_success_record_cannot_be_flipped(test_engine):
+    """已 success 的行不可被迟到的 failed 改判——keep-N 名额只认「有 success 记录」，
+    覆盖成功行会让在服版本的镜像被当失败版清掉（04 §4.5/§6 数据地基）。"""
+    sf = make_session_factory(test_engine)
+    aid = await _mk_app(sf)
+    rid = await records.begin(sf, aid, "publish", "b20260920130000")
+    await records.finish(sf, rid, "success", step="record", detail={"durationMs": 10})
+    await records.finish(sf, rid, "failed", error="迟到的改判")
+    rows = await records.list_for(sf, aid)
+    assert rows[0]["status"] == "success" and rows[0]["step"] == "record"
+    assert rows[0]["error"] is None and rows[0]["detail"]["durationMs"] == 10
+    # running 行照常可收口（守卫只封 success 这一种翻转）
+    rid2 = await records.begin(sf, aid, "publish", "b20260920130001")
+    await records.finish(sf, rid2, "failed", error="正常失败")
+    got = [r for r in await records.list_for(sf, aid) if r["id"] == rid2]
+    assert got[0]["status"] == "failed" and got[0]["error"] == "正常失败"

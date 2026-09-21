@@ -1030,3 +1030,62 @@ def test_hub_active_session_ids_snapshot():
     assert sorted(hub.active_session_ids()) == [7, 9]
     hub.drop_emit(7, emit)
     assert hub.active_session_ids() == [9]
+
+
+# ---- 终审 C-1 / I-1 回归 ----
+
+
+async def test_publish_wires_legacy_dockerfile_and_idempotent(monkeypatch, sf, seed, pub_root, tmp_path):
+    """C-1：M1 存量 Dockerfile 没有 COPY nginx.conf → 构建静默成功产出 stock nginx 配置，
+    /api 探针 404 直到体检超时——preflight 必须把它接上，且幂等/自定义形状放过。"""
+    legacy = ("FROM node:20-alpine AS build\nWORKDIR /src\nRUN npm run build\n\n"
+              "FROM nginx:1.27-alpine\nCOPY --from=build /src/dist /usr/share/nginx/html\n")
+    wid, aid = await seed(slug="zcpub", prod_port=8982, dev_port=8983)
+    fe = pub_root / "frontend"
+    (fe / "Dockerfile").write_text(legacy, encoding="utf-8")
+    seams = PubSeams(monkeypatch, pub_root)
+
+    await prod.publish(sf, _pub_app(aid), notify=seams.notify, force=True)
+
+    wired = (fe / "Dockerfile").read_text(encoding="utf-8")
+    assert "COPY nginx.conf /etc/nginx/conf.d/default.conf" in wired
+    assert wired.index("COPY nginx.conf") < wired.index("COPY --from=build")   # conf 先拷，构建上下文才带得上
+    assert (fe / "nginx.conf").is_file()
+    assert any("补齐" in ln and "Dockerfile" in ln for ln in seams.logs)
+
+    # 幂等：已接线再跑一轮不重复插行
+    assert prod._wire_dockerfile_proxy(fe / "Dockerfile") is False
+    assert wired == (fe / "Dockerfile").read_text(encoding="utf-8")
+    # 不认识的平台外形状（非 nginx 基座）原样放过
+    custom = tmp_path / "custom" / "frontend"
+    custom.mkdir(parents=True)
+    (custom / "Dockerfile").write_text("FROM caddy:2\n", encoding="utf-8")
+    before = (custom / "Dockerfile").read_text(encoding="utf-8")
+    assert prod._wire_dockerfile_proxy(custom / "Dockerfile") is False
+    assert (custom / "Dockerfile").read_text(encoding="utf-8") == before
+
+
+async def test_publish_survives_readme_and_cleanup_tail_failures(monkeypatch, sf, seed, pub_root):
+    """I-1：晋升+体检通过即不可撤销点——README 刷挂 / keep-N 清理抛都只降级 warning，
+    记账必 success、事件流只有一条 done(ok:true)，修前整条成功发布会被改判 failed 并污染 keep 名额。"""
+    wid, aid = await seed(slug="zcpub", prod_port=8982, dev_port=8983)
+    (pub_root / "README.md").write_bytes(b"# zcpub \xff\xfe broken-encoding\n")   # 非 UTF-8（用户/AI 可改坏）
+    seams = PubSeams(monkeypatch, pub_root)
+
+    async def boom(sf_, app_id_, slug_, notify=None):
+        raise RuntimeError("docker daemon 挂了")
+
+    monkeypatch.setattr(prod, "cleanup_images", boom)
+    res = await prod.publish(sf, _pub_app(aid), notify=seams.notify, force=True)
+
+    assert res["status"] == "running"
+    assert await _db_pair(sf, aid) == (res["version"], "running")
+    row = await _record(sf, aid, "publish", res["version"])
+    assert row[1] == "success" and row[2] == "record"
+    assert len(seams.dones) == 1 and seams.dones[0]["ok"] is True
+    assert seams.statuses == ["publishing", "running"]
+    assert any("README" in ln for ln in seams.logs) and any("清理异常" in ln for ln in seams.logs)
+    # 成功行落定后，任何迟到者都不能把它改成 failed（keep-N 名额的数据地基）
+    await records.finish(sf, row[0], "failed", error="迟到的改判")
+    again = await _record(sf, aid, "publish", res["version"])
+    assert again[1] == "success"

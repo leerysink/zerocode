@@ -225,20 +225,45 @@ async def _step_ev(app_id, notify, rid_step_cb, step: str, state: str) -> None:
 
 
 async def _ensure_prod_proxy_conf(root: Path) -> bool:
-    """存量应用补齐 frontend/nginx.conf（T3b 之前创建的工程没有它，build 必挂）。
+    """存量应用补齐生产反代接线（T3b 之前创建的工程没有 nginx.conf，更没把它 COPY 进镜像）。
 
+    终审 C-1：只补 conf 不够——M1 存量 frontend/Dockerfile 没有 `COPY nginx.conf` 那行，
+    构建会**静默成功**并产出 stock nginx 配置（无 /api 反代），体检 api 探针 404 直到超时。
+    故 conf 补齐后顺带幂等补 Dockerfile 接线；两者任一发生即返回 True（播报补齐事件）。
     模板源取 `app_service.TEMPLATES`——平台唯一写入方就地补文件，不造 parents 链（控制者裁定）。
     """
     from app.services.app_service import TEMPLATES
     fe = root / "frontend"
     conf = fe / "nginx.conf"
-    if not fe.is_dir() or conf.is_file():
+    patched = False
+    if fe.is_dir() and not conf.is_file():
+        src = TEMPLATES / "vue3-fastapi" / "frontend" / "nginx.conf"
+        if not src.is_file():
+            raise DeployError(f"生产反代模板缺失：{src}", status=500)
+        conf.write_text(src.read_text(encoding="utf-8"), encoding="utf-8", newline="")
+        patched = True
+    if fe.is_dir() and _wire_dockerfile_proxy(fe / "Dockerfile"):
+        patched = True
+    return patched
+
+
+def _wire_dockerfile_proxy(dockerfile: Path) -> bool:
+    """M1 存量 frontend/Dockerfile 缺 `COPY nginx.conf`：在 nginx 基座 FROM 行后补一行（幂等）。
+
+    只对**平台模板形状**出手（FROM nginx* 且无该 COPY 指令）；形状不认识就原样放过，
+    不虚补也不报错——应用自带的反代接线由应用自己负责（conf 已有测试钉住不覆盖）。
+    """
+    if not dockerfile.is_file():
         return False
-    src = TEMPLATES / "vue3-fastapi" / "frontend" / "nginx.conf"
-    if not src.is_file():
-        raise DeployError(f"生产反代模板缺失：{src}", status=500)
-    conf.write_text(src.read_text(encoding="utf-8"), encoding="utf-8", newline="")
-    return True
+    lines = dockerfile.read_text(encoding="utf-8").splitlines()
+    if any("nginx.conf" in ln and ln.strip().upper().startswith("COPY") for ln in lines):
+        return False
+    for i, ln in enumerate(lines):
+        if ln.strip().upper().startswith("FROM NGIN"):
+            lines.insert(i + 1, "COPY nginx.conf /etc/nginx/conf.d/default.conf")
+            dockerfile.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="")
+            return True
+    return False
 
 
 async def publish(sf, app: dict, notify=None, *, force: bool = False) -> dict:
@@ -285,7 +310,7 @@ async def publish(sf, app: dict, notify=None, *, force: bool = False) -> dict:
         if not (root / "app.json").is_file():
             raise DeployError("app.json 缺失，无法发布")
         if await _ensure_prod_proxy_conf(root):
-            await _step(app_id, notify, "✓ 已为存量应用补齐 frontend/nginx.conf（生产反代）")
+            await _step(app_id, notify, "✓ 已为存量应用补齐 frontend 生产反代（nginx.conf / Dockerfile COPY 接线）")
         await _step_ev(app_id, notify, rst, "preflight", "ok")
         # 2 build（旧容器不动——04 §4.1；渲染先于 build：prod-compose.yml 的落盘条件已放宽为栈判定）
         await _step_ev(app_id, notify, rst, "build", "running")
@@ -382,15 +407,30 @@ async def publish(sf, app: dict, notify=None, *, force: bool = False) -> dict:
                 "UPDATE app_project SET current_version=:v, status_prod='running', "
                 "updated_at=now() WHERE id=:i"), {"v": version, "i": app_id})
             await s.commit()
+        # 终审 I-1：晋升+体检通过即不可撤销点——之后的收尾（URL/README/记账/清镜像）各自圈稳，
+        # 任何一步抛只降级为 warning，绝不再改判成败（finish 的 success 守卫是记账层兜底）。
         from app.deploy import nics
-        urls = await nics.app_urls(sf, app)
-        url = urls["lan"] or urls["localhost"]
-        nics.update_readme(root, url, version)
+        try:
+            urls = await nics.app_urls(sf, app)
+            url = urls["lan"] or urls["localhost"]
+        except Exception as ue:  # noqa: BLE001
+            url = f"http://localhost:{_prod_port(app)}"
+            await _step(app_id, notify, f"✗ 发布 URL 汇总失败（不影响发布结果，排查稍后看 prod/status）：{ue}",
+                        level=logging.WARNING)
+        try:
+            nics.update_readme(root, url, version)
+        except Exception as re_:  # noqa: BLE001  README 属应用工作区文件（编码可能被用户改坏），读挂只警
+            await _step(app_id, notify, f"✗ README 发布块刷新失败（不影响发布结果）：{re_}",
+                        level=logging.WARNING)
         await records.finish(sf, rid, "success", step="record", detail={
             "images": [f"zc-{slug}-frontend:prod-{version}", f"zc-{slug}-backend:prod-{version}"],
             "sqlApplied": sql_applied, "durationMs": int((time.monotonic() - t0) * 1000),
             "health": checks, "url": url})
-        await cleanup_images(sf, app_id, slug, notify=notify)   # keep-N：发布收尾顺手清旧镜像
+        try:
+            await cleanup_images(sf, app_id, slug, notify=notify)   # keep-N：发布收尾顺手清旧镜像
+        except Exception as ce:  # noqa: BLE001  清理本就有下次发布兜底，抛上来不把成功改判
+            await _step(app_id, notify, f"✗ 旧镜像清理异常（下次发布兜底重试）：{ce}",
+                        level=logging.WARNING)
         await _step_ev(app_id, notify, None, "record", "ok")
         await _notify(notify, app_id, {"type": "prod_status", "status": "running"})
         await _step(app_id, notify, f"✓ 发布完成 {version}，访问 {url}"
@@ -461,12 +501,16 @@ async def rollback(sf, app: dict, version: str, notify=None) -> dict:
         await _notify(notify, app_id, {"type": "prod_status",
                                        "status": "running" if ok else "unhealthy"})
         from app.deploy import nics
-        urls = await nics.app_urls(sf, app)
+        try:
+            urls = await nics.app_urls(sf, app)
+            rurl = urls["lan"] or urls["localhost"]
+        except Exception as ue:  # noqa: BLE001  I-1 同款收尾窗：记账已收口，URL 汇总挂只降级
+            rurl = ""
         await _notify(notify, app_id, {"type": "publish_done", "ok": ok, "version": version,
-                                       "url": urls["lan"] or urls["localhost"],
+                                       "url": rurl,
                                        "error": "" if ok else f"体检未通过 {checks}"})
         return {"status": "running" if ok else "unhealthy", "version": version,
-                "url": urls["lan"] or urls["localhost"], "recordId": rid}
+                "url": rurl, "recordId": rid}
     except DeployError as e:
         await records.finish(sf, rid, "failed", error=str(e)[:2000])
         await set_status(sf, app_id, "error")

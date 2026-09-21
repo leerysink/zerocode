@@ -371,3 +371,66 @@ async def test_lifespan_prod_reconcile_failure_is_not_fatal(test_engine, monkeyp
         with TestClient(app) as tc:
             assert tc.get("/api/apps").status_code == 200
     assert "prod 启动对账失败" in caplog.text
+
+
+# ---- 终审 I-2：publishing 状态二次闸扩到 rollback / prod start / prod restart ----
+
+async def test_publishing_blocks_rollback_and_prod_start(client, monkeypatch, no_preflight):
+    """I-2：`_spawn` 只挡本进程——另一进程在发布（或遗留 publishing）时，rollback 与
+    prod 启动类动作一律 409 立答，不打扰 Docker、不留后台任务；stop 是逃生通道不挡。"""
+    aid = await _mk(client)
+    called: list[str] = []
+
+    async def fake_rollback(sf, app, version=None, notify=None):
+        called.append("rollback")
+
+    async def fake_start(sf, app, notify=None):
+        called.append("start")
+
+    async def fake_stop(sf, app, notify=None):
+        called.append("stop")
+        return {"status": "stopped"}
+
+    monkeypatch.setattr(prod_mod, "rollback", fake_rollback)
+    monkeypatch.setattr(prod_mod, "prod_start", fake_start)
+    monkeypatch.setattr(prod_mod, "prod_stop", fake_stop)
+    async with client.app.state.session_factory() as s:
+        await s.execute(text("UPDATE app_project SET status_prod='publishing' WHERE id=:i"),
+                        {"i": aid})
+        await s.commit()
+
+    r = await client.post(f"/api/apps/{aid}/rollback", json={"version": VERSION})
+    assert r.status_code == 409 and "进行中" in r.json()["detail"]
+    for action in ("start", "restart"):
+        r = await client.post(f"/api/apps/{aid}/prod/{action}")
+        assert r.status_code == 409, action
+        assert "进行中" in r.json()["detail"], action
+    assert aid not in client.app.state.dev_tasks
+    assert not called
+
+    r = await client.post(f"/api/apps/{aid}/prod/stop")      # 停栈不被 publishing 挡住
+    assert r.status_code == 202, r.text
+    await client.app.state.dev_tasks[aid]
+    assert called == ["stop"]
+
+
+async def test_rollback_and_prod_gates_pass_when_not_publishing(client, monkeypatch, no_preflight):
+    """非 publishing 态三道闸全部放行（回归护栏：闸门不把正常路径一起锁死）。"""
+    aid = await _mk(client)
+    done: list[str] = []
+
+    async def fake_rollback(sf, app, version=None, notify=None):
+        done.append("rollback")
+
+    async def fake_start(sf, app, notify=None):
+        done.append("start")
+
+    monkeypatch.setattr(prod_mod, "rollback", fake_rollback)
+    monkeypatch.setattr(prod_mod, "prod_start", fake_start)
+    r = await client.post(f"/api/apps/{aid}/rollback", json={"version": VERSION})
+    assert r.status_code == 202, r.text
+    await client.app.state.dev_tasks[aid]
+    r = await client.post(f"/api/apps/{aid}/prod/start")
+    assert r.status_code == 202, r.text
+    await client.app.state.dev_tasks[aid]
+    assert done == ["rollback", "start"]
