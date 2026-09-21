@@ -182,7 +182,7 @@ export const useChatStore = defineStore('chat', {
       // 定时器重连传 keepBackoff=true，以延续同一断线期的指数退避（1s→2s→4s→…上限 15s）
       if (!keepBackoff) this._retry = 0
       this.currentSessionId = sessionId
-      const ws = new WebSocket(wsUrl(sessionId))
+      const ws = new WebSocket(wsUrl(`/ws/chat/${sessionId}`))
       this._ws = ws
       ws.onopen = () => {
         this.wsStatus = 'connected'

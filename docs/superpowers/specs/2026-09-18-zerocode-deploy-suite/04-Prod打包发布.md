@@ -45,7 +45,7 @@ publish(app) = [
 ]
 ```
 
-- `status_prod`：`stopped | publishing | running | unhealthy | error`。
+- `status_prod`：`stopped | starting | publishing | running | unhealthy | error`（`starting` 为 prod 栈启动/重启的进行态，M2 实现时补入；发布用 `publishing` 另有并发闸语义）。
 - 步骤 2-5 期间旧容器继续运行（构建新镜像不 touch 旧容器；up 在 5 才切换）——**发布失败旧版本零感知**（FR4-01/S-04-2）。
 - 幂等重入：任意步骤失败后重新点发布，从 preflight 重跑全部（build 有层缓存，代价小）；`publishing` 状态下禁止并发第二次发布。
 
@@ -61,7 +61,8 @@ publish(app) = [
 
 ### 4.3 健康检查与自动回退
 
-- 探测：平台后端直接 `GET http://localhost:<prod_port>/`；backend health 通过 `docker compose exec backend curl/wget` 或容器内 healthcheck 指令（模板内置 HEALTHCHECK，`docker inspect` 读结果），取最简可靠路径。
+- 探测：平台后端直连 `GET http://localhost:<prod_port>/`（frontend）与 `GET http://localhost:<prod_port>/api/health`（api，经 nginx `/api` 反代进后端），取最简可靠路径（不引入 `docker compose exec` / 容器 HEALTHCHECK 采集）。
+- 落地口径（M2 实现）：判定 = 上述两个探针都 200（`static` 栈无 `/api/health`，只判 `GET /`）；prod_port 只有 frontend nginx 对外，`/api/health` 靠 nginx 反代转发，故 `/api` 反代断则 api 探针 404——这一条本身就是联合健康要拦截的故障。`records.detail.health` 存的就是 `{frontend, api}` 两个 HTTP 探针结果，供历史抽屉排查用。（容器级 `docker inspect` health 采集本波未实现，列入后续。）
 - 60s 内不通过：`up -d` 保持新容器但标记发布失败 → 自动 `up -d` 回退上一版本 tag → UI 显示"新版本体检未通过，已保持上一版本"。
 - 首次发布（无上一版本）：保持新容器运行但标 `unhealthy`，URL 仍展示（便于排查）。
 

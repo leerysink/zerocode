@@ -4,7 +4,7 @@ import pytest
 from pathlib import Path
 from sqlalchemy import text
 from app.db import make_engine, make_session_factory
-from app.deploy import provision
+from app.deploy import ports, provision
 from app.deploy.errors import DeployError
 from app.services import app_service
 
@@ -13,17 +13,24 @@ pytestmark = pytest.mark.asyncio
 SLUG = "zctask5"
 ROOT = Path(f"D:/__zc_task5__/{SLUG}")   # 隔离目录：不落仓库 apps/（裁定 R-B：create 调用一律显式传 root）
 ROOT2 = Path(f"D:/__zc_task5_b__/{SLUG}")  # 同 slug 的另一个空目录：用于绕过目录预检、精确命中 _insert_rows 分支
+SEED_SLUG = "zctask5seed"                # 端口竞态用例的占位应用（本文件自己的产物，收尾/起手都清）
+SEED_ROOT = "D:/__zc_task5__seed"
 
 async def _wipe():
+    """清本文件自己的产物（含上一次崩溃残留的占位行）。
+
+    只按本文件的 slug / root_path 精确删——共享 dev 库里并行会话的应用行（test1 等）一律不碰，
+    那些行是门禁假红的来源，靠断言相对化来免疫（本波 Task 1），不靠清库。
+    """
     sf = make_session_factory(make_engine())
     try:
         await provision.drop_env(sf, SLUG, "dev")
     except Exception:
         pass
     async with sf() as s:
-        await s.execute(text("DELETE FROM app_project WHERE slug=:s"), {"s": SLUG})
-        await s.execute(text("DELETE FROM workspace WHERE root_path=:a OR root_path=:b"),
-                        {"a": str(ROOT), "b": str(ROOT2)})
+        await s.execute(text("DELETE FROM app_project WHERE slug = ANY(:s)"), {"s": [SLUG, SEED_SLUG]})
+        await s.execute(text("DELETE FROM workspace WHERE root_path = ANY(:p)"),
+                        {"p": [str(ROOT), str(ROOT2), SEED_ROOT]})
         await s.commit()
     shutil.rmtree(ROOT.parent, ignore_errors=True)
     shutil.rmtree(ROOT2.parent, ignore_errors=True)
@@ -120,26 +127,34 @@ async def test_create_app_rollback_on_provision_failure(monkeypatch):
             "SELECT count(*) FROM workspace WHERE root_path=:p"), {"p": str(ROOT)})).scalar() == 0
 
 async def test_create_app_port_race_falls_back_to_unique(monkeypatch):
-    """裁定 R-A 兜底：只读探测与行插入之间的端口竞态，由 app_project.prod_port UNIQUE 拦下 → 409 且全回滚。"""
+    """裁定 R-A 兜底：只读探测与行插入之间的端口竞态，由 app_project.prod_port UNIQUE 拦下 → 409 且全回滚。
+
+    硬化（本波 Task 1）：占位应用的端口对改为**从共享 dev 库当前登记状态推导**（ports.allocate_pair），
+    不再钉死 8210/8211。原写法在段首被他方应用行（并行会话 / 冒烟残留）占住时，插桩自己先撞
+    app_project_prod_port_key 而假红（造干扰实测：Key (prod_port)=(8210) already exists）——
+    用例要验的是「同一对被抢走」，与是哪一对无关，故被抢的那一对也必须跟着环境推导。
+    """
     sf = make_session_factory(make_engine())
-    seed_root = "D:/__zc_task5__seed"
-    async with sf() as s:                                      # 占位应用先占走 8210/8211
+    async with sf() as s:
+        seed_prod, seed_dev = await ports.allocate_pair(s)        # 此刻真实可用的一对（避开一切已登记/占用）
+    async with sf() as s:                                         # 占位应用把这**一对**登记占走
         wid = (await s.execute(text(
             "INSERT INTO workspace (name, root_path) VALUES ('占位', :p) RETURNING id"),
-            {"p": seed_root})).scalar()
+            {"p": SEED_ROOT})).scalar()
         await s.execute(text(
             "INSERT INTO app_project (workspace_id, name, slug, scale, stack, prod_port, dev_port) "
-            "VALUES (:w, '占位', 'zctask5seed', 'small', 'static', 8210, 8211)"), {"w": wid})
+            "VALUES (:w, '占位', :sl, 'small', 'static', :pp, :dp)"),
+            {"w": wid, "sl": SEED_SLUG, "pp": seed_prod, "dp": seed_dev})
         await s.commit()
     try:
-        async def fake_pair(session, probe=None):              # 探测被绕过 → 模拟并发抢走同端口
-            return 8210, 8211
+        async def fake_pair(session, probe=None):                 # 探测被绕过 → 模拟并发抢走同一对
+            return seed_prod, seed_dev
         monkeypatch.setattr(app_service, "allocate_pair", fake_pair)
         with pytest.raises(DeployError) as ei:
             await app_service.create_app_project(
                 sf, name="竞态", slug=SLUG, scale="small", stack="vue3-fastapi", root=str(ROOT))
         assert ei.value.status == 409
-        assert not ROOT.exists()                               # 已渲染的半成品目录一并回滚
+        assert not ROOT.exists()                                  # 已渲染的半成品目录一并回滚
         async with sf() as s:
             assert (await s.execute(text(
                 "SELECT count(*) FROM app_project WHERE slug=:s"), {"s": SLUG})).scalar() == 0
@@ -147,8 +162,8 @@ async def test_create_app_port_race_falls_back_to_unique(monkeypatch):
                 "SELECT count(*) FROM workspace WHERE root_path=:p"), {"p": str(ROOT)})).scalar() == 0
     finally:
         async with sf() as s:
-            await s.execute(text("DELETE FROM app_project WHERE slug='zctask5seed'"))
-            await s.execute(text("DELETE FROM workspace WHERE root_path=:p"), {"p": seed_root})
+            await s.execute(text("DELETE FROM app_project WHERE slug=:s"), {"s": SEED_SLUG})
+            await s.execute(text("DELETE FROM workspace WHERE root_path=:p"), {"p": SEED_ROOT})
             await s.commit()
 
 async def test_create_app_duplicate_slug_insert_row():
@@ -180,7 +195,10 @@ async def test_create_app_duplicate_slug_insert_row():
     assert await provision.read_cred(sf, SLUG, "dev") == cred   # dbcred 键未被 drop_env 抹掉
     assert await _select1() == 1                           # A 的 dev 库未被 DROP
     rows = await app_service.list_apps(sf)
-    assert len(rows) == 1 and rows[0]["id"] == app["id"]   # 恰 1 行：既没误删 A，也没留下撞车行
+    # 相对化（本波 Task 1）：共享 dev 库里可以并存他方会话的应用行，全表条数不是本用例的不变式；
+    # 要钉的是「本 slug 恰一行」——既没误删 A，也没留下撞车行。
+    mine = [a for a in rows if a["slug"] == SLUG]
+    assert len(mine) == 1 and mine[0]["id"] == app["id"]
     assert not ROOT2.exists()                              # 本次半成品目录仍应被清理
     async with sf() as s:                                  # 本次未提交任何 workspace 行
         assert (await s.execute(text(

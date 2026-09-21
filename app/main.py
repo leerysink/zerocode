@@ -59,9 +59,10 @@ async def _watchdog(engine, hub):
             logger.exception("watchdog 巡检失败")
 
 async def _deploy_startup(app: FastAPI) -> None:
-    """部署环境的启动准备（Task 12 / 裁定 D-3）：孤儿 dev 栈清理 → zcnet → sqlrunner 镜像。
+    """部署环境的启动准备（Task 12 / 裁定 D-3）：孤儿 dev 栈清理 → zcnet → sqlrunner 镜像 →
+    prod 启动对账（Task 8 / 04 §6）。
 
-    三步各自兜底、全部非致命：Docker Desktop 没开只意味着「预览暂不可用」，绝不能把平台启动卡死
+    各步兜底、全部非致命：Docker Desktop 没开只意味着「预览暂不可用」，绝不能把平台启动卡死
     或带崩——所以只在模块内按**属性名**取用（deploy_engine.cleanup_orphans 等），测试替身可拦。
     """
     from app.deploy import engine as deploy_engine, provision, sqlrun
@@ -78,6 +79,14 @@ async def _deploy_startup(app: FastAPI) -> None:
         await sqlrun.build_if_missing()
     except Exception:
         logger.exception("sqlrunner 镜像构建失败（首次预览时会重试）")
+    # Task 8（04 §6）：中断发布记账收口 + prod 状态按容器实况复位。同样非致命——Docker 没开
+    # 只意味着发布/正式环境暂不可用；只碰 prod 自己的状态列，不触发 dev 清理（cleanup_orphans 只管 dev 栈）。
+    try:
+        from app.deploy import prod as deploy_prod
+        await deploy_prod.reconcile(app.state.session_factory,
+                                    notify=app.state.deploy_hub.publish)
+    except Exception:
+        logger.exception("prod 启动对账失败（Docker 未就绪？）")
 
 
 def create_app(database_url: str | None = None) -> FastAPI:
@@ -126,6 +135,9 @@ def create_app(database_url: str | None = None) -> FastAPI:
     # 部署发布套件（Task 12）：/ws/deploy/{app_id} 部署事件流（须在静态托管之前，路由不被 SPA 吞掉）
     from app.api import deploy_ws
     app.include_router(deploy_ws.router)
+    # 部署发布套件（Task 5）：/api/system/nics 网卡候选（局域网地址选择的数据源）
+    from app.api import system
+    app.include_router(system.router)
     app.include_router(ws_router)
 
     # ---- 前端静态托管（Task 15）：挂载 frontend/dist，SPA 回退 index.html ----

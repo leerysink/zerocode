@@ -1,14 +1,19 @@
 <script setup>
-// 应用页（M1 最小版，规格 08 FR8-01/FR8-02 的基础实现）：卡片列表 + 三步向导 + 预览抽屉
+// 应用页（M1 卡片/向导/预览抽屉 + M2 发布接线）：发布/回滚进度弹层与发布历史抽屉都只在
+// 打开时挂载（v-if）——WS 订阅单实例纪律由 PublishModal 自身的 connect/close 保证；
+// 卡片 prod 状态靠既有 5s 轮询刷新，正式地址 hover 才懒加载 appUrls（不轰炸后端）。
 import { onMounted, onUnmounted, reactive, ref } from 'vue'
 import { message } from 'ant-design-vue'
 import {
-  AppstoreOutlined, CloudUploadOutlined, CopyOutlined, EyeOutlined,
+  AppstoreOutlined, CloudUploadOutlined, CopyOutlined, EyeOutlined, HistoryOutlined,
   PlayCircleOutlined, PoweroffOutlined, ProfileOutlined, ReloadOutlined, RocketOutlined,
 } from '@ant-design/icons-vue'
 import {
-  createApp, devRestart, devStart, devStatus, devStop, listApps, validateAppSlug,
+  appUrls, createApp, devRestart, devStart, devStatus, devStop, listApps, prodStart,
+  prodStop, validateAppSlug,
 } from '../api'
+import PublishHistory from '../components/PublishHistory.vue'
+import PublishModal from '../components/PublishModal.vue'
 import { SMALL_STACKS, slugFromName, validateForm } from '../utils/appForm'
 import DeployLogPanel from '../components/DeployLogPanel.vue'
 
@@ -18,6 +23,9 @@ const showWizard = ref(false)
 const current = ref(0)
 const preview = reactive({ open: false, app: null, url: '', status: '', nonce: 0 })
 const logs = reactive({ open: false, app: null })
+const pub = reactive({ open: false, app: null, mode: 'publish', version: null, autoStart: false, seq: 0 })
+const hist = reactive({ open: false, app: null })
+const urlsCache = reactive({})
 const form = reactive({ name: '', slug: '', slugTouched: false, scale: 'small', stack: 'vue3-fastapi' })
 let timer = null
 
@@ -132,6 +140,50 @@ function openLogs(a) {
   logs.app = a
   logs.open = true
 }
+
+// ---------- M2 发布接线 ----------
+// 栈闸门：M2 引擎只支持 vue3-fastapi（后端未拦、UI 拦——static/其他栈按钮置灰带说明）
+const canPublish = (a) => a.stack === 'vue3-fastapi'
+function openPublish(a) {
+  Object.assign(pub, { app: a, mode: 'publish', version: null, autoStart: false,
+    seq: pub.seq + 1, open: true })
+}
+function openHistory(a) {
+  hist.app = a
+  hist.open = true
+}
+// 历史页确认回滚 → 关掉抽屉、开进度弹层（autoStart 单点触发 rollbackApp）
+function startRollback(version) {
+  const app = hist.app
+  hist.open = false
+  Object.assign(pub, { app, mode: 'rollback', version, autoStart: true,
+    seq: pub.seq + 1, open: true })
+}
+async function toggleProd(a) {
+  try {
+    if (a.status_prod === 'running') {
+      await prodStop(a.id)
+      message.success('正式环境已停止')
+    } else {
+      await prodStart(a.id)
+      message.info('正式环境启动中，稍候自动刷新')
+    }
+    setTimeout(load, 1200)
+  } catch (e) {
+    message.error(e?.response?.data?.detail || '操作失败')
+  }
+}
+async function ensureUrls(a) {
+  if (urlsCache[a.id]) return
+  try {
+    urlsCache[a.id] = (await appUrls(a.id)).data
+  } catch { /* hover 懒加载失败静默，卡片仍有端口兜底 */ }
+}
+async function copyProdUrl(a) {
+  await ensureUrls(a)
+  const u = urlsCache[a.id]
+  await copyUrl(u?.lan || u?.localhost || `http://localhost:${a.prod_port}`)
+}
 </script>
 
 <template>
@@ -161,7 +213,13 @@ function openLogs(a) {
           <a v-if="a.status_dev === 'running'" :href="`http://localhost:${a.dev_port}`"
              target="_blank">打开</a>
         </p>
-        <p class="zc-line sub">正式发布：M2 即将上线 <cloud-upload-outlined /></p>
+        <p class="zc-line sub" @mouseenter="ensureUrls(a)">
+          正式：<span class="zc-dot" :style="{ background: statusColor(a.status_prod) }" />{{ statusText(a.status_prod) }}
+          <template v-if="a.current_version"> · {{ a.current_version }}</template>
+          <a v-if="a.status_prod === 'running'" href="#" @click.prevent="copyProdUrl(a)">
+            <copy-outlined /> 正式地址
+          </a>
+        </p>
         <a-space wrap>
           <a-button size="middle" @click="openPreview(a)"><eye-outlined /> 预览</a-button>
           <a-button size="middle" @click="toggleDev(a)">
@@ -171,6 +229,17 @@ function openLogs(a) {
           </a-button>
           <a-button size="middle" @click="restartDev(a)">重启</a-button>
           <a-button size="middle" @click="openLogs(a)"><profile-outlined /> 查看日志</a-button>
+          <a-button type="primary" ghost :disabled="!canPublish(a)"
+                    :title="canPublish(a) ? '' : '该栈发布支持即将上线'"
+                    :loading="a.status_prod === 'publishing'" @click="openPublish(a)">
+            <cloud-upload-outlined /> 发布
+          </a-button>
+          <a-button size="middle" @click="toggleProd(a)">
+            <poweroff-outlined v-if="a.status_prod === 'running'" />
+            <play-circle-outlined v-else />
+            {{ a.status_prod === 'running' ? '停止正式' : '启动正式' }}
+          </a-button>
+          <a-button size="middle" @click="openHistory(a)"><history-outlined /> 发布历史</a-button>
         </a-space>
       </a-card>
     </div>
@@ -236,6 +305,14 @@ function openLogs(a) {
               :body-style="{ padding: '12px 16px' }" destroy-on-close>
       <deploy-log-panel v-if="logs.app" :app-id="logs.app.id" :app-name="logs.app.name"
                         :active="logs.open" />
+    </a-drawer>
+
+    <PublishModal v-if="pub.open" :key="pub.seq" v-model:open="pub.open" :app="pub.app"
+                  :mode="pub.mode" :rollback-version="pub.version" :auto-start="pub.autoStart"
+                  @done="load" />
+
+    <a-drawer v-model:open="hist.open" :title="`发布历史 · ${hist.app?.name || ''}`" width="760px">
+      <PublishHistory v-if="hist.open && hist.app" :app="hist.app" @rollback="startRollback" />
     </a-drawer>
   </div>
 </template>

@@ -42,6 +42,10 @@ class ChatHub:
         if self.emits.get(session_id) is emit:
             self.emits.pop(session_id, None)
 
+    def active_session_ids(self) -> list:
+        """当前有活跃下行流的会话（发布闸门 FR4-09 数据源）：emits 登记表键集快照。"""
+        return list(self.emits)
+
     async def emit_event(self, session_id, event):
         """向指定会话的当前连接下发事件；该会话无连接（槽为空）时静默丢弃。"""
         emit = self.emits.get(session_id)

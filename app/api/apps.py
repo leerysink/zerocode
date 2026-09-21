@@ -6,9 +6,12 @@ Task 12 追加 dev 生命周期与 sqlchange 端点：长任务（起栈/迁移�
 进度经 DeployHub → /ws/deploy/{app_id} 下发（规格 03 §4.4）；同应用同时只允许一个部署任务。
 预览启动（start/restart）在受理前**同步**预检 Docker：Task 11 的契约是「预检异常零事件、原样上抛
 供 REST 映射 503」，异步化会让这个映射点消失——用户 Docker 没开就会拿到 202 + WS 全程静默（审查 I-1）。
+Task 8 追加发布/回滚/prod 生命周期/发布历史端点（规格 04 §5）：与 dev 同一条 `_spawn` 单任务契约；
+chat 闸门（FR4-09）的 409 detail 是**字典** `{code, message}`——前端要按 code 分支弹确认，不能只吃字符串。
 """
 import asyncio
 import logging
+import re
 from functools import partial
 
 from fastapi import APIRouter, Request, HTTPException
@@ -17,7 +20,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
 from app import config as app_config
-from app.deploy import engine, sqlrun
+from app.deploy import engine, prod, records, sqlrun
 from app.deploy.errors import DeployError
 from app.deploy.provision import read_cred
 from app.deploy.slugs import suggest_slug, validate_slug
@@ -41,6 +44,14 @@ class SlugIn(BaseModel):
 
 class AppRenameIn(BaseModel):
     name: str
+
+
+class PublishIn(BaseModel):
+    force: bool = False
+
+
+class RollbackIn(BaseModel):
+    version: str
 
 
 def _http(e: DeployError) -> HTTPException:
@@ -159,8 +170,9 @@ def _spawn(request: Request, app_id: int, coro_factory) -> None:
     tasks[app_id] = task
 
 
-async def _dev_task(request: Request, app_id: int, action, *, docker_gate: bool = False) -> dict:
-    """dev 端点共用一条链：取应用 →（启动类）同步 Docker 预检 → 起后台任务 → 202。
+async def _dev_task(request: Request, app_id: int, action, *, docker_gate: bool = False,
+                    env: str = "dev") -> dict:
+    """生命周期端点共用一条链：取应用 →（启动类）同步 Docker 预检 → 起后台任务 → 202。
 
     `action` 在**请求时**按模块属性取出（engine.start_dev 等），monkeypatch 才拦得住。
 
@@ -168,13 +180,25 @@ async def _dev_task(request: Request, app_id: int, action, *, docker_gate: bool 
     这个映射点只在同步调用时存在——放进 create_task 后用户只会看到 202 + WS 静默（审查 I-1，探针实证）。
     stop 关闸门：Docker 缺失时 `compose down` 本就无意义，更不该挡住用户关栈的意图
     （失败交后台 done 回调留痕 + 平台启动清理兜底）。
+
+    `env`（Task 8）：prod 端点复用同一条链，但预检走 `prod.preflight_docker`——prod.py 的 D-1
+    模块级名字纪律让测试替身拦得住这个属性；dev 行为（默认值）不动。
+
+    终审 I-2：prod 启动类动作（start/restart，即 docker_gate 开的那批）加 publish 同款状态二次闸——
+    `_spawn` 只挡本进程，`publishing` 可能是另一进程在跑/遗留，此时插一次 up 会互踩 current_version
+    与容器；stop 不挡（停栈是逃生通道，发布卡死时用户总关得掉）。409 立答于 _spawn 之前，零事件。
     """
     sf = request.app.state.session_factory
     hub = request.app.state.deploy_hub
     try:
         app = await app_service.get_app(sf, app_id)
+        if docker_gate and env == "prod" and app["status_prod"] == "publishing":
+            raise DeployError("发布/回滚进行中，请等待完成", status=409)
         if docker_gate:
-            await engine.preflight_docker()
+            if env == "prod":
+                await prod.preflight_docker()
+            else:
+                await engine.preflight_docker()
         _spawn(request, app_id, lambda: action(sf, app, notify=hub.publish))
     except DeployError as e:
         raise _http(e)
@@ -202,6 +226,18 @@ async def dev_status(request: Request, app_id: int):
     try:
         app = await app_service.get_app(sf, app_id)
         return await engine.dev_status(sf, app)
+    except DeployError as e:
+        raise _http(e)
+
+
+@router.get("/{app_id}/urls")
+async def app_urls(request: Request, app_id: int):
+    """应用访问地址（规格 05 §5）：本机 + 局域网 + 网卡候选，无副作用只读。"""
+    sf = request.app.state.session_factory
+    try:
+        app = await app_service.get_app(sf, app_id)
+        from app.deploy import nics
+        return await nics.app_urls(sf, app)
     except DeployError as e:
         raise _http(e)
 
@@ -299,3 +335,135 @@ async def sql_files(request: Request, app_id: int):
             _app_db_url(cred), "SELECT filename, success FROM sqlchange_history")}
     return [{"filename": f, "applied": f in applied, "success": applied.get(f, {}).get("success")}
             for f in files]
+
+# ---------- 发布与 prod（Task 8 / 规格 04 §5）：202 受理 + 后台执行，进度走 publish_step 事件 ----------
+
+# 版本号 `b<本地 YYYYMMDDHHmmss>`（04 §4.5）：脏输入在闸门处立答 400，不打扰 Docker 也不留任务
+_VERSION_RE = re.compile(r"^b\d{14}$")
+
+
+@router.post("/{app_id}/publish", status_code=202)
+async def publish(request: Request, app_id: int, body: PublishIn):
+    """一键发布（04 §5 / FR4-09 chat 闸门 + publishing 并发双保险）。
+
+    闸门顺序：任务互斥（`_spawn` 契约）→ 状态并发闸 → chat 确认 → 同步预检 → 受理。
+    chat 闸门只看**本应用工作区**的活跃会话（别的应用在改代码不该挡住这次发布）；
+    409 detail 是字典 `{code, message}`——前端按 `code === 'chat_active'` 弹强制确认，
+    不能只吃字符串（`_http` 的 str detail 通道给不了这个分支能力）。
+    """
+    sf = request.app.state.session_factory
+    hub = request.app.state.deploy_hub
+    try:
+        app = await app_service.get_app(sf, app_id)
+        _reject_if_task_running(request, app_id)
+        if app["status_prod"] == "publishing":
+            # _spawn 只挡本进程在跑的任务；publishing 可能是上一进程遗留，按状态再挡一道
+            raise DeployError("发布进行中，请等待完成", status=409)
+        if not body.force:
+            active = list(request.app.state.hub.active_session_ids())
+            if active:
+                async with sf() as s:
+                    hit = (await s.execute(text(
+                        "SELECT 1 FROM chat_session WHERE workspace_id=:w AND id = ANY(:ids) LIMIT 1"),
+                        {"w": app["workspace_id"], "ids": active})).first()
+                if hit:
+                    raise HTTPException(409, {
+                        "code": "chat_active",
+                        "message": "当前 AI 正在修改代码，发布的可能是不完整版本，是否继续？"})
+        await prod.preflight_docker()
+        _spawn(request, app_id, lambda: prod.publish(sf, app, notify=hub.publish,
+                                                     force=body.force))
+    except DeployError as e:
+        raise _http(e)
+    return {"ok": True}
+
+
+@router.post("/{app_id}/rollback", status_code=202)
+async def rollback(request: Request, app_id: int, body: RollbackIn):
+    """一键回滚（FR4-04）：只切程序，数据库永不回滚（07/D8）；镜像缺位由引擎在后台经 publish_done 事件收口。"""
+    if not _VERSION_RE.match(body.version or ""):
+        raise HTTPException(400, "版本号格式非法（应为 b<14位时间戳>）")
+    sf = request.app.state.session_factory
+    hub = request.app.state.deploy_hub
+    try:
+        app = await app_service.get_app(sf, app_id)
+        _reject_if_task_running(request, app_id)
+        if app["status_prod"] == "publishing":
+            # 终审 I-2：与 publish 端点同款二次闸——_spawn 只挡本进程，publishing 可能是
+            # 另一进程在跑/遗留，回滚插队会与在跑的发布互踩 current_version 与容器
+            raise DeployError("发布/回滚进行中，请等待完成", status=409)
+        await prod.preflight_docker()
+        _spawn(request, app_id, lambda: prod.rollback(sf, app, body.version, notify=hub.publish))
+    except DeployError as e:
+        raise _http(e)
+    return {"ok": True}
+
+
+@router.post("/{app_id}/prod/start", status_code=202)
+async def prod_start(request: Request, app_id: int):
+    return await _dev_task(request, app_id, prod.prod_start, docker_gate=True, env="prod")
+
+
+@router.post("/{app_id}/prod/stop", status_code=202)
+async def prod_stop(request: Request, app_id: int):
+    return await _dev_task(request, app_id, prod.prod_stop, env="prod")
+
+
+@router.post("/{app_id}/prod/restart", status_code=202)
+async def prod_restart(request: Request, app_id: int):
+    return await _dev_task(request, app_id, prod.prod_restart, docker_gate=True, env="prod")
+
+
+@router.get("/{app_id}/prod/status")
+async def prod_status(request: Request, app_id: int):
+    """直返引擎结果（含 urls 块）：端点不裁字段、不加包装（04 §5 接口表）。"""
+    sf = request.app.state.session_factory
+    try:
+        app = await app_service.get_app(sf, app_id)
+        return await prod.prod_status(sf, app)
+    except DeployError as e:
+        raise _http(e)
+
+
+@router.get("/{app_id}/records")
+async def list_records(request: Request, app_id: int, limit: int = 50):
+    """发布历史（04 §4.5）：新→旧，UI 历史抽屉与排查入口共用。"""
+    sf = request.app.state.session_factory
+    try:
+        await app_service.get_app(sf, app_id)
+        return await records.list_for(sf, app_id, limit=limit)
+    except DeployError as e:
+        raise _http(e)
+
+
+@router.delete("/{app_id}/records/{rid}")
+async def delete_record(request: Request, app_id: int, rid: int):
+    """FR4-08：删历史行 + 尽力 rmi 该版本两镜像。
+
+    rmi 失败（Docker 未就绪/镜像被引用）只记 warning——删记录是用户清理历史的意图，
+    不该被镜像侧的不确定性挡回去，且 keep-N 仍会兜底重试清理。rid 不属该应用 → 404
+    （DELETE ... RETURNING 空集即不存在，不另发一次 SELECT）。
+    """
+    sf = request.app.state.session_factory
+    try:
+        app = await app_service.get_app(sf, app_id)
+    except DeployError as e:
+        raise _http(e)
+    async with sf() as s:
+        row = (await s.execute(text(
+            "DELETE FROM deploy_record WHERE id = :r AND app_id = :a RETURNING version"),
+            {"r": rid, "a": app_id})).first()
+        await s.commit()
+    if row is None:
+        raise HTTPException(404, "发布记录不存在")
+    version = row[0]
+    if version:
+        for role in ("frontend", "backend"):
+            tag = f"zc-{app['slug']}-{role}:prod-{version}"
+            try:
+                code, log = await prod._docker("image", "rm", tag, timeout=120)
+                if code != 0:
+                    logger.warning("删发布记录时镜像移除失败（忽略）: %s %s", tag, log[-200:])
+            except Exception as e:
+                logger.warning("删发布记录时镜像移除异常（忽略）: %s %s", tag, e)
+    return {"ok": True}

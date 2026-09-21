@@ -2,3 +2,4 @@
 # 容器内执行的 shell 脚本必须 LF：本机 core.autocrlf=true，检出时若翻成 CRLF
 # busybox 会报 `\r: not found`（镜像构建读的是工作区文件），故显式锁 LF。
 *.sh text eol=lf
+*.conf text eol=lf
