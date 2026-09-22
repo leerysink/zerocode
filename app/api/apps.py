@@ -368,6 +368,40 @@ async def sql_files(request: Request, app_id: int):
     return [{"filename": f, "applied": f in applied, "success": applied.get(f, {}).get("success")}
             for f in files]
 
+
+@router.post("/{app_id}/sqlchange/scaffold-backfill")
+async def scaffold_backfill(request: Request, app_id: int):
+    """破坏性结构变更的数据轨回填骨架生成（同步）：在 sqlchange/ 新增 D<日期>_<序号>_backfill.sql。
+
+    与 store 打包无冲突：store 上架锚点取自 sqlchange_history（DB），未发布应用的半途 D 文件不进包；
+    文件名 D<8位日期>_<2位序号>_backfill.sql 匹配 prod._SQL_NAME（[VD] 轨均合法），preflight 命名闸门放行。
+    只新增绝不覆盖：序号取当日 D<today>_* 现有最大 +1。
+    """
+    from datetime import datetime
+    from app.deploy import schemadiff
+    sf = request.app.state.session_factory
+    try:
+        app = await app_service.get_app(sf, app_id)
+        root = await engine._app_root(sf, app)
+    except DeployError as e:
+        raise _http(e)
+    d = prod.compute_schema_diff(root, app.get("current_version"))
+    if d is None:
+        raise HTTPException(400, "无上一版结构基线可比对（未发布或缺 schema 快照），无法生成回填骨架")
+    if not schemadiff.destructive_changes(d):
+        raise HTTPException(400, "未检出破坏性变更，无需回填")
+    content = schemadiff.backfill_skeleton(d, today=datetime.now().strftime("%Y%m%d"))
+    scdir = root / "sqlchange"
+    scdir.mkdir(exist_ok=True)
+    today = datetime.now().strftime("%Y%m%d")
+    prefix = f"D{today}_"
+    seqs = [int(p.name[len(prefix):len(prefix) + 2]) for p in scdir.glob(prefix + "*.sql")
+            if p.name[len(prefix):len(prefix) + 2].isdigit()]
+    nn = f"{(max(seqs) + 1) if seqs else 1:02d}"
+    filename = f"{prefix}{nn}_backfill.sql"
+    (scdir / filename).write_text(content, encoding="utf-8", newline="")
+    return {"filename": filename, "content": content}
+
 # ---------- 发布与 prod（Task 8 / 规格 04 §5）：202 受理 + 后台执行，进度走 publish_step 事件 ----------
 
 # 版本号 `b<本地 YYYYMMDDHHmmss>`（04 §4.5）：脏输入在闸门处立答 400，不打扰 Docker 也不留任务

@@ -451,3 +451,74 @@ async def test_rollback_and_prod_gates_pass_when_not_publishing(client, monkeypa
     assert r.status_code == 202, r.text
     await client.app.state.dev_tasks[aid]
     assert done == ["rollback", "start"]
+
+
+# ---------- P3 回填脚手架端点 ----------
+
+async def test_scaffold_backfill_writes_D_file(client):
+    """有破坏性基线 → 同步写 sqlchange/D<today>_NN_backfill.sql，返回 {filename, content}；再点序号递增不覆盖。
+
+    不钉死 01：模板自带 D<today>_01_seed.sql 种子，脚手架按当日已有最大序号+1避重——验证不clobber 种子、且递增。
+    """
+    import datetime as _dt
+    import re
+    aid = await _mk(client)
+    root = APP_DIR
+    (root / "schema").mkdir(parents=True, exist_ok=True)
+    (root / "schema" / "schema.sql").write_text(
+        "CREATE TABLE IF NOT EXISTS demo_notes (id BIGSERIAL PRIMARY KEY);\n", encoding="utf-8")
+    prev = "b20260920000000"
+    (root / "releases" / prev).mkdir(parents=True, exist_ok=True)
+    (root / "releases" / prev / "schema.sql").write_text(
+        "CREATE TABLE IF NOT EXISTS demo_notes (id BIGSERIAL PRIMARY KEY);\n"
+        "ALTER TABLE demo_notes ADD COLUMN IF NOT EXISTS title VARCHAR(200);\n", encoding="utf-8")
+    async with client.app.state.session_factory() as s:
+        from sqlalchemy import text as _t
+        await s.execute(_t("UPDATE app_project SET current_version=:v WHERE id=:i"),
+                        {"v": prev, "i": aid})
+        await s.commit()
+
+    today = _dt.datetime.now().strftime("%Y%m%d")
+    pat = re.compile(rf"^D{today}_(\d{{2}})_backfill\.sql$")
+    r = await client.post(f"/api/apps/{aid}/sqlchange/scaffold-backfill")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    m1 = pat.match(body["filename"])
+    assert m1, body["filename"]
+    assert "title" in body["content"]
+    on_disk = (root / "sqlchange" / body["filename"])
+    assert on_disk.is_file() and on_disk.read_text(encoding="utf-8") == body["content"]
+    # 不 clobber 模板种子（脚手架文件与 seed 共存于 sqlchange/）
+    assert list((root / "sqlchange").glob("D*_seed.sql"))
+
+    r2 = await client.post(f"/api/apps/{aid}/sqlchange/scaffold-backfill")
+    m2 = pat.match(r2.json()["filename"])
+    assert m2 and int(m2.group(1)) == int(m1.group(1)) + 1
+
+
+async def test_scaffold_backfill_400_without_baseline(client):
+    """无 current_version / 无基线 → 400，不落任何文件。"""
+    aid = await _mk(client)
+    r = await client.post(f"/api/apps/{aid}/sqlchange/scaffold-backfill")
+    assert r.status_code == 400
+    sc = APP_DIR / "sqlchange"
+    assert not sc.exists() or not list(sc.glob("*_backfill.sql"))
+
+
+async def test_scaffold_backfill_400_when_no_destructive(client):
+    """有基线但非破坏（等价）→ 400「未检出破坏性变更」。"""
+    aid = await _mk(client)
+    root = APP_DIR
+    (root / "schema").mkdir(parents=True, exist_ok=True)
+    same = "CREATE TABLE IF NOT EXISTS t (id INT);\n"
+    (root / "schema" / "schema.sql").write_text(same, encoding="utf-8")
+    prev = "b20260920000000"
+    (root / "releases" / prev).mkdir(parents=True, exist_ok=True)
+    (root / "releases" / prev / "schema.sql").write_text(same, encoding="utf-8")
+    async with client.app.state.session_factory() as s:
+        from sqlalchemy import text as _t
+        await s.execute(_t("UPDATE app_project SET current_version=:v WHERE id=:i"),
+                        {"v": prev, "i": aid})
+        await s.commit()
+    r = await client.post(f"/api/apps/{aid}/sqlchange/scaffold-backfill")
+    assert r.status_code == 400 and "破坏性" in r.json()["detail"]
