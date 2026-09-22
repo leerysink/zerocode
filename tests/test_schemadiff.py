@@ -54,3 +54,40 @@ def test_rename_surfaces_as_drop_plus_add_destructive():
     prev = _snap("CREATE TABLE IF NOT EXISTS a (fullname TEXT);")
     cur = _snap("CREATE TABLE IF NOT EXISTS a (full_name TEXT);")
     assert destructive_changes(schema_diff(prev, cur))
+
+
+from app.deploy.schemadiff import backfill_skeleton
+
+
+def _diff(prev_sql, cur_sql):
+    return schema_diff(parse_schema(prev_sql), parse_schema(cur_sql))
+
+
+def test_backfill_skeleton_empty_when_no_destructive():
+    d = _diff("CREATE TABLE IF NOT EXISTS a (id INT);",
+              "CREATE TABLE IF NOT EXISTS a (id INT);\n"
+              "ALTER TABLE a ADD COLUMN IF NOT EXISTS b TEXT;")   # 纯新增
+    assert backfill_skeleton(d, today="20260922") == ""
+
+
+def test_backfill_skeleton_covers_dropped_and_type_change():
+    prev = ("CREATE TABLE IF NOT EXISTS a (id INT, old TEXT, amount VARCHAR(20));\n"
+            "CREATE TABLE IF NOT EXISTS gone (id INT);")
+    cur = "CREATE TABLE IF NOT EXISTS a (id INT, amount INT);"   # 删 old、gone 整表删、amount 类型变更
+    out = backfill_skeleton(_diff(prev, cur), today="20260922")
+    assert out
+    assert "20260922" in out                       # 头含生成日期
+    assert "删除表 gone" in out                     # 删表项
+    assert "a.old" in out                          # 删列项
+    assert "a.amount" in out                       # 类型变更项
+    # 通体注释：每个非空行都以 -- 开头（未补实即发布为 no-op）
+    assert all(ln.startswith("--") for ln in out.splitlines() if ln.strip())
+    # 占位 UPDATE 被注释（含 UPDATE 关键字且整行是注释）
+    assert any("UPDATE" in ln for ln in out.splitlines() if ln.startswith("--"))
+
+
+def test_backfill_skeleton_rename_candidate_pairing():
+    prev = "CREATE TABLE IF NOT EXISTS a (id INT, fullname TEXT);"
+    cur = ("CREATE TABLE IF NOT EXISTS a (id INT, full_name TEXT);")   # drop fullname + add full_name
+    out = backfill_skeleton(_diff(prev, cur), today="20260922")
+    assert "改名" in out and "a.fullname" in out and "a.full_name" in out

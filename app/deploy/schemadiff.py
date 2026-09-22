@@ -127,3 +127,44 @@ def destructive_message(diff: dict) -> str:
             + "；".join(items)
             + "。请按两步走处理（先加新列/双写并下个版本发布，再于数据轨补回填、"
               "下个版本才从 schema.sql 移除旧列），或设置 deploy.skip_schema_destructive 临时放行")
+
+
+def backfill_skeleton(diff: dict, *, today: str) -> str:
+    """由破坏性 diff 生成数据轨回填骨架文件内容（D<today>_NN_backfill.sql 的正文）。
+
+    只产出注释与被注释掉的幂等 UPDATE 占位——不臆造业务转换（对齐主 spec §19）。
+    通体 `--` 注释：未补实即发布也仅是 no-op、不会打断迁移；填实后取消注释生效。
+    无破坏性变更 → 返回空串（调用端据此拒绝生成）。
+    """
+    if not destructive_changes(diff):
+        return ""
+    L = [
+        f"-- 数据轨回填骨架 · 生成于 {today}",
+        "-- 用途：承接被破坏性闸门拦下的结构变更（删表/删列/改名/类型变更），在数据轨做一次幂等回填。",
+        "-- 这是骨架：以下 UPDATE 均为注释占位，请用真实转换逻辑替换 <...> 后取消注释再发布。",
+        "-- 纪律：schema.sql 永不 DROP，物理旧列仍在库中；回填完成后再于下个版本移除旧列声明。",
+        "",
+    ]
+    for t in diff["dropped_tables"]:
+        L.append(f"-- 删除表 {t}：先确认无下游依赖并归档数据，下个版本再从 schema.sql 移除")
+    if diff["dropped_tables"]:
+        L.append("")
+    for t in sorted(diff["dropped_columns"]):
+        olds = diff["dropped_columns"][t]
+        it = iter(list(diff["added_columns"].get(t, [])))
+        for c in olds:
+            rn = next(it, None)
+            if rn:
+                L.append(f"-- 疑似改名 {t}.{c} → {t}.{rn}（如非改名请忽略本段）")
+                L.append(f"-- UPDATE {t} SET {rn} = <从 {c} 派生的表达式> WHERE {rn} IS NULL;")
+            else:
+                L.append(f"-- 删除列 {t}.{c}：先归档/迁移其数据，下个版本再从 schema.sql 移除")
+                L.append(f"-- UPDATE {t} SET <目标列> = <从 {c} 派生的表达式> WHERE <目标列> IS NULL;")
+        L.append("")
+    for t in sorted(diff["type_changed"]):
+        for c in sorted(diff["type_changed"][t]):
+            a, b = diff["type_changed"][t][c]
+            L.append(f"-- 列 {t}.{c} 类型变更 {a} → {b}：确认既有值可安全转换，必要时先加新列双写")
+            L.append(f"-- UPDATE {t} SET {c} = <按 {b} 归一化的表达式> WHERE <守卫条件>;")
+        L.append("")
+    return "\n".join(L).rstrip() + "\n"
