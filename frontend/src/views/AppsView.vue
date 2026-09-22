@@ -5,9 +5,9 @@
 import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { message, Modal } from 'ant-design-vue'
 import {
-  AppstoreOutlined, CloudUploadOutlined, CopyOutlined, EyeOutlined, HistoryOutlined,
-  MenuOutlined, PlayCircleOutlined, PoweroffOutlined, ReloadOutlined, RocketOutlined,
-  ShopOutlined,
+  AppstoreOutlined, CloudUploadOutlined, CopyOutlined, DeleteOutlined, EditOutlined,
+  EyeOutlined, FolderOpenOutlined, HistoryOutlined, MenuOutlined, PlayCircleOutlined,
+  PoweroffOutlined, ProfileOutlined, RedoOutlined, ReloadOutlined, RocketOutlined, ShopOutlined,
 } from '@ant-design/icons-vue'
 import {
   appUrls, createApp, deleteApp, devReset, devRestart, devStart, devStatus, devStop, listApps,
@@ -350,15 +350,15 @@ async function doRelease() {
             <template #overlay>
               <div class="zc-app-menu">
                 <div class="zc-app-menu-item zc-menu-preview" @click.stop="openPreview(a)"><eye-outlined /> 预览</div>
-                <div class="zc-app-menu-item zc-menu-reset" @click.stop="resetDev(a)">重建 dev</div>
+                <div class="zc-app-menu-item zc-menu-reset" @click.stop="resetDev(a)"><redo-outlined /> 重建 dev</div>
                 <div class="zc-app-menu-item zc-menu-history" @click.stop="openHistory(a)"><history-outlined /> 发布历史</div>
                 <div v-if="canReleaseToStore(a)" class="zc-app-menu-item zc-menu-release" @click.stop="openRelease(a)"><shop-outlined /> 发布到商店</div>
-                <div class="zc-app-menu-item zc-menu-rename" @click.stop="openRename(a)">重命名</div>
-                <div class="zc-app-menu-item zc-menu-folder" @click.stop="openAppFolder(a)">打开工程目录</div>
-                <div class="zc-app-menu-item zc-menu-copy" @click.stop="copyPreviewUrl(a)">复制预览地址</div>
-                <div class="zc-app-menu-item zc-menu-logs" @click.stop="openLogs(a)">查看日志</div>
+                <div class="zc-app-menu-item zc-menu-rename" @click.stop="openRename(a)"><edit-outlined /> 重命名</div>
+                <div class="zc-app-menu-item zc-menu-folder" @click.stop="openAppFolder(a)"><folder-open-outlined /> 打开工程目录</div>
+                <div class="zc-app-menu-item zc-menu-copy" @click.stop="copyPreviewUrl(a)"><copy-outlined /> 复制预览地址</div>
+                <div class="zc-app-menu-item zc-menu-logs" @click.stop="openLogs(a)"><profile-outlined /> 查看日志</div>
                 <div class="zc-app-menu-item zc-app-menu-danger zc-menu-del" @click.stop="openDelete(a)">
-                  删除应用
+                  <delete-outlined /> 删除应用
                 </div>
               </div>
             </template>
