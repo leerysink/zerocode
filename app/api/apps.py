@@ -390,10 +390,10 @@ async def scaffold_backfill(request: Request, app_id: int):
         raise HTTPException(400, "无上一版结构基线可比对（未发布或缺 schema 快照），无法生成回填骨架")
     if not schemadiff.destructive_changes(d):
         raise HTTPException(400, "未检出破坏性变更，无需回填")
-    content = schemadiff.backfill_skeleton(d, today=datetime.now().strftime("%Y%m%d"))
+    today = datetime.now().strftime("%Y%m%d")   # 算一次：骨架表头注释与文件名日期跨年/跨零点保持一致
+    content = schemadiff.backfill_skeleton(d, today=today)
     scdir = root / "sqlchange"
     scdir.mkdir(exist_ok=True)
-    today = datetime.now().strftime("%Y%m%d")
     prefix = f"D{today}_"
     seqs = [int(p.name[len(prefix):len(prefix) + 2]) for p in scdir.glob(prefix + "*.sql")
             if p.name[len(prefix):len(prefix) + 2].isdigit()]
