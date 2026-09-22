@@ -804,6 +804,73 @@ async def test_publish_archives_schema_snapshot_on_success(monkeypatch, sf, seed
     assert archived.is_file() and archived.read_text(encoding="utf-8") == snap
 
 
+# ---- P3：破坏性闸门可确认 + 结构化负载 ----
+
+
+def _seed_destructive(pub_root):
+    """当前 schema.sql 删了上一版有 title 列 → 破坏性。"""
+    (pub_root / "schema").mkdir()
+    (pub_root / "schema" / "schema.sql").write_text(
+        "CREATE TABLE IF NOT EXISTS demo_notes (id BIGSERIAL PRIMARY KEY);\n",
+        encoding="utf-8", newline="")
+    prev_dir = pub_root / "releases" / PREV_VER
+    prev_dir.mkdir(parents=True)
+    (prev_dir / "schema.sql").write_text(
+        "CREATE TABLE IF NOT EXISTS demo_notes (id BIGSERIAL PRIMARY KEY);\n"
+        "ALTER TABLE demo_notes ADD COLUMN IF NOT EXISTS title VARCHAR(200) NOT NULL;\n",
+        encoding="utf-8", newline="")
+
+
+async def test_compute_schema_diff_helper(tmp_path):
+    # 缺基线 → None
+    assert prod.compute_schema_diff(tmp_path, None) is None
+    assert prod.compute_schema_diff(tmp_path, PREV_VER) is None   # 无文件
+    # 有 prev + cur，删列 → 破坏性 diff
+    _seed_destructive(tmp_path)
+    d = prod.compute_schema_diff(tmp_path, PREV_VER)
+    assert d is not None and "title" in d["dropped_columns"].get("demo_notes", [])
+
+
+async def test_publish_destructive_carries_structured_payload(monkeypatch, sf, seed, pub_root):
+    """被拦时 publish_done 事件带 code/destructive 结构化负载（不再只有红字 blob）。"""
+    wid, aid = await seed(slug="zcpub", prod_port=8982, dev_port=8983,
+                          status_prod="running", current_version=PREV_VER)
+    _seed_destructive(pub_root)
+    seams = PubSeams(monkeypatch, pub_root)
+    with pytest.raises(DeployError):
+        await prod.publish(sf, _pub_app(aid), notify=seams.notify, force=True)
+    done = seams.dones[-1]
+    assert done["ok"] is False
+    assert done["code"] == "schema_destructive"
+    assert isinstance(done["destructive"], list) and done["destructive"]
+    assert any("title" in x for x in done["destructive"])
+
+
+async def test_publish_confirm_destructive_bypasses_gate(monkeypatch, sf, seed, pub_root):
+    """确认放行：confirm_destructive=True → 闸门跳过 → 走完并归档本版快照为新基线。"""
+    wid, aid = await seed(slug="zcpub", prod_port=8982, dev_port=8983,
+                          status_prod="running", current_version=PREV_VER)
+    _seed_destructive(pub_root)
+    seams = PubSeams(monkeypatch, pub_root)
+    res = await prod.publish(sf, _pub_app(aid), notify=seams.notify,
+                             force=True, confirm_destructive=True)
+    assert res["status"] == "running"
+    assert seams.step_seq.count(("preflight", "ok")) == 1        # preflight 通过
+    archived = pub_root / "releases" / res["version"] / "schema.sql"
+    assert archived.is_file()
+    assert any("人工确认放行" in ln for ln in seams.logs)
+
+
+async def test_publish_nondestructive_has_no_code_field(monkeypatch, sf, seed, pub_root):
+    """既有全绿用例：无 schema/ 破坏性时 done 不带 code（向后兼容）。"""
+    wid, aid = await seed(slug="zcpub", prod_port=8982, dev_port=8983,
+                          status_prod="running", current_version=PREV_VER)
+    seams = PubSeams(monkeypatch, pub_root)
+    await prod.publish(sf, _pub_app(aid), notify=seams.notify, force=True)
+    assert seams.dones[-1]["ok"] is True
+    assert "code" not in seams.dones[-1]
+
+
 async def test_publish_requires_dev_cred(monkeypatch, sf, seed, pub_root):
     """D-T4：build 前 dev 凭据读空 = 数据异常，500 显式抛（不静默传空 dict 让渲染器保留旧键）。"""
     wid, aid = await seed(slug="zcpub", prod_port=8982, dev_port=8983)
