@@ -9,7 +9,8 @@ import { flushPromises, mount } from '@vue/test-utils'
 
 const mocks = vi.hoisted(() => ({
   useDeploy: vi.fn(),
-  api: { appUrls: vi.fn(), publishApp: vi.fn(), putConfig: vi.fn(), rollbackApp: vi.fn() },
+  api: { appUrls: vi.fn(), publishApp: vi.fn(), putConfig: vi.fn(), rollbackApp: vi.fn(),
+    scaffoldBackfill: vi.fn() },
   antd: {
     message: { success: vi.fn(), error: vi.fn(), info: vi.fn(), warning: vi.fn() },
     Modal: { confirm: vi.fn() },
@@ -121,7 +122,7 @@ describe('PublishModal 发布链', () => {
     await wrapper.find('.zc-pub-foot .stub-btn').trigger('click')
     await flushPromises()
     expect(dep.reset).toHaveBeenCalled()
-    expect(mocks.api.publishApp).toHaveBeenCalledWith(7, false)
+    expect(mocks.api.publishApp).toHaveBeenCalledWith(7, false, false)
   })
 
   it('publishing 进行中不重复受理（重复点击守卫）', async () => {
@@ -144,7 +145,7 @@ describe('PublishModal 发布链', () => {
     expect(arg.okText).toBe('继续发布')
     await arg.onOk()
     await flushPromises()
-    expect(mocks.api.publishApp).toHaveBeenLastCalledWith(7, true)
+    expect(mocks.api.publishApp).toHaveBeenLastCalledWith(7, true, false)
   })
 
   it('非 chat_active 错误走 message.error，不弹确认', async () => {
@@ -155,6 +156,59 @@ describe('PublishModal 发布链', () => {
     await flushPromises()
     expect(mocks.antd.Modal.confirm).not.toHaveBeenCalled()
     expect(mocks.antd.message.error).toHaveBeenCalledWith('Docker 未就绪')
+  })
+})
+
+describe('PublishModal 破坏性确认交互', () => {
+  function destructive() {
+    const ctx = mountModal()
+    ctx.dep.lastDone.value = { type: 'publish_done', ok: false, error: '破坏性 blob...',
+      code: 'schema_destructive',
+      destructive: ['删除表 gone', '删除列 demo_notes.title（改名亦属此，需两步走）'] }
+    return ctx
+  }
+
+  it('code=schema_destructive → 渲染结构化清单 + 两按钮，不再是红字 blob', async () => {
+    const { wrapper } = destructive()
+    await flushPromises()
+    const list = wrapper.find('.zc-pub-destr')
+    expect(list.exists()).toBe(true)
+    expect(list.text()).toContain('demo_notes.title')
+    const txt = wrapper.text()
+    expect(txt).toContain('我已确认风险，继续发布')
+    expect(txt).toContain('生成回填骨架')
+  })
+
+  it('「继续发布」→ publishApp(id, true, true)（force + confirmDestructive）', async () => {
+    mocks.api.publishApp.mockResolvedValue({ data: { ok: true } })
+    const { wrapper } = destructive()
+    await flushPromises()
+    const btn = wrapper.findAll('.zc-pub-destr ~ * .stub-btn, .stub-btn')
+      .find((b) => b.text().includes('我已确认风险'))
+    await btn.trigger('click')
+    await flushPromises()
+    expect(mocks.api.publishApp).toHaveBeenLastCalledWith(7, true, true)
+  })
+
+  it('「生成回填骨架」→ scaffoldBackfill(id) 成功提示落盘文件名', async () => {
+    mocks.api.scaffoldBackfill.mockResolvedValue({ data: { filename: 'D20260922_01_backfill.sql' } })
+    const { wrapper } = destructive()
+    await flushPromises()
+    const btn = wrapper.findAll('.stub-btn')
+      .find((b) => b.text().includes('生成回填骨架'))
+    await btn.trigger('click')
+    await flushPromises()
+    expect(mocks.api.scaffoldBackfill).toHaveBeenCalledWith(7)
+    expect(mocks.antd.message.success).toHaveBeenCalledWith(
+      expect.stringContaining('D20260922_01_backfill.sql'))
+  })
+
+  it('普通失败（无 code）仍走原 failText + 重试，不显破坏清单', async () => {
+    const { wrapper, dep } = mountModal()
+    dep.lastDone.value = { type: 'publish_done', ok: false, error: '镜像构建失败' }
+    await flushPromises()
+    expect(wrapper.find('.zc-pub-destr').exists()).toBe(false)
+    expect(wrapper.find('.zc-pub-fail').text()).toContain('镜像构建失败')
   })
 })
 

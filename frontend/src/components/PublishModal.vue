@@ -8,7 +8,7 @@
 import { computed, nextTick, onUnmounted, ref, watch } from 'vue'
 import { Modal, message } from 'ant-design-vue'
 import { CheckCircleOutlined, CloseCircleOutlined, CopyOutlined, LoadingOutlined } from '@ant-design/icons-vue'
-import { appUrls, publishApp, putConfig, rollbackApp } from '../api'
+import { appUrls, publishApp, putConfig, rollbackApp, scaffoldBackfill } from '../api'
 import { useDeploy } from '../composables/useDeploy'
 
 const props = defineProps({
@@ -37,6 +37,9 @@ const doneOk = computed(() => !!done.value && done.value.ok)
 const doneFail = computed(() => !!done.value && !done.value.ok)
 const failText = computed(() => (done.value?.error
   || (props.mode === 'rollback' ? '回滚失败' : '发布失败')).slice(0, 200))
+const isDestructive = computed(() => done.value?.code === 'schema_destructive')
+const destructiveList = computed(() => (Array.isArray(done.value?.destructive)
+  ? done.value.destructive : []))
 const mainUrl = computed(() => done.value?.url || urls.value?.lan || urls.value?.localhost
   || `http://localhost:${props.app.prod_port}`)
 
@@ -107,11 +110,11 @@ async function chooseNic(ip) {
     await loadUrls()
   } catch (e) { message.error(e?.response?.data?.detail || '网卡设置失败') }
 }
-async function publishWith(force) {
+async function publishWith(force, confirmDestructive = false) {
   dep.reset()
   accepting.value = true
   try {
-    await publishApp(props.app.id, force)
+    await publishApp(props.app.id, force, confirmDestructive)
     message.info('发布已受理，进度见下方步骤')
   } catch (e) {
     const detail = e?.response?.data?.detail
@@ -119,12 +122,21 @@ async function publishWith(force) {
       Modal.confirm({
         title: 'AI 正在修改代码', content: detail.message,
         okText: '继续发布', cancelText: '等一等',
-        onOk: () => publishWith(true),
+        onOk: () => publishWith(true, confirmDestructive),
       })
     } else {
       message.error(typeof detail === 'string' ? detail : '发布请求未被受理')
     }
   } finally { accepting.value = false }
+}
+async function confirmPublish() { await publishWith(true, true) }
+async function genSkeleton() {
+  try {
+    const { data } = await scaffoldBackfill(props.app.id)
+    message.success(`已写入 sqlchange/${data.filename}，请在 AI 会话补实回填逻辑后重新发布`)
+  } catch (e) {
+    message.error(e?.response?.data?.detail || '生成回填骨架失败')
+  }
 }
 async function start() {
   if (accepting.value || running.value) return          // 受理窗口/进行中不重复触发
@@ -198,7 +210,20 @@ async function start() {
       </details>
     </template>
 
-    <template v-if="doneFail">
+    <template v-if="doneFail && isDestructive">
+      <p class="zc-pub-fail">检测到破坏性结构变更，已阻断发布。请确认下列变更系有意为之：</p>
+      <ul class="zc-pub-destr">
+        <li v-for="(item, i) in destructiveList" :key="i">{{ item }}</li>
+        <li v-if="!destructiveList.length">（无明细，见上方说明）</li>
+      </ul>
+      <a-space>
+        <a-button size="middle" @click="genSkeleton">生成回填骨架</a-button>
+        <a-button size="middle" type="primary" :loading="running" @click="confirmPublish">
+          我已确认风险，继续发布
+        </a-button>
+      </a-space>
+    </template>
+    <template v-else-if="doneFail">
       <p class="zc-pub-fail">{{ failText }}</p>
       <a-space>
         <a-button size="middle" :loading="running" @click="start">
@@ -237,6 +262,8 @@ async function start() {
 .zc-pub-sub { color: var(--zc-text-sub); font-size: 12px; margin: 4px 0; }
 .zc-pub-fail { background: #fdf3f2; border: 1px solid #eadcdb; color: #b96a6a; border-radius: 4px;
                padding: 8px 10px; font-size: 12px; white-space: pre-wrap; word-break: break-all; }
+.zc-pub-destr { margin: 6px 0 10px; padding-left: 20px; font-size: 12px; color: #b96a6a; }
+.zc-pub-destr li { margin: 2px 0; }
 .zc-code { display: block; background: #f7f8fa; border-radius: 4px; padding: 6px 8px; margin: 4px 0;
            font-family: Consolas, monospace; font-size: 11px; word-break: break-all; }
 .zc-code-copy { margin-left: 8px; white-space: nowrap; }
