@@ -129,3 +129,27 @@ def test_render_copies_binary_file_byte_identical(tmp_path):
     out = tmp_path / "out" / "frontend"
     assert (out / "public" / "favicon.ico").read_bytes() == blob                   # 逐字节相等
     assert (out / "package.json").read_bytes() == b'{"name": "s-fe"}\n'   # 替换生效且不增换行
+
+
+def test_render_skips_demo_seed_when_template_ships_its_own(tmp_path):
+    """springboot 模板自带 RBAC 种子，平台不再追加 demo_notes 种子（该表只存在于 fastapi 栈 → 首迁移必红）。"""
+    tpl = tmp_path / "tpl"
+    (tpl / "sqlchange").mkdir(parents=True)
+    (tpl / "sqlchange" / "D20260101_01_rbac_seed.sql").write_text("SELECT 1;", encoding="utf-8")
+    out = tmp_path / "out"
+    scaffold.render(tpl, out, {
+        "SLUG": "s", "APP_NAME": "甲", "DEV_PORT": "1", "PROD_PORT": "2",
+        "DEV_DB": "s_dev", "PROD_DB": "s_prod", "TODAY": "20260922"})
+    assert [p.name for p in (out / "sqlchange").glob("*.sql")] == ["D20260101_01_rbac_seed.sql"]
+
+
+def test_render_appends_demo_seed_when_template_has_no_sql(tmp_path):
+    """对照（回归钉）：模板数据轨为空时照旧追加，vue3-fastapi 行为一字不变。"""
+    tpl = tmp_path / "tpl"
+    (tpl / "sqlchange").mkdir(parents=True)
+    (tpl / "sqlchange" / "README.md").write_text("只追加", encoding="utf-8")   # 与真模板同形：目录非空但无 .sql
+    out = tmp_path / "out"
+    scaffold.render(tpl, out, {
+        "SLUG": "s", "APP_NAME": "甲", "DEV_PORT": "1", "PROD_PORT": "2",
+        "DEV_DB": "s_dev", "PROD_DB": "s_prod", "TODAY": "20260922"})
+    assert (out / "sqlchange" / "D20260922_01_seed.sql").is_file()

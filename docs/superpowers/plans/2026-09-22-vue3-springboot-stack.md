@@ -805,6 +805,37 @@ def test_template_wiring_targets_compose_service_names(tmp_path):
     sec = (out / "backend" / "src" / "main" / "java" / PKG / "config" /
            "SecurityConfig.java").read_text(encoding="utf-8")
     assert '"/health"' in sec          # 探针不放行则 401，发布体检必挂
+
+
+RESOURCE_SUFFIXES = {".ico", ".png", ".jpg", ".jpeg", ".gif", ".woff", ".woff2",
+                     ".ttf", ".eot", ".jar"}
+
+
+@pytest.mark.skipif(not TEMPLATE.is_dir(), reason="vue3-springboot 模板尚未落仓")
+def test_template_files_are_strict_utf8_or_known_resource(tmp_path):
+    """收口 A1 的盲区：渲染器对解不出 UTF-8 的文件只搬字节（A1），所以错编码的文本
+    （GBK/UTF-16）会被静默原样复制、占位符永远不替换——模板侧只允许「严格 UTF-8 文本」
+    与「已知资源扩展名」两类，第三条路直接红。（A1 的 `_render_file` docstring 指名依赖本测试）
+    """
+    offenders = []
+    for p in sorted(TEMPLATE.rglob("*")):
+        if not p.is_file():
+            continue
+        rel = str(p.relative_to(TEMPLATE))
+        raw = p.read_bytes()
+        try:
+            raw.decode("utf-8")
+        except UnicodeDecodeError:
+            if p.suffix.lower() not in RESOURCE_SUFFIXES:
+                offenders.append(f"{rel}：非 UTF-8 且不是已知资源件")
+            elif b"{{" in raw:
+                offenders.append(f"{rel}：资源件里含 {{{{ 字节，渲染器不会替换它")
+    assert offenders == []
+    # 渲染产物逐文件扫字节：一个 {{ 都不许漏出来（比 render() 的文本自检覆盖宽）
+    out = _render(tmp_path)
+    for p in out.rglob("*"):
+        if p.is_file():
+            assert b"{{" not in p.read_bytes(), p.relative_to(out)
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
