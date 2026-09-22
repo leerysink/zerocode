@@ -13,6 +13,7 @@ from pathlib import Path
 import httpx
 from sqlalchemy import text
 from app.deploy import engine, records
+from app.deploy import gateway_routes
 from app.deploy.compose import ensure_deploy_files
 from app.deploy.errors import DeployError
 from app.deploy.engine import (preflight_docker, _app_root, _compose_meta, _notify,
@@ -44,6 +45,8 @@ async def set_status(sf, app_id: int, status: str) -> None:
             "UPDATE app_project SET status_prod = :st, updated_at = now() WHERE id = :i"),
             {"st": status, "i": app_id})
         await s.commit()
+    # 状态落库后旁路刷新网关路由表（running 进表、其余出表）；失败只告警不回滚业务
+    await gateway_routes.refresh(sf)
 
 
 async def get_status(sf, app_id: int) -> str:

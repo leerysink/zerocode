@@ -1,0 +1,37 @@
+# CONTEXT — 领域术语表
+
+项目内统一术语，拷问对齐时敲定，实现与文档必须使用这些规范词。
+
+## 平台网关（gateway）
+
+独立的 OpenResty 容器，仓库顶层 `gateway/` 目录编排，人工 `docker compose up -d` 长驻。
+职责：终止 TLS（自签通配证书）+ 按应用域名动态路由到各应用 prod 端口。
+平台后端不管它的启停，只喂它路由数据。应用容器本身不感知 HTTPS。
+
+## 应用域名（app domain）
+
+`{slug}.zerocode.com`。slug 是应用的稳定标识——改名（rename_app）不动 slug，
+所以域名一经发布永不漂移。通配证书只能匹配**一级**（`*.zerocode.com` 不匹配
+`a.b.zerocode.com`），slug 为单段字符串，恰好吻合此约束。
+
+## routes.json（网关路由表）
+
+平台导出的 `{slug: prod_port}` 映射文件，volume 挂进网关容器；OpenResty 的 lua
+按文件 mtime 缓存刷新。导出时机：发布成功、prod 启动、prod 停止、删除应用。
+它是网关与平台之间唯一的契约——网关不依赖平台 API 存活。
+
+## 自签通配证书
+
+openssl 脚本（仓库内 make-cert）生成的本地 CA + `*.zerocode.com` 证书，
+落在 `gateway/certs/`（gitignore 排除，不入库）。浏览器需手动信任该 CA。
+上服务器时重跑脚本、换真 DNS 解析即可。
+
+## miss（路由未命中）
+
+请求的 slug 不在 routes.json 中（应用未发布/已停/已删）→ 网关返回 404 提示页，
+告知用户去控制台启动应用。不重定向、不区分 503。
+
+## 控制台（console）
+
+zerocode 平台自身的管理界面。**不走网关**，继续以
+http://localhost:端口 直连访问。网关只服务应用域名。

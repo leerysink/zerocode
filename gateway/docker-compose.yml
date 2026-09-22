@@ -1,0 +1,27 @@
+# 平台中央网关（OpenResty）。人工常驻：docker compose -f gateway/docker-compose.yml up -d
+# 平台后端只喂 gateway/routes/routes.json，不管本容器启停。
+name: zerocode-gateway
+
+services:
+  gateway:
+    image: openresty/openresty:alpine
+    container_name: zerocode-gateway
+    restart: unless-stopped
+    # 本仓库配置在 /etc/nginx/nginx.conf；openresty 默认前缀不读这里，须显式 -c
+    command: ["openresty", "-g", "daemon off;", "-c", "/etc/nginx/nginx.conf"]
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      # 本机 Docker Desktop：host.docker.internal 经内嵌 DNS 解析到宿主
+      # 上服务器同机部署：改回 127.0.0.1（IP 字面量，proxy_pass 直连不经 DNS）
+      UPSTREAM_HOST: host.docker.internal
+      ROUTES_PATH: /etc/nginx/routes/routes.json
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./lua:/etc/nginx/lua:ro
+      - ./404.html:/etc/nginx/404.html:ro
+      - ./routes:/etc/nginx/routes:ro
+      - ./certs:/etc/nginx/certs:ro

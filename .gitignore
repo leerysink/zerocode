@@ -24,3 +24,8 @@ apps/
 
 # SDD workspace
 .superpowers/
+
+# Gateway 自签证书（本机生成，不入库）
+gateway/certs/
+# 平台自动重导的运行时路由表（目录内 .gitkeep 入库，routes.json 不入库）
+gateway/routes/routes.json

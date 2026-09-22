@@ -31,6 +31,21 @@ async def test_engine():
     await engine.dispose()
 
 @pytest.fixture
+def gateway_routes_tmp(tmp_path_factory, monkeypatch):
+    """把网关 routes.json 导出重定向到会话临时文件：prod 起停/删除会旁路刷新它，
+    不隔离就会写进仓库 gateway/routes/（既有 prod 测试不该感知这个副作用）。"""
+    p = tmp_path_factory.mktemp("gateway") / "routes.json"
+    monkeypatch.setenv("ZEROCODE_GATEWAY_ROUTES", str(p))
+    return p
+
+
+@pytest.fixture(autouse=True)
+def _isolate_gateway_routes(gateway_routes_tmp):
+    """全量测试自动隔离网关路由表落盘路径（无显式依赖也生效）。"""
+    return gateway_routes_tmp
+
+
+@pytest.fixture
 async def client(test_engine):
     from asgi_lifespan import LifespanManager
     from httpx import AsyncClient, ASGITransport

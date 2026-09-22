@@ -9,6 +9,7 @@ from pathlib import Path
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from app.deploy import provision, scaffold
+from app.deploy import gateway_routes
 from app.deploy.errors import DeployError
 from app.deploy.ports import allocate_pair
 from app.deploy.settings import REPO_ROOT, deploy_cfg, resolve_apps_root
@@ -289,5 +290,7 @@ async def delete_app(session_factory, app_id: int) -> dict:
         ensure_deletable(snap)
         await s.execute(text("DELETE FROM workspace WHERE id = :i"), {"i": snap["workspace_id"]})
         await s.commit()
+    # 应用行已级联删除，刷新网关路由表把该 slug 从 routes.json 摘掉（失败只告警）
+    await gateway_routes.refresh(session_factory)
     snap["databases"] = [f"{snap['slug']}_dev", f"{snap['slug']}_prod"]
     return snap
