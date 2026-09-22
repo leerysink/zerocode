@@ -1,0 +1,70 @@
+# 公共配置；差异项见 application-dev.yml / application-prod.yml
+server:
+  port: 8080
+  servlet:
+    context-path: /api
+
+spring:
+  application:
+    name: base
+  profiles:
+    active: dev
+  datasource:
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      maximum-pool-size: 10
+      minimum-idle: 2
+      connection-timeout: 30000
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      database: 0
+      timeout: 5000ms
+      lettuce:
+        pool:
+          # 必须显式开启：不开则依赖 Boot 从「pool 节点被写过」隐式推断，将来有人删下三行就会静默退化为非池化
+          enabled: true
+          max-active: 16
+          max-idle: 8
+          min-idle: 1
+          # 默认 -1（池耗尽时无限阻塞），给上限让耗尽时快速失败而不是挂住请求线程
+          max-wait: 3000ms
+  servlet:
+    multipart:
+      max-file-size: 10MB
+      max-request-size: 50MB
+  jackson:
+    date-format: yyyy-MM-dd HH:mm:ss
+    time-zone: Asia/Shanghai
+
+mybatis-plus:
+  mapper-locations: classpath*:mapper/**/*.xml
+  type-aliases-package: com.zerocode.app.entity
+  configuration:
+    map-underscore-to-camel-case: true
+  global-config:
+    db-config:
+      id-type: auto
+      logic-delete-field: deleted
+      logic-delete-value: 1
+      logic-not-delete-value: 0
+
+jwt:
+  # 本地/测试用默认值；生产必须在 application-prod.yml 里用无默认值的 ${JWT_SECRET} 覆盖，
+  # 否则会用仓库里公开的密钥签发 token，任何拿到源码的人都能离线伪造超管身份
+  secret: ${JWT_SECRET:leerysink-base-jwt-secret-key-please-override-in-prod-1234567890abcd}
+  expiration: 86400000
+  header: Authorization
+  token-prefix: "Bearer "
+
+file:
+  allowed-types: jpg,jpeg,png,gif,bmp,webp,pdf
+  max-size: 10485760
+
+# 数据库结构变更不再由应用自动执行：版本化脚本仍归档在 database/changelog/，需手工按文件名升序执行
+
+logging:
+  path: ${user.dir}/logs
+  max-history: 180
+  max-file-size: 100MB

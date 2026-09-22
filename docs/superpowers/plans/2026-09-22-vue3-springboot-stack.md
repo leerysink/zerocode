@@ -214,14 +214,19 @@ foreach ($f in $files) {
 
 > Windows PowerShell 5.1 的 `Set-Content -Encoding UTF8` 会写 BOM，Java/YAML 带 BOM 是隐雷，故用 `UTF8Encoding($false)`。
 
-- [ ] **Step 4: 改名体检（必须零命中）**
+- [ ] **Step 4: 改名体检**
 
 ```powershell
 Get-ChildItem -Recurse -File $tpl | Select-String -Pattern "leerysink" | ForEach-Object { $_.Path + ":" + $_.LineNumber }
 (Get-ChildItem -Recurse -File "$tpl\backend\src\main\java").Count
+(Get-ChildItem -Recurse -File "$ref\backend\src\main\java\com\leerysink\base").Count
+$bad = @(); Get-ChildItem -Recurse -File "$tpl\backend","$tpl\frontend" | Where-Object { $_.Extension -in '.java','.xml','.yml','.ts','.vue','.json','.css','.html','.md' } | ForEach-Object { try { $t = [System.IO.File]::ReadAllText($_.FullName, [System.Text.UTF8Encoding]::new($false, $true)) } catch { $bad += $_.Name; return }; if ($t.Contains([char]0xFFFD)) { $bad += $_.Name } }; "encoding damage: $($bad.Count)"
 ```
 
-Expected: 第一条**无输出**；第二条 `100`（与参考工程 java 文件数一致，防漏拷）。
+Expected（实跑已核）：
+- 第一条**只允许两处**：`backend/pom.xml` 的 `<groupId>com.leerysink</groupId>`（不含 `.base`，本次替换替不到）与 `application.yml` 的 `jwt.secret` 默认值——两处都由 **A4** 收口（Step 2 整文件重写 yml + Step 5 改 pom 坐标），其余必须零命中；
+- 第二、三条相等（实测都是 **92**；早期记录的 100 是把 `target/` 产物算进去了）；
+- 第四条 `encoding damage: 0`——Step 3 的 `ReadAllText(UTF8)` 遇到非 UTF-8源文件会写成替换符（且替换符序列仍是合法 UTF-8，事后看不出来），所以必须双查「严格解码 + 不含 U+FFFD」。
 
 - [ ] **Step 5: 占位符碰撞体检（本 Task 硬闸门）**
 
@@ -451,10 +456,10 @@ uploads/
 - [ ] **Step 8: 平台约定违规体检**
 
 ```powershell
-Get-ChildItem -Recurse -File app\templates\vue3-springboot | Select-String -Pattern 'D:/project|8082|PG_PASSWORD|application-dev|application-local' | ForEach-Object { $_.Filename + ":" + $_.LineNumber + "  " + $_.Line.Trim() }
+Get-ChildItem -Recurse -File app\templates\vue3-springboot | Select-String -Pattern 'D:/project|8082|PG_PASSWORD|application-dev|application-local|leerysink' | ForEach-Object { $_.Filename + ":" + $_.LineNumber + "  " + $_.Line.Trim() }
 ```
 
-Expected: **无输出**（绝对路径上传目录、8082 固定端口、旧环境变量名全部消失）。
+Expected: **无输出**（绝对路径上传目录、8082 固定端口、旧环境变量名、A3 遗留的两处 `leerysink` 全部消失）。
 
 - [ ] **Step 9: 提交**
 

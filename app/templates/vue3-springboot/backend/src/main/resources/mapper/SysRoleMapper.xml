@@ -1,0 +1,121 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.zerocode.app.mapper.SysRoleMapper">
+
+    <resultMap id="sysRoleResultMap" type="com.zerocode.app.entity.SysRole">
+        <id property="id" column="id"/>
+        <result property="roleName" column="role_name"/>
+        <result property="roleKey" column="role_key"/>
+        <result property="dataScope" column="data_scope"/>
+        <result property="sort" column="sort"/>
+        <result property="status" column="status"/>
+        <result property="remark" column="remark"/>
+        <result property="createTime" column="create_time"/>
+        <result property="updateTime" column="update_time"/>
+        <result property="deleted" column="deleted"/>
+    </resultMap>
+
+    <resultMap id="roleMemberResultMap" type="com.zerocode.app.vo.RoleMemberVO">
+        <id property="userId" column="user_id"/>
+        <result property="username" column="username"/>
+        <result property="nickname" column="nickname"/>
+        <result property="phone" column="phone"/>
+        <result property="deptId" column="dept_id"/>
+        <result property="deptName" column="dept_name"/>
+        <result property="status" column="status"/>
+    </resultMap>
+
+    <sql id="roleMemberColumns">
+        u.id AS user_id, u.username, u.nickname, u.phone,
+        u.dept_id, d.dept_name, u.status
+    </sql>
+
+    <select id="selectRolesByUserId" resultMap="sysRoleResultMap">
+        SELECT r.* FROM sys_role r
+        INNER JOIN sys_user_role ur ON r.id = ur.role_id
+        WHERE ur.user_id = #{userId} AND r.deleted = 0
+    </select>
+
+    <select id="selectDeptIdsByRoleId" resultType="java.lang.Long">
+        SELECT dept_id FROM sys_role_dept WHERE role_id = #{roleId}
+    </select>
+
+    <select id="selectDeptIdsByUserId" resultType="java.lang.Long">
+        SELECT DISTINCT rd.dept_id FROM sys_role_dept rd
+        INNER JOIN sys_user_role ur ON rd.role_id = ur.role_id
+        WHERE ur.user_id = #{userId}
+    </select>
+
+    <delete id="deleteRoleDeptByRoleId">
+        DELETE FROM sys_role_dept WHERE role_id = #{roleId}
+    </delete>
+
+    <insert id="batchInsertRoleDept">
+        INSERT INTO sys_role_dept(role_id, dept_id) VALUES
+        <foreach collection="deptIds" item="deptId" separator=",">
+            (#{roleId}, #{deptId})
+        </foreach>
+    </insert>
+
+    <delete id="deleteUserRoleByUserId">
+        DELETE FROM sys_user_role WHERE user_id = #{userId}
+    </delete>
+
+    <insert id="batchInsertUserRole">
+        INSERT INTO sys_user_role(user_id, role_id) VALUES
+        <foreach collection="roleIds" item="roleId" separator=",">
+            (#{userId}, #{roleId})
+        </foreach>
+    </insert>
+
+    <delete id="deleteRoleMenuByRoleId">
+        DELETE FROM sys_role_menu WHERE role_id = #{roleId}
+    </delete>
+
+    <insert id="batchInsertRoleMenu">
+        INSERT INTO sys_role_menu(role_id, menu_id) VALUES
+        <foreach collection="menuIds" item="menuId" separator=",">
+            (#{roleId}, #{menuId})
+        </foreach>
+    </insert>
+
+    <select id="selectMembersByRoleId" resultMap="roleMemberResultMap">
+        SELECT <include refid="roleMemberColumns"/>
+        FROM sys_user u
+        INNER JOIN sys_user_role ur ON ur.user_id = u.id
+        LEFT JOIN sys_dept d ON d.id = u.dept_id AND d.deleted = 0
+        WHERE ur.role_id = #{roleId} AND u.deleted = 0
+        ORDER BY u.id
+    </select>
+
+    <select id="selectCandidateMembersByRoleId" resultMap="roleMemberResultMap">
+        SELECT <include refid="roleMemberColumns"/>
+        FROM sys_user u
+        LEFT JOIN sys_dept d ON d.id = u.dept_id AND d.deleted = 0
+        WHERE u.deleted = 0 AND u.status = 1
+          AND NOT EXISTS (
+              SELECT 1 FROM sys_user_role ur WHERE ur.role_id = #{roleId} AND ur.user_id = u.id
+          )
+        ORDER BY u.id
+    </select>
+
+    <select id="selectMemberUserIdsByRoleId" resultType="java.lang.Long">
+        SELECT user_id FROM sys_user_role WHERE role_id = #{roleId}
+    </select>
+
+    <insert id="batchInsertUserRoleByRoleId">
+        INSERT INTO sys_user_role(user_id, role_id) VALUES
+        <foreach collection="userIds" item="userId" separator=",">
+            (#{userId}, #{roleId})
+        </foreach>
+    </insert>
+
+    <delete id="deleteUserRoleByRoleIdAndUserId">
+        DELETE FROM sys_user_role WHERE role_id = #{roleId} AND user_id = #{userId}
+    </delete>
+
+    <delete id="deleteUserRoleByRoleId">
+        DELETE FROM sys_user_role WHERE role_id = #{roleId}
+    </delete>
+
+</mapper>

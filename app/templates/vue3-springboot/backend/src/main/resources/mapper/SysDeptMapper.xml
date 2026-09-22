@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.zerocode.app.mapper.SysDeptMapper">
+
+    <!-- 部门子树：自身 + 全部后代，按 parent_id 递归展开。
+         用 UNION 而不是 UNION ALL：PG 对 UNION ALL 递归不去重也不会自动终止，
+         脏数据成环时会无限递归挂死连接；UNION 去重后遇环自然收敛 -->
+    <select id="selectDescendantIds" resultType="java.lang.Long">
+        WITH RECURSIVE subtree(id) AS (
+            SELECT id FROM sys_dept WHERE id = #{deptId} AND deleted = 0
+            UNION
+            SELECT d.id
+            FROM sys_dept d
+            INNER JOIN subtree s ON d.parent_id = s.id
+            WHERE d.deleted = 0
+        )
+        SELECT id FROM subtree
+    </select>
+
+    <select id="countChildren" resultType="java.lang.Integer">
+        SELECT COUNT(1) FROM sys_dept WHERE parent_id = #{deptId} AND deleted = 0
+    </select>
+
+</mapper>

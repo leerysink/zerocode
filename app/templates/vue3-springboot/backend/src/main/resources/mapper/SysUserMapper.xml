@@ -1,0 +1,109 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.zerocode.app.mapper.SysUserMapper">
+
+    <resultMap id="sysUserResultMap" type="com.zerocode.app.entity.SysUser">
+        <id property="id" column="id"/>
+        <result property="username" column="username"/>
+        <result property="password" column="password"/>
+        <result property="nickname" column="nickname"/>
+        <result property="deptId" column="dept_id"/>
+        <result property="phone" column="phone"/>
+        <result property="email" column="email"/>
+        <result property="status" column="status"/>
+        <result property="createTime" column="create_time"/>
+        <result property="updateTime" column="update_time"/>
+        <result property="deleted" column="deleted"/>
+    </resultMap>
+
+    <select id="selectByUsername" resultMap="sysUserResultMap">
+        SELECT * FROM sys_user WHERE username = #{username} AND deleted = 0
+    </select>
+
+    <!-- 用户分页列表：左连接 sys_dept 取部门名称。故意不加 d.deleted = 0，
+         保证 dept_id 指向已软删部门的历史用户也能显示名称而不是裸 ID。
+         数据权限条件由 @DataScope 切面驱动：切面置 dataScopeFiltered=true 时
+         visibleDeptIds 必非空（空集合会被哨兵 id 占位），所以 foreach 不会拼出 IN () -->
+    <select id="selectUserPage" resultType="com.zerocode.app.vo.SysUserVO">
+        SELECT
+            u.id, u.username, u.nickname, u.dept_id, u.phone, u.email, u.status, u.create_time,
+            d.dept_name
+        FROM sys_user u
+        LEFT JOIN sys_dept d ON d.id = u.dept_id
+        WHERE u.deleted = 0
+        <if test="query.username != null and query.username != ''">
+            AND u.username LIKE '%' || #{query.username} || '%'
+        </if>
+        <if test="query.status != null">
+            AND u.status = #{query.status}
+        </if>
+        <if test="query.dataScopeFiltered">
+            AND u.dept_id IN
+            <foreach collection="query.visibleDeptIds" item="deptId" open="(" separator="," close=")">
+                #{deptId}
+            </foreach>
+        </if>
+        ORDER BY u.create_time DESC, u.id DESC
+    </select>
+
+    <select id="selectRoleKeysByUserId" resultType="java.lang.String">
+        SELECT r.role_key
+        FROM sys_role r
+        INNER JOIN sys_user_role ur ON r.id = ur.role_id
+        WHERE ur.user_id = #{userId} AND r.deleted = 0 AND r.status = 1
+    </select>
+
+    <select id="selectPermissionsByUserId" resultType="java.lang.String">
+        SELECT DISTINCT m.permission
+        FROM sys_menu m
+        INNER JOIN sys_role_menu rm ON m.id = rm.menu_id
+        INNER JOIN sys_user_role ur ON rm.role_id = ur.role_id
+        WHERE ur.user_id = #{userId} AND m.permission IS NOT NULL AND m.permission != '' AND m.status = 1
+    </select>
+
+    <!-- 用户可见部门ID集合：一条 SQL 完成 seed 收集与子树展开，ancestors 不参与权限逻辑。
+         seed 三路对应 data_scope=2（本部门，不展开）/3（本部门及以下，展开）/4（自定义，不展开），
+         递归项必须把 s.expand 原样往下传：写成常量 FALSE 会让下一轮 WHERE s.expand 全部落空，
+         data_scope=3 就只展开一级（已在 PG 16.15 真库对照实测：2,10 vs 2,10,11,12）。
+         用 UNION 而不是 UNION ALL：PG 对 UNION ALL 递归不去重也不自动终止，
+         脏数据成环时会无限递归挂死连接；UNION 去重后遇环自然收敛（与 SysDeptMapper 一致）。
+         口径说明：sys_dept.status 不参与可见集合计算（只用 deleted）——停用部门的语义是
+         「不再作为新用户/新数据的归属目标」，不是「历史数据消失」；若这里过滤 status，
+         停用一个中间部门就会把它下面整片子树的历史数据从所有人名下抹掉。
+         对照：sys_role.status 必须参与，角色停用就是要立刻收掉它带来的可见范围 -->
+    <select id="selectVisibleDeptIds" resultType="java.lang.Long">
+        WITH RECURSIVE seeds(id, expand) AS (
+            SELECT u.dept_id, FALSE
+            FROM sys_user u
+            INNER JOIN sys_user_role ur ON ur.user_id = u.id
+            INNER JOIN sys_role r ON r.id = ur.role_id AND r.deleted = 0 AND r.status = 1
+            WHERE u.id = #{userId} AND r.data_scope = 2 AND u.dept_id IS NOT NULL AND u.deleted = 0
+            UNION
+            SELECT u.dept_id, TRUE
+            FROM sys_user u
+            INNER JOIN sys_user_role ur ON ur.user_id = u.id
+            INNER JOIN sys_role r ON r.id = ur.role_id AND r.deleted = 0 AND r.status = 1
+            WHERE u.id = #{userId} AND r.data_scope = 3 AND u.dept_id IS NOT NULL AND u.deleted = 0
+            UNION
+            SELECT rd.dept_id, FALSE
+            FROM sys_role_dept rd
+            INNER JOIN sys_role r ON r.id = rd.role_id AND r.deleted = 0 AND r.status = 1
+            INNER JOIN sys_user_role ur ON ur.role_id = r.id
+            WHERE ur.user_id = #{userId} AND r.data_scope = 4
+            UNION
+            SELECT d.id, s.expand
+            FROM sys_dept d
+            INNER JOIN seeds s ON d.parent_id = s.id
+            WHERE s.expand AND d.deleted = 0
+        )
+        SELECT DISTINCT id FROM seeds WHERE id IS NOT NULL
+    </select>
+
+    <select id="hasAllDataScope" resultType="java.lang.Integer">
+        SELECT COUNT(1)
+        FROM sys_user_role ur
+        INNER JOIN sys_role r ON ur.role_id = r.id
+        WHERE ur.user_id = #{userId} AND r.data_scope = 1 AND r.deleted = 0 AND r.status = 1
+    </select>
+
+</mapper>
