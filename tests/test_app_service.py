@@ -205,3 +205,16 @@ async def test_create_app_duplicate_slug_insert_row():
     async with sf() as s:                                  # 本次未提交任何 workspace 行
         assert (await s.execute(text(
             "SELECT count(*) FROM workspace WHERE root_path=:p"), {"p": str(ROOT2)})).scalar() == 0
+
+
+@pytest.mark.parametrize("bad", ['库存<管理>', 'R&D 中心', '设备"台账"', 'C:\\仓库', '巡检\n日志', 'a\x00b'])
+async def test_check_name_rejects_source_breaking_chars(bad):
+    """名字会被内插进生成工程的 pom/Java/py/html，这些宿主没有通用转义，入口就得拒。"""
+    with pytest.raises(DeployError, match="应用名称"):
+        app_service.check_name(bad)
+
+
+@pytest.mark.parametrize("ok", ["来料登记", "库存 管理 v2", "O'Brien 仓库", "巡检·看板", "a" * 100])
+async def test_check_name_still_accepts_ordinary_names(ok):
+    """对照钉：只拒写坏源码的字符，不顺手把中文/空格/单引号/长度边界一起拒掉。"""
+    assert app_service.check_name(ok) == ok

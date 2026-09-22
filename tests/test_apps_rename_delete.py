@@ -104,6 +104,17 @@ async def test_rename_rejects_blank_and_overlong(client):
                           i=app["id"]))[0] == "改名前"           # 失败不得留下半改状态
 
 
+async def test_rename_rejects_source_breaking_chars(client):
+    """名字会被内插进工程源码（banner/README/App.vue 等），入口就得拒，不能留碎产物。"""
+    app = await _create(client)
+    for bad in ('库存<管理>', "R&D 中心", '设备"台账"', 'C:\\仓库', '巡检\n日志'):
+        r = await client.patch(f"/api/apps/{app['id']}", json={"name": bad})
+        assert r.status_code == 400, f"{bad[:8]!r} → {r.status_code}"
+        assert "应用名称" in r.json()["detail"]
+    assert (await _scalar(client, "SELECT name FROM app_project WHERE id=:i",
+                          i=app["id"]))[0] == "改名前"
+
+
 async def test_rename_missing_app_is_404(client):
     r = await client.patch("/api/apps/999999", json={"name": "不存在"})
     assert r.status_code == 404, r.text

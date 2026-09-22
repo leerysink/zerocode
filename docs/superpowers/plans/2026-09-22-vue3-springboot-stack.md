@@ -18,13 +18,15 @@
 - Phase A/B/C/D 对应规格 §11 的四片，**每片结束都要有真跑证据**，不允许「前三片纸面绿、第四片才第一次启动」。
 - **回归环境注意**：本仓可能有并发会话共用同一个 `zerocode-pg16`，全量 `pytest tests` 会撞出
   `DeadlockDetectedError: deadlock detected` 与一批每次不同的 FAILED（实测同一棵树两次跑的红点不重叠）。
-  - 任何红必须先单跑该文件定性，不得直接归因于本次改动，也不得为了跑绿去 stash 别人的在途修改。
+  任何红必须先单跑该文件定性，不得直接归因于本次改动，也不得为了跑绿去 stash 别人的在途修改。
+- **提交前必验边界**：`git add <file>` 前先 `git diff <file>` 确认该文件的 diff **只含本次改动**。
+  并发会话可能把半成品留在同一个文件里（实跑碰到过 `app_service.py` 里他人在途的 `gateway_routes` 引用），
+  整文件 add 会提交出一个 import 不存在的坏 commit。
   - **⚠ 待裁定（A4 实跑发现，已提问用户）**：`check_name` 只校 strip + 长度，不限制字符集，而模板把
     `{{APP_NAME}}` 内插进机器可解析的文件。名字含 `< > & " \` 时产物会直接碎：
     本栈 `pom.xml` 的 `<name>` 与 `BaseApplication` 的 Java text block（`\q` 是非法转义 → 编译不过）；
     fastapi 栈早已有同一问题（`backend/app/main.py:18` 的 `APP_NAME = "{{APP_NAME}}"` 含 `"` 即破）。
-    三个候选：收紧 `check_name` 字符集（改变既有栈行为，存量应用改名会被拒）/ 模板侧不再内插名字到代码文件
-    （改从环境变量取，但平台尚未注入 APP_NAME）/ 只记为已知风险。未裁定前不得自行实现。
+    三个候选已裁定：用户选定「收紧 `check_name` 字符集」→ **Task A4b**。
 
 ---
 
@@ -562,6 +564,82 @@ Expected: **无输出**（绝对路径上传目录、8082 固定端口、旧环�
 git add app/templates/vue3-springboot/backend
 git commit -m "feat(template): port backend to zerocode conventions (single application.yml, actuator on /api/health, prod Dockerfile)"
 ```
+
+### Task A4b: 应用名字符集收口（阻断 `{{APP_NAME}}` 内插进源码的碎产物路径）
+
+**用户裁定（2026-09-22）**：选「收紧 `check_name`」，不在模板侧规避，也不只记风险。
+
+**背景**：A4 实跑发现 `check_name` 只校 strip + 长度。而 `{{APP_NAME}}` 会被内插进机器可解析的
+文件：本栈 `pom.xml` 的 `<name>`（`&` 即 XML 非法）与 `BaseApplication` 的 Java text block
+（`\q` 是非法转义 → 编译不过）；fastapi 栈同一形状早就存在（`backend/app/main.py:18`
+`APP_NAME = "{{APP_NAME}}"` 含 `"` 即碎）。全仓只有一个渲染入口带名字
+（`app_service.py:136` 的 mapping，上游就是 `check_name`），改名路径（:255）也共用同一函数，
+所以一处收口就能盖住两个栈。
+
+**为什么不转义**：`< > & " \` 在 Java text block / XML / Python 字面量 / HTML 文本四种宿主里转义规则
+各不相同，按目标格式转义需引入多个占位符键（契约面变大，AI 还要学会不用错）；而“应用名带引号或反斜杠”本身
+就是少量输入，入口拒掉的成本远低于产物碎掉后排查。
+
+**字符集**：只拒真正写坏源码的——`<` `>` `&` `"` `\` 与控制字符（含换行制表）。**不拒** `'`
+（在四种宿主里均安全，SQL 字面量路径已由 scaffold 做 `'`→`''` 转义），也不拒中文/空格/emoji。
+
+**Files:**
+- Modify: `app/services/app_service.py`（`check_name` 内加一条，顶部 `import re`）
+- Test: `tests/test_app_service.py`、`tests/test_apps_rename_delete.py`
+
+- [x] **Step 1: 写失败测试**
+
+```python
+@pytest.mark.parametrize("bad", ['库存<管理>', 'R&D 中心', '设备"台账"', 'C:\\仓库', '巡检\n日志', 'a\x00b'])
+async def test_check_name_rejects_source_breaking_chars(bad):
+    """名字会被内插进生成工程的 pom/Java/py/html，这些宿主没有通用转义，入口就得拒。"""
+    with pytest.raises(DeployError, match="应用名称"):
+        app_service.check_name(bad)
+
+
+@pytest.mark.parametrize("ok", ["来料登记", "库存 管理 v2", "O'Brien 仓库", "巡检·看板", "a" * 100])
+async def test_check_name_still_accepts_ordinary_names(ok):
+    """对照钉：只拒写坏源码的字符，不顺手把中文/空格/单引号/长度边界一起拒掉。"""
+    assert app_service.check_name(ok) == ok
+```
+
+> 实跑记注：两条写成 `async def`（本文件 `pytestmark = pytest.mark.asyncio`，同步用例会刷
+> 「marked with asyncio but not an async function」告警），`check_name` 本身仍是同步函数。
+
+再加一条改名路径的同口径断言（`tests/test_apps_rename_delete.py` 的
+`test_rename_rejects_source_breaking_chars`）：五个坏名字 `PATCH /api/apps/{id}` 全 400 且
+「应用名称」在 detail 里，改完已落库的名字仍为「改名前」（不得留半改状态）。
+
+- [x] **Step 2: 跑测试确认失败** — 实跑 `pytest tests/test_app_service.py -q -k check_name` →
+  **6 failed, 5 passed**（拒接组全红、对照组已绿，说明「不拒中文/单引号」无需实现）。
+
+- [x] **Step 3: 实现**
+
+`app/services/app_service.py` 顶部 `import datetime, json, shutil` 旁加 `re`；`check_name` 的
+空名校验之后插入：
+
+```python
+    # 应用名会被内插进生成工程的源码与配置（pom.xml 的 <name>、Java text block 横幅、
+    # main.py 的字符串字面量、index.html 的 <title>）——这些宿主没有通用转义规则，
+    # 含 < > & " \ 或控制字符的名字会让产物直接编译不过／XML 非法。
+    # 与其让坏产物在预览阶段炸开且无从溯源，不如在入口给一条明确的 400。
+    if NAME_UNSAFE.search(stripped):
+        raise DeployError('应用名称不能包含 < > & " \\ 或换行等控制字符（会写进生成的源码里）')
+```
+
+模块级常量（`NAME_MAX` 旁）：
+
+```python
+NAME_UNSAFE = re.compile(r"[<>\"\\&\x00-\x1f\x7f]")
+```
+
+- [x] **Step 4: 跑绿** — `pytest tests/test_app_service.py tests/test_apps_rename_delete.py -q` → 33 passed；
+  受影响面补跑 `tests/test_apps_api.py tests/test_store_install_flow.py tests/test_store_api.py tests/test_ws.py`
+  → 31 passed（名字入口唯一，无其他调用方需要同步收口）。
+
+- [x] **Step 5: 提交** — `feat(apps): reject app names that would break generated source files`
+
+---
 
 ### Task A5: 前端接线与 prod 反代（vite / nginx / Dockerfile / 文案）
 

@@ -4,7 +4,7 @@
 端口分配前置于模板渲染（裁定 R-A）：真实端口先进 mapping，README/模板与库内登记用同一对端口，
 不再出现「空端口渲染 + 只回填不重渲染」的坏产物。并发创建同端口竞争由 app_project.prod_port UNIQUE 兜底。
 """
-import datetime, json, shutil
+import datetime, json, re, shutil
 from pathlib import Path
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
@@ -23,6 +23,9 @@ TEMPLATES = REPO_ROOT / "app" / "templates"   # 仓库根/app/templates（同 sc
 HEALTH_BY_STACK = {"vue3-fastapi": "/api/health", "vue3-node": "/api/health",
                    "vue3-springboot": "/actuator/health", "static": ""}
 NAME_MAX = 100    # workspace.name / app_project.name 同为 VARCHAR(100)
+# 名字会被内插进生成工程的源码与配置（pom.xml 的 <name>、Java text block 横幅、main.py 的字符串字面量、
+# index.html 的 <title>），单引号安全（SQL 字面量路径由 scaffold 做 '→'' 转义），故只拒写坏产物的那几个。
+NAME_UNSAFE = re.compile(r"[<>\"\\&\x00-\x1f\x7f]")
 STOPPABLE = ("running", "starting")   # 删除前需要收口的 dev 状态：这两态 Docker 里可能有真容器
 
 
@@ -35,6 +38,10 @@ def check_name(name: str) -> str:
     stripped = (name or "").strip()
     if not stripped:
         raise DeployError("应用名称不能为空")
+    if NAME_UNSAFE.search(stripped):
+        # 这些字符在 Java text block / XML / Python 字面量 / HTML 文本里的转义规则各不相同，无通用转义，
+        # 放它过入库就是“创建成功但预览/发布必碎”且无从溯源；入口一条 400 最便宜。
+        raise DeployError('应用名称不能包含 < > & " \\ 或换行等控制字符（会写进生成的源码里）')
     if len(stripped) > NAME_MAX:
         raise DeployError(f"应用名称过长（上限 {NAME_MAX} 字），请缩短后重试")
     return stripped
