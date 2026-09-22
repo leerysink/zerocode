@@ -114,3 +114,18 @@ def test_template_nginx_prod_proxy(tmp_path):
     assert "proxy_pass http://backend:8000" in ng and "try_files" in ng
     dk = (tmp_path / "frontend" / "Dockerfile").read_text(encoding="utf-8")
     assert "COPY nginx.conf /etc/nginx/conf.d/default.conf" in dk
+
+
+def test_render_copies_binary_file_byte_identical(tmp_path):
+    """favicon.ico 这类非 UTF-8 资源必须按字节 copy（read_text 会抛 UnicodeDecodeError → 创建失败回滚）。"""
+    tpl = tmp_path / "tpl"
+    (tpl / "frontend" / "public").mkdir(parents=True)
+    (tpl / "frontend" / "package.json").write_bytes(b'{"name": "{{SLUG}}-fe"}\n')   # 含换行：钉住 newline=""
+    blob = bytes([0, 0, 1, 0, 0, 0, 0, 0, 255, 254, 0, 1, 0, 0, 0, 0])   # 必然解不出 UTF-8
+    (tpl / "frontend" / "public" / "favicon.ico").write_bytes(blob)
+    scaffold.render(tpl, tmp_path / "out", {
+        "SLUG": "s", "APP_NAME": "甲", "DEV_PORT": "1", "PROD_PORT": "2",
+        "DEV_DB": "s_dev", "PROD_DB": "s_prod", "TODAY": "20260101"})
+    out = tmp_path / "out" / "frontend"
+    assert (out / "public" / "favicon.ico").read_bytes() == blob                   # 逐字节相等
+    assert (out / "package.json").read_bytes() == b'{"name": "s-fe"}\n'   # 替换生效且不增换行

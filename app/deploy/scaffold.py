@@ -11,6 +11,22 @@ INSERT INTO demo_notes (title) VALUES ('欢迎使用 {APP_NAME}') ON CONFLICT DO
 """
 # 结构真相在 schema/schema.sql（模板自带、声明式快照）；脚手架只补数据轨种子。
 
+def _render_file(src: Path, target: Path, mapping: dict) -> None:
+    """渲染单个文件：解得出 UTF-8 才做占位替换，解不出即按字节原样 copy。
+
+    模板里的图标/字体类二进制不是文本，read_text 会抛 UnicodeDecodeError 把整个创建流程带回滚；
+    它们也不含 {{KEY}}，跳过替换无损（模板侧的「非 UTF-8 文件不得带占位字节」由模板体检测试钉住）。
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        text = src.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        target.write_bytes(src.read_bytes())
+        return
+    target.write_text(PLACEHOLDER.sub(lambda m: str(mapping[m.group(1)]), text),
+                      encoding="utf-8", newline="")
+
+
 def render(template: Path, dst: Path, mapping: dict) -> None:
     """把 template 目录渲染到 dst：占位符替换 + 生成初始迁移 + 残留自检。
 
@@ -29,10 +45,7 @@ def render(template: Path, dst: Path, mapping: dict) -> None:
         if src.is_dir():
             target.mkdir(parents=True, exist_ok=True)
             continue
-        text = src.read_text(encoding="utf-8")
-        text = PLACEHOLDER.sub(lambda m: str(mapping[m.group(1)]), text)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(text, encoding="utf-8", newline="")
+        _render_file(src, target, mapping)
     today = mapping["TODAY"]
     init = dst / "sqlchange" / f"D{today}_01_seed.sql"
     init.parent.mkdir(parents=True, exist_ok=True)
