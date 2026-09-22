@@ -11,6 +11,8 @@ import * as api from '../api'
 global.ResizeObserver = class { observe() {} unobserve() {} disconnect() {} }
 
 vi.mock('../api')
+// 页头新增 BackButton（内部 useRouter()）：本测试只挂 Antd 无 router，这里给一个 push 桩。
+vi.mock('vue-router', () => ({ useRouter: () => ({ push: vi.fn() }) }))
 
 const releases = [
   { id: 1, slug: 'test1', version: 'b2', title: '陌如玉', summary: '桌面备忘', stack: 'vue3-fastapi',

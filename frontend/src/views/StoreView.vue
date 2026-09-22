@@ -5,6 +5,7 @@ import { message } from 'ant-design-vue'
 import { AppstoreOutlined, PlusOutlined, SendOutlined } from '@ant-design/icons-vue'
 import * as api from '../api'
 import ActorNameModal from '../components/ActorNameModal.vue'
+import BackButton from '../components/BackButton.vue'
 
 const tab = ref('store')
 const releases = ref([])
@@ -69,7 +70,10 @@ function gotoApps () { window.location.href = '/apps' }
 <template>
   <div class="zc-store">
     <header class="zc-store-head">
-      <h2><appstore-outlined /> 应用商店</h2>
+      <div class="zc-store-head-left">
+        <back-button />
+        <h2><appstore-outlined /> 应用商店</h2>
+      </div>
       <a-space>
         <a-button @click="load">刷新</a-button>
         <a-button type="primary" @click="gotoApps"><plus-outlined /> 新建应用</a-button>
@@ -136,6 +140,7 @@ function gotoApps () { window.location.href = '/apps' }
 <style scoped>
 .zc-store { padding: 16px 20px; }
 .zc-store-head { display: flex; align-items: center; justify-content: space-between; }
+.zc-store-head-left { display: flex; align-items: center; gap: 10px; }
 .zc-store-meta { color: rgba(0, 0, 0, 0.55); font-size: 13px; }
 .zc-store-summary { margin: 8px 0 12px; }
 .zc-store-tip { color: rgba(0, 0, 0, 0.55); font-size: 13px; }

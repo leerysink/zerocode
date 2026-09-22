@@ -46,17 +46,20 @@ const scaleCards = [
   { value: 'large', title: '大型', desc: '多角色/流程类业务系统，Vue3 + Spring Boot 3' },
 ]
 
-async function load() {
-  loading.value = true
+// silent=true：后台 5s 轮询只悄悄换数据、不翻 loading 态——否则每 5 秒整片卡片被 <a-spin>
+// 顶掉再重渲染，用户眼里就是「页面一直在刷新」。首屏与手动「刷新」仍走带 loading 的正常路径，
+// 轮询期间的报错也不弹（避免后端抖动时刷屏）。
+async function load(silent = false) {
+  if (!silent) loading.value = true
   try {
     apps.value = (await listApps()).data
   } catch (e) {
-    message.error(e?.response?.data?.detail || '应用列表加载失败')
+    if (!silent) message.error(e?.response?.data?.detail || '应用列表加载失败')
   } finally {
-    loading.value = false
+    if (!silent) loading.value = false
   }
 }
-onMounted(() => { load(); timer = setInterval(load, 5000) })
+onMounted(() => { load(); timer = setInterval(() => load(true), 5000) })
 onUnmounted(() => clearInterval(timer))
 
 function onName() {
@@ -325,7 +328,7 @@ async function doRelease() {
         <h2><appstore-outlined /> 我的应用</h2>
       </div>
       <a-space>
-        <a-button @click="load"><reload-outlined /> 刷新</a-button>
+        <a-button @click="load()"><reload-outlined /> 刷新</a-button>
         <a-button type="primary" @click="showWizard = true"><rocket-outlined /> 新建应用</a-button>
       </a-space>
     </div>
@@ -346,6 +349,9 @@ async function doRelease() {
             <menu-outlined class="zc-card-menu-btn" title="更多操作" @click.stop />
             <template #overlay>
               <div class="zc-app-menu">
+                <div class="zc-app-menu-item zc-menu-preview" @click.stop="openPreview(a)"><eye-outlined /> 预览</div>
+                <div class="zc-app-menu-item zc-menu-reset" @click.stop="resetDev(a)">重建 dev</div>
+                <div class="zc-app-menu-item zc-menu-history" @click.stop="openHistory(a)"><history-outlined /> 发布历史</div>
                 <div class="zc-app-menu-item zc-menu-rename" @click.stop="openRename(a)">重命名</div>
                 <div class="zc-app-menu-item zc-menu-folder" @click.stop="openAppFolder(a)">打开工程目录</div>
                 <div class="zc-app-menu-item zc-menu-copy" @click.stop="copyPreviewUrl(a)">复制预览地址</div>
@@ -370,14 +376,12 @@ async function doRelease() {
           </a>
         </p>
         <a-space wrap>
-          <a-button size="middle" @click="openPreview(a)"><eye-outlined /> 预览</a-button>
           <a-button size="middle" @click="toggleDev(a)">
             <poweroff-outlined v-if="a.status_dev === 'running'" />
             <play-circle-outlined v-else />
-            {{ a.status_dev === 'running' ? '停止' : '启动预览' }}
+            {{ a.status_dev === 'running' ? '停止预览' : '启动预览' }}
           </a-button>
           <a-button size="middle" @click="restartDev(a)">重启</a-button>
-          <a-button size="middle" @click="resetDev(a)">重建 dev</a-button>
           <a-button type="primary" ghost :disabled="!canPublish(a)"
                     :title="canPublish(a) ? '' : '该栈发布支持即将上线'"
                     :loading="a.status_prod === 'publishing'" @click="openPublish(a)">
@@ -388,7 +392,6 @@ async function doRelease() {
             <play-circle-outlined v-else />
             {{ a.status_prod === 'running' ? '停止正式' : '启动正式' }}
           </a-button>
-          <a-button size="middle" @click="openHistory(a)"><history-outlined /> 发布历史</a-button>
           <a-button v-if="canReleaseToStore(a)" size="middle" @click="openRelease(a)">
             <shop-outlined /> 发布到商店
           </a-button>
@@ -502,7 +505,7 @@ async function doRelease() {
 .zc-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
 .zc-head-left { display: flex; align-items: center; gap: 10px; }
 .zc-head h2 { font-size: 18px; font-weight: 600; color: var(--zc-text); margin: 0; }
-.zc-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 14px; }
+.zc-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(440px, 1fr)); gap: 14px; }
 .zc-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 8px; flex-shrink: 0; }
 /* 标题行拉成 flex：状态点固定、应用名可省略号、规格标签贴着名字（antd 的 .ant-card-head-title 里） */
 .zc-card :deep(.ant-card-head-title) { display: flex; align-items: center; overflow: hidden; }
@@ -528,7 +531,7 @@ async function doRelease() {
 .zc-app-menu { background: #fff; border-radius: 6px; box-shadow: 0 6px 16px rgba(0, 0, 0, 0.12);
                padding: 4px 0; min-width: 148px; }
 .zc-app-menu-item { padding: 6px 14px; font-size: 13px; color: var(--zc-text); cursor: pointer;
-                    white-space: nowrap; }
+                    white-space: nowrap; display: flex; align-items: center; gap: 8px; }
 .zc-app-menu-item:hover { background: rgba(91, 122, 157, 0.08); }
 .zc-app-menu-danger { color: #b96a6a; }
 .zc-app-menu-danger:hover { background: #fdf3f2; }

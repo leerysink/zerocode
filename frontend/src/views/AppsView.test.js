@@ -119,12 +119,11 @@ describe('AppsView 发布接线', () => {
     expect(wrapper.find('.stub-pub-modal').exists()).toBe(true)
   })
 
-  it('重建 dev 按钮：弹确认框，确认后调 devReset（202 受理）', async () => {
+  it('☰ 菜单「重建 dev」：弹确认框，确认后调 devReset（202 受理）', async () => {
     const wrapper = await mountView()
-    const btn = wrapper.findAll('.stub-card')[0].findAll('.stub-a-button')
-      .find((b) => b.text() === '重建 dev')
-    expect(btn).toBeTruthy()
-    await btn.trigger('click')
+    const item = wrapper.findAll('.stub-card')[0].find('.zc-menu-reset')
+    expect(item.exists()).toBe(true)
+    await item.trigger('click')
     expect(mocks.antd.Modal.confirm).toHaveBeenCalledTimes(1)
     const opts = mocks.antd.Modal.confirm.mock.calls[0][0]
     await opts.onOk()
@@ -201,12 +200,12 @@ describe('AppsView 商店接线', () => {
 
 // ---------- 卡片右上 ☰ 折叠菜单：重命名/打开工程目录/复制预览地址/查看日志/删除 ----------
 describe('AppsView 卡片折叠菜单', () => {
-  it('卡片右上 ☰ 菜单含五项操作', async () => {
+  it('卡片右上 ☰ 菜单收纳预览/重建/历史 + 五项工具操作', async () => {
     const wrapper = await mountView()
     const menu = wrapper.findAll('.stub-card')[0].find('.stub-dropdown')
     expect(menu.exists()).toBe(true)
     const text = menu.text()
-    for (const label of ['重命名', '打开工程目录', '复制预览地址', '查看日志', '删除应用'])
+    for (const label of ['预览', '重建 dev', '发布历史', '重命名', '打开工程目录', '复制预览地址', '查看日志', '删除应用'])
       expect(text).toContain(label)
   })
 
