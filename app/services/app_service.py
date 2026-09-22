@@ -21,10 +21,11 @@ LARGE_STACK = "vue3-springboot"
 STACKS = SMALL_STACKS + (LARGE_STACK,)
 TEMPLATES = REPO_ROOT / "app" / "templates"   # 仓库根/app/templates（同 scaffold 测试的 TEMPLATE 常量）
 HEALTH_BY_STACK = {"vue3-fastapi": "/api/health", "vue3-node": "/api/health",
-                   "vue3-springboot": "/actuator/health", "static": ""}
+                   "vue3-springboot": "/api/health", "static": ""}
 NAME_MAX = 100    # workspace.name / app_project.name 同为 VARCHAR(100)
-# 名字会被内插进生成工程的源码与配置（pom.xml 的 <name>、Java text block 横幅、main.py 的字符串字面量、
+# 名字会被内插进生成工程的源码与配置（pom.xml 的 <name>、Java 启动横幅的字符串字面量、main.py 的字符串字面量、
 # index.html 的 <title>），单引号安全（SQL 字面量路径由 scaffold 做 '→'' 转义），故只拒写坏产物的那几个。
+# % 也不拒（「50% 折扣」是正常业务名）：模板侧保证名字只作格式化实参出现，不进格式串（见 BaseApplication 横幅）。
 NAME_UNSAFE = re.compile(r"[<>\"\\&\x00-\x1f\x7f]")
 STOPPABLE = ("running", "starting")   # 删除前需要收口的 dev 状态：这两态 Docker 里可能有真容器
 
@@ -39,7 +40,7 @@ def check_name(name: str) -> str:
     if not stripped:
         raise DeployError("应用名称不能为空")
     if NAME_UNSAFE.search(stripped):
-        # 这些字符在 Java text block / XML / Python 字面量 / HTML 文本里的转义规则各不相同，无通用转义，
+        # 这些字符在 Java 字面量 / XML / Python 字面量 / HTML 文本里的转义规则各不相同，无通用转义，
         # 放它过入库就是“创建成功但预览/发布必碎”且无从溯源；入口一条 400 最便宜。
         raise DeployError('应用名称不能包含 < > & " \\ 或换行等控制字符（会写进生成的源码里）')
     if len(stripped) > NAME_MAX:

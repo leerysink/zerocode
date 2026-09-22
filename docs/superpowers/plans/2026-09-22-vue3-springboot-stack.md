@@ -349,7 +349,7 @@ RESIDUE = re.compile(r"\{\{\s*[A-Z][A-Z0-9_]*\s*\}\}")
 - Modify: `.../com/zerocode/app/config/SecurityConfig.java`、`.../com/zerocode/app/BaseApplication.java`、`backend/pom.xml`
 - Create: `backend/Dockerfile`、`backend/.dockerignore`
 
-- [ ] **Step 1: 确认 profile 只剩一份**
+- [x] **Step 1: 确认 profile 只剩一份**
 
 ```powershell
 Get-ChildItem app\templates\vue3-springboot\backend\src\main\resources -File | Select-Object -ExpandProperty Name
@@ -357,7 +357,7 @@ Get-ChildItem app\templates\vue3-springboot\backend\src\main\resources -File | S
 
 Expected: `application.yml`、`logback-spring.xml`。若仍出现 `application-dev.yml` / `application-prod.yml`，用 DeleteFile 工具删除。
 
-- [ ] **Step 2: 整文件重写 `application.yml`（C-3 + C-4）**
+- [x] **Step 2: 整文件重写 `application.yml`（C-3 + C-4）**
 
 ```yaml
 # 单一配置：环境差异全部外置为平台注入的环境变量。
@@ -456,7 +456,7 @@ logging:
     com.zerocode.app: info
 ```
 
-- [ ] **Step 3: `SecurityConfig` 白名单放开 health（C-5）**
+- [x] **Step 3: `SecurityConfig` 白名单放开 health（C-5）**
 
 把
 
@@ -472,7 +472,7 @@ logging:
 
 > `/health` 是**相对 context-path** 的 pattern，探针实际 URL 是 `/api/health`。spike 实测：不放行则 actuator 被兜底拦成 401，发布体检必失败。
 
-- [ ] **Step 4: 启动横幅去品牌、去文档行（C-6）**
+- [x] **Step 4: 启动横幅去品牌、去文档行（C-6）**
 
 `BaseApplication.java` 中把
 
@@ -484,16 +484,19 @@ logging:
                 """.formatted(baseUrl, baseUrl));
 ```
 
-改为
+改为（**A4c 返修后的最终形状**：名字作 `formatted` 的实参，不写进格式串）
 
 ```java
-                  {{APP_NAME}} 启动成功!
+                  %s 启动成功!
                   后端地址: %s
                 ===================================================
-                """.formatted(baseUrl));
+                """.formatted("{{APP_NAME}}", baseUrl));
 ```
 
-- [ ] **Step 5: `pom.xml` 改坐标 + 补 actuator（C-1）**
+> 原计划此处写的是 `{{APP_NAME}} 启动成功!` 直接落在 text block 里，评审 I-1 指出那等于把
+> 名字当格式字符串，名字含 `%` 即启动即崩（详 **Task A4c**）。
+
+- [x] **Step 5: `pom.xml` 改坐标 + 补 actuator（C-1）**
 
 原 `<groupId>com.leerysink</groupId>` 不含 `.base`，A3 Step 3 替不到它，此处手工改这四行：
 
@@ -515,7 +518,7 @@ logging:
 
 `<parent>` 的 `3.2.5` 与 `<java.version>17` **不动**（D-6：以 spike 实测基线为准，低于旧规格 02 §4.3 的 `^3.3`，差异在 Task D2 回写规格）。
 
-- [ ] **Step 6: 新增 `backend/Dockerfile`（C-8，prod build 用）**
+- [x] **Step 6: 新增 `backend/Dockerfile`（C-8，prod build 用）**
 
 ```dockerfile
 # syntax=docker/dockerfile:1
@@ -536,7 +539,7 @@ ENTRYPOINT ["java", "-jar", "/app/app.jar"]
 
 > `target/*.jar` 用通配：artifactId 已被替换成 slug，写死文件名会漂。`-DskipTests` 与 fastapi 栈「build 期不跑测试」同口径。
 
-- [ ] **Step 7: 新增 `backend/.dockerignore`**
+- [x] **Step 7: 新增 `backend/.dockerignore`**
 
 ```
 target/
@@ -546,7 +549,7 @@ uploads/
 
 （dev 期 `mvn spring-boot:run` 在挂载卷里产出 `backend/target`、`backend/logs`；不排除会把几百 MB 塞进 build context。）
 
-- [ ] **Step 8: 平台约定违规体检**
+- [x] **Step 8: 平台约定违规体检**
 
 ```powershell
 Get-ChildItem -Recurse -File app\templates\vue3-springboot | Select-String -Pattern 'D:/project|8082|PG_PASSWORD|application-dev|application-local|leerysink' | ForEach-Object { $_.Filename + ":" + $_.LineNumber + "  " + $_.Line.Trim() }
@@ -558,7 +561,7 @@ Expected: **无输出**（绝对路径上传目录、8082 固定端口、旧环�
 > `frontend/vite.config.ts:29-30`（那是 **A5 Step 1** 的活）。A4 跑时按目录取严：
 > `Get-ChildItem -Recurse -File $tpl\backend` 必须零命中，frontend 侧剩这两行属预期，A5 后归零。
 
-- [ ] **Step 9: 提交**
+- [x] **Step 9: 提交** — `e115a6f`（实跑：渲染后 12 项断言全绿，唯一 residue 在 `vite.config.ts`，属 A5）
 
 ```bash
 git add app/templates/vue3-springboot/backend
@@ -638,6 +641,79 @@ NAME_UNSAFE = re.compile(r"[<>\"\\&\x00-\x1f\x7f]")
   → 31 passed（名字入口唯一，无其他调用方需要同步收口）。
 
 - [x] **Step 5: 提交** — `feat(apps): reject app names that would break generated source files`
+
+---
+
+### Task A4c: A4/A4b 评审返修（I-1 名字里的 `%` 打挂横幅 + I-2 健康路径与模板矛盾）
+
+**来源**：A4+A4b 的两轴评审（轴一 ✅ 边界干净，轴二提出 2 必修 + 3 记账）。两项都不修完不能进 A5：
+I-1 造成「创建成功但预览永远起不来」，I-2 把错路径喂给 AI 契约。
+
+**I-1（必修）**：`check_name` 刻意不拒 `%`（「50% 折扣」是正常业务名，且 `%` 在 pom / Java 字面量里合法），
+而 A4 落地的横幅把 `{{APP_NAME}}` 直写进 text block —— 那里是 `formatted` 的**格式字符串**，名字里的裸 `%`
+被当转换符，启动即抛 `UnknownFormatConversionException`。修法取评审推荐：**名字改为格式实参**（两行都用 `%s`），
+而不是在平台侧加拒 `%`（那是把模板的锅转嫁成用户输入限制，且 fastapi 栈名字仍可用 `%`）。
+
+**I-2（必修）**：`HEALTH_BY_STACK["vue3-springboot"]` 仍是 `/actuator/health`，与 A4 落地的 `/api/health`（D-7）矛盾。
+该值经 `app.json` → `contract.py:82` 原文进 AI 契约、经 `store/release.py:94` 进商店包 manifest，
+留错等于让 AI 按一个 404 的路径去改后端。本栈无存量应用，无历史值需迁移；**B2 的整栈真创建端到端断言仍留 B2**
+（那一条还依赖 B1 的 dev-compose 与 `.env` 密钥，现在跑不过）。
+
+**Files:**
+- Modify: `app/templates/vue3-springboot/backend/src/main/java/com/zerocode/app/BaseApplication.java`
+- Modify: `app/services/app_service.py`（`HEALTH_BY_STACK` 一项 + 两处注释同步为当下事实）
+- Test: `tests/test_scaffold.py`、`tests/test_app_service.py`
+
+- [x] **Step 1: 写失败测试**
+
+```python
+def test_springboot_banner_keeps_percent_in_app_name_harmless(tmp_path):
+    name = "50% 折扣 进度%s完成"
+    scaffold.render(SPRINGBOOT_TEMPLATE, tmp_path, {..., "APP_NAME": name, ...})
+    java = (tmp_path / "backend" / ... / "BaseApplication.java").read_text(encoding="utf-8")
+    body = java.split('"""')[1]                       # 横幅 text block 本体
+    assert "%s" in body and "%" not in body.replace("%s", "")   # 只允许 %s 这类合法转换符
+    assert '"%s"' % name in java.split(".formatted(")[1]        # 名字以带引号实参出现，不在格式串里
+
+
+async def test_large_stack_health_path_matches_template():
+    assert app_service.HEALTH_BY_STACK["vue3-springboot"] == "/api/health"
+```
+
+- [x] **Step 2: 跑红** — 实跑两条新用例：**2 failed**（横幅 body 里裸 `%` 命中 / 路径仍 `/actuator/health`）。
+
+- [x] **Step 3: 实现**
+
+```java
+        System.out.println("""
+
+                ===================================================
+                  %s 启动成功!
+                  后端地址: %s
+                ===================================================
+                """.formatted("{{APP_NAME}}", baseUrl));
+```
+
+```python
+HEALTH_BY_STACK = {"vue3-fastapi": "/api/health", "vue3-node": "/api/health",
+                   "vue3-springboot": "/api/health", "static": ""}
+```
+
+- [x] **Step 4: 真 JVM 实测（纸面通过不算通过）** — 本机 JDK 17.0.10，把渲染产物的 `println` 表达式原样
+  塞进单文件 `Mini.java` 编译并运行（一次性验证物，用完已删）：
+  ① 现状 rc=0，输出里含 `50% 折扣 进度%s完成`；② **反例**（名字写回格式串）rc=1 且 stderr 是
+  `java.util.UnknownFormatConversionException: Conversion = ' '`——证明①不是空跑；③ pom `<name>` 渲染成原值。
+
+- [x] **Step 5: 跑绿 + 提交** — `pytest tests/test_scaffold.py tests/test_app_service.py tests/test_apps_rename_delete.py -q`
+  → **50 passed**。
+
+**评审记账项处置**（不另开任务，归到各自所属 Step）：
+- M-1：三份 yml 合一后不再有 `dev` profile，logback 走 `!dev` 分支 → 预览期日志由 DEBUG 降 INFO（排障细节变少，
+  不黑屏）。与模板自洽，用户想看 SQL 就地改 `application.yml`（已在 C-6 注释里写明）；
+- M-2：`stringtype=unspecified` 必须由平台注入的 JDBC 串带上（模板 yml 不给默认值）——**已覆盖**：B1 Step 的
+  dev-compose 与 C1 的 prod-compose 注入串都带 `?currentSchema=public&stringtype=unspecified`；
+- M-3：prod 未保留 base-pro 的 `logging.level.root: warn`——本栈模板统一 `com.zerocode.app: info`，root 走 Boot 默认，
+  不额外拦第三方的 INFO（dev/prod 同构比“少几条噪声”重要，且应用工程内可改）。
 
 ---
 
@@ -1346,7 +1422,10 @@ from app.deploy import compose
 - [ ] **Step 2: 跑测试确认失败**
 
 Run: `pytest tests/test_app_service.py::test_create_large_app_opened_with_api_health_probe -q`
-Expected: FAIL — `meta["health"]["backend"] == "/actuator/health"`
+
+> 勘误（A4c 已收口）：`HEALTH_BY_STACK` 已改 `/api/health`（与常量同形的窄断言已进 `test_app_service.py`），
+> 本 Step 不再是「health 路径 FAIL」；现在跑不过的是 **Step 1 里依赖 B1 的那半**（dev-compose 的 maven/redis
+> 服务与 `.env` 里的 `JWT_SECRET`/`REDIS_PASSWORD`）。B2 实际验证的是「整栈真创建能走通到落盘」。
 
 - [ ] **Step 3: 改实现**
 
@@ -1354,6 +1433,8 @@ Expected: FAIL — `meta["health"]["backend"] == "/actuator/health"`
 HEALTH_BY_STACK = {"vue3-fastapi": "/api/health", "vue3-node": "/api/health",
                    "vue3-springboot": "/api/health", "static": ""}
 ```
+
+> 已随 **Task A4c** 提前完成（I-2 必修），本 Step 只剩下面那条注释。
 
 `_check_scale_stack` 的 R-C 闸门**不删码**（模板目录落地后 `is_dir()` 自然为真，`vue3-node`/`static` 继续 400），只把注释改成当下事实：
 
@@ -2175,7 +2256,7 @@ git commit -m "docs(ux): tell the truth about large-stack cold start in the wiza
 | D-4 铺底+dev+prod 全链路 | Phase A / Phase B / Phase C 各自收尾 |
 | D-5 固定包名 com.zerocode.app | A3（改名硬闸）+ A4（pom 坐标）+ D2（规格改注） |
 | D-6 先 spike 再写 spec | 已完成（spike 数据入 spec §10，本计划只引用不重做） |
-| spec §5 健康探针收敛 | B2（HEALTH_BY_STACK）+ A4 Step 3（白名单）+ C4 Step 2（实测 200） |
+| spec §5 健康探针收敛 | A4c（`HEALTH_BY_STACK` 已提前收口）+ B2（整栈创建端到端）+ A4 Step 3（白名单）+ C4 Step 2（实测 200） |
 | spec §6 密钥不入库不改表 | B1（`STACK_SECRETS` 生成环）+ C1（同一份 .env） |
 | spec §7 契约追加 | D1 |
 | spec §8 验收（真跑、留证据） | B4 + C4 |

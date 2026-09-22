@@ -218,3 +218,12 @@ async def test_check_name_rejects_source_breaking_chars(bad):
 async def test_check_name_still_accepts_ordinary_names(ok):
     """对照钉：只拒写坏源码的字符，不顺手把中文/空格/单引号/长度边界一起拒掉。"""
     assert app_service.check_name(ok) == ok
+
+
+async def test_large_stack_health_path_matches_template():
+    """健康路径必须与模板真实探针同形（决策 D-7：context-path /api + actuator base-path /）。
+
+    这个值会写进 app.json，再经 contract.py 原文喂给 AI、经 store/release.py 打进商店包；
+    留 /actuator/health 就是让 AI 按一个 404 的路径去改后端。整栈真创建的端到端断言在 B2。
+    """
+    assert app_service.HEALTH_BY_STACK["vue3-springboot"] == "/api/health"

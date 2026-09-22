@@ -201,3 +201,24 @@ def test_render_springboot_template_end_to_end(tmp_path):
     assert (tmp_path / "frontend" / "vite.config.ts").is_file()
     assert (tmp_path / "backend" / "src" / "main" / "java" / "com" / "zerocode" / "app"
             / "BaseApplication.java").is_file()
+
+
+def test_springboot_banner_keeps_percent_in_app_name_harmless(tmp_path):
+    """应用名里的 % 不许打挂启动横幅：名字必须是 .formatted 的实参，不能是格式字符串本身。
+
+    check_name 刻意不拒 %（「50% 折扣」是正常业务名，%在 pom/XML/Java 字面量里都合法），而
+    String.formatted 会把格式串里的裸 % 当转换符 —— 名字进了 text block 就是启动即抛
+    UnknownFormatConversionException，创建成功、预览永远起不来。
+    """
+    import pytest
+    if not SPRINGBOOT_TEMPLATE.is_dir():
+        pytest.skip("vue3-springboot 模板尚未落仓")
+    name = "50% 折扣 进度%s完成"
+    scaffold.render(SPRINGBOOT_TEMPLATE, tmp_path, {
+        "SLUG": "bigapp", "APP_NAME": name, "DEV_PORT": "8211", "PROD_PORT": "8210",
+        "DEV_DB": "bigapp_dev", "PROD_DB": "bigapp_prod", "TODAY": "20260922"})
+    java = (tmp_path / "backend" / "src" / "main" / "java" / "com" / "zerocode" / "app"
+            / "BaseApplication.java").read_text(encoding="utf-8")
+    body = java.split('"""')[1]                       # 横幅 text block 本体
+    assert "%s" in body and "%" not in body.replace("%s", "")   # 只允许 %s 这类合法转换符
+    assert '"%s"' % name in java.split(".formatted(")[1]        # 名字以带引号实参出现，不在格式串里
