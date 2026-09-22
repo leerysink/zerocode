@@ -352,6 +352,7 @@ async function doRelease() {
                 <div class="zc-app-menu-item zc-menu-preview" @click.stop="openPreview(a)"><eye-outlined /> 预览</div>
                 <div class="zc-app-menu-item zc-menu-reset" @click.stop="resetDev(a)">重建 dev</div>
                 <div class="zc-app-menu-item zc-menu-history" @click.stop="openHistory(a)"><history-outlined /> 发布历史</div>
+                <div v-if="canReleaseToStore(a)" class="zc-app-menu-item zc-menu-release" @click.stop="openRelease(a)"><shop-outlined /> 发布到商店</div>
                 <div class="zc-app-menu-item zc-menu-rename" @click.stop="openRename(a)">重命名</div>
                 <div class="zc-app-menu-item zc-menu-folder" @click.stop="openAppFolder(a)">打开工程目录</div>
                 <div class="zc-app-menu-item zc-menu-copy" @click.stop="copyPreviewUrl(a)">复制预览地址</div>
@@ -391,9 +392,6 @@ async function doRelease() {
             <poweroff-outlined v-if="a.status_prod === 'running'" />
             <play-circle-outlined v-else />
             {{ a.status_prod === 'running' ? '停止正式' : '启动正式' }}
-          </a-button>
-          <a-button v-if="canReleaseToStore(a)" size="middle" @click="openRelease(a)">
-            <shop-outlined /> 发布到商店
           </a-button>
         </a-space>
       </a-card>

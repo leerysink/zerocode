@@ -173,21 +173,18 @@ describe('AppsView 商店接线', () => {
     expect(cards[0].text()).not.toContain('来自商店')
   })
 
-  it('入口闸门：发布过的非商店应用有「发布到商店」按钮；没发布过/商店实例没有', async () => {
+  it('入口闸门：发布过的非商店应用 ☰ 菜单里有「发布到商店」；没发布过/商店实例没有', async () => {
     const wrapper = await mountStoreView()
-    const has = (i) => wrapper.findAll('.stub-card')[i].findAll('.stub-a-button')
-      .some((b) => b.text().includes('发布到商店'))
+    const has = (i) => wrapper.findAll('.stub-card')[i].find('.zc-menu-release').exists()
     expect(has(0)).toBe(true)
     expect(has(1)).toBe(false)   // current_version=null
     expect(has(2)).toBe(false)   // 商店实例不重复上架
   })
 
-  it('发布到商店：弹窗提交调 releaseToStore(appId, {title, summary})', async () => {
+  it('发布到商店：菜单项点开弹窗提交调 releaseToStore(appId, {title, summary})', async () => {
     mocks.api.releaseToStore.mockResolvedValue({ data: { id: 9 } })
     const wrapper = await mountStoreView()
-    const btn = wrapper.findAll('.stub-card')[0].findAll('.stub-a-button')
-      .find((b) => b.text().includes('发布到商店'))
-    await btn.trigger('click')
+    await wrapper.findAll('.stub-card')[0].find('.zc-menu-release').trigger('click')
     const modal = wrapper.find('.stub-modal')
     expect(modal.exists()).toBe(true)
     await modal.find('.stub-input').setValue('甲商店版')
