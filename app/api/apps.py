@@ -17,10 +17,9 @@ from functools import partial
 from fastapi import APIRouter, Request, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import text
-from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
-from app import config as app_config
 from app.deploy import engine, prod, records, sqlrun
+from app.deploy import provision
 from app.deploy.errors import DeployError
 from app.deploy.provision import read_cred
 from app.deploy.slugs import suggest_slug, validate_slug
@@ -48,6 +47,7 @@ class AppRenameIn(BaseModel):
 
 class PublishIn(BaseModel):
     force: bool = False
+    confirmDestructive: bool = False
 
 
 class RollbackIn(BaseModel):
@@ -244,12 +244,8 @@ async def app_urls(request: Request, app_id: int):
 
 # ---------- sqlchange（Task 12 / 规格 07）：应用侧迁移的执行、记账与待办清单 ----------
 
-def _app_db_url(cred: dict) -> str:
-    """应用库连接串：复用平台 PG 实例的 host/port（生产由 ZEROCODE_DATABASE_URL 决定，不写死 5433），
-    只换库名/角色/密码。SQLAlchemy 默认掩码密码，取串必须 render_as_string(hide_password=False)。"""
-    base = make_url(app_config.database_url())
-    return base.set(database=cred["db"], username=cred["user"],
-                    password=cred["password"]).render_as_string(hide_password=False)
+# 应用库连接串口径收口到锚点服务（Task 5）：两处各自维护一份早晚漂移。
+from app.store.anchor import app_db_url as _app_db_url
 
 
 async def _history_rows(url: str, sql: str) -> list[dict]:
@@ -295,6 +291,39 @@ async def sql_apply(request: Request, app_id: int):
     return {"ok": True}
 
 
+async def _reset_dev(sf, app: dict, hub) -> None:
+    """重建 dev 库：drop → 重新 provision → 从 sqlchange 文件全量 fold。
+    用于消除 dev 漂移，使其重新等于 fold(文件)；失败以 dev_reset_result 事件收口。"""
+    app_id = app["id"]
+    slug = app["slug"]
+
+    def on_log(line: str) -> None:
+        hub.publish(app_id, {"app_id": app_id, "type": "dev_log", "line": line})
+
+    try:
+        await provision.drop_env(sf, slug, "dev")
+        cred = await provision.provision_env(sf, slug, "dev")
+        root = await engine._app_root(sf, app)
+        res = await sqlrun.run_sqlchange(root, "dev", cred, on_log=on_log)
+        ok = res["ok"]
+    except Exception as e:
+        ok, res = False, {"code": -1, "log": str(e)}
+    hub.publish(app_id, {"app_id": app_id, "type": "dev_reset_result", "env": "dev", "ok": ok, **res})
+
+
+@router.post("/{app_id}/dev/reset", status_code=202)
+async def dev_reset(request: Request, app_id: int):
+    """一键重建 dev 库（drop+provision+fold sqlchange）：202 受理 + 后台执行，进度走 dev_log/dev_reset_result。"""
+    sf = request.app.state.session_factory
+    hub = request.app.state.deploy_hub
+    try:
+        app = await app_service.get_app(sf, app_id)
+        _spawn(request, app_id, lambda: _reset_dev(sf, app, hub))
+    except DeployError as e:
+        raise _http(e)
+    return {"ok": True}
+
+
 @router.get("/{app_id}/sqlchange/records")
 async def sql_records(request: Request, app_id: int, env: str = "dev"):
     if env not in ("dev", "prod"):
@@ -319,7 +348,10 @@ async def sql_records(request: Request, app_id: int, env: str = "dev"):
 
 @router.get("/{app_id}/sqlchange/files")
 async def sql_files(request: Request, app_id: int):
-    """待执行清单：文件名升序（= 执行顺序），并标注 dev 库里已记账的那些。"""
+    """待执行清单：文件名升序（= 执行顺序），并标注 dev 库里已记账的那些。
+
+    P2 双轨：glob 由 `V*.sql` 放宽为 `*.sql`，让数据轨 `D*.sql`（与遗留 `V*.sql`）一并入待办清单；
+    口径只影响本 UI 列表——商店上架锚点取自 sqlchange_history（DB），与本目录 glob 无关（不伤打包）。"""
     sf = request.app.state.session_factory
     try:
         app = await app_service.get_app(sf, app_id)
@@ -327,7 +359,7 @@ async def sql_files(request: Request, app_id: int):
     except DeployError as e:
         raise _http(e)
     d = root / "sqlchange"
-    files = sorted(p.name for p in d.glob("V*.sql")) if d.is_dir() else []
+    files = sorted(p.name for p in d.glob("*.sql")) if d.is_dir() else []
     cred = await read_cred(sf, app["slug"], "dev")
     applied: dict[str, dict] = {}
     if cred:
@@ -335,6 +367,43 @@ async def sql_files(request: Request, app_id: int):
             _app_db_url(cred), "SELECT filename, success FROM sqlchange_history")}
     return [{"filename": f, "applied": f in applied, "success": applied.get(f, {}).get("success")}
             for f in files]
+
+
+@router.post("/{app_id}/sqlchange/scaffold-backfill")
+async def scaffold_backfill(request: Request, app_id: int):
+    """破坏性结构变更的数据轨回填骨架生成（同步）：在 sqlchange/ 新增 D<日期>_<序号>_backfill.sql。
+
+    与 store 打包无冲突：store 上架锚点取自 sqlchange_history（DB），未发布应用的半途 D 文件不进包；
+    文件名 D<8位日期>_<2位序号>_backfill.sql 匹配 prod._SQL_NAME（[VD] 轨均合法），preflight 命名闸门放行。
+    只新增绝不覆盖：序号取当日 D<today>_* 现有最大 +1。
+    """
+    from datetime import datetime
+    from app.deploy import schemadiff
+    sf = request.app.state.session_factory
+    try:
+        app = await app_service.get_app(sf, app_id)
+        root = await engine._app_root(sf, app)
+    except DeployError as e:
+        raise _http(e)
+    d = prod.compute_schema_diff(root, app.get("current_version"))
+    if d is None:
+        raise HTTPException(400, "无上一版结构基线可比对（未发布或缺 schema 快照），无法生成回填骨架")
+    if not schemadiff.destructive_changes(d):
+        raise HTTPException(400, "未检出破坏性变更，无需回填")
+    today = datetime.now().strftime("%Y%m%d")   # 算一次：骨架表头注释与文件名日期跨年/跨零点保持一致
+    content = schemadiff.backfill_skeleton(d, today=today)
+    scdir = root / "sqlchange"
+    scdir.mkdir(exist_ok=True)
+    prefix = f"D{today}_"
+    seqs = [int(p.name[len(prefix):len(prefix) + 2]) for p in scdir.glob(prefix + "*.sql")
+            if p.name[len(prefix):len(prefix) + 2].isdigit()]
+    next_seq = (max(seqs) + 1) if seqs else 1
+    if next_seq > 99:   # 两位序号上限：越界会产 3 位非法名、反被 preflight 命名闸门拦停
+        raise HTTPException(409, f"当日回填脚手架已达上限（99），请次日再试或清理 {today} 的 D*.sql")
+    nn = f"{next_seq:02d}"
+    filename = f"{prefix}{nn}_backfill.sql"
+    (scdir / filename).write_text(content, encoding="utf-8", newline="")
+    return {"filename": filename, "content": content}
 
 # ---------- 发布与 prod（Task 8 / 规格 04 §5）：202 受理 + 后台执行，进度走 publish_step 事件 ----------
 
@@ -372,7 +441,8 @@ async def publish(request: Request, app_id: int, body: PublishIn):
                         "message": "当前 AI 正在修改代码，发布的可能是不完整版本，是否继续？"})
         await prod.preflight_docker()
         _spawn(request, app_id, lambda: prod.publish(sf, app, notify=hub.publish,
-                                                     force=body.force))
+                                                     force=body.force,
+                                                     confirm_destructive=body.confirmDestructive))
     except DeployError as e:
         raise _http(e)
     return {"ok": True}

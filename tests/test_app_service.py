@@ -50,7 +50,9 @@ async def test_create_app_happy_path():
     # 目录产物
     assert (ROOT / "app.json").is_file()
     assert (ROOT / "backend" / "app" / "main.py").is_file()
-    assert list((ROOT / "sqlchange").glob("V*.sql"))
+    assert list((ROOT / "sqlchange").glob("D*.sql"))          # P2 数据轨种子（结构真相已迁至 schema.sql）
+    assert (ROOT / "schema" / "schema.sql").is_file()          # P2 结构轨声明式快照
+    assert not list((ROOT / "sqlchange").glob("V*.sql"))       # 不再有结构增量 V 文件
     assert (ROOT / "deploy" / "dev-compose.yml").is_file()      # 由 ensure_deploy_files 生成（Task 10）
     assert (ROOT / "deploy" / ".env").is_file()
     # 裁定 R-A：端口分配前置于 render —— README 必须渲染出真实端口，不得是空端口

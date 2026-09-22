@@ -8,7 +8,7 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { message } from 'ant-design-vue'
 import {
   AppstoreOutlined, DeleteOutlined, EllipsisOutlined, FolderOutlined, PlusOutlined,
-  SettingOutlined,
+  SettingOutlined, ShopOutlined,
 } from '@ant-design/icons-vue'
 import { createSession, deleteApp, deleteSession, listApps, listSessions, renameApp } from '../api'
 import { useChatStore } from '../stores/chat'
@@ -187,6 +187,7 @@ async function doDelete() {
     <div class="zc-footer">
       <div class="zc-footer-row">
         <router-link to="/apps"><appstore-outlined /> 应用</router-link>
+        <router-link to="/store"><shop-outlined /> 商店</router-link>
         <router-link to="/settings"><setting-outlined /> 设置</router-link>
       </div>
     </div>

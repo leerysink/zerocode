@@ -20,6 +20,9 @@ from app.deploy.engine import (preflight_docker, _app_root, _compose_meta, _noti
 from app.deploy.provision import read_cred, provision_env
 from app.deploy.settings import deploy_cfg
 from app.deploy.sqlrun import run_sqlchange
+from app.deploy.schemacheck import verify_dev_matches_files, parity_block_message
+from app.deploy import schemadiff
+from app.deploy.schemadiff import destructive_changes, destructive_message
 
 logger = logging.getLogger(__name__)
 
@@ -193,10 +196,28 @@ async def reconcile(sf, notify=None) -> None:
 
 # ===================== Task 7：发布流水线（publish 七步 / 自动回退 / rollback / keep-5）=====================
 
+
+def compute_schema_diff(root: Path, prev_version: str | None) -> dict | None:
+    """结构轨破坏性 diff 的唯一计算口：上一版归档快照 vs 当前 schema.sql。
+
+    缺基线（prev_version 空 / 无归档 / 无当前快照）→ None（无从比较）。破坏性闸门
+    与回填脚手架端点共用，避免路径口径漂移。
+    """
+    if not prev_version:
+        return None
+    snap_cur = root / "schema" / "schema.sql"
+    snap_prev = root / "releases" / prev_version / "schema.sql"
+    if not (snap_cur.is_file() and snap_prev.is_file()):
+        return None
+    return schemadiff.schema_diff(
+        schemadiff.parse_schema(snap_prev.read_text(encoding="utf-8")),
+        schemadiff.parse_schema(snap_cur.read_text(encoding="utf-8")))
+
 # 04 §4.1 状态机进度（前端进度条按此顺序点亮；record 收口在记账之后，故最后一步是记账）
 STEPLIST = ("preflight", "build", "provision", "migrate", "deploy", "health", "record")
 # 迁移文件名规范（07 迁移闸门 + 全局约束「注释不得含分号」）：安全名=词/连字符/点/汉字，不含分号
-_SQL_NAME = _re.compile(r"^V\d{8}_\d{2}_[\w\-.\u4e00-\u9fff]+\.sql$")
+# 数据轨 D* 与遗留结构轨 V* 均合法（P2 双轨；破坏性变更由 diff 闸门拦，不靠命名）
+_SQL_NAME = _re.compile(r"^[VD]\d{8}_\d{2}_[\w\-.\u4e00-\u9fff]+\.sql$")
 
 
 def next_version() -> str:
@@ -266,7 +287,8 @@ def _wire_dockerfile_proxy(dockerfile: Path) -> bool:
     return False
 
 
-async def publish(sf, app: dict, notify=None, *, force: bool = False) -> dict:
+async def publish(sf, app: dict, notify=None, *, force: bool = False,
+                  confirm_destructive: bool = False) -> dict:
     """七步发布（04 §4.1）：旧容器全程不动，体检过了才切 current_version（§4.3 失败自动回退）。
 
     force 是端点层 chat 闸门（FR4-09）的透传位——引擎不查 hub，「发布进行中/有活跃会话」的 409
@@ -294,10 +316,14 @@ async def publish(sf, app: dict, notify=None, *, force: bool = False) -> dict:
     async def rst(step):
         await records.set_step(sf, rid, step)
 
-    def done_payload(ok: bool, error: str = "") -> dict:
+    def done_payload(ok: bool, error: str = "", payload: dict | None = None) -> dict:
         # 失败时 version 回指 prev_version：前端卡片继续显示「在服务的版本」，不虚报新版本
-        return {"type": "publish_done", "ok": ok, "version": version if ok else prev_version,
-                "url": f"http://localhost:{_prod_port(app)}", "error": error}
+        out = {"type": "publish_done", "ok": ok, "version": version if ok else prev_version,
+               "url": f"http://localhost:{_prod_port(app)}", "error": error}
+        if payload:
+            out["code"] = payload.get("code")            # 本期恒 "schema_destructive"
+            out["destructive"] = payload.get("destructive")
+        return out
 
     try:
         await set_status(sf, app_id, "publishing")
@@ -311,6 +337,34 @@ async def publish(sf, app: dict, notify=None, *, force: bool = False) -> dict:
             raise DeployError("app.json 缺失，无法发布")
         if await _ensure_prod_proxy_conf(root):
             await _step(app_id, notify, "✓ 已为存量应用补齐 frontend 生产反代（nginx.conf / Dockerfile COPY 接线）")
+        # 1.x dev/prod 结构等价校验（P1 止血；并入 preflight，不改步序）：
+        #     dev 实际结构必须等于 fold(sqlchange 文件)，否则视为漂移，硬阻断发布。
+        _skip_verify = str((await deploy_cfg(sf)).get("deploy.skip_schema_parity", "")).lower() in ("1", "true", "yes")
+        if _skip_verify:
+            await _step(app_id, notify, "⚠ 已跳过 dev/prod 结构等价校验（deploy.skip_schema_parity）")
+        else:
+            _vp = await verify_dev_matches_files(sf, root, slug)
+            _block = parity_block_message(_vp)
+            if _block:
+                raise DeployError(_block)
+            await _step(app_id, notify, "✓ dev 结构与 sqlchange 文件等价校验通过")
+        # 1.y 结构破坏性闸门（P2→P3 可确认）：上一版归档快照 vs 当前 schema.sql，
+        #     命中删/改名/收窄即阻断；confirm_destructive（一次性）或持久 skip 才放行。
+        _skip_destr = str((await deploy_cfg(sf)).get("deploy.skip_schema_destructive", "")).lower() in ("1", "true", "yes")
+        if _skip_destr:
+            await _step(app_id, notify, "⚠ 已跳过结构破坏性闸门（deploy.skip_schema_destructive 持久兜底）")
+        elif confirm_destructive:
+            await _step(app_id, notify, "⚠ 破坏性变更已由人工确认放行（本次一次性，不改持久配置）")
+        else:
+            d = compute_schema_diff(root, prev_version)
+            if d is not None:
+                msg = destructive_message(d)
+                if msg:
+                    raise DeployError(msg, payload={
+                        "code": "schema_destructive",
+                        "destructive": destructive_changes(d),
+                        "diff": d})
+                await _step(app_id, notify, "✓ 结构破坏性校验通过（相对上一版无删/改名/收窄）")
         await _step_ev(app_id, notify, rst, "preflight", "ok")
         # 2 build（旧容器不动——04 §4.1；渲染先于 build：prod-compose.yml 的落盘条件已放宽为栈判定）
         await _step_ev(app_id, notify, rst, "build", "running")
@@ -407,6 +461,18 @@ async def publish(sf, app: dict, notify=None, *, force: bool = False) -> dict:
                 "UPDATE app_project SET current_version=:v, status_prod='running', "
                 "updated_at=now() WHERE id=:i"), {"v": version, "i": app_id})
             await s.commit()
+        # P2：发布成功即归档本版结构快照（releases/<version>/schema.sql），作为下次破坏性 diff 基线。
+        # 文件存、不碰平台库；归档失败不改判发布成败（下次缺基线时闸门自动跳过）。
+        try:
+            _snap = root / "schema" / "schema.sql"
+            if _snap.is_file():
+                _dst = root / "releases" / version
+                _dst.mkdir(parents=True, exist_ok=True)
+                (_dst / "schema.sql").write_text(_snap.read_text(encoding="utf-8"),
+                                                 encoding="utf-8", newline="")
+        except Exception as se:  # noqa: BLE001
+            await _step(app_id, notify, f"✗ schema 快照归档失败（不影响发布结果）：{se}",
+                        level=logging.WARNING)
         # 终审 I-1：晋升+体检通过即不可撤销点——之后的收尾（URL/README/记账/清镜像）各自圈稳，
         # 任何一步抛只降级为 warning，绝不再改判成败（finish 的 success 守卫是记账层兜底）。
         from app.deploy import nics
@@ -448,7 +514,7 @@ async def publish(sf, app: dict, notify=None, *, force: bool = False) -> dict:
                                            "message": str(e)})
         await _step(app_id, notify, f"✗ 发布失败：{str(e).splitlines()[0][:200]}",
                     level=logging.WARNING)
-        await _notify(notify, app_id, done_payload(False, str(e)[:500]))
+        await _notify(notify, app_id, done_payload(False, str(e)[:500], getattr(e, "payload", None)))
         raise
     except Exception as e:
         await records.finish(sf, rid, "failed", error=f"{type(e).__name__}: {e}")

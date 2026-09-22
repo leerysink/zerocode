@@ -1,6 +1,6 @@
 import { createRouter, createWebHistory } from 'vue-router'
 
-// 路由表：/ 对话页、/settings 设置页（视图均懒加载，按需分包）
+// 路由表：/ 对话页、/settings 设置页、/store 应用商店（视图均懒加载，按需分包）
 const routes = [
   {
     path: '/',
@@ -16,6 +16,11 @@ const routes = [
     path: '/apps',
     name: 'apps',
     component: () => import('../views/AppsView.vue'),
+  },
+  {
+    path: '/store',
+    name: 'store',
+    component: () => import('../views/StoreView.vue'),
   },
 ]
 

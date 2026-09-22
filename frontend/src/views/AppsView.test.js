@@ -8,10 +8,11 @@ import { flushPromises, mount } from '@vue/test-utils'
 const mocks = vi.hoisted(() => ({
   api: {
     listApps: vi.fn(), createApp: vi.fn(), validateAppSlug: vi.fn(),
-    devStart: vi.fn(), devStop: vi.fn(), devRestart: vi.fn(), devStatus: vi.fn(),
+    devStart: vi.fn(), devStop: vi.fn(), devRestart: vi.fn(), devReset: vi.fn(), devStatus: vi.fn(),
     prodStart: vi.fn(), prodStop: vi.fn(), prodRestart: vi.fn(), prodStatus: vi.fn(),
     appUrls: vi.fn(), publishApp: vi.fn(), rollbackApp: vi.fn(),
     appRecords: vi.fn(), deleteRecord: vi.fn(), systemNics: vi.fn(), putConfig: vi.fn(),
+    releaseToStore: vi.fn(),
     wsUrl: vi.fn(() => 'ws://test'),
   },
   antd: { message: { success: vi.fn(), error: vi.fn(), info: vi.fn(), warning: vi.fn() },
@@ -108,5 +109,84 @@ describe('AppsView 发布接线', () => {
       .find((b) => b.text() === '发布')
     await btn.trigger('click')
     expect(wrapper.find('.stub-pub-modal').exists()).toBe(true)
+  })
+
+  it('重建 dev 按钮：弹确认框，确认后调 devReset（202 受理）', async () => {
+    const wrapper = await mountView()
+    const btn = wrapper.findAll('.stub-card')[0].findAll('.stub-a-button')
+      .find((b) => b.text() === '重建 dev')
+    expect(btn).toBeTruthy()
+    await btn.trigger('click')
+    expect(mocks.antd.Modal.confirm).toHaveBeenCalledTimes(1)
+    const opts = mocks.antd.Modal.confirm.mock.calls[0][0]
+    await opts.onOk()
+    expect(mocks.api.devReset).toHaveBeenCalledWith(1)
+  })
+})
+
+// ---------- M3-a 商店接线：角标 / 发布到商店入口（最小追加，不动既有布局） ----------
+const STORE_APPS = [
+  { id: 1, name: '甲', slug: 'aaa', stack: 'vue3-fastapi', scale: 'small', dev_port: 8301,
+    prod_port: 8401, status_dev: 'stopped', status_prod: 'running', current_version: 'b1' },
+  { id: 2, name: '乙', slug: 'bbb', stack: 'vue3-fastapi', scale: 'small', dev_port: 8302,
+    prod_port: 8402, status_dev: 'stopped', status_prod: 'stopped', current_version: null },
+  { id: 3, name: '丙i', slug: 'ccci', stack: 'vue3-fastapi', scale: 'small', dev_port: 8303,
+    prod_port: 8403, status_dev: 'stopped', status_prod: 'running', current_version: 'b1',
+    store: { release_slug: 'aaa', release_version: 'b1', release_title: '甲', channel: 'managed' } },
+]
+
+// 上架弹窗需要真一点的桩：open 才渲染、带 ok 按钮、输入框回写 v-model:value
+const STORE_STUBS = {
+  ...STUBS,
+  'a-modal': { name: 'a-modal', props: ['open'], render() {
+    if (!this.open) return null
+    return h('div', { class: 'stub-modal' }, [
+      this.$slots.default?.(),
+      h('button', { class: 'stub-modal-ok', onClick: () => this.$emit('ok') }, 'ok')]) } },
+  'a-input': { name: 'a-input', props: ['value'], render() {
+    return h('input', { class: 'stub-input', value: this.value,
+      onInput: (e) => this.$emit('update:value', e.target.value) }) } },
+  'a-textarea': { name: 'a-textarea', props: ['value'], render() {
+    return h('textarea', { class: 'stub-textarea', value: this.value,
+      onInput: (e) => this.$emit('update:value', e.target.value) }) } },
+}
+
+async function mountStoreView() {
+  mocks.api.listApps.mockResolvedValue({ data: STORE_APPS })
+  const wrapper = mount(AppsView, { global: { stubs: STORE_STUBS } })
+  await flushPromises()
+  return wrapper
+}
+
+describe('AppsView 商店接线', () => {
+  it('商店实例卡片带「来自商店」角标，普通应用没有', async () => {
+    const wrapper = await mountStoreView()
+    const cards = wrapper.findAll('.stub-card')
+    expect(cards[2].text()).toContain('来自商店')
+    expect(cards[0].text()).not.toContain('来自商店')
+  })
+
+  it('入口闸门：发布过的非商店应用有「发布到商店」按钮；没发布过/商店实例没有', async () => {
+    const wrapper = await mountStoreView()
+    const has = (i) => wrapper.findAll('.stub-card')[i].findAll('.stub-a-button')
+      .some((b) => b.text().includes('发布到商店'))
+    expect(has(0)).toBe(true)
+    expect(has(1)).toBe(false)   // current_version=null
+    expect(has(2)).toBe(false)   // 商店实例不重复上架
+  })
+
+  it('发布到商店：弹窗提交调 releaseToStore(appId, {title, summary})', async () => {
+    mocks.api.releaseToStore.mockResolvedValue({ data: { id: 9 } })
+    const wrapper = await mountStoreView()
+    const btn = wrapper.findAll('.stub-card')[0].findAll('.stub-a-button')
+      .find((b) => b.text().includes('发布到商店'))
+    await btn.trigger('click')
+    const modal = wrapper.find('.stub-modal')
+    expect(modal.exists()).toBe(true)
+    await modal.find('.stub-input').setValue('甲商店版')
+    await modal.find('.stub-textarea').setValue('简介文本')
+    await wrapper.find('.stub-modal-ok').trigger('click')
+    await flushPromises()
+    expect(mocks.api.releaseToStore).toHaveBeenCalledWith(1, { title: '甲商店版', summary: '简介文本' })
   })
 })

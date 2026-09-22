@@ -72,7 +72,7 @@ def load_app_json(root: Path) -> dict:
 
 
 async def _insert_rows(session_factory, *, name, slug, scale, stack, root,
-                       prod_port: int, dev_port: int) -> dict:
+                       prod_port: int, dev_port: int, origin: str | None = None) -> dict:
     """workspace + app_project 单事务提交；端口由调用方前置分配后显式传入（裁定 R-A）。
 
     UNIQUE 冲突（并发创建的 slug/端口/目录竞态）→ 409，由上层统一回滚。
@@ -92,12 +92,12 @@ async def _insert_rows(session_factory, *, name, slug, scale, stack, root,
                 "INSERT INTO workspace (name, root_path) VALUES (:n, :p) RETURNING id"),
                 {"n": name, "p": str(root)})).scalar()
             row = (await s.execute(text(
-                "INSERT INTO app_project (workspace_id, name, slug, scale, stack, prod_port, dev_port) "
-                "VALUES (:w, :n, :s, :sc, :st, :pp, :dp) "
+                "INSERT INTO app_project (workspace_id, name, slug, scale, stack, prod_port, "
+                "dev_port, origin) VALUES (:w, :n, :s, :sc, :st, :pp, :dp, :og) "
                 "RETURNING id, workspace_id, name, slug, scale, stack, prod_port, dev_port, "
                 "status_dev, status_prod, current_version, created_at, updated_at"),
                 {"w": wid, "n": name, "s": slug, "sc": scale, "st": stack,
-                 "pp": prod_port, "dp": dev_port})).mappings().first()
+                 "pp": prod_port, "dp": dev_port, "og": origin})).mappings().first()
             await s.commit()
         except IntegrityError as e:
             # 只读探测与插入之间的竞态（另一路创建占走同一目录/端口/slug）：事务已废，交给上层回滚
@@ -112,8 +112,14 @@ async def _delete_rows(session_factory, app_id: int) -> None:
 
 
 async def create_app_project(session_factory, *, name: str, slug: str, scale: str,
-                             stack: str, root: str | None = None) -> dict:
-    """原子创建一个应用工程：任一步失败即回滚（平台记录 + 供给 + 目录），抛 DeployError。"""
+                             stack: str, root: str | None = None,
+                             origin: str | None = None, materialize=None) -> dict:
+    """原子创建一个应用工程：任一步失败即回滚（平台记录 + 供给 + 目录），抛 DeployError。
+
+    `materialize(root_path, mapping)`：铺源钩子。默认走栈模板渲染；商店安装传自己的闭包
+    （从包 copy 源码 + 锚点 sqlchange），从而复用本函数的端口分配、app.json、原子回滚。
+    `origin`：安装来源标记（`store:<release_id>`），自建应用为 NULL。
+    """
     name_stripped = check_name(name)
     validate_slug(slug)
     _check_scale_stack(scale, stack)
@@ -133,9 +139,11 @@ async def create_app_project(session_factory, *, name: str, slug: str, scale: st
     workspace_id = None
     provisioned_ok = False   # 本流是否真的供给过 dev 库：回滚只允许删本流自己建的东西（I-1）
     try:
-        scaffold.render(TEMPLATES / stack, root_path, mapping)   # R-C 已保证模板目录存在
+        render = materialize or (lambda rp, mp: scaffold.render(TEMPLATES / stack, rp, mp))
+        render(root_path, mapping)   # R-C 已保证模板目录存在
         app = await _insert_rows(session_factory, name=name_stripped, slug=slug, scale=scale,
-                                 stack=stack, root=root_path, prod_port=prod_port, dev_port=dev_port)
+                                 stack=stack, root=root_path, prod_port=prod_port,
+                                 dev_port=dev_port, origin=origin)
         app_id = app["id"]
         workspace_id = app["workspace_id"]
         # app.json：不含密码；端口来自同一次分配，与库内登记一致
@@ -193,25 +201,48 @@ async def _rollback(session_factory, root_path: Path, slug: str, app_id: int | N
 
 async def list_apps(session_factory) -> list[dict]:
     """应用列表（应用页与侧栏分组共用）。带上 workspace.root_path：
-    侧栏一行就是一个应用，确认删除时要当场把「工程目录还在哪儿」说清楚。"""
+    侧栏一行就是一个应用，确认删除时要当场把「工程目录还在哪儿」说清楚。
+
+    store 键：商店实例的绑定摘要（来源包/通道/已应用指纹），列表卡片角标与升级入口靠它；
+    一次性拉全部 link 再拼，不在循环里查库。"""
     async with session_factory() as s:
         rows = (await s.execute(text(
             "SELECT a.id, a.workspace_id, a.name, a.slug, a.scale, a.stack, a.prod_port, a.dev_port, "
-            "a.status_dev, a.status_prod, a.current_version, a.created_at, a.updated_at, w.root_path "
+            "a.status_dev, a.status_prod, a.current_version, a.origin, a.created_at, a.updated_at, w.root_path "
             "FROM app_project a LEFT JOIN workspace w ON w.id = a.workspace_id "
             "ORDER BY a.id DESC"))).mappings().all()
-    return [to_dict(r) for r in rows]
+        links = (await s.execute(text(
+            "SELECT l.app_id, l.release_id, l.channel, l.detach_reason, l.applied_fingerprint, "
+            "l.last_upgraded_at, r.version AS release_version, r.slug AS release_slug, "
+            "r.title AS release_title FROM app_instance_link l "
+            "JOIN app_release r ON r.id = l.release_id"))).mappings().all()
+    by_app = {int(l["app_id"]): to_dict(l) for l in links}
+    out = []
+    for r in rows:
+        d = to_dict(r)
+        d["store"] = by_app.get(int(d["id"]))
+        out.append(d)
+    return out
 
 
 async def get_app(session_factory, app_id: int) -> dict:
+    """单应用详情：与 list_apps 同形状携带 origin/store，前端一处判定逻辑两处复用。"""
     async with session_factory() as s:
         row = (await s.execute(text(
             "SELECT id, workspace_id, name, slug, scale, stack, prod_port, dev_port, "
-            "status_dev, status_prod, current_version, created_at, updated_at "
+            "status_dev, status_prod, current_version, origin, created_at, updated_at "
             "FROM app_project WHERE id = :i"), {"i": app_id})).mappings().first()
-    if not row:
-        raise DeployError("应用不存在", status=404)
-    return to_dict(row)
+        if not row:
+            raise DeployError("应用不存在", status=404)
+        link = (await s.execute(text(
+            "SELECT l.app_id, l.release_id, l.channel, l.detach_reason, l.applied_fingerprint, "
+            "l.last_upgraded_at, r.version AS release_version, r.slug AS release_slug, "
+            "r.title AS release_title FROM app_instance_link l "
+            "JOIN app_release r ON r.id = l.release_id WHERE l.app_id = :i"),
+            {"i": app_id})).mappings().first()
+    d = to_dict(row)
+    d["store"] = to_dict(link) if link else None
+    return d
 
 
 async def rename_app(session_factory, app_id: int, name: str) -> dict:

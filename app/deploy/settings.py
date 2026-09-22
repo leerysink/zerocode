@@ -9,6 +9,8 @@ DEFAULTS = {
     "deploy.keep_versions": 5,
     "deploy.health_timeout": 240,
     "deploy.auto_stop_dev_on_exit": True,
+    # 商店包是平台资产，默认落在仓库根 store/（与 apps/ 同级）；空串走 store_root() 的兜底。
+    "store.root": "",
 }
 REPO_ROOT = Path(__file__).resolve().parents[2]  # app/deploy/settings.py → 仓库根
 

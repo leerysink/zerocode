@@ -5,13 +5,20 @@
 // 基础配置字段映射与保存走 config store（loadConfig / save），api_key 掩码哨兵 sk-*** 由后端 PUT 过滤、不会覆盖真实密钥。
 // 模型库 api_key 契约（后端 app/api/models.py）：编辑留空 = 不改（提交时填哨兵 sk-***），新建必填；GET 永远掩码回显。
 import { createVNode, onMounted, ref } from 'vue'
+import { useRouter } from 'vue-router'
 import { Modal, message } from 'ant-design-vue'
-import { ExclamationCircleOutlined } from '@ant-design/icons-vue'
+import { ArrowLeftOutlined, ExclamationCircleOutlined } from '@ant-design/icons-vue'
 import { deleteModel, createModel, listModels, pgStatus, testLLM, updateModel } from '../api'
 import { useConfigStore } from '../stores/config'
 import { buildModelPayload, emptyModelForm, validateModelForm } from '../utils/modelForm'
 
 const store = useConfigStore()
+// 设置页是无侧栏的独立页，回退优先走浏览器历史；直接输 URL 进来时历史为空 → 兜底回对话首页。
+const router = useRouter()
+function goBack() {
+  if (window.history.state?.back) router.back()
+  else router.push('/')
+}
 const pg = ref(null) // {ok, version|error}
 const testing = ref(false)
 
@@ -157,7 +164,10 @@ async function save() {
 
 <template>
   <div class="zc-settings">
-    <h2 class="zc-page-title">设置</h2>
+    <div class="zc-page-head">
+      <a-button type="text" class="zc-back" @click="goBack"><arrow-left-outlined /> 返回</a-button>
+      <h2 class="zc-page-title">设置</h2>
+    </div>
 
     <a-tabs v-model:activeKey="activeTab" class="zc-tabs">
       <a-tab-pane key="models" tab="模型库">
@@ -271,11 +281,24 @@ async function save() {
   margin: 0 auto;
   padding: 24px 0 40px;
 }
+.zc-page-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 16px;
+}
+.zc-back {
+  padding-inline: 6px;
+  color: var(--zc-text-sub);
+}
+.zc-back:hover {
+  color: var(--zc-primary);
+}
 .zc-page-title {
   font-size: 18px;
   font-weight: 600;
   color: var(--zc-text);
-  margin: 0 0 16px;
+  margin: 0;
 }
 .zc-card {
   margin-bottom: 16px;

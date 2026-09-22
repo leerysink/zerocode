@@ -83,6 +83,12 @@ async def run_sqlchange(app_dir: Path, env: str, cred: dict, on_log=None) -> dic
     if not sql_dir.is_dir():
         return {"ok": False, "code": 2,
                 "log": f"sqlchange 目录不存在: {sql_dir}（迁移闸门拒绝空跑）"}
+    # P2 结构轨：存在 schema 目录才挂 /schema（缺时不挂，避免 Docker Desktop 静默造空 /schema；
+    # run.sh 的 [ -f /schema/schema.sql ] 双保险，缺快照时 fold 段自动跳过）。
+    schema_dir = app_dir / "schema"
+    mounts = ["-v", f"{sql_dir}:/sql:ro"]
+    if schema_dir.is_dir():
+        mounts = ["-v", f"{schema_dir}:/schema:ro", *mounts]
     await ensure_zcnet()
     # M-1（终审 F-01）：镜像只在平台启动构建一次，Docker 晚启动即永久缺失——main.py 注释承诺
     # 「首次预览时会重试」，这里兑现：网络自愈旁补镜像自愈（build_if_missing 幂等，inspect 命中即返回）。
@@ -92,6 +98,6 @@ async def run_sqlchange(app_dir: Path, env: str, cred: dict, on_log=None) -> dic
         "-e", f"TARGET_DB={cred['db']}",
         "-e", f"TARGET_USER={cred['user']}",
         "-e", f"TARGET_PASSWORD={cred['password']}",
-        "-v", f"{sql_dir}:/sql:ro",
+        *mounts,
         IMAGE, on_line=on_log)
     return {"ok": code == 0, "code": code, "log": log}

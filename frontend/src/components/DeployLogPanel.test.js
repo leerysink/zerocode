@@ -112,6 +112,19 @@ describe('DeployLogPanel', () => {
     expect(last.classes()).toContain('err')
   })
 
+  it('dev_reset_result 补一行重建结果摘要（成功 ok / 失败 err）', async () => {
+    const w = await mountPanel()
+    const sock = FakeWS.instances[0]
+    sock.emit({ type: 'dev_reset_result', env: 'dev', ok: true, code: 0 })
+    await flushPromises()
+    const last = w.findAll('.zc-dlog-line').at(-1)
+    expect(last.text()).toContain('✓ dev 库重建完成（dev）')
+    expect(last.classes()).toContain('ok')
+    sock.emit({ type: 'dev_reset_result', env: 'dev', ok: false, code: -1 })
+    await flushPromises()
+    expect(w.findAll('.zc-dlog-line').at(-1).text()).toContain('✗ dev 库重建失败（dev）')
+  })
+
   it('note 与失败原因照面：Docker 没开也能看到平台步骤行', async () => {
     devLogs.mockResolvedValue({ data: { lines: [lineRows[0]],
                                         note: '容器日志暂不可用：Docker 未启动或不可用',

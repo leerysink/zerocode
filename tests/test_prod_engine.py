@@ -444,12 +444,13 @@ class PubSeams(Seams):
     """
 
     def __init__(self, monkeypatch, root, *, build_code=0, up_codes=(0,), health_results=(True,),
-                 mig_ok=True, dev_cred=True, prod_cred=True, images=True, rm_code=0):
+                 mig_ok=True, dev_cred=True, prod_cred=True, images=True, rm_code=0, parity_ok=True):
         super().__init__(monkeypatch)
         self.root = Path(root)
         self.up_codes, self.health_results = tuple(up_codes), tuple(health_results)
         self.build_code, self.mig_ok, self.images = build_code, mig_ok, images
         self.rm_code = rm_code
+        self.parity_ok = parity_ok
         self.n_up = self.n_health = 0
         calls = self.calls
 
@@ -512,11 +513,20 @@ class PubSeams(Seams):
         async def app_root(sf_, app_):
             return self.root
 
+        async def verify(sf_, root_, slug_):
+            # P1 结构等价校验：默认放行（ok=True）；parity_ok=False 时模拟 dev 漂移阻断
+            calls.append(("verify", slug_))
+            if self.parity_ok:
+                return {"ok": True, "diff": {}}
+            return {"ok": False, "diff": {"objects_only_in_dev": ["stray"],
+                                          "objects_only_in_files": []}}
+
         # preflight_docker 与 set_status 由基座 Seams 负责（基座已记录 ("preflight",) 与 ("status", st)）
         for name, fn in (("_docker", docker),
                          ("read_cred", cred), ("provision_env", prov), ("run_sqlchange", mig),
                          ("wait_prod_health", health), ("ensure_deploy_files", ensure),
-                         ("image_exists", image_exists), ("_app_root", app_root)):
+                         ("image_exists", image_exists), ("_app_root", app_root),
+                         ("verify_dev_matches_files", verify)):
             monkeypatch.setattr(prod, name, fn)
 
     @property
@@ -716,6 +726,149 @@ async def test_publish_blocks_on_bad_sqlchange_name(monkeypatch, sf, seed, pub_r
         kind, st, step = (await s.execute(t(
             "SELECT kind, status, step FROM deploy_record WHERE app_id=:i"), {"i": aid})).first()
     assert (kind, st, step) == ("publish", "failed", "preflight")
+
+
+async def test_publish_blocks_on_dev_drift(monkeypatch, sf, seed, pub_root):
+    """P1 结构等价闸门（并入 preflight）：dev 与文件漂移 → 不起栈、不收口 ok、阻断发布。"""
+    wid, aid = await seed(slug="zcpub", prod_port=8982, dev_port=8983,
+                          status_prod="running", current_version=PREV_VER)
+    seams = PubSeams(monkeypatch, pub_root, parity_ok=False)
+
+    with pytest.raises(DeployError) as ei:
+        await prod.publish(sf, _pub_app(aid), notify=seams.notify, force=True)
+    assert "不一致" in str(ei.value) and "stray" in str(ei.value)
+    assert seams.step_seq == [("preflight", "running")]          # 校验在 preflight 内、ok 之前
+    assert "compose build" not in seams.verbs and not seams.ups()
+    assert seams.dones[-1]["ok"] is False and "漂移" in seams.dones[-1]["error"]
+    assert seams.statuses == ["publishing", "error"]
+
+
+async def test_publish_can_skip_schema_parity_check(monkeypatch, sf, seed, pub_root):
+    """兑底开关：置 deploy.skip_schema_parity=true 时即使漂移也放行（不写库，monkeypatch 配置）。"""
+    async def _cfg(_s):
+        return {"deploy.skip_schema_parity": "true"}
+    monkeypatch.setattr(prod, "deploy_cfg", _cfg)
+    wid, aid = await seed(slug="zcpub", prod_port=8982, dev_port=8983)
+    seams = PubSeams(monkeypatch, pub_root, parity_ok=False)      # 即便模拟漂移…
+
+    res = await prod.publish(sf, _pub_app(aid), notify=seams.notify, force=True)   # …仍应发布成功
+    assert res["status"] == "running" and seams.steps_ok == list(PUB_STEPS)
+    assert not any(c[0] == "verify" for c in seams.calls)          # 开关生效：根本没调校验
+
+
+async def test_publish_blocks_on_destructive_schema_drift(monkeypatch, sf, seed, pub_root):
+    """P2 结构破坏性闸门（并入 preflight）：上一版归档快照有列 title、当前 schema.sql 删了它
+    → 抛 DeployError、不起栈、不晋升 current_version（破坏性不自动执行，需人工两步走）。"""
+    wid, aid = await seed(slug="zcpub", prod_port=8982, dev_port=8983,
+                          status_prod="running", current_version=PREV_VER)
+    (pub_root / "schema").mkdir()
+    (pub_root / "schema" / "schema.sql").write_text(
+        "CREATE TABLE IF NOT EXISTS demo_notes (id BIGSERIAL PRIMARY KEY);\n",
+        encoding="utf-8", newline="")
+    prev_dir = pub_root / "releases" / PREV_VER
+    prev_dir.mkdir(parents=True)
+    (prev_dir / "schema.sql").write_text(
+        "CREATE TABLE IF NOT EXISTS demo_notes (id BIGSERIAL PRIMARY KEY);\n"
+        "ALTER TABLE demo_notes ADD COLUMN IF NOT EXISTS title VARCHAR(200) NOT NULL;\n",
+        encoding="utf-8", newline="")
+    seams = PubSeams(monkeypatch, pub_root)
+
+    with pytest.raises(DeployError) as ei:
+        await prod.publish(sf, _pub_app(aid), notify=seams.notify, force=True)
+    assert "破坏性" in str(ei.value) and "title" in str(ei.value)
+    assert seams.step_seq == [("preflight", "running")]          # 阻断在 preflight 内、ok 之前
+    assert "compose build" not in seams.verbs and not seams.ups()
+    assert seams.dones[-1]["ok"] is False
+    assert seams.statuses == ["publishing", "error"]
+    assert await _db_pair(sf, aid) == (PREV_VER, "error")         # 旧版本记录不动，仅态转 error
+
+
+async def test_publish_archives_schema_snapshot_on_success(monkeypatch, sf, seed, pub_root):
+    """P2 快照归档：非破坏发布成功 → 本版 releases/<version>/schema.sql 落盘（下次 diff 基线）。"""
+    wid, aid = await seed(slug="zcpub", prod_port=8982, dev_port=8983,
+                          status_prod="running", current_version=PREV_VER)
+    snap = ("CREATE TABLE IF NOT EXISTS demo_notes (id BIGSERIAL PRIMARY KEY);\n"
+            "ALTER TABLE demo_notes ADD COLUMN IF NOT EXISTS title VARCHAR(200) NOT NULL;\n")
+    (pub_root / "schema").mkdir()
+    (pub_root / "schema" / "schema.sql").write_text(snap, encoding="utf-8", newline="")
+    prev_dir = pub_root / "releases" / PREV_VER
+    prev_dir.mkdir(parents=True)
+    (prev_dir / "schema.sql").write_text(snap, encoding="utf-8", newline="")   # 同结构=非破坏，闸门放行
+    seams = PubSeams(monkeypatch, pub_root)
+
+    res = await prod.publish(sf, _pub_app(aid), notify=seams.notify, force=True)
+
+    assert res["status"] == "running" and seams.steps_ok == list(PUB_STEPS)
+    assert any("结构破坏性校验通过" in ln for ln in seams.logs)   # 闸门真跑了（非静默跳过）
+    archived = pub_root / "releases" / res["version"] / "schema.sql"
+    assert archived.is_file() and archived.read_text(encoding="utf-8") == snap
+
+
+# ---- P3：破坏性闸门可确认 + 结构化负载 ----
+
+
+def _seed_destructive(pub_root):
+    """当前 schema.sql 删了上一版有 title 列 → 破坏性。"""
+    (pub_root / "schema").mkdir()
+    (pub_root / "schema" / "schema.sql").write_text(
+        "CREATE TABLE IF NOT EXISTS demo_notes (id BIGSERIAL PRIMARY KEY);\n",
+        encoding="utf-8", newline="")
+    prev_dir = pub_root / "releases" / PREV_VER
+    prev_dir.mkdir(parents=True)
+    (prev_dir / "schema.sql").write_text(
+        "CREATE TABLE IF NOT EXISTS demo_notes (id BIGSERIAL PRIMARY KEY);\n"
+        "ALTER TABLE demo_notes ADD COLUMN IF NOT EXISTS title VARCHAR(200) NOT NULL;\n",
+        encoding="utf-8", newline="")
+
+
+async def test_compute_schema_diff_helper(tmp_path):
+    # 缺基线 → None
+    assert prod.compute_schema_diff(tmp_path, None) is None
+    assert prod.compute_schema_diff(tmp_path, PREV_VER) is None   # 无文件
+    # 有 prev + cur，删列 → 破坏性 diff
+    _seed_destructive(tmp_path)
+    d = prod.compute_schema_diff(tmp_path, PREV_VER)
+    assert d is not None and "title" in d["dropped_columns"].get("demo_notes", [])
+
+
+async def test_publish_destructive_carries_structured_payload(monkeypatch, sf, seed, pub_root):
+    """被拦时 publish_done 事件带 code/destructive 结构化负载（不再只有红字 blob）。"""
+    wid, aid = await seed(slug="zcpub", prod_port=8982, dev_port=8983,
+                          status_prod="running", current_version=PREV_VER)
+    _seed_destructive(pub_root)
+    seams = PubSeams(monkeypatch, pub_root)
+    with pytest.raises(DeployError):
+        await prod.publish(sf, _pub_app(aid), notify=seams.notify, force=True)
+    done = seams.dones[-1]
+    assert done["ok"] is False
+    assert done["code"] == "schema_destructive"
+    assert isinstance(done["destructive"], list) and done["destructive"]
+    assert any("title" in x for x in done["destructive"])
+
+
+async def test_publish_confirm_destructive_bypasses_gate(monkeypatch, sf, seed, pub_root):
+    """确认放行：confirm_destructive=True → 闸门跳过 → 走完并归档本版快照为新基线。"""
+    wid, aid = await seed(slug="zcpub", prod_port=8982, dev_port=8983,
+                          status_prod="running", current_version=PREV_VER)
+    _seed_destructive(pub_root)
+    seams = PubSeams(monkeypatch, pub_root)
+    res = await prod.publish(sf, _pub_app(aid), notify=seams.notify,
+                             force=True, confirm_destructive=True)
+    assert res["status"] == "running"
+    assert seams.step_seq.count(("preflight", "ok")) == 1        # preflight 通过
+    archived = pub_root / "releases" / res["version"] / "schema.sql"
+    assert archived.is_file()
+    assert any("人工确认放行" in ln for ln in seams.logs)
+
+
+async def test_publish_nondestructive_has_no_code_field(monkeypatch, sf, seed, pub_root):
+    """既有全绿用例：无 schema/ 破坏性时 done 不带 code（向后兼容）。"""
+    wid, aid = await seed(slug="zcpub", prod_port=8982, dev_port=8983,
+                          status_prod="running", current_version=PREV_VER)
+    seams = PubSeams(monkeypatch, pub_root)
+    await prod.publish(sf, _pub_app(aid), notify=seams.notify, force=True)
+    assert seams.dones[-1]["ok"] is True
+    assert "code" not in seams.dones[-1]
 
 
 async def test_publish_requires_dev_cred(monkeypatch, sf, seed, pub_root):

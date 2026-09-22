@@ -62,8 +62,17 @@ def test_contract_gate_requires_zc_app_manifest(tmp_path):
     assert build_app_contract(tmp_path)          # 对照：合法清单照常注入，闸门不误伤
 
 def test_contract_sql_and_db_fact_bans(tmp_path):
-    """I-2/M-2 文本锚：第 3 条含单事务建索引禁令；库事实段含库名/用户引用禁令。"""
+    """I-2/M-2 文本锚 + P2 双轨口径：第 3 条含单事务建索引禁令；库事实段含库名/用户引用禁令。"""
     (tmp_path / "app.json").write_text(json.dumps(VALID_META, ensure_ascii=False), encoding="utf-8")
     c = build_app_contract(tmp_path)
-    assert "sqlchange 文件在单事务内执行，建索引写普通 CREATE INDEX，不得使用 CREATE INDEX CONCURRENTLY" in c
+    assert "单事务内执行" in c and "CREATE INDEX IF NOT EXISTS" in c \
+        and "不得使用 CREATE INDEX CONCURRENTLY" in c
     assert "仅供理解，代码与 SQL 不得引用库名/用户名" in c
+
+
+def test_contract_states_dual_track_model(tmp_path):
+    """P2 双轨口径写入契约：结构真相走 schema/schema.sql 目标态、数据变更走 sqlchange/D*。"""
+    (tmp_path / "app.json").write_text(json.dumps(VALID_META, ensure_ascii=False), encoding="utf-8")
+    c = build_app_contract(tmp_path)
+    assert "schema/schema.sql" in c and "sqlchange/D" in c
+    assert "数据库变更走双轨" in c and "破坏性" in c
