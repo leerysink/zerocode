@@ -12,7 +12,7 @@ const mocks = vi.hoisted(() => ({
     prodStart: vi.fn(), prodStop: vi.fn(), prodRestart: vi.fn(), prodStatus: vi.fn(),
     appUrls: vi.fn(), publishApp: vi.fn(), rollbackApp: vi.fn(),
     appRecords: vi.fn(), deleteRecord: vi.fn(), systemNics: vi.fn(), putConfig: vi.fn(),
-    releaseToStore: vi.fn(),
+    releaseToStore: vi.fn(), renameApp: vi.fn(), deleteApp: vi.fn(), openFolder: vi.fn(),
     wsUrl: vi.fn(() => 'ws://test'),
   },
   antd: { message: { success: vi.fn(), error: vi.fn(), info: vi.fn(), warning: vi.fn() },
@@ -20,6 +20,10 @@ const mocks = vi.hoisted(() => ({
 }))
 vi.mock('../api', () => mocks.api)
 vi.mock('ant-design-vue', () => mocks.antd)
+// AppsView 顶层调 useConfigStore()：无 pinia 会挂载即抛，这里给一个只读桩（openFolderMode=auto）
+vi.mock('../stores/config', () => ({
+  useConfigStore: () => ({ ensureLoaded: vi.fn(async () => {}), form: { openFolderMode: 'auto' } }),
+}))
 
 import AppsView from './AppsView.vue'
 
@@ -58,6 +62,10 @@ const STUBS = {
   'a-input': slot('a-input'),
   'a-select': slot('a-select'),
   'a-tooltip': slot('a-tooltip'),
+  'a-dropdown': { name: 'a-dropdown', render() {
+    return h('div', { class: 'stub-dropdown' }, [this.$slots.default?.(), this.$slots.overlay?.()]) } },
+  BackButton: { name: 'BackButton', render() { return h('button', { class: 'stub-back' }, '返回') } },
+  WorkspaceExplorer: { name: 'WorkspaceExplorer', render() { return h('div', { class: 'stub-explorer' }) } },
   PublishModal: { name: 'PublishModal', render() { return h('div', { class: 'stub-pub-modal' }) } },
   PublishHistory: { name: 'PublishHistory', render() { return h('div', { class: 'stub-pub-history' }) } },
 }
@@ -188,5 +196,30 @@ describe('AppsView 商店接线', () => {
     await wrapper.find('.stub-modal-ok').trigger('click')
     await flushPromises()
     expect(mocks.api.releaseToStore).toHaveBeenCalledWith(1, { title: '甲商店版', summary: '简介文本' })
+  })
+})
+
+// ---------- 卡片右上 ☰ 折叠菜单：重命名/打开工程目录/复制预览地址/查看日志/删除 ----------
+describe('AppsView 卡片折叠菜单', () => {
+  it('卡片右上 ☰ 菜单含五项操作', async () => {
+    const wrapper = await mountView()
+    const menu = wrapper.findAll('.stub-card')[0].find('.stub-dropdown')
+    expect(menu.exists()).toBe(true)
+    const text = menu.text()
+    for (const label of ['重命名', '打开工程目录', '复制预览地址', '查看日志', '删除应用'])
+      expect(text).toContain(label)
+  })
+
+  it('菜单点「删除应用」→ 弹确认框，确认后调 deleteApp', async () => {
+    mocks.api.deleteApp.mockResolvedValue({ data: { kept: { root_path: 'apps/aaa' } } })
+    mocks.api.listApps.mockResolvedValue({ data: APPS })
+    const wrapper = mount(AppsView, { global: { stubs: STORE_STUBS } })
+    await flushPromises()
+    await wrapper.findAll('.zc-menu-del')[0].trigger('click')
+    await flushPromises()
+    expect(wrapper.find('.stub-modal').exists()).toBe(true)
+    await wrapper.find('.stub-modal-ok').trigger('click')
+    await flushPromises()
+    expect(mocks.api.deleteApp).toHaveBeenCalledWith(1)
   })
 })

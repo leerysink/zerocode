@@ -2,21 +2,25 @@
 // 应用页（M1 卡片/向导/预览抽屉 + M2 发布接线）：发布/回滚进度弹层与发布历史抽屉都只在
 // 打开时挂载（v-if）——WS 订阅单实例纪律由 PublishModal 自身的 connect/close 保证；
 // 卡片 prod 状态靠既有 5s 轮询刷新，正式地址 hover 才懒加载 appUrls（不轰炸后端）。
-import { onMounted, onUnmounted, reactive, ref } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { message, Modal } from 'ant-design-vue'
 import {
   AppstoreOutlined, CloudUploadOutlined, CopyOutlined, EyeOutlined, HistoryOutlined,
-  PlayCircleOutlined, PoweroffOutlined, ProfileOutlined, ReloadOutlined, RocketOutlined,
+  MenuOutlined, PlayCircleOutlined, PoweroffOutlined, ReloadOutlined, RocketOutlined,
   ShopOutlined,
 } from '@ant-design/icons-vue'
 import {
-  appUrls, createApp, devReset, devRestart, devStart, devStatus, devStop, listApps, prodStart,
-  prodStop, releaseToStore, validateAppSlug,
+  appUrls, createApp, deleteApp, devReset, devRestart, devStart, devStatus, devStop, listApps,
+  openFolder, prodStart, prodStop, releaseToStore, renameApp, validateAppSlug,
 } from '../api'
 import PublishHistory from '../components/PublishHistory.vue'
 import PublishModal from '../components/PublishModal.vue'
 import { SMALL_STACKS, slugFromName, validateForm } from '../utils/appForm'
 import DeployLogPanel from '../components/DeployLogPanel.vue'
+import BackButton from '../components/BackButton.vue'
+import WorkspaceExplorer from '../components/WorkspaceExplorer.vue'
+import { resolveOpenFolderMode } from '../utils/openFolder'
+import { useConfigStore } from '../stores/config'
 
 const apps = ref([])
 const loading = ref(true)
@@ -28,6 +32,12 @@ const pub = reactive({ open: false, app: null, mode: 'publish', version: null, a
 const hist = reactive({ open: false, app: null })
 const rel = reactive({ open: false, app: null, title: '', summary: '' })
 const urlsCache = reactive({})
+const rename = reactive({ open: false, app: null, name: '' })
+const del = reactive({ open: false, app: null })
+// 内置文件管理器（远端访问 / 直开失败时的兜底），记哪个应用在用它
+const explorer = reactive({ open: false, app: null })
+const openingFolder = ref(false)
+const cfg = useConfigStore()
 const form = reactive({ name: '', slug: '', slugTouched: false, scale: 'small', stack: 'vue3-fastapi' })
 let timer = null
 
@@ -160,6 +170,90 @@ function openLogs(a) {
   logs.open = true
 }
 
+// ---- 卡片 ☰ 菜单：重命名 / 打开工程目录 / 复制预览地址 / 查看日志 / 删除 ----
+const devUrl = (a) => `http://localhost:${a.dev_port}`
+
+function openRename(a) {
+  rename.app = a
+  rename.name = a.name
+  rename.open = true
+}
+const renameOk = computed(() => !!rename.name.trim())
+async function doRename() {
+  if (!rename.app || !renameOk.value) return
+  try {
+    await renameApp(rename.app.id, rename.name.trim())
+    message.success('已重命名')
+    rename.open = false
+    await load()
+  } catch (e) {
+    message.error(e?.response?.data?.detail || '重命名失败')
+  }
+}
+
+// 打开工程目录：与右栏文件面板同一套判断——本机直开系统文件管理器，
+// 远端访问（服务端开窗用户看不见）或直开失败就当场降级到内置文件管理器。
+async function openAppFolder(a) {
+  if (openingFolder.value) return
+  openingFolder.value = true
+  try {
+    await cfg.ensureLoaded()
+    if (resolveOpenFolderMode(cfg.form.openFolderMode, window.location.hostname) === 'web') {
+      explorer.app = a
+      explorer.open = true
+      return
+    }
+    await openFolder(a.workspace_id)
+    message.success('已在系统文件管理器中打开工程目录')
+  } catch (e) {
+    explorer.app = a
+    explorer.open = true
+    message.info('无法直接打开文件夹，已改用内置文件管理器')
+  } finally {
+    openingFolder.value = false
+  }
+}
+
+async function copyPreviewUrl(a) {
+  try {
+    await navigator.clipboard.writeText(devUrl(a))
+    message.success('预览地址已复制')
+  } catch (e) {
+    message.error('复制失败，请手动选择地址')
+  }
+}
+
+function openDelete(a) {
+  del.app = a
+  del.open = true
+}
+// 卡片上的删除走一次确认：只删平台记录与会话，工程目录与数据库都还在，
+// 确认文案必须把「删了什么、留了什么」说清，而不是加一道打字闸门。
+async function doDelete() {
+  if (!del.app) return
+  const a = del.app
+  try {
+    const { data } = await deleteApp(a.id)
+    const kept = data?.kept
+    message.success(kept?.root_path ? `应用已删除，工程目录保留在 ${kept.root_path}` : '应用已删除')
+    del.open = false
+    closeOverlays(a.id)
+    await load()
+  } catch (e) {
+    message.error(e?.response?.data?.detail || '删除失败')
+  }
+}
+
+// 应用没了还留着它的抽屉：预览/日志面板会继续拿死 id 轮询状态，只会刷出一串错误
+function closeOverlays(appId) {
+  if (preview.open && preview.app?.id === appId) preview.open = false
+  if (logs.open && logs.app?.id === appId) {
+    logs.open = false
+    logs.app = null
+  }
+  if (explorer.open && explorer.app?.id === appId) explorer.open = false
+}
+
 // ---------- M2 发布接线 ----------
 // 栈闸门：M2 引擎只支持 vue3-fastapi（后端未拦、UI 拦——static/其他栈按钮置灰带说明）
 const canPublish = (a) => a.stack === 'vue3-fastapi'
@@ -226,7 +320,10 @@ async function doRelease() {
 <template>
   <div class="zc-apps">
     <div class="zc-head">
-      <h2><appstore-outlined /> 我的应用</h2>
+      <div class="zc-head-left">
+        <back-button />
+        <h2><appstore-outlined /> 我的应用</h2>
+      </div>
       <a-space>
         <a-button @click="load"><reload-outlined /> 刷新</a-button>
         <a-button type="primary" @click="showWizard = true"><rocket-outlined /> 新建应用</a-button>
@@ -240,11 +337,25 @@ async function doRelease() {
       <a-card v-for="a in apps" :key="a.id" class="zc-card">
         <template #title>
           <span class="zc-dot" :style="{ background: statusColor(a.status_dev) }" />
-          {{ a.name }}
+          <span class="zc-card-name">{{ a.name }}</span>
           <a-tag v-if="a.store" class="zc-store-tag">来自商店</a-tag>
+          <a-tag class="zc-card-tag">{{ a.scale === 'large' ? '大型' : '小型' }} · {{ a.stack }}</a-tag>
         </template>
         <template #extra>
-          <a-tag>{{ a.scale === 'large' ? '大型' : '小型' }} · {{ a.stack }}</a-tag>
+          <a-dropdown :trigger="['click']" placement="bottomRight">
+            <menu-outlined class="zc-card-menu-btn" title="更多操作" @click.stop />
+            <template #overlay>
+              <div class="zc-app-menu">
+                <div class="zc-app-menu-item zc-menu-rename" @click.stop="openRename(a)">重命名</div>
+                <div class="zc-app-menu-item zc-menu-folder" @click.stop="openAppFolder(a)">打开工程目录</div>
+                <div class="zc-app-menu-item zc-menu-copy" @click.stop="copyPreviewUrl(a)">复制预览地址</div>
+                <div class="zc-app-menu-item zc-menu-logs" @click.stop="openLogs(a)">查看日志</div>
+                <div class="zc-app-menu-item zc-app-menu-danger zc-menu-del" @click.stop="openDelete(a)">
+                  删除应用
+                </div>
+              </div>
+            </template>
+          </a-dropdown>
         </template>
         <p class="zc-line">
           预览：{{ statusText(a.status_dev) }} · 端口 {{ a.dev_port }}
@@ -267,7 +378,6 @@ async function doRelease() {
           </a-button>
           <a-button size="middle" @click="restartDev(a)">重启</a-button>
           <a-button size="middle" @click="resetDev(a)">重建 dev</a-button>
-          <a-button size="middle" @click="openLogs(a)"><profile-outlined /> 查看日志</a-button>
           <a-button type="primary" ghost :disabled="!canPublish(a)"
                     :title="canPublish(a) ? '' : '该栈发布支持即将上线'"
                     :loading="a.status_prod === 'publishing'" @click="openPublish(a)">
@@ -366,15 +476,38 @@ async function doRelease() {
         含真实执行过的数据变更序列；获批者会得到独立代码与独立数据库的实例。
       </p>
     </a-modal>
+
+    <a-modal v-model:open="rename.open" title="重命名应用" ok-text="保存" destroy-on-close
+             class="zc-rename-modal" :ok-button-props="{ disabled: !renameOk }" @ok="doRename">
+      <a-input v-model:value="rename.name" placeholder="应用名称" class="zc-rename-input" />
+      <p class="zc-modal-tip">只改显示名；应用标识（{{ rename.app?.slug }}）与工程目录保持不变。</p>
+    </a-modal>
+
+    <a-modal v-model:open="del.open" title="删除应用" ok-text="确认删除" ok-type="danger" destroy-on-close
+             class="zc-del-modal" @ok="doDelete">
+      <p class="zc-modal-warn">将删除应用「{{ del.app?.name }}」及其会话记录。</p>
+      <p class="zc-modal-tip">
+        工程目录保留在 {{ del.app?.root_path }}，数据库 {{ del.app?.slug }}_dev / {{ del.app?.slug }}_prod
+        也保留；如需彻底清理，请自行删除目录与库。
+      </p>
+    </a-modal>
+
+    <workspace-explorer v-if="explorer.app" v-model:open="explorer.open"
+                        :workspace-id="explorer.app.workspace_id" :workspace-name="explorer.app.name" />
   </div>
 </template>
 
 <style scoped>
 .zc-apps { padding: 20px 24px; height: 100%; overflow-y: auto; box-sizing: border-box; }
 .zc-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+.zc-head-left { display: flex; align-items: center; gap: 10px; }
 .zc-head h2 { font-size: 18px; font-weight: 600; color: var(--zc-text); margin: 0; }
 .zc-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 14px; }
-.zc-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 8px; }
+.zc-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 8px; flex-shrink: 0; }
+/* 标题行拉成 flex：状态点固定、应用名可省略号、规格标签贴着名字（antd 的 .ant-card-head-title 里） */
+.zc-card :deep(.ant-card-head-title) { display: flex; align-items: center; overflow: hidden; }
+.zc-card-name { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.zc-card-tag { flex-shrink: 0; margin-inline-start: 8px; font-weight: 400; }
 .zc-line { margin: 0 0 6px; color: var(--zc-text); font-size: 13px; }
 .zc-line.sub { color: var(--zc-text-sub); }
 .zc-spin { display: block; margin: 60px auto; }
@@ -386,4 +519,18 @@ async function doRelease() {
 .zc-tip { color: var(--zc-text-sub); font-size: 12px; margin: 8px 0 0; }
 .zc-modal-tip { margin: 8px 0 0; color: var(--zc-text-sub); font-size: 12px; line-height: 1.6; }
 .zc-store-tag { margin-inline-start: 8px; font-weight: 400; vertical-align: middle; }
+
+/* 菜单入口用三横（☰）而不是 ⋯ 的圆点：圆点在卡片头部太小、几乎看不见。
+   字号抬到 16px、默认透明度 0.7，hover 提亮为主色（与侧栏同一套低饱和语言）。 */
+.zc-card-menu-btn { flex-shrink: 0; font-size: 16px; line-height: 1; padding: 3px 4px; cursor: pointer;
+                    opacity: 0.7; transition: opacity 0.15s; color: var(--zc-text-sub); }
+.zc-card-menu-btn:hover { opacity: 1; color: var(--zc-primary); }
+.zc-app-menu { background: #fff; border-radius: 6px; box-shadow: 0 6px 16px rgba(0, 0, 0, 0.12);
+               padding: 4px 0; min-width: 148px; }
+.zc-app-menu-item { padding: 6px 14px; font-size: 13px; color: var(--zc-text); cursor: pointer;
+                    white-space: nowrap; }
+.zc-app-menu-item:hover { background: rgba(91, 122, 157, 0.08); }
+.zc-app-menu-danger { color: #b96a6a; }
+.zc-app-menu-danger:hover { background: #fdf3f2; }
+.zc-modal-warn { margin: 0 0 6px; color: var(--zc-text); font-size: 13px; }
 </style>
