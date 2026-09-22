@@ -232,7 +232,7 @@ async def dev_status(request: Request, app_id: int):
 
 @router.get("/{app_id}/urls")
 async def app_urls(request: Request, app_id: int):
-    """应用访问地址（规格 05 §5）：本机 + 局域网 + 网卡候选，无副作用只读。"""
+    """应用 prod 访问地址（规格 05 §5 / 通配域名网关）：只回 domain=https://{slug}.zerocode.com，无副作用只读。"""
     sf = request.app.state.session_factory
     try:
         app = await app_service.get_app(sf, app_id)

@@ -2,14 +2,14 @@
 // Task 10：PublishModal——发布/回滚进度弹层行为契约（规格 04 §5 + 08 UI）。
 // useDeploy 整体替身（WS 与状态流在 T9 已单测），这里只验组件接线：
 // 生命周期（open→connect / close 不泄漏）、steps 渲染、409 chat_active 确认链、
-// 完成态 URL 复制与 netsh 现场生成、回滚 autoStart 单点触发 rollbackApp。
+// 完成态域名 URL 展示与复制、回滚 autoStart 单点触发 rollbackApp。
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
 import { h, ref } from 'vue'
 import { flushPromises, mount } from '@vue/test-utils'
 
 const mocks = vi.hoisted(() => ({
   useDeploy: vi.fn(),
-  api: { appUrls: vi.fn(), publishApp: vi.fn(), putConfig: vi.fn(), rollbackApp: vi.fn(),
+  api: { appUrls: vi.fn(), publishApp: vi.fn(), rollbackApp: vi.fn(),
     scaffoldBackfill: vi.fn() },
   antd: {
     message: { success: vi.fn(), error: vi.fn(), info: vi.fn(), warning: vi.fn() },
@@ -71,8 +71,7 @@ beforeEach(() => {
   vi.clearAllMocks()
   writeText = vi.fn().mockResolvedValue(undefined)
   Object.defineProperty(window.navigator, 'clipboard', { value: { writeText }, configurable: true })
-  mocks.api.appUrls.mockResolvedValue({ data: { localhost: 'http://localhost:8210',
-    lan: 'http://10.0.0.2:8210', lanCandidates: [], defaultNic: '' } })
+  mocks.api.appUrls.mockResolvedValue({ data: { domain: 'https://todo8.zerocode.com' } })
 })
 afterEach(() => vi.restoreAllMocks())
 
@@ -216,24 +215,24 @@ describe('PublishModal 完成态', () => {
   async function doneOk() {
     const ctx = mountModal()
     ctx.dep.lastDone.value = { type: 'publish_done', ok: true,
-      url: 'http://10.0.0.2:8210', version: 'b20260921120000' }
+      url: 'https://todo8.zerocode.com', version: 'b20260921120000' }
     await flushPromises()
     return ctx
   }
 
-  it('大号 URL 展示 + 点击复制', async () => {
+  it('大号 URL 展示 + 点击复制（发布完成以网关域名为准）', async () => {
     const { wrapper } = await doneOk()
     const link = wrapper.find('.zc-pub-url')
-    expect(link.text()).toContain('http://10.0.0.2:8210')
+    expect(link.text()).toContain('https://todo8.zerocode.com')
     await link.trigger('click')
-    expect(writeText).toHaveBeenCalledWith('http://10.0.0.2:8210')
+    expect(writeText).toHaveBeenCalledWith('https://todo8.zerocode.com')
   })
 
-  it('三步排查含 netsh 命令（slug+端口现场生成）', async () => {
-    const { wrapper } = await doneOk()
-    const html = wrapper.html()
-    expect(html).toContain('zerocode-todo8-8210')
-    expect(html).toContain('localport=8210')
+  it('无 done.url 时回退到 appUrls 域名', async () => {
+    const ctx = mountModal()
+    ctx.dep.lastDone.value = { type: 'publish_done', ok: true, version: 'b20260921120000' }
+    await flushPromises()
+    expect(ctx.wrapper.find('.zc-pub-url').text()).toContain('https://todo8.zerocode.com')
   })
 
   it('收口即 emit done 通知父级刷新', async () => {

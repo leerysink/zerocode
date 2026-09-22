@@ -12,7 +12,7 @@ import pytest
 from sqlalchemy import text as t
 
 from app.db import make_session_factory
-from app.deploy import compose, prod, records, sqlrun
+from app.deploy import compose, nics, prod, records, sqlrun
 from app.deploy.errors import DeployError
 from app.hub import ChatHub
 
@@ -367,7 +367,7 @@ async def test_prod_status_reads_db_and_compose_text(monkeypatch, sf, seed):
     res = await prod.prod_status(sf, _app(aid))
     assert res["status_prod"] == "running"                       # 库里态，不是猜的
     assert res["compose_ps"] == '{"State":"running"}'            # 文本仅经端点回（不进事件）
-    assert res["localhost"] == "http://localhost:8998"
+    assert res["domain"] == f"https://zcdemo.{nics.GATEWAY_DOMAIN}"   # prod 地址统一为网关域名
     assert seen and seen[0][0] == "compose" and "ps" in seen[0]
 
 
@@ -617,7 +617,7 @@ async def test_publish_success_sequence(monkeypatch, sf, seed, pub_root):
 
     res = await prod.publish(sf, _pub_app(aid), notify=seams.notify, force=True)
 
-    assert res["status"] == "running" and "8982" in res["url"]
+    assert res["status"] == "running" and res["url"] == f"https://zcpub.{nics.GATEWAY_DOMAIN}"
     assert re.fullmatch(r"b\d{14}", res["version"])            # b<本地 YYYYMMDDHHmmss>
     # ① 步骤事件：每步 running→ok 成对全序（③裁定：失败不发 state=failed，统一走 publish_done）
     assert seams.step_seq == [p for s in PUB_STEPS for p in ((s, "running"), (s, "ok"))]
@@ -653,7 +653,7 @@ async def test_publish_success_sequence(monkeypatch, sf, seed, pub_root):
     assert row[4]["sqlApplied"] == ["V20260920_01_init.sql"]
     assert row[4]["images"] == [f"zc-zcpub-frontend:prod-{res['version']}",
                                 f"zc-zcpub-backend:prod-{res['version']}"]
-    assert row[4]["durationMs"] >= 0 and "8982" in row[4]["url"]
+    assert row[4]["durationMs"] >= 0 and row[4]["url"] == f"https://zcpub.{nics.GATEWAY_DOMAIN}"
     assert row[4]["health"] == {"frontend": True, "api": True}   # M-b：04 §4.5 detail 形态含 health
     # ⑧ keep-5：只挤掉最老一版（前后端各一个 tag），近 5 版镜像不碰
     assert sorted(seams.rms()) == sorted([f"zc-zcpub-frontend:prod-{olds[0]}",

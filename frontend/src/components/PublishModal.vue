@@ -1,5 +1,5 @@
 <script setup>
-// 发布弹层（M2 / T10，规格 04 §5 + 08 UI）：七步进度 + 构建日志 + 完成弹层 + 三步排查指引。
+// 发布弹层（M2 / T10，规格 04 §5 + 08 UI）：七步进度 + 构建日志 + 完成弹层（域名访问）。
 // WS 订阅单实例纪律：应用列表页只在「弹窗开着」时持有 useDeploy——open true→connect /
 // false→close，父级 v-if 摘除时 onUnmounted 兜底 close（单测断言不泄漏后台连接）；
 // 列表卡片上的 prod 状态靠 5s 轮询双通道刷新。
@@ -8,7 +8,7 @@
 import { computed, nextTick, onUnmounted, ref, watch } from 'vue'
 import { Modal, message } from 'ant-design-vue'
 import { CheckCircleOutlined, CloseCircleOutlined, CopyOutlined, LoadingOutlined } from '@ant-design/icons-vue'
-import { appUrls, publishApp, putConfig, rollbackApp, scaffoldBackfill } from '../api'
+import { appUrls, publishApp, rollbackApp, scaffoldBackfill } from '../api'
 import { useDeploy } from '../composables/useDeploy'
 
 const props = defineProps({
@@ -26,7 +26,6 @@ const STEP_LABELS = {
 }
 const dep = useDeploy(props.app.id)
 const urls = ref(null)
-const nic = ref('')
 const accepting = ref(false)
 const tailRef = ref(null)
 
@@ -40,8 +39,8 @@ const failText = computed(() => (done.value?.error
 const isDestructive = computed(() => done.value?.code === 'schema_destructive')
 const destructiveList = computed(() => (Array.isArray(done.value?.destructive)
   ? done.value.destructive : []))
-const mainUrl = computed(() => done.value?.url || urls.value?.lan || urls.value?.localhost
-  || `http://localhost:${props.app.prod_port}`)
+const mainUrl = computed(() => done.value?.url || urls.value?.domain
+  || `https://${props.app.slug}.zerocode.com`)
 
 // 失败收口时把仍处 running 的步骤标为红叉（事件流失败不再发 publish_step failed，由前端补语义）
 const stepsView = computed(() => Object.entries(STEP_LABELS).map(([key, label]) => {
@@ -50,14 +49,6 @@ const stepsView = computed(() => Object.entries(STEP_LABELS).map(([key, label]) 
   return { key, label, state }
 }))
 
-const nicOptions = computed(() => (urls.value?.lanCandidates || []).map((c) => ({
-  value: c.ip, label: c.docker_hint ? `${c.ip}（虚拟网卡）` : c.ip,
-})))
-
-// netsh 命令按 slug+prod_port 现场生成（04 §5 排查指引②）；管理员运行提示写在 UI 文案里
-const netshCmd = computed(() => `netsh advfirewall firewall add rule `
-  + `name="zerocode-${props.app.slug}-${props.app.prod_port}" dir=in action=allow `
-  + `protocol=TCP localport=${props.app.prod_port}`)
 const buildText = computed(() => dep.buildTail.value
   .map((t) => (t.kind === 'build' ? '   ' : ' » ') + t.line).join(String.fromCharCode(10)))
 
@@ -89,7 +80,6 @@ watch(() => dep.buildTail.value.length, async () => {
 async function loadUrls() {
   try {
     urls.value = (await appUrls(props.app.id)).data
-    nic.value = urls.value.defaultNic || ''
   } catch { urls.value = null }
 }
 async function copyText(t) {
@@ -102,13 +92,6 @@ function copyError() {
   const tail = dep.buildTail.value.slice(-80).map((t) => t.line).join(String.fromCharCode(10))
   copyText(`发布失败：${failText.value}${String.fromCharCode(10)}${tail}`)
   message.info('错误日志已复制，粘贴到聊天会话即可让 AI 排查')
-}
-async function chooseNic(ip) {
-  nic.value = ip
-  try {
-    await putConfig({ 'deploy.default_nic': ip })
-    await loadUrls()
-  } catch (e) { message.error(e?.response?.data?.detail || '网卡设置失败') }
 }
 async function publishWith(force, confirmDestructive = false) {
   dep.reset()
@@ -186,28 +169,9 @@ async function start() {
       <p class="zc-pub-done">已上线 ✓</p>
       <a class="zc-pub-url" :href="mainUrl" target="_blank"
          @click.prevent="copyText(mainUrl)">{{ mainUrl }} <copy-outlined /></a>
-      <p class="zc-pub-sub">本机访问：{{ urls?.localhost || `http://localhost:${app.prod_port}` }}
-        <a href="#" @click.prevent="copyText(urls?.localhost || `http://localhost:${app.prod_port}`)">复制</a>
-      </p>
-      <a-space v-if="nicOptions.length > 1" style="margin: 6px 0">
-        <span class="zc-pub-sub">网卡：</span>
-        <a-select size="middle" style="width: 220px" :value="nic" :options="nicOptions"
-                  @change="chooseNic" />
-      </a-space>
       <a-space style="margin: 6px 0">
         <a-button size="middle" @click="copyText(`访问地址：${mainUrl}`)">复制给同事</a-button>
       </a-space>
-      <details class="zc-pub-fold">
-        <summary>打不开？三步排查</summary>
-        <ol class="zc-pub-help">
-          <li><b>同网段</b>：两机 IP 前三段需一致（如都在 192.168.1.x），互 ping 不通先查这一点。</li>
-          <li><b>防火墙</b>：Windows 防火墙可能阻挡端口 {{ app.prod_port }} 入站。以管理员身份在终端运行
-            （或转给 IT）：<span class="zc-code">{{ netshCmd }}
-              <a class="zc-code-copy" href="#" @click.prevent="copyText(netshCmd)">
-                <copy-outlined />复制命令</a></span></li>
-          <li><b>地址完整性</b>：完整地址需包含 <code>http://</code> 前缀与端口号，别只填 IP。</li>
-        </ol>
-      </details>
     </template>
 
     <template v-if="doneFail && isDestructive">
@@ -259,14 +223,9 @@ async function start() {
 .zc-pub-done { color: #5b8a72; font-weight: 600; margin: 10px 0 4px; }
 .zc-pub-url { display: inline-block; font-size: 17px; font-weight: 600; color: var(--zc-primary);
               text-decoration: none; word-break: break-all; }
-.zc-pub-sub { color: var(--zc-text-sub); font-size: 12px; margin: 4px 0; }
 .zc-pub-fail { background: #fdf3f2; border: 1px solid #eadcdb; color: #b96a6a; border-radius: 4px;
                padding: 8px 10px; font-size: 12px; white-space: pre-wrap; word-break: break-all; }
 .zc-pub-destr { margin: 6px 0 10px; padding-left: 20px; font-size: 12px; color: #b96a6a; }
 .zc-pub-destr li { margin: 2px 0; }
-.zc-code { display: block; background: #f7f8fa; border-radius: 4px; padding: 6px 8px; margin: 4px 0;
-           font-family: Consolas, monospace; font-size: 11px; word-break: break-all; }
-.zc-code-copy { margin-left: 8px; white-space: nowrap; }
-.zc-pub-help li { margin: 6px 0; }
 .zc-pub-foot { margin-top: 14px; text-align: right; }
 </style>

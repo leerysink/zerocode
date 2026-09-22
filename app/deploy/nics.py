@@ -2,11 +2,15 @@
 """局域网地址（规格 05 FR5-03/§4.2）：网卡枚举双途径 + default_nic 记忆 + README 发布块。
 纯 socket 探测不发包（UDP connect 只选路）；平台不改防火墙（05 §4.3 安全边界）。"""
 import ipaddress
+import os
 import re
 import socket
 from pathlib import Path
 
 MARK_START, MARK_END = "<!-- zc:publish -->", "<!-- /zc:publish -->"
+# 中央网关通配域名后缀（见 gateway/）：prod 访问地址统一为 https://{slug}.{GATEWAY_DOMAIN}。
+# 换域名只改这里 + 网关侧证书/nginx server_name；默认 zerocode.com，可用 env 覆盖便于测试/多环境。
+GATEWAY_DOMAIN = os.environ.get("ZEROCODE_GATEWAY_DOMAIN", "zerocode.com")
 # Docker 默认 bridge 网段：候选里出现它多半不是用户要的局域网地址，只标注不剔除。
 # 模块级常量：lan_candidates 每次调用都重建 /12 网络是白花的开销（T4 审查移交）。
 _DOCKER_NET = ipaddress.ip_network("172.16.0.0/12")
@@ -51,21 +55,15 @@ async def default_nic(sf) -> str:
     from app.deploy.settings import deploy_cfg
     return (await deploy_cfg(sf)).get("deploy.default_nic", "") or ""
 
-async def pick_lan_ip(sf) -> str:
-    dflt = await default_nic(sf)
-    cands = lan_candidates()
-    if dflt and any(c["ip"] == dflt for c in cands):
-        return dflt
-    return cands[0]["ip"] if cands else ""
-
 async def app_urls(sf, app: dict) -> dict:
-    ports = app.get("ports") if isinstance(app.get("ports"), dict) else {}
-    prod = ports.get("prod", app.get("prod_port"))
-    lan_ip = await pick_lan_ip(sf)
-    return {"localhost": f"http://localhost:{prod}",
-            "lan": (f"http://{lan_ip}:{prod}" if lan_ip else ""),
-            "lanCandidates": lan_candidates(),
-            "defaultNic": await default_nic(sf)}
+    """prod 访问地址：统一交中央网关的通配域名 https://{slug}.zerocode.com。
+
+    域名是 slug 的稳定投影，不绑端口；真正可访问的前提是应用 prod 处于 running（进 routes.json），
+    否则网关给 404 提示页。localhost/lan 直连不再是平台对外呈现的生产地址（内网排障仍可用端口直连），
+    故这里只回 domain 一项。slug 缺位（异常数据）回空串，不谎拼 https://.zerocode.com。
+    """
+    slug = (app.get("slug") or "").strip()
+    return {"domain": f"https://{slug}.{GATEWAY_DOMAIN}" if slug else ""}
 
 def _dominant_eol(text_: str) -> str:
     """首行探测文件主导行尾：第一个 LF 若被 CR 前导即 CRLF 文件（空文件/裸 LF 回落 "\\n"）。

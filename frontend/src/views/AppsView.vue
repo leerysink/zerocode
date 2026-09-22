@@ -299,7 +299,7 @@ async function ensureUrls(a) {
 async function copyProdUrl(a) {
   await ensureUrls(a)
   const u = urlsCache[a.id]
-  await copyUrl(u?.lan || u?.localhost || `http://localhost:${a.prod_port}`)
+  await copyUrl(u?.domain || `https://${a.slug}.zerocode.com`)
 }
 
 // ---------- M3-a 商店：发布到商店（只认真实在服的 prod 版本，闸门在后端） ----------

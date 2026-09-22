@@ -1,9 +1,6 @@
 # tests/test_nics.py
-import json
-
 import pytest
 from app.deploy import nics
-from app.db import make_engine, make_session_factory
 
 # 模块级 pytestmark 已删：asyncio_mode=auto（pytest.ini）自动接管 async 用例，
 # 而本文件的同步用例挂着该标记会各刷一条 PytestWarning（门禁输出的噪音来自 brief 原文，非新行为）。
@@ -57,48 +54,15 @@ def test_update_readme_keeps_line_endings(tmp_path):
     run("lf", "# 应用\n\n正文\n", "\n")
 
 
-# 两个哨兵都不能用 None 顶替：prev is None 既可能是「键在库里存的是 JSON null」，
-# 也可能是「库里根本没这行」，还可能是「SELECT 自己抛了、还没读到」——三种语义必须分开。
-_UNSET = object()      # 没读到（含 SELECT 前就炸）：我们一个字都没写，什么都不该还原
-_NO_ROW = object()     # 读到了、但库里没有这行：用例的 INSERT 造出了它，收尾该删掉自己造的行
+async def test_app_urls_domain():
+    """prod 访问地址统一为网关域名 https://{slug}.zerocode.com（通配证书只覆盖一级 slug）。
 
-
-async def test_pick_and_urls(monkeypatch):
-    engine = make_engine()
-    sf = make_session_factory(engine)
-    monkeypatch.setattr(nics, "_via_hostname", lambda: ["192.168.1.50"])
-    monkeypatch.setattr(nics, "_via_udp", lambda: "192.168.1.50")
-    from sqlalchemy import text as t
-    prev = _UNSET
-    try:
-        async with sf() as s:
-            # 进入时先记录 deploy.default_nic 的旧值（本用例连的是 make_engine() 的平台默认库 =
-            # 共享 dev 库，用户可能真在配置页选过网卡）。收尾写回的是**读到的旧值**，不是种子 ""：
-            # 「自己的产物自己带走」= 不留示例 IP，也不抹别人的选择（T5 审查 I-2；
-            # 旧写法无条件 UPDATE value='""'，实测跑一次 pytest 就把用户的网卡选择静默清空）。
-            row = (await s.execute(t("SELECT value FROM app_config WHERE key = 'deploy.default_nic'"))).first()
-            prev = row[0] if row else _NO_ROW
-            await s.execute(t("INSERT INTO app_config (key, value) VALUES ('deploy.default_nic', '\"192.168.1.50\"') "
-                              "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"))
-            await s.commit()
-        assert nics.pick_lan_ip.__wrapped__ if hasattr(nics.pick_lan_ip, "__wrapped__") else True
-        urls = await nics.app_urls(sf, {"ports": {"prod": 8210}, "prod_port": 8210})
-        assert urls["localhost"] == "http://localhost:8210"
-        assert urls["lan"] == "http://192.168.1.50:8210"
-        assert any(c["ip"] == "192.168.1.50" for c in urls["lanCandidates"])
-    finally:
-        # prev 仍是 _UNSET 说明连 SELECT 都没跑到（或它自己抛了），我们一个字都没写，不该还原更不该删。
-        if prev is not _UNSET:
-            async with sf() as s:
-                if prev is _NO_ROW:
-                    await s.execute(t("DELETE FROM app_config WHERE key = 'deploy.default_nic'"))
-                else:
-                    # value 是 JSONB，asyncpg 读出来已解码成 Python 对象（'192.168.1.50' 是 str 不是 JSON 文本），
-                    # 直接绑回原始串会被 PG 当非法 JSON；按 config_service 的同款手法 json.dumps + CAST(:v AS JSONB)。
-                    await s.execute(t("UPDATE app_config SET value = CAST(:old AS JSONB) WHERE key = 'deploy.default_nic'"),
-                                    {"old": json.dumps(prev)})
-                await s.commit()
-        await engine.dispose()   # 同仓 test_apps_api / test_ws 惯例：自造的池自放
+    slug 缺位/空白回空 domain——不谎拼 https://.zerocode.com（网关解不到、徒增误导）。
+    app_urls 不碰库（纯 slug 投影），sf 传 None 即可。
+    """
+    assert await nics.app_urls(None, {"slug": "demoapp"}) == {"domain": f"https://demoapp.{nics.GATEWAY_DOMAIN}"}
+    assert await nics.app_urls(None, {"slug": "  spaced  "}) == {"domain": f"https://spaced.{nics.GATEWAY_DOMAIN}"}
+    assert await nics.app_urls(None, {}) == {"domain": ""}
 
 
 def test_urls_and_nics_routes_registered():

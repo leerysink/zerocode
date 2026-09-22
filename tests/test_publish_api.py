@@ -274,13 +274,12 @@ async def test_prod_status_shape(client, monkeypatch):
     aid = await _mk(client)
 
     async def fake_status(sf, app):
-        return {"status_prod": "stopped", "compose_ps": "", "localhost": "http://localhost:1",
-                "lan": "", "lanCandidates": [], "defaultNic": ""}
+        return {"status_prod": "stopped", "compose_ps": "", "domain": "https://demo.zerocode.com"}
 
     monkeypatch.setattr(prod_mod, "prod_status", fake_status)
     r = await client.get(f"/api/apps/{aid}/prod/status")
     assert r.status_code == 200 and r.json()["status_prod"] == "stopped"
-    assert "localhost" in r.json() and "lanCandidates" in r.json()
+    assert "domain" in r.json()
 
 
 # ---------- 发布历史（04 §5 / FR4-08）：GET 列表 + DELETE 删行并尽力删镜像 ----------
