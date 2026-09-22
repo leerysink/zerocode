@@ -5,6 +5,11 @@ from pathlib import Path
 from app.deploy.errors import DeployError
 
 PLACEHOLDER = re.compile(r"\{\{(\w+)\}\}")
+# 残留自检的判据：平台占位符形态（大写下划线，容忍手滑带的空格），不是任意 "{{"。
+# 模板里的 Vue 插值 {{ appTitle }} / {{ record.status === 1 ? '启用' : '停用' }} 本就该原样
+# 活到产物里（vue3-springboot 有 93 处），宽判据会把整栈创建应用打成 500。
+# 平台占位符键全是大写下划线（见 render 的 required），插值全小驼峰，两种形态可分。
+RESIDUE = re.compile(r"\{\{\s*[A-Z][A-Z0-9_]*\s*\}\}")
 INIT_SQL = """-- D{TODAY}_01_seed.sql —— 数据轨种子（幂等，可重放）
 -- 日期：{TODAY_DASH}  用途：demo_notes 欢迎行（AI 可替换或追加新 D 文件）  影响：demo_notes
 INSERT INTO demo_notes (title) VALUES ('欢迎使用 {APP_NAME}') ON CONFLICT DO NOTHING;
@@ -59,7 +64,10 @@ def render(template: Path, dst: Path, mapping: dict) -> None:
             TODAY=today,
             TODAY_DASH=f"{today[:4]}-{today[4:6]}-{today[6:]}",
             APP_NAME=str(mapping["APP_NAME"]).replace("'", "''")), encoding="utf-8", newline="")
-    # 残留自检：任何文件不得残留 {{
+    # 残留自检：任何文件不得残留未渲染的平台占位符
     for p in dst.rglob("*"):
-        if p.is_file() and "{{" in p.read_text(encoding="utf-8", errors="replace"):
-            raise DeployError(f"占位符渲染残留: {p.relative_to(dst)}")
+        if not p.is_file():
+            continue
+        hit = RESIDUE.search(p.read_text(encoding="utf-8", errors="replace"))
+        if hit:
+            raise DeployError(f"占位符渲染残留: {p.relative_to(dst)} 处有 {hit.group(0)}")

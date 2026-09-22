@@ -153,3 +153,51 @@ def test_render_appends_demo_seed_when_template_has_no_sql(tmp_path):
         "SLUG": "s", "APP_NAME": "甲", "DEV_PORT": "1", "PROD_PORT": "2",
         "DEV_DB": "s_dev", "PROD_DB": "s_prod", "TODAY": "20260922"})
     assert (out / "sqlchange" / "D20260922_01_seed.sql").is_file()
+
+
+def test_render_keeps_vue_interpolation_alive(tmp_path):
+    """Vue 插值不是平台占位符：{{ appTitle }} 这类必须能原样活过残留自检。
+
+    宽判据 "{{" in text 会把 vue3-springboot 模板里 93 处插值全判成渲染残留 → 创建应用直接 500。
+    """
+    tpl = tmp_path / "tpl"
+    (tpl / "frontend" / "src" / "views").mkdir(parents=True)
+    (tpl / "frontend" / "src" / "views" / "index.vue").write_text(
+        "<h1>{{ appTitle }}</h1>\n<span>{{ record.status === 1 ? '启用' : '停用' }}</span>\n"
+        "<b>{{SLUG}}</b>\n", encoding="utf-8")
+    out = tmp_path / "out"
+    scaffold.render(tpl, out, {
+        "SLUG": "s", "APP_NAME": "甲", "DEV_PORT": "1", "PROD_PORT": "2",
+        "DEV_DB": "s_dev", "PROD_DB": "s_prod", "TODAY": "20260922"})
+    vue = (out / "frontend" / "src" / "views" / "index.vue").read_text(encoding="utf-8")
+    assert "{{ appTitle }}" in vue and "{{ record.status === 1 ? '启用' : '停用' }}" in vue
+    assert "<b>s</b>" in vue          # 平台占位符照旧替换
+
+
+def test_render_flags_spaced_platform_placeholder_as_residue(tmp_path):
+    """真事故仍要拦：平台占位符全是大写下划线，带空格写歪就替换不掉（PLACEHOLDER 不吃空格）。"""
+    import pytest
+    from app.deploy.errors import DeployError
+    tpl = tmp_path / "tpl"
+    tpl.mkdir(parents=True)
+    (tpl / "README.md").write_text("应用名：{{ APP_NAME }}\n", encoding="utf-8")
+    with pytest.raises(DeployError, match="APP_NAME"):
+        scaffold.render(tpl, tmp_path / "out", {
+            "SLUG": "s", "APP_NAME": "甲", "DEV_PORT": "1", "PROD_PORT": "2",
+            "DEV_DB": "s_dev", "PROD_DB": "s_prod", "TODAY": "20260922"})
+
+
+SPRINGBOOT_TEMPLATE = TEMPLATE.parent / "vue3-springboot"
+
+
+def test_render_springboot_template_end_to_end(tmp_path):
+    """整栈真模板必须能渲染干净（残留自检是这道闸的第一道防线，不留到 A7 才发现）。"""
+    import pytest
+    if not SPRINGBOOT_TEMPLATE.is_dir():
+        pytest.skip("vue3-springboot 模板尚未落仓")
+    scaffold.render(SPRINGBOOT_TEMPLATE, tmp_path, {
+        "SLUG": "bigapp", "APP_NAME": "大型应用", "DEV_PORT": "8211", "PROD_PORT": "8210",
+        "DEV_DB": "bigapp_dev", "PROD_DB": "bigapp_prod", "TODAY": "20260922"})
+    assert (tmp_path / "frontend" / "vite.config.ts").is_file()
+    assert (tmp_path / "backend" / "src" / "main" / "java" / "com" / "zerocode" / "app"
+            / "BaseApplication.java").is_file()

@@ -3,3 +3,16 @@
 # busybox 会报 `\r: not found`（镜像构建读的是工作区文件），故显式锁 LF。
 *.sh text eol=lf
 *.conf text eol=lf
+
+# 二进制资源显式钉住：git 默认按内容自判（首 8000 字节内有无 NUL），一旦被误判为文本，
+# 检出时就会做换行转换；而 scaffold 只对「解不出 UTF-8」的文件保字节，判错的代价是模板里的
+# 图标/字体被无声改写（vue3-springboot 模板首次往仓库引入了 favicon.ico）。
+*.ico binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.eot binary

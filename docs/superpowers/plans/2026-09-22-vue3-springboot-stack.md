@@ -16,6 +16,9 @@
 - 测试命令统一：`cd d:\project\zerocode; .venv\Scripts\python -m pytest <target> -q`。
 - 删文件一律用 DeleteFile 工具，不用 shell 删除命令。
 - Phase A/B/C/D 对应规格 §11 的四片，**每片结束都要有真跑证据**，不允许「前三片纸面绿、第四片才第一次启动」。
+- **回归环境注意**：本仓可能有并发会话共用同一个 `zerocode-pg16`，全量 `pytest tests` 会撞出
+  `DeadlockDetectedError: deadlock detected` 与一批每次不同的 FAILED（实测同一棵树两次跑的红点不重叠）。
+  任何红必须先单跑该文件定性，不得直接归因于本次改动，也不得为了跑绿去 stash 别人的在途修改。
 
 ---
 
@@ -174,7 +177,7 @@ git commit -m "feat(scaffold): let stacks that ship their own sqlchange seed sup
 ### Task A3: 模板骨架落仓（复制 + 包名改名 + 占位符碰撞体检）
 
 **Files:**
-- Create: `app/templates/vue3-springboot/backend/**`（100 个 java + `logback-spring.xml` + `mapper/*.xml` + `pom.xml`）
+- Create: `app/templates/vue3-springboot/backend/**`（92 个 java + `logback-spring.xml` + `mapper/*.xml` + `pom.xml`）
 - Create: `app/templates/vue3-springboot/frontend/**`（33 个 src 文件 + 根配置 + `public/favicon.ico`(6991B)、`public/favicon.svg`）
 
 本 Task 只搬运 + 改名，**不改内容**（内容改造在 A4/A5）。产物还不可运行，但先过碰撞体检，后续才敢往上改。
@@ -237,8 +240,14 @@ Get-ChildItem -Recurse -File $tpl | Select-String -Pattern '\{\{\w+\}\}' |
   ForEach-Object { $_.Filename + ":" + $_.LineNumber + "  " + $_.Matches[0].Value } | Sort-Object -Unique
 ```
 
-Expected: **无输出**。base-pro 的插值全部形如 `{{ appTitle }}`（带空格），不匹配该正则（spike 已核）。
-若有输出且确属前端插值 → 就地改成带空格形态或提为常量，**不许留到后面**。
+Expected: **无输出**。base-pro 的插值全部形如 `{{ appTitle }}`（带空格），不匹配该正则（实测 92 java/43 frontend 全树仅 12 个 .vue 里有 93 处插值，java/yml/xml/ts/json 零命中）。
+若有输出（即无空格的 `{{word}}` 形态，会被 `PLACEHOLDER` 吃掉并抛 `KeyError`）且确属前端插值
+→ 就地改成带空格形态或提为常量，**不许留到后面**（与本 Task 评审后的 A3b 不矛盾：A3b 放的是
+「带空格的大写判据外」的插值，无空格的小写形态仍必须在源头消掉）。
+
+> ⚠⚠ 但本 Step 只能保证 `PLACEHOLDER` 不报 `KeyError`，**保不住 `render` 末尾的残留自检**：那条
+> 自检用的是宽判据 `"{{" in text`，93 处插值全部撞穿→创建应用 500。已单开 **Task A3b** 收口，
+> 不修完再进 A4，会把后续每次「渲染验不过」误判成自己改坏了。
 
 - [ ] **Step 6: 提交**
 
@@ -246,6 +255,82 @@ Expected: **无输出**。base-pro 的插值全部形如 `{{ appTitle }}`（带�
 git add app/templates/vue3-springboot
 git commit -m "feat(template): vendor base-pro backend/frontend into vue3-springboot stack, repackaged to com.zerocode.app"
 ```
+
+---
+
+### Task A3b: 残留自检判据收窄到「平台占位符形态」（A3 评审 I-1）
+
+**状态：✅ 已完成**（与本 Task 同批提交，必在 A4 之前）
+
+**背景**：A3 评审实跑 `scaffold.render(vue3-springboot 模板)` 抛
+`DeployError: 占位符渲染残留: frontend\src\layout\index.vue`。原因：`render()` 末尾的自检是
+子串级宽判据 `"{{" in text`，而 Vue 插值带空格（`{{ appTitle }}`）不被 `PLACEHOLDER` 替换，
+会原样活到产物里 → **整栈创建应用 100% 500 回滚**。fastapi 栈时代模板里的 `{{` 全是大写形态、
+渲染即消失，所以这条判据从不会命中；A3 是第一次往模板里放「渲染后仍存活」的 `{{`。
+
+**为什么不逐处消掉 93 个插值**（v-pre / 提常量）：成本高，且会永久约束 AI 后续生成页面的写法。
+平台占位符键一律大写下划线（见 `render` 的 `required`），Vue 插值一律小驼峰，两种形态可分。
+
+**Files:**
+- Modify: `app/deploy/scaffold.py`（顶部新增 `RESIDUE` + `render` 末尾自检循环）
+- Modify: `.gitattributes`（二进制资源显式钉住，A3 评审 M-1）
+- Test: `tests/test_scaffold.py`
+
+- [x] **Step 1: 写失败测试**（三条：插值要能活 / 大写带空格仍要拦 / 真模板能渲染干净）
+
+```python
+def test_render_keeps_vue_interpolation_alive(tmp_path):
+    """Vue 插值不是平台占位符：{{ appTitle }} 这类必须能原样活过残留自检。"""
+    # fixture 里同时放 `{{ appTitle }}`、`{{ record.status === 1 ? '启用' : '停用' }}` 与 `{{SLUG}}`，
+    # 断言前两者原样存活、后者被替换成 `s`。
+
+
+def test_render_flags_spaced_platform_placeholder_as_residue(tmp_path):
+    """真事故仍要拦：平台占位符全是大写下划线，带空格写歪就替换不掉（PLACEHOLDER 不吃空格）。"""
+    # README.md 写 `{{ APP_NAME }}` → pytest.raises(DeployError, match="APP_NAME")。
+
+
+def test_render_springboot_template_end_to_end(tmp_path):
+    """整栈真模板必须能渲染干净（不留到 A7 才发现）。"""
+    # render 真模板，断言 vite.config.ts 与 com/zerocode/app/BaseApplication.java 存在。
+```
+
+- [x] **Step 2: 跑测试确认失败** — `pytest tests/test_scaffold.py -q` → 3 failed 12 passed（三条都撞在
+  `DeployError: 占位符渲染残留` 上，前两条仍因报错文案不含 token 而 `match="APP_NAME"` 不中）。
+
+- [x] **Step 3: 改实现**
+
+```python
+PLACEHOLDER = re.compile(r"\{\{(\w+)\}\}")
+# 残留自检的判据：平台占位符形态（大写下划线，容忍手滑带的空格），不是任意 "{{"。
+# 模板里的 Vue 插值 {{ appTitle }} / {{ record.status === 1 ? '启用' : '停用' }} 本就该原样
+# 活到产物里（vue3-springboot 有 93 处），宽判据会把整栈创建应用打成 500。
+# 平台占位符键全是大写下划线（见 render 的 required），插值全小驼峰，两种形态可分。
+RESIDUE = re.compile(r"\{\{\s*[A-Z][A-Z0-9_]*\s*\}\}")
+```
+
+`render` 末尾的自检循环改为逐文件 `RESIDUE.search(...)`，报错时把命中的 token 一并带出（方便定位）：
+
+```python
+    # 残留自检：任何文件不得残留未渲染的平台占位符
+    for p in dst.rglob("*"):
+        if not p.is_file():
+            continue
+        hit = RESIDUE.search(p.read_text(encoding="utf-8", errors="replace"))
+        if hit:
+            raise DeployError(f"占位符渲染残留: {p.relative_to(dst)} 处有 {hit.group(0)}")
+```
+
+`.gitattributes` 补二进制钉（评审 M-1：当前靠 git 内容自判 + `_render_file` 的「解不出 UTF-8」兼容，
+两道全兜不住「恰好是合法 UTF-8 的二进制」这个未来形态）：`*.ico *.png *.jpg *.jpeg *.gif
+*.woff *.woff2 *.ttf *.eot` 均 `binary`。没加 `app/templates/** text eol=lf`：产物已由
+`read_text` 通用换行 + `write_text(newline="")` 收敛成 LF，再改工作区 EOL 只动无关文件。
+
+- [x] **Step 4: 跑绿 + 相关回归** — `tests/test_scaffold.py` 15 passed；scaffold 消费方
+  （app_service / apps_api / store_install_flow / schemacheck / compose_render / deploy_basics /
+  provision）67 passed。全量红的 12 条经单跑定性为并发会话抢 PG（deadlock），与本改动无关。
+
+- [x] **Step 5: 提交** — `fix(scaffold): narrow the residue self-check to platform-placeholder shape`
 
 ---
 
@@ -836,11 +921,12 @@ def test_template_files_are_strict_utf8_or_known_resource(tmp_path):
             elif b"{{" in raw:
                 offenders.append(f"{rel}：资源件里含 {{{{ 字节，渲染器不会替换它")
     assert offenders == []
-    # 渲染产物逐文件扫字节：一个 {{ 都不许漏出来（比 render() 的文本自检覆盖宽）
+    # 渲染产物逐文件扫字节：不得残留「平台占位符形态」（大写键，容忍空格）。
+    # 注意不能断言 `b"{{" not in`：Vue 插值本就该活到产物里（见 Task A3b）。
     out = _render(tmp_path)
     for p in out.rglob("*"):
         if p.is_file():
-            assert b"{{" not in p.read_bytes(), p.relative_to(out)
+            assert not re.search(rb"\{\{\s*[A-Z][A-Z0-9_]*\s*\}\}", p.read_bytes()), p.relative_to(out)
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
