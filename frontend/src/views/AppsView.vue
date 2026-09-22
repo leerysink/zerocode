@@ -5,7 +5,8 @@
 import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { message, Modal } from 'ant-design-vue'
 import {
-  AppstoreOutlined, CloudUploadOutlined, CopyOutlined, DeleteOutlined, EditOutlined,
+  AppstoreOutlined, CloudServerOutlined, CloudUploadOutlined, CopyOutlined, DeleteOutlined, EditOutlined,
+  ExperimentOutlined,
   EyeOutlined, FolderOpenOutlined, HistoryOutlined, MenuOutlined, PlayCircleOutlined,
   PoweroffOutlined, ProfileOutlined, RedoOutlined, ReloadOutlined, RocketOutlined, ShopOutlined,
 } from '@ant-design/icons-vue'
@@ -376,24 +377,43 @@ async function doRelease() {
             <copy-outlined /> 正式地址
           </a>
         </p>
-        <a-space wrap>
-          <a-button size="middle" @click="toggleDev(a)">
-            <poweroff-outlined v-if="a.status_dev === 'running'" />
-            <play-circle-outlined v-else />
-            {{ a.status_dev === 'running' ? '停止预览' : '启动预览' }}
-          </a-button>
-          <a-button size="middle" @click="restartDev(a)">重启</a-button>
-          <a-button type="primary" ghost :disabled="!canPublish(a)"
-                    :title="canPublish(a) ? '' : '该栈发布支持即将上线'"
-                    :loading="a.status_prod === 'publishing'" @click="openPublish(a)">
-            <cloud-upload-outlined /> 发布
-          </a-button>
-          <a-button size="middle" @click="toggleProd(a)">
-            <poweroff-outlined v-if="a.status_prod === 'running'" />
-            <play-circle-outlined v-else />
-            {{ a.status_prod === 'running' ? '停止正式' : '启动正式' }}
-          </a-button>
-        </a-space>
+        <!-- 操作仍在一行，但按环境切成两段：测试环境（dev，直改直跑的预览实例）| 生产环境（prod，已发布版本）。
+             中间一条竖线 + 各段环境标签，避免同名动作被误读成跨环境操作。 -->
+        <div class="zc-acts">
+          <div class="zc-env-group zc-env-dev">
+            <span class="zc-env-label"
+                  title="测试环境（dev）：直接跑工程目录里的代码，独立 dev 端口与 _dev 库">
+              <experiment-outlined /> 测试环境
+            </span>
+            <a-space :size="6">
+              <a-button size="small" @click="toggleDev(a)">
+                <poweroff-outlined v-if="a.status_dev === 'running'" />
+                <play-circle-outlined v-else />
+                {{ a.status_dev === 'running' ? '停止预览' : '启动预览' }}
+              </a-button>
+              <a-button size="small" @click="restartDev(a)">重启</a-button>
+            </a-space>
+          </div>
+          <span class="zc-env-split" />
+          <div class="zc-env-group zc-env-prod">
+            <span class="zc-env-label"
+                  title="生产环境（prod）：跑已发布的版本，独立 prod 端口与 _prod 库">
+              <cloud-server-outlined /> 生产环境
+            </span>
+            <a-space :size="6">
+              <a-button type="primary" ghost size="small" :disabled="!canPublish(a)"
+                        :title="canPublish(a) ? '' : '该栈发布支持即将上线'"
+                        :loading="a.status_prod === 'publishing'" @click="openPublish(a)">
+                <cloud-upload-outlined /> 发布
+              </a-button>
+              <a-button size="small" @click="toggleProd(a)">
+                <poweroff-outlined v-if="a.status_prod === 'running'" />
+                <play-circle-outlined v-else />
+                {{ a.status_prod === 'running' ? '停止正式' : '启动正式' }}
+              </a-button>
+            </a-space>
+          </div>
+        </div>
       </a-card>
     </div>
 
@@ -503,7 +523,7 @@ async function doRelease() {
 .zc-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
 .zc-head-left { display: flex; align-items: center; gap: 10px; }
 .zc-head h2 { font-size: 18px; font-weight: 600; color: var(--zc-text); margin: 0; }
-.zc-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(440px, 1fr)); gap: 14px; }
+.zc-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(520px, 1fr)); gap: 14px; }
 .zc-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 8px; flex-shrink: 0; }
 /* 标题行拉成 flex：状态点固定、应用名可省略号、规格标签贴着名字（antd 的 .ant-card-head-title 里） */
 .zc-card :deep(.ant-card-head-title) { display: flex; align-items: center; overflow: hidden; }
@@ -511,6 +531,15 @@ async function doRelease() {
 .zc-card-tag { flex-shrink: 0; margin-inline-start: 8px; font-weight: 400; }
 .zc-line { margin: 0 0 6px; color: var(--zc-text); font-size: 13px; }
 .zc-line.sub { color: var(--zc-text-sub); }
+/* 一行内的环境分段：两段各自 flex 贴标签 + 按钮，中间竖线分隔；窄屏折行兜底。
+   按钮走 small（与其他卡片区一致）以保证两组 + 两个标签能舒坦地平在一行。 */
+.zc-acts { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.zc-env-group { display: flex; align-items: center; gap: 6px; }
+.zc-env-label { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; line-height: 1;
+                white-space: nowrap; padding: 3px 6px; border-radius: 4px; }
+.zc-env-split { width: 1px; height: 18px; background: var(--zc-border); }
+.zc-env-dev .zc-env-label { color: var(--zc-primary); background: rgba(91, 122, 157, 0.10); }
+.zc-env-prod .zc-env-label { color: #9a7b3f; background: rgba(196, 154, 68, 0.12); }
 .zc-spin { display: block; margin: 60px auto; }
 .zc-pick { border: 1px solid var(--zc-border); border-radius: 6px; padding: 10px 14px; margin-bottom: 10px;
            cursor: pointer; display: flex; flex-direction: column; gap: 4px; }

@@ -101,6 +101,28 @@ describe('AppsView 发布接线', () => {
     expect(wrapper.findAll('.stub-card')[1].text()).toContain('启动正式')
   })
 
+  it('单行内的环境分段：测试环境组放预览启停/重启，竖线后生产环境组放发布/正式启停', async () => {
+    const wrapper = await mountView()
+    const card = wrapper.findAll('.stub-card')[0]
+    const acts = card.find('.zc-acts')
+    expect(acts.exists()).toBe(true)
+    const dev = acts.find('.zc-env-dev')
+    const prod = acts.find('.zc-env-prod')
+    expect(dev.exists()).toBe(true)
+    expect(prod.exists()).toBe(true)
+    // 两段在同一行容器里，中间有竖线分隔
+    expect(acts.findAll('.zc-env-group').length).toBe(2)
+    expect(acts.find('.zc-env-split').exists()).toBe(true)
+    expect(dev.text()).toContain('测试环境')
+    expect(dev.text()).toContain('启动预览')   // status_dev=stopped
+    expect(dev.text()).toContain('重启')
+    expect(dev.text()).not.toContain('发布')
+    expect(prod.text()).toContain('生产环境')
+    expect(prod.text()).toContain('发布')
+    expect(prod.text()).toContain('停止正式')   // status_prod=running
+    expect(prod.text()).not.toContain('预览')
+  })
+
   it('栈闸门：非 vue3-fastapi 的发布按钮置灰带说明 title', async () => {
     const wrapper = await mountView()
     const pubBtns = wrapper.findAll('.stub-card')[1].findAll('.stub-a-button')
