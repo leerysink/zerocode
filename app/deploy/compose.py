@@ -62,6 +62,7 @@ _MIGRATE_SVC = """  migrate:
       TARGET_USER: ${DEV_USER}
       TARGET_PASSWORD: ${DEV_PASSWORD}
     volumes:
+      - ../schema:/schema:ro
       - ../sqlchange:/sql:ro
     networks: [zcnet]
     restart: "no"
@@ -128,6 +129,7 @@ _MIGRATE_PROD = """  migrate:
       TARGET_USER: ${PROD_USER}
       TARGET_PASSWORD: ${PROD_PASSWORD}
     volumes:
+      - ../schema:/schema:ro
       - ../sqlchange:/sql:ro
     networks: [zcnet]
     restart: "no"

@@ -3,14 +3,15 @@
 // 打开时挂载（v-if）——WS 订阅单实例纪律由 PublishModal 自身的 connect/close 保证；
 // 卡片 prod 状态靠既有 5s 轮询刷新，正式地址 hover 才懒加载 appUrls（不轰炸后端）。
 import { onMounted, onUnmounted, reactive, ref } from 'vue'
-import { message } from 'ant-design-vue'
+import { message, Modal } from 'ant-design-vue'
 import {
   AppstoreOutlined, CloudUploadOutlined, CopyOutlined, EyeOutlined, HistoryOutlined,
   PlayCircleOutlined, PoweroffOutlined, ProfileOutlined, ReloadOutlined, RocketOutlined,
+  ShopOutlined,
 } from '@ant-design/icons-vue'
 import {
-  appUrls, createApp, devRestart, devStart, devStatus, devStop, listApps, prodStart,
-  prodStop, validateAppSlug,
+  appUrls, createApp, devReset, devRestart, devStart, devStatus, devStop, listApps, prodStart,
+  prodStop, releaseToStore, validateAppSlug,
 } from '../api'
 import PublishHistory from '../components/PublishHistory.vue'
 import PublishModal from '../components/PublishModal.vue'
@@ -25,6 +26,7 @@ const preview = reactive({ open: false, app: null, url: '', status: '', nonce: 0
 const logs = reactive({ open: false, app: null })
 const pub = reactive({ open: false, app: null, mode: 'publish', version: null, autoStart: false, seq: 0 })
 const hist = reactive({ open: false, app: null })
+const rel = reactive({ open: false, app: null, title: '', summary: '' })
 const urlsCache = reactive({})
 const form = reactive({ name: '', slug: '', slugTouched: false, scale: 'small', stack: 'vue3-fastapi' })
 let timer = null
@@ -131,6 +133,23 @@ async function restartDev(a) {
     message.error(e?.response?.data?.detail || '重启失败')
   }
 }
+async function resetDev(a) {
+  // 破坏性：drop 并重建 <slug>_dev，从 sqlchange 文件全量 fold；prod 不受影响。
+  Modal.confirm({
+    title: '重建 dev 数据库',
+    content: `将删除并重建 ${a.slug}_dev（从 sqlchange 文件全量重放），用于消除 dev 漂移；不影响 ${a.slug}_prod。确认继续？`,
+    okText: '重建',
+    okType: 'danger',
+    onOk: async () => {
+      try {
+        await devReset(a.id)
+        message.info('dev 重建已受理，进度见查看日志')
+      } catch (e) {
+        message.error(e?.response?.data?.detail || '重建失败')
+      }
+    },
+  })
+}
 async function copyUrl(url) {
   await navigator.clipboard.writeText(url)
   message.success('已复制')
@@ -184,6 +203,24 @@ async function copyProdUrl(a) {
   const u = urlsCache[a.id]
   await copyUrl(u?.lan || u?.localhost || `http://localhost:${a.prod_port}`)
 }
+
+// ---------- M3-a 商店：发布到商店（只认真实在服的 prod 版本，闸门在后端） ----------
+const canReleaseToStore = (a) => a.stack === 'vue3-fastapi' && !!a.current_version && !a.store
+function openRelease(a) {
+  Object.assign(rel, { app: a, title: a.name, summary: '', open: true })
+}
+async function doRelease() {
+  if (!rel.app) return
+  try {
+    await releaseToStore(rel.app.id, { title: rel.title.trim() || rel.app.name, summary: rel.summary })
+    message.success('已上架商店，可在侧栏「商店」页看到')
+    rel.open = false
+    await load()
+  } catch (e) {
+    const d = e?.response?.data?.detail
+    message.error(typeof d === 'string' ? d : '上架失败')
+  }
+}
 </script>
 
 <template>
@@ -204,6 +241,7 @@ async function copyProdUrl(a) {
         <template #title>
           <span class="zc-dot" :style="{ background: statusColor(a.status_dev) }" />
           {{ a.name }}
+          <a-tag v-if="a.store" class="zc-store-tag">来自商店</a-tag>
         </template>
         <template #extra>
           <a-tag>{{ a.scale === 'large' ? '大型' : '小型' }} · {{ a.stack }}</a-tag>
@@ -228,6 +266,7 @@ async function copyProdUrl(a) {
             {{ a.status_dev === 'running' ? '停止' : '启动预览' }}
           </a-button>
           <a-button size="middle" @click="restartDev(a)">重启</a-button>
+          <a-button size="middle" @click="resetDev(a)">重建 dev</a-button>
           <a-button size="middle" @click="openLogs(a)"><profile-outlined /> 查看日志</a-button>
           <a-button type="primary" ghost :disabled="!canPublish(a)"
                     :title="canPublish(a) ? '' : '该栈发布支持即将上线'"
@@ -240,6 +279,9 @@ async function copyProdUrl(a) {
             {{ a.status_prod === 'running' ? '停止正式' : '启动正式' }}
           </a-button>
           <a-button size="middle" @click="openHistory(a)"><history-outlined /> 发布历史</a-button>
+          <a-button v-if="canReleaseToStore(a)" size="middle" @click="openRelease(a)">
+            <shop-outlined /> 发布到商店
+          </a-button>
         </a-space>
       </a-card>
     </div>
@@ -314,6 +356,16 @@ async function copyProdUrl(a) {
     <a-drawer v-model:open="hist.open" :title="`发布历史 · ${hist.app?.name || ''}`" width="760px">
       <PublishHistory v-if="hist.open && hist.app" :app="hist.app" @rollback="startRollback" />
     </a-drawer>
+
+    <a-modal v-model:open="rel.open" title="发布到商店" ok-text="上架" destroy-on-close @ok="doRelease">
+      <a-input v-model:value="rel.title" placeholder="商店展示名称" />
+      <a-textarea v-model:value="rel.summary" placeholder="一句话简介（可选）" :rows="3"
+                  style="margin-top: 8px" />
+      <p class="zc-modal-tip">
+        上架的是当前正式在服版本 {{ rel.app?.current_version ? `（${rel.app.current_version}）` : '' }}，
+        含真实执行过的数据变更序列；获批者会得到独立代码与独立数据库的实例。
+      </p>
+    </a-modal>
   </div>
 </template>
 
@@ -332,4 +384,6 @@ async function copyProdUrl(a) {
 .zc-pick span { color: var(--zc-text-sub); font-size: 12px; }
 .zc-wizard-foot { display: flex; justify-content: flex-end; margin-top: 16px; }
 .zc-tip { color: var(--zc-text-sub); font-size: 12px; margin: 8px 0 0; }
+.zc-modal-tip { margin: 8px 0 0; color: var(--zc-text-sub); font-size: 12px; line-height: 1.6; }
+.zc-store-tag { margin-inline-start: 8px; font-weight: 400; vertical-align: middle; }
 </style>

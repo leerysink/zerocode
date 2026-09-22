@@ -159,6 +159,17 @@ def test_ensure_deploy_files_prod_updates_env(tmp_path):
 PROD_CRED = {"db": "lailiao_prod", "user": "lailiao_prod", "password": "pwprod"}
 
 
+def test_migrate_mounts_schema_and_sqlchange():
+    """P2 Task 5：dev 与 prod 的 migrate 服务都同时挂载声明式结构轨 /schema 与数据轨 /sql。"""
+    dev = compose.render_dev_compose(META)
+    prod = compose.render_prod_compose(META)
+    for y in (dev, prod):
+        doc = yaml.safe_load(y)
+        vols = doc["services"]["migrate"]["volumes"]
+        assert "../schema:/schema:ro" in vols
+        assert "../sqlchange:/sql:ro" in vols
+
+
 # ==== Task 4 追加（控制者裁定 D-T4：单向推进语义双向化 + 模板片段不得重复注入）====
 
 def test_ensure_deploy_files_keeps_creds_of_the_omitted_side(tmp_path):

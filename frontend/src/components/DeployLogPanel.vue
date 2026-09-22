@@ -78,6 +78,11 @@ function handleEvent(ev) {
             line: `[zerocode] ${ev.ok ? '✓' : '✗'} 迁移${ev.ok ? '成功' : '失败'}（${ev.env || 'dev'}）` }])
     return
   }
+  if (ev.type === 'dev_reset_result') {
+    push([{ seq: 0, ts: new Date().toISOString(), source: 'platform', service: '平台',
+            line: `[zerocode] ${ev.ok ? '✓' : '✗'} dev 库重建${ev.ok ? '完成' : '失败'}（${ev.env || 'dev'}）` }])
+    return
+  }
   const row = rowFromEvent(ev)
   if (row) push([row])
 }

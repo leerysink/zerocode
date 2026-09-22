@@ -55,6 +55,8 @@ export const validateAppSlug = (slug) => http.post('/apps/validate-slug', { slug
 export const devStart = (id) => http.post(`/apps/${id}/dev/start`)
 export const devStop = (id) => http.post(`/apps/${id}/dev/stop`)
 export const devRestart = (id) => http.post(`/apps/${id}/dev/restart`)
+// 一键重建 dev 库：drop+provision+从 sqlchange 文件全量 fold（破坏性，202 受理，进度走 WS）
+export const devReset = (id) => http.post(`/apps/${id}/dev/reset`)
 export const devStatus = (id) => http.get(`/apps/${id}/dev/status`)
 export const devLogs = (id, tail = 200, sinceSeq = 0) =>
   http.get(`/apps/${id}/dev/logs`, { params: { tail, since_seq: sinceSeq } })
@@ -78,3 +80,18 @@ export const appRecords = (id, limit = 50) => http.get(`/apps/${id}/records`, { 
 export const deleteRecord = (id, rid) => http.delete(`/apps/${id}/records/${rid}`)
 export const appUrls = (id) => http.get(`/apps/${id}/urls`)
 export const systemNics = () => http.get('/system/nics')
+
+// ---- 应用商店 M3-a（轻身份 / 上架 / 申请审批）----
+export const storeIdentify = (nickname) => http.post('/store/identify', { nickname })
+export const storeMe = () => http.get('/store/me')
+export const storeReleases = () => http.get('/store/releases')
+export const storeWithdraw = (id) => http.post(`/store/releases/${id}/withdraw`)
+export const storeApplications = (box = 'mine') => http.get('/store/applications', { params: { box } })
+export const storeMyReleases = () => http.get('/store/applications', { params: { box: 'review' } })
+export const storeApply = (releaseId, wantName) =>
+  http.post('/store/applications', { release_id: releaseId, want_name: wantName })
+export const storeApprove = (id) => http.post(`/store/applications/${id}/approve`, { approve: true })
+export const storeReject = (id, reason) =>
+  http.post(`/store/applications/${id}/reject`, { approve: false, reason })
+export const releaseToStore = (appId, data) => http.post(`/apps/${appId}/release`, data)
+export const storeLink = (appId) => http.get(`/store/link/${appId}`)

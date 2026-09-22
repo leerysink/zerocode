@@ -197,7 +197,8 @@ async def reconcile(sf, notify=None) -> None:
 # 04 §4.1 状态机进度（前端进度条按此顺序点亮；record 收口在记账之后，故最后一步是记账）
 STEPLIST = ("preflight", "build", "provision", "migrate", "deploy", "health", "record")
 # 迁移文件名规范（07 迁移闸门 + 全局约束「注释不得含分号」）：安全名=词/连字符/点/汉字，不含分号
-_SQL_NAME = _re.compile(r"^V\d{8}_\d{2}_[\w\-.\u4e00-\u9fff]+\.sql$")
+# 数据轨 D* 与遗留结构轨 V* 均合法（P2 双轨；破坏性变更由 diff 闸门拦，不靠命名）
+_SQL_NAME = _re.compile(r"^[VD]\d{8}_\d{2}_[\w\-.\u4e00-\u9fff]+\.sql$")
 
 
 def next_version() -> str:
@@ -323,6 +324,21 @@ async def publish(sf, app: dict, notify=None, *, force: bool = False) -> dict:
             if _block:
                 raise DeployError(_block)
             await _step(app_id, notify, "✓ dev 结构与 sqlchange 文件等价校验通过")
+        # 1.y 结构破坏性闸门（P2）：上一版归档快照 vs 当前 schema.sql，检出删/改名/收窄即阻断。
+        #     以 schema/schema.sql 存有为前置（存量无结构轨应用自动跳过）；diff 不生成 DDL，只做分析型拦截。
+        _skip_destr = str((await deploy_cfg(sf)).get("deploy.skip_schema_destructive", "")).lower() in ("1", "true", "yes")
+        snap_cur = root / "schema" / "schema.sql"
+        if snap_cur.is_file() and prev_version and not _skip_destr:
+            snap_prev = root / "releases" / prev_version / "schema.sql"
+            if snap_prev.is_file():
+                from app.deploy import schemadiff
+                d = schemadiff.schema_diff(
+                    schemadiff.parse_schema(snap_prev.read_text(encoding="utf-8")),
+                    schemadiff.parse_schema(snap_cur.read_text(encoding="utf-8")))
+                msg = schemadiff.destructive_message(d)
+                if msg:
+                    raise DeployError(msg)
+                await _step(app_id, notify, "✓ 结构破坏性校验通过（相对上一版无删/改名/收窄）")
         await _step_ev(app_id, notify, rst, "preflight", "ok")
         # 2 build（旧容器不动——04 §4.1；渲染先于 build：prod-compose.yml 的落盘条件已放宽为栈判定）
         await _step_ev(app_id, notify, rst, "build", "running")
@@ -419,6 +435,18 @@ async def publish(sf, app: dict, notify=None, *, force: bool = False) -> dict:
                 "UPDATE app_project SET current_version=:v, status_prod='running', "
                 "updated_at=now() WHERE id=:i"), {"v": version, "i": app_id})
             await s.commit()
+        # P2：发布成功即归档本版结构快照（releases/<version>/schema.sql），作为下次破坏性 diff 基线。
+        # 文件存、不碰平台库；归档失败不改判发布成败（下次缺基线时闸门自动跳过）。
+        try:
+            _snap = root / "schema" / "schema.sql"
+            if _snap.is_file():
+                _dst = root / "releases" / version
+                _dst.mkdir(parents=True, exist_ok=True)
+                (_dst / "schema.sql").write_text(_snap.read_text(encoding="utf-8"),
+                                                 encoding="utf-8", newline="")
+        except Exception as se:  # noqa: BLE001
+            await _step(app_id, notify, f"✗ schema 快照归档失败（不影响发布结果）：{se}",
+                        level=logging.WARNING)
         # 终审 I-1：晋升+体检通过即不可撤销点——之后的收尾（URL/README/记账/清镜像）各自圈稳，
         # 任何一步抛只降级为 warning，绝不再改判成败（finish 的 success 守卫是记账层兜底）。
         from app.deploy import nics

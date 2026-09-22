@@ -138,6 +138,10 @@ def create_app(database_url: str | None = None) -> FastAPI:
     # 部署发布套件（Task 5）：/api/system/nics 网卡候选（局域网地址选择的数据源）
     from app.api import system
     app.include_router(system.router)
+    # 应用商店（M3-a）：/api/store 与上架入口 /api/apps/{id}/release
+    from app.api import store as store_api
+    app.include_router(store_api.router)
+    app.include_router(store_api.apps_ext)
     app.include_router(ws_router)
 
     # ---- 前端静态托管（Task 15）：挂载 frontend/dist，SPA 回退 index.html ----

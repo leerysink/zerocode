@@ -13,9 +13,12 @@ def test_render_replaces_and_generates_init_sql(tmp_path):
     assert '"name": "lailiao-frontend"' in pkg and "{{" not in pkg
     readme = (tmp_path / "README.md").read_text(encoding="utf-8")
     assert "来料登记" in readme and "8211" in readme
-    sqls = list((tmp_path / "sqlchange").glob("V*.sql"))
-    assert len(sqls) == 1 and re.fullmatch(r"V20260918_01_init\.sql", sqls[0].name)
-    assert "CREATE TABLE IF NOT EXISTS demo_notes" in sqls[0].read_text(encoding="utf-8")
+    seeds = list((tmp_path / "sqlchange").glob("D*.sql"))
+    assert len(seeds) == 1 and re.fullmatch(r"D20260918_01_seed\.sql", seeds[0].name)
+    snap = (tmp_path / "schema" / "schema.sql").read_text(encoding="utf-8")
+    assert "CREATE TABLE IF NOT EXISTS demo_notes" in snap
+    # 不再有结构增量 V 文件（结构真相已迁到声明式 schema.sql）
+    assert not list((tmp_path / "sqlchange").glob("V*.sql"))
     # 全目录无残留占位符
     for p in tmp_path.rglob("*"):
         if p.is_file():
@@ -26,6 +29,31 @@ def test_render_missing_key_raises(tmp_path):
     from app.deploy.errors import DeployError
     with pytest.raises(DeployError):
         scaffold.render(TEMPLATE, tmp_path, {"SLUG": "x"})  # 缺大部分键
+
+
+def test_render_creates_schema_snapshot_and_data_seed(tmp_path):
+    """P2 双轨：结构进声明式 schema.sql（纯幂等 DDL、无数据），种子进数据轨 D 文件。"""
+    mapping = {"SLUG": "lailiao", "APP_NAME": "来料登记", "DEV_PORT": "8211", "PROD_PORT": "8210",
+               "DEV_DB": "lailiao_dev", "PROD_DB": "lailiao_prod", "TODAY": "20260922"}
+    scaffold.render(TEMPLATE, tmp_path, mapping)
+    # 结构轨：声明式快照（纯幂等 DDL，无 INSERT）
+    snap = (tmp_path / "schema" / "schema.sql").read_text(encoding="utf-8")
+    assert "CREATE TABLE IF NOT EXISTS demo_notes" in snap
+    assert "ADD COLUMN IF NOT EXISTS" in snap
+    assert "INSERT" not in snap.upper()
+    # 数据轨：种子进 D 文件（append-only，幂等 ON CONFLICT）
+    seeds = list((tmp_path / "sqlchange").glob("D*.sql"))
+    assert len(seeds) == 1 and re.fullmatch(r"D20260922_01_seed\.sql", seeds[0].name)
+    assert "INSERT INTO demo_notes" in seeds[0].read_text(encoding="utf-8")
+
+
+def test_app_readme_states_append_only(tmp_path):
+    """M3-a Task 13：应用 README 把「只追加 + 两步走」写给作者本人看。"""
+    scaffold.render(TEMPLATE, tmp_path, {
+        "SLUG": "a", "APP_NAME": "甲", "DEV_PORT": "8300", "PROD_PORT": "8301",
+        "DEV_DB": "a_dev", "PROD_DB": "a_prod", "TODAY": "20260922"})
+    text_ = (tmp_path / "README.md").read_text(encoding="utf-8")
+    assert "不得修改" in text_ and "两步" in text_
 
 def test_render_missing_template_raises(tmp_path):
     import pytest
@@ -40,8 +68,8 @@ def test_render_init_sql_content(tmp_path):
     mapping = {"SLUG": "lailiao", "APP_NAME": "来料登记", "DEV_PORT": "8211", "PROD_PORT": "8210",
                "DEV_DB": "lailiao_dev", "PROD_DB": "lailiao_prod", "TODAY": "20260918"}
     scaffold.render(TEMPLATE, tmp_path, mapping)
-    init = (tmp_path / "sqlchange" / "V20260918_01_init.sql").read_text(encoding="utf-8")
-    assert "来料登记" in init and "2026-09-18" in init  # APP_NAME 与 TODAY 转横线日期均落到演示迁移
+    init = (tmp_path / "sqlchange" / "D20260918_01_seed.sql").read_text(encoding="utf-8")
+    assert "来料登记" in init and "2026-09-18" in init  # APP_NAME 与 TODAY 转横线日期均落到数据轨种子
 
 
 def test_render_init_sql_escapes_single_quote_in_app_name(tmp_path):
@@ -52,7 +80,7 @@ def test_render_init_sql_escapes_single_quote_in_app_name(tmp_path):
                "PROD_PORT": "8210", "DEV_DB": "lobrien_dev", "PROD_DB": "lobrien_prod",
                "TODAY": "20260918"}
     scaffold.render(TEMPLATE, tmp_path, mapping)
-    init = (tmp_path / "sqlchange" / "V20260918_01_init.sql").read_text(encoding="utf-8")
+    init = (tmp_path / "sqlchange" / "D20260918_01_seed.sql").read_text(encoding="utf-8")
     assert "O''Brien 来料登记" in init                      # PG 标准转义：单引号双写
     line = next(l for l in init.splitlines() if "INSERT INTO demo_notes" in l)
     assert "VALUES ('欢迎使用 O''Brien 来料登记')" in line   # 开/闭引号 + 转义对，字面量闭合

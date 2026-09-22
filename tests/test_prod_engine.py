@@ -756,6 +756,54 @@ async def test_publish_can_skip_schema_parity_check(monkeypatch, sf, seed, pub_r
     assert not any(c[0] == "verify" for c in seams.calls)          # 开关生效：根本没调校验
 
 
+async def test_publish_blocks_on_destructive_schema_drift(monkeypatch, sf, seed, pub_root):
+    """P2 结构破坏性闸门（并入 preflight）：上一版归档快照有列 title、当前 schema.sql 删了它
+    → 抛 DeployError、不起栈、不晋升 current_version（破坏性不自动执行，需人工两步走）。"""
+    wid, aid = await seed(slug="zcpub", prod_port=8982, dev_port=8983,
+                          status_prod="running", current_version=PREV_VER)
+    (pub_root / "schema").mkdir()
+    (pub_root / "schema" / "schema.sql").write_text(
+        "CREATE TABLE IF NOT EXISTS demo_notes (id BIGSERIAL PRIMARY KEY);\n",
+        encoding="utf-8", newline="")
+    prev_dir = pub_root / "releases" / PREV_VER
+    prev_dir.mkdir(parents=True)
+    (prev_dir / "schema.sql").write_text(
+        "CREATE TABLE IF NOT EXISTS demo_notes (id BIGSERIAL PRIMARY KEY);\n"
+        "ALTER TABLE demo_notes ADD COLUMN IF NOT EXISTS title VARCHAR(200) NOT NULL;\n",
+        encoding="utf-8", newline="")
+    seams = PubSeams(monkeypatch, pub_root)
+
+    with pytest.raises(DeployError) as ei:
+        await prod.publish(sf, _pub_app(aid), notify=seams.notify, force=True)
+    assert "破坏性" in str(ei.value) and "title" in str(ei.value)
+    assert seams.step_seq == [("preflight", "running")]          # 阻断在 preflight 内、ok 之前
+    assert "compose build" not in seams.verbs and not seams.ups()
+    assert seams.dones[-1]["ok"] is False
+    assert seams.statuses == ["publishing", "error"]
+    assert await _db_pair(sf, aid) == (PREV_VER, "error")         # 旧版本记录不动，仅态转 error
+
+
+async def test_publish_archives_schema_snapshot_on_success(monkeypatch, sf, seed, pub_root):
+    """P2 快照归档：非破坏发布成功 → 本版 releases/<version>/schema.sql 落盘（下次 diff 基线）。"""
+    wid, aid = await seed(slug="zcpub", prod_port=8982, dev_port=8983,
+                          status_prod="running", current_version=PREV_VER)
+    snap = ("CREATE TABLE IF NOT EXISTS demo_notes (id BIGSERIAL PRIMARY KEY);\n"
+            "ALTER TABLE demo_notes ADD COLUMN IF NOT EXISTS title VARCHAR(200) NOT NULL;\n")
+    (pub_root / "schema").mkdir()
+    (pub_root / "schema" / "schema.sql").write_text(snap, encoding="utf-8", newline="")
+    prev_dir = pub_root / "releases" / PREV_VER
+    prev_dir.mkdir(parents=True)
+    (prev_dir / "schema.sql").write_text(snap, encoding="utf-8", newline="")   # 同结构=非破坏，闸门放行
+    seams = PubSeams(monkeypatch, pub_root)
+
+    res = await prod.publish(sf, _pub_app(aid), notify=seams.notify, force=True)
+
+    assert res["status"] == "running" and seams.steps_ok == list(PUB_STEPS)
+    assert any("结构破坏性校验通过" in ln for ln in seams.logs)   # 闸门真跑了（非静默跳过）
+    archived = pub_root / "releases" / res["version"] / "schema.sql"
+    assert archived.is_file() and archived.read_text(encoding="utf-8") == snap
+
+
 async def test_publish_requires_dev_cred(monkeypatch, sf, seed, pub_root):
     """D-T4：build 前 dev 凭据读空 = 数据异常，500 显式抛（不静默传空 dict 让渲染器保留旧键）。"""
     wid, aid = await seed(slug="zcpub", prod_port=8982, dev_port=8983)

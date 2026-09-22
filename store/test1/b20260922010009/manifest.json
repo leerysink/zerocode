@@ -1,0 +1,46 @@
+{
+  "schema": "zc-release/1",
+  "slug": "test1",
+  "version": "b20260922010009",
+  "anchor": [
+    {
+      "filename": "V20260920_01_init.sql",
+      "checksum": "56a0cf6e0f00af532dc15a5d1ab41753"
+    },
+    {
+      "filename": "V20260920_02_desktop_settings.sql",
+      "checksum": "43a745f06c37a3b0663805449e082ecc"
+    },
+    {
+      "filename": "V20260920_03_desktop_memos.sql",
+      "checksum": "5212bc1b77e2de2633031b6f026238c1"
+    }
+  ],
+  "fingerprint": "cb47dcc9a962bd7f14e650dc689ed00b483e6879c54f7fc3639f3f5db851651e",
+  "created_at": "2026-09-21T19:41:41.651742+00:00",
+  "exclude_top": [
+    "README.md",
+    "app.json",
+    "deploy",
+    "sqlchange"
+  ],
+  "exclude_dirs": [
+    ".pytest_cache",
+    ".venv",
+    ".vite",
+    "__pycache__",
+    "build",
+    "dist",
+    "node_modules",
+    "venv"
+  ],
+  "app_id": 383,
+  "title": "陌如玉",
+  "summary": "手写备忘小应用",
+  "stack": "vue3-fastapi",
+  "health": {
+    "frontend": "/",
+    "backend": "/api/health"
+  },
+  "prev_release_id": null
+}

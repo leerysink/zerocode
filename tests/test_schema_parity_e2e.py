@@ -54,6 +54,39 @@ async def test_verify_scratch_fold_is_green(sf):
         shutil.rmtree(ROOT, ignore_errors=True)
 
 
+@pytest.mark.asyncio
+async def test_run_sh_folds_schema_then_data(sf):
+    """P2 Task 4：run.sh 先 fold 声明式 schema.sql（建表 + ADD COLUMN 收敛），
+    再按 history 增量跑数据轨 D 文件；重复 fold 幂等不报错，新增列被补上。"""
+    root = ROOT / SLUG
+    _write({})  # 建目录骨架（rmtree + 创建 sqlchange）
+    (root / "schema").mkdir(parents=True, exist_ok=True)
+    (root / "schema" / "schema.sql").write_text(
+        "CREATE TABLE IF NOT EXISTS demo (id BIGSERIAL PRIMARY KEY);\n"
+        "ALTER TABLE demo ADD COLUMN IF NOT EXISTS title VARCHAR(200) NOT NULL;\n",
+        encoding="utf-8", newline="")
+    (root / "sqlchange" / "D20260922_01_seed.sql").write_text(
+        "INSERT INTO demo (title) VALUES ('hi') ON CONFLICT DO NOTHING;\n",
+        encoding="utf-8", newline="")
+    await sqlrun.build_if_missing()
+    cred = await provision.create_db_with_role(sf, scratch.verify_db_name(SLUG))
+    try:
+        first = await sqlrun.run_sqlchange(root, "verify", cred)
+        assert first["ok"] is True and "FOLD schema.sql" in first["log"]
+        # 追加一列再 fold：验证 ADD COLUMN 收敛（重放幂等）
+        (root / "schema" / "schema.sql").write_text(
+            (root / "schema" / "schema.sql").read_text(encoding="utf-8")
+            + "ALTER TABLE demo ADD COLUMN IF NOT EXISTS extra INT;\n",
+            encoding="utf-8", newline="")
+        second = await sqlrun.run_sqlchange(root, "verify", cred)
+        assert second["ok"] is True                 # 再 fold 不报错，新列被补上
+        norm = schemacheck.normalize_dump(await schemacheck.dump_schema(cred))
+        assert "extra" in norm
+    finally:
+        await provision.drop_db(sf, scratch.verify_db_name(SLUG))
+        shutil.rmtree(ROOT, ignore_errors=True)
+
+
 def _dev_url(cred):
     return (f"postgresql+asyncpg://{cred['user']}:{cred['password']}"
             f"@localhost:5433/{cred['db']}")

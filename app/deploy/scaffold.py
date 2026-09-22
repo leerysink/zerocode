@@ -5,17 +5,11 @@ from pathlib import Path
 from app.deploy.errors import DeployError
 
 PLACEHOLDER = re.compile(r"\{\{(\w+)\}\}")
-INIT_SQL = """-- V{TODAY}_01_init.sql
--- 日期：{TODAY_DASH}  用途：示例表 demo_notes（AI 可按需求替换或追加新文件）  影响：demo_notes
-
-CREATE TABLE IF NOT EXISTS demo_notes (
-    id         BIGSERIAL PRIMARY KEY,
-    title      VARCHAR(200) NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
+INIT_SQL = """-- D{TODAY}_01_seed.sql —— 数据轨种子（幂等，可重放）
+-- 日期：{TODAY_DASH}  用途：demo_notes 欢迎行（AI 可替换或追加新 D 文件）  影响：demo_notes
 INSERT INTO demo_notes (title) VALUES ('欢迎使用 {APP_NAME}') ON CONFLICT DO NOTHING;
 """
+# 结构真相在 schema/schema.sql（模板自带、声明式快照）；脚手架只补数据轨种子。
 
 def render(template: Path, dst: Path, mapping: dict) -> None:
     """把 template 目录渲染到 dst：占位符替换 + 生成初始迁移 + 残留自检。
@@ -40,7 +34,7 @@ def render(template: Path, dst: Path, mapping: dict) -> None:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(text, encoding="utf-8", newline="")
     today = mapping["TODAY"]
-    init = dst / "sqlchange" / f"V{today}_01_init.sql"
+    init = dst / "sqlchange" / f"D{today}_01_seed.sql"
     init.parent.mkdir(parents=True, exist_ok=True)
     # M-2②（终审 F-03）：APP_NAME 进 SQL 字面量前做 PG 标准转义 `'`→`''`（对照探针：含引号名称
     # 原值渲染出引号不闭合的 INSERT，psql --single-transaction 整文件回滚 → 首预览必红且 M1 无删除入口）。

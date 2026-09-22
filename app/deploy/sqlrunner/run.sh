@@ -19,7 +19,17 @@ $PSQL -q -c "CREATE TABLE IF NOT EXISTS sqlchange_history (
   duration_ms INT,
   applied_at TIMESTAMPTZ NOT NULL DEFAULT now())" || exit 2
 
-for f in $(ls /sql/V*.sql 2>/dev/null | sort); do
+# 结构轨：若存在声明式快照则先全量幂等 fold（可重放，永不 DROP）。
+# fold 不进 history（每次重放，幂等无害），仅作结构投影；缺失 schema 目录时静默跳过（向后兼容存量 V* 应用）。
+if [ -f /schema/schema.sql ]; then
+  echo "FOLD schema.sql"
+  if ! $PSQL -q -f /schema/schema.sql; then
+    echo "FAIL schema.sql"
+    exit 2
+  fi
+fi
+
+for f in $(ls /sql/*.sql 2>/dev/null | sort); do
   base=$(basename "$f")
   sum=$(md5sum "$f" | cut -d' ' -f1)
   # 坑：boolean::text 在 PG 里是 'true'/'false'，不是 psql 显示的 't'/'f'；

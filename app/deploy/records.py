@@ -62,11 +62,15 @@ async def list_for(sf, app_id: int, limit: int = 50) -> list[dict]:
 
 
 async def mark_interrupted(sf) -> int:
-    """平台重启对账（04 §6）：上次崩溃遗留的 running 发布/回滚记录标 failed+interrupted。"""
+    """平台重启对账（04 §6）：上次崩溃遗留的 running 发布/回滚/商店记录标 failed+interrupted。
+
+    install/release 与 publish/rollback 同性质——都是 _spawn 后台任务，中断后不收回执就会
+    永远 running，把该应用的互斥闸门（_spawn 409）和版本清理名额一起卡死。"""
     async with sf() as s:
         res = await s.execute(text(
             "UPDATE deploy_record SET status='failed', step='interrupted', finished_at=now(), "
-            "error='平台重启中断' WHERE status='running' AND kind IN ('publish','rollback')"))
+            "error='平台重启中断' WHERE status='running' "
+            "AND kind IN ('publish','rollback','install','release')"))
         await s.commit()
         return res.rowcount
 

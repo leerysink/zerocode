@@ -17,9 +17,7 @@ from functools import partial
 from fastapi import APIRouter, Request, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import text
-from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
-from app import config as app_config
 from app.deploy import engine, prod, records, sqlrun
 from app.deploy import provision
 from app.deploy.errors import DeployError
@@ -245,12 +243,8 @@ async def app_urls(request: Request, app_id: int):
 
 # ---------- sqlchange（Task 12 / 规格 07）：应用侧迁移的执行、记账与待办清单 ----------
 
-def _app_db_url(cred: dict) -> str:
-    """应用库连接串：复用平台 PG 实例的 host/port（生产由 ZEROCODE_DATABASE_URL 决定，不写死 5433），
-    只换库名/角色/密码。SQLAlchemy 默认掩码密码，取串必须 render_as_string(hide_password=False)。"""
-    base = make_url(app_config.database_url())
-    return base.set(database=cred["db"], username=cred["user"],
-                    password=cred["password"]).render_as_string(hide_password=False)
+# 应用库连接串口径收口到锚点服务（Task 5）：两处各自维护一份早晚漂移。
+from app.store.anchor import app_db_url as _app_db_url
 
 
 async def _history_rows(url: str, sql: str) -> list[dict]:
@@ -353,7 +347,10 @@ async def sql_records(request: Request, app_id: int, env: str = "dev"):
 
 @router.get("/{app_id}/sqlchange/files")
 async def sql_files(request: Request, app_id: int):
-    """待执行清单：文件名升序（= 执行顺序），并标注 dev 库里已记账的那些。"""
+    """待执行清单：文件名升序（= 执行顺序），并标注 dev 库里已记账的那些。
+
+    P2 双轨：glob 由 `V*.sql` 放宽为 `*.sql`，让数据轨 `D*.sql`（与遗留 `V*.sql`）一并入待办清单；
+    口径只影响本 UI 列表——商店上架锚点取自 sqlchange_history（DB），与本目录 glob 无关（不伤打包）。"""
     sf = request.app.state.session_factory
     try:
         app = await app_service.get_app(sf, app_id)
@@ -361,7 +358,7 @@ async def sql_files(request: Request, app_id: int):
     except DeployError as e:
         raise _http(e)
     d = root / "sqlchange"
-    files = sorted(p.name for p in d.glob("V*.sql")) if d.is_dir() else []
+    files = sorted(p.name for p in d.glob("*.sql")) if d.is_dir() else []
     cred = await read_cred(sf, app["slug"], "dev")
     applied: dict[str, dict] = {}
     if cred:
