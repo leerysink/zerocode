@@ -221,4 +221,19 @@ def test_springboot_banner_keeps_percent_in_app_name_harmless(tmp_path):
             / "BaseApplication.java").read_text(encoding="utf-8")
     body = java.split('"""')[1]                       # 横幅 text block 本体
     assert "%s" in body and "%" not in body.replace("%s", "")   # 只允许 %s 这类合法转换符
+    assert body.count("%s") == 2                       # 与下面的两个实参同步（名字、baseUrl）：加行不加实参就是 MissingFormatArgumentException
     assert '"%s"' % name in java.split(".formatted(")[1]        # 名字以带引号实参出现，不在格式串里
+
+
+def test_fastapi_app_vue_name_sits_in_a_double_quoted_host(tmp_path):
+    """名字进 Vue 宿主只能待在被 NAME_UNSAFE 保护的双引号里（评审 A4c IMP-1 同类洞）。
+
+    `:title="'{{APP_NAME}}'"` 是模板表达式里的 **JS 单引号字符串**，而 check_name 刻意放行 `'`
+    （SQL 路径已转义，pom/Java/HTML 里也安全）——「O'Brien 仓库」渲染出来就是 `title: 'O'Brien 仓库'`，
+    编译产物语法错、预览必碎。改静态属性后属性值里的 `'` 无语法意义（`"` 已被入口拒掉）。
+    """
+    scaffold.render(TEMPLATE, tmp_path, {
+        "SLUG": "lailiao", "APP_NAME": "O'Brien 仓库", "DEV_PORT": "8211", "PROD_PORT": "8210",
+        "DEV_DB": "lailiao_dev", "PROD_DB": "lailiao_prod", "TODAY": "20260922"})
+    vue = (tmp_path / "frontend" / "src" / "App.vue").read_text(encoding="utf-8")
+    assert 'title="O\'Brien 仓库"' in vue and ":title=\"'" not in vue

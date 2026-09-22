@@ -22,11 +22,13 @@
 - **提交前必验边界**：`git add <file>` 前先 `git diff <file>` 确认该文件的 diff **只含本次改动**。
   并发会话可能把半成品留在同一个文件里（实跑碰到过 `app_service.py` 里他人在途的 `gateway_routes` 引用），
   整文件 add 会提交出一个 import 不存在的坏 commit。
-  - **⚠ 待裁定（A4 实跑发现，已提问用户）**：`check_name` 只校 strip + 长度，不限制字符集，而模板把
-    `{{APP_NAME}}` 内插进机器可解析的文件。名字含 `< > & " \` 时产物会直接碎：
-    本栈 `pom.xml` 的 `<name>` 与 `BaseApplication` 的 Java text block（`\q` 是非法转义 → 编译不过）；
-    fastapi 栈早已有同一问题（`backend/app/main.py:18` 的 `APP_NAME = "{{APP_NAME}}"` 含 `"` 即破）。
-    三个候选已裁定：用户选定「收紧 `check_name` 字符集」→ **Task A4b**。
+  - **✅ 已裁定（A4 实跑发现 → A4b/A4c 落地）**：`{{APP_NAME}}` 会被内插进机器可解析的文件，名字含
+    `< > & " \` 或控制字符时产物直接碎（`pom.xml` 的 `<name>`、Java 字面量、`main.py` 的字符串）。
+    用户选定「收紧 `check_name`」（**Task A4b**）：入口一条 400，不做多宿主转义。
+  - **名字宿主铁则（A4c 复审 IMP-1 后的全局约束，Phase A 余下 Step 与后续任何新栈均适用）**：
+    `check_name` 只拒 `"` 不拒 `'` 与 `%`，所以吃 `{{APP_NAME}}` 的位置**只能是双引号字符串、静态 HTML/Vue
+    属性、XML 文本或格式化实参**；单引号 JS 字符串（`:title="'{{APP_NAME}}'"`、`appTitle = '{{APP_NAME}}'`）与
+    格式字符串（text block 里直接内插）一律不许 —— 两者都是「创建成功、预览必碎」同一失效族。
 
 ---
 
@@ -715,6 +717,18 @@ HEALTH_BY_STACK = {"vue3-fastapi": "/api/health", "vue3-node": "/api/health",
 - M-3：prod 未保留 base-pro 的 `logging.level.root: warn`——本栈模板统一 `com.zerocode.app: info`，root 走 Boot 默认，
   不额外拦第三方的 INFO（dev/prod 同构比“少几条噪声”重要，且应用工程内可改）。
 
+**复审追加（同一失效族就地收口，commit `1873fe0` 之后）**：复审确认 I-1/I-2 真闭环（含评审方自己重跑的
+真 JVM 正/反例），并补了三个同族小项：
+- **IMP-1**：`vue3-fastapi/frontend/src/App.vue:29` 的 `:title="'{{APP_NAME}}'"` 是 **JS 单引号字符串**，
+  而 `check_name` 刻意放行 `'` —— 名字 `O'Brien 仓库` 渲染后生成 `title: 'O'Brien 仓库'`，`node --check` 直接
+  SyntaxError（复审实跑证据）。改静态属性 `title="{{APP_NAME}}"`，并新增
+  `test_fastapi_app_vue_name_sits_in_a_double_quoted_host` 钉住；同一规则已写进全局约定，**A5 Step 5 的
+  `appTitle` 也改为双引号宿主**（否则新栈刚交付就带同一个洞）。
+- **IMP-2**：横幅钉只挡裸 `%`，没挡「转换符与实参个数不匹配」（`MissingFormatArgumentException` 是 I-1 的另一半）
+  → 补 `assert body.count("%s") == 2`。
+- **MIN-1**：`%` 的「可用性」半边无测试 → `test_check_name_still_accepts_ordinary_names` 补一项 `50% 折扣`（
+  有人反手把 `%` 加进 `NAME_UNSAFE` 时这条会红）。
+
 ---
 
 ### Task A5: 前端接线与 prod 反代（vite / nginx / Dockerfile / 文案）
@@ -820,9 +834,12 @@ dist/
 
 ```ts
 /** 全局可配置项 */
-export const appTitle = '{{APP_NAME}}'
+export const appTitle = "{{APP_NAME}}"
 export const appSubtitle = 'Vue3 + Spring Boot 3 基础管理后台'
 ```
+
+> 名字用**双引号**（全局约定「名字宿主铁则」）：`check_name` 拒 `"` 不拒 `'`，单引号宿主下
+> 「O'Brien 仓库」会渲染出语法错的产物（A4c 复审在 fastapi 栈 `App.vue` 实跑到）。
 
 - 登录页：`Select-String -Pattern "基础管理后台|base-pro"` 定位 `src/views/login/index.vue` 里写死的品牌字样，改为引用已导入的 `appTitle`；并在表单下方保留一行常驻提示：
 

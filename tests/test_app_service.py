@@ -214,9 +214,13 @@ async def test_check_name_rejects_source_breaking_chars(bad):
         app_service.check_name(bad)
 
 
-@pytest.mark.parametrize("ok", ["来料登记", "库存 管理 v2", "O'Brien 仓库", "巡检·看板", "a" * 100])
+@pytest.mark.parametrize("ok", ["来料登记", "库存 管理 v2", "O'Brien 仓库", "巡检·看板", "50% 折扣", "a" * 100])
 async def test_check_name_still_accepts_ordinary_names(ok):
-    """对照钉：只拒写坏源码的字符，不顺手把中文/空格/单引号/长度边界一起拒掉。"""
+    """对照钉：只拒写坏源码的字符，不顺手把中文/空格/单引号/%/长度边界一起拒掉。
+
+    `50% 折扣` 是 I-1 的另一半：模板侧靠「名字只作格式化实参」兜住，不是平台拒 `%`，
+    有人反手把 `%` 加进 NAME_UNSAFE 时这条会红。
+    """
     assert app_service.check_name(ok) == ok
 
 

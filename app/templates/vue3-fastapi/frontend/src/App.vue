@@ -26,7 +26,7 @@ onMounted(load)
 </script>
 
 <template>
-  <a-card :title="'{{APP_NAME}}'" style="max-width: 720px; margin: 40px auto">
+  <a-card title="{{APP_NAME}}" style="max-width: 720px; margin: 40px auto">
     <a-typography-paragraph><span v-text="health"></span></a-typography-paragraph>
     <a-space-compact style="display:flex; gap:8px; margin-bottom:16px">
       <a-input v-model:value="title" placeholder="记点什么…" style="width: 300px" @pressEnter="add" />
