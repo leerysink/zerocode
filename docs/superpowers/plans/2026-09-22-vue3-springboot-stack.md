@@ -22,6 +22,9 @@
 - **提交前必验边界**：`git add <file>` 前先 `git diff <file>` 确认该文件的 diff **只含本次改动**。
   并发会话可能把半成品留在同一个文件里（实跑碰到过 `app_service.py` 里他人在途的 `gateway_routes` 引用），
   整文件 add 会提交出一个 import 不存在的坏 commit。
+  - **索引也共享**（实跑碰到）：`git add` 与 `git commit` 之间的窗口里，并发会话的一次 commit 可能把
+    **我已 stage 的文件连带提交**（我的四个文件落在了 `a90797a`，commit message 却是对方写的）。
+    自己 commit 回报 `nothing to commit` 时不要重做，先 `git log --stat -1` 确认内容是否已被收走。
   - **✅ 已裁定（A4 实跑发现 → A4b/A4c 落地）**：`{{APP_NAME}}` 会被内插进机器可解析的文件，名字含
     `< > & " \` 或控制字符时产物直接碎（`pom.xml` 的 `<name>`、Java 字面量、`main.py` 的字符串）。
     用户选定「收紧 `check_name`」（**Task A4b**）：入口一条 400，不做多宿主转义。
@@ -717,7 +720,7 @@ HEALTH_BY_STACK = {"vue3-fastapi": "/api/health", "vue3-node": "/api/health",
 - M-3：prod 未保留 base-pro 的 `logging.level.root: warn`——本栈模板统一 `com.zerocode.app: info`，root 走 Boot 默认，
   不额外拦第三方的 INFO（dev/prod 同构比“少几条噪声”重要，且应用工程内可改）。
 
-**复审追加（同一失效族就地收口，commit `1873fe0` 之后）**：复审确认 I-1/I-2 真闭环（含评审方自己重跑的
+**复审追加（同一失效族就地收口，落在 `a90797a`）**：复审确认 I-1/I-2 真闭环（含评审方自己重跑的
 真 JVM 正/反例），并补了三个同族小项：
 - **IMP-1**：`vue3-fastapi/frontend/src/App.vue:29` 的 `:title="'{{APP_NAME}}'"` 是 **JS 单引号字符串**，
   而 `check_name` 刻意放行 `'` —— 名字 `O'Brien 仓库` 渲染后生成 `title: 'O'Brien 仓库'`，`node --check` 直接
