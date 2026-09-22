@@ -70,7 +70,9 @@ export function deployWsUrl(appId) {
 }
 
 // ---- 部署发布套件 M2（发布/回滚/prod 生命周期/发布历史/访问地址） ----
-export const publishApp = (id, force = false) => http.post(`/apps/${id}/publish`, { force })
+export const publishApp = (id, force = false, confirmDestructive = false) =>
+  http.post(`/apps/${id}/publish`, { force, confirmDestructive })
+export const scaffoldBackfill = (id) => http.post(`/apps/${id}/sqlchange/scaffold-backfill`)
 export const rollbackApp = (id, version) => http.post(`/apps/${id}/rollback`, { version })
 export const prodStart = (id) => http.post(`/apps/${id}/prod/start`)
 export const prodStop = (id) => http.post(`/apps/${id}/prod/stop`)
