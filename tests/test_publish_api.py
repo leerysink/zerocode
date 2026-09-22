@@ -82,7 +82,7 @@ async def test_publish_chat_gate_and_spawn_shape(client, monkeypatch, no_preflig
     aid = await _mk(client)
     called = []
 
-    async def fake_publish(sf, app, notify=None, *, force=False):
+    async def fake_publish(sf, app, notify=None, *, force=False, confirm_destructive=False):
         called.append(force)
         return {"status": "running", "version": VERSION, "url": "http://x", "recordId": 1}
 
@@ -111,12 +111,29 @@ async def test_publish_chat_gate_and_spawn_shape(client, monkeypatch, no_preflig
     assert rr.status_code == 200 and isinstance(rr.json(), list)
 
 
+async def test_publish_forwards_confirm_destructive(client, monkeypatch, no_preflight):
+    """端点把 confirmDestructive 透传给引擎（与 force 解耦）：body→kwarg 双向可观测。"""
+    aid = await _mk(client)
+    seen = []
+
+    async def cap(sf, app, notify=None, *, force=False, confirm_destructive=False):
+        seen.append((force, confirm_destructive))
+        return {"status": "running"}
+
+    monkeypatch.setattr(prod_mod, "publish", cap)
+    r = await client.post(f"/api/apps/{aid}/publish",
+                          json={"force": False, "confirmDestructive": True})
+    assert r.status_code == 202, r.text
+    await client.app.state.dev_tasks[aid]
+    assert seen == [(False, True)]        # force 未开、破坏性确认开
+
+
 async def test_publish_chat_gate_only_own_workspace(client, monkeypatch, no_preflight):
     """闸门只看**本应用工作区**的活跃会话：别的应用在改代码不该挡住这次发布。"""
     aid = await _mk(client)
     called = []
 
-    async def fake_publish(sf, app, notify=None, *, force=False):
+    async def fake_publish(sf, app, notify=None, *, force=False, confirm_destructive=False):
         called.append(app["slug"])
         return {"status": "running"}
 
@@ -150,7 +167,7 @@ async def test_publish_409_when_status_publishing(client, monkeypatch, no_prefli
     aid = await _mk(client)
     called = []
 
-    async def fake_publish(sf, app, notify=None, *, force=False):
+    async def fake_publish(sf, app, notify=None, *, force=False, confirm_destructive=False):
         called.append(force)
         return {"status": "running"}
 

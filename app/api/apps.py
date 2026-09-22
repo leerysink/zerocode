@@ -47,6 +47,7 @@ class AppRenameIn(BaseModel):
 
 class PublishIn(BaseModel):
     force: bool = False
+    confirmDestructive: bool = False
 
 
 class RollbackIn(BaseModel):
@@ -403,7 +404,8 @@ async def publish(request: Request, app_id: int, body: PublishIn):
                         "message": "当前 AI 正在修改代码，发布的可能是不完整版本，是否继续？"})
         await prod.preflight_docker()
         _spawn(request, app_id, lambda: prod.publish(sf, app, notify=hub.publish,
-                                                     force=body.force))
+                                                     force=body.force,
+                                                     confirm_destructive=body.confirmDestructive))
     except DeployError as e:
         raise _http(e)
     return {"ok": True}
