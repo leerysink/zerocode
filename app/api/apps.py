@@ -397,7 +397,10 @@ async def scaffold_backfill(request: Request, app_id: int):
     prefix = f"D{today}_"
     seqs = [int(p.name[len(prefix):len(prefix) + 2]) for p in scdir.glob(prefix + "*.sql")
             if p.name[len(prefix):len(prefix) + 2].isdigit()]
-    nn = f"{(max(seqs) + 1) if seqs else 1:02d}"
+    next_seq = (max(seqs) + 1) if seqs else 1
+    if next_seq > 99:   # 两位序号上限：越界会产 3 位非法名、反被 preflight 命名闸门拦停
+        raise HTTPException(409, f"当日回填脚手架已达上限（99），请次日再试或清理 {today} 的 D*.sql")
+    nn = f"{next_seq:02d}"
     filename = f"{prefix}{nn}_backfill.sql"
     (scdir / filename).write_text(content, encoding="utf-8", newline="")
     return {"filename": filename, "content": content}
