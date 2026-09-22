@@ -52,7 +52,9 @@ public class SecurityConfig {
                 .cors(cors -> cors.configurationSource(corsConfigurationSource()))
                 .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 .authorizeHttpRequests(auth -> auth
-                        .requestMatchers("/auth/login", "/auth/captcha").permitAll()
+                        // /health 是 actuator 探针路径（context-path 已是 /api，故完整 URL 为 /api/health）；
+                        // 不放行则被兜底拦成 401，平台发布体检永远跑不到健康那一步。
+                        .requestMatchers("/auth/login", "/auth/captcha", "/health").permitAll()
                         .requestMatchers("/doc.html", "/swagger-ui/**", "/v3/api-docs/**",
                                 "/webjars/**", "/favicon.ico").permitAll()
                         .requestMatchers(HttpMethod.OPTIONS, "/**").permitAll()

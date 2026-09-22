@@ -18,7 +18,13 @@
 - Phase A/B/C/D 对应规格 §11 的四片，**每片结束都要有真跑证据**，不允许「前三片纸面绿、第四片才第一次启动」。
 - **回归环境注意**：本仓可能有并发会话共用同一个 `zerocode-pg16`，全量 `pytest tests` 会撞出
   `DeadlockDetectedError: deadlock detected` 与一批每次不同的 FAILED（实测同一棵树两次跑的红点不重叠）。
-  任何红必须先单跑该文件定性，不得直接归因于本次改动，也不得为了跑绿去 stash 别人的在途修改。
+  - 任何红必须先单跑该文件定性，不得直接归因于本次改动，也不得为了跑绿去 stash 别人的在途修改。
+  - **⚠ 待裁定（A4 实跑发现，已提问用户）**：`check_name` 只校 strip + 长度，不限制字符集，而模板把
+    `{{APP_NAME}}` 内插进机器可解析的文件。名字含 `< > & " \` 时产物会直接碎：
+    本栈 `pom.xml` 的 `<name>` 与 `BaseApplication` 的 Java text block（`\q` 是非法转义 → 编译不过）；
+    fastapi 栈早已有同一问题（`backend/app/main.py:18` 的 `APP_NAME = "{{APP_NAME}}"` 含 `"` 即破）。
+    三个候选：收紧 `check_name` 字符集（改变既有栈行为，存量应用改名会被拒）/ 模板侧不再内插名字到代码文件
+    （改从环境变量取，但平台尚未注入 APP_NAME）/ 只记为已知风险。未裁定前不得自行实现。
 
 ---
 
@@ -545,6 +551,10 @@ Get-ChildItem -Recurse -File app\templates\vue3-springboot | Select-String -Patt
 ```
 
 Expected: **无输出**（绝对路径上传目录、8082 固定端口、旧环境变量名、A3 遗留的两处 `leerysink` 全部消失）。
+
+> 实跑勘误：本体检是**全模板**的，而 `8082` 与 `application-dev.yml` 字样还留在
+> `frontend/vite.config.ts:29-30`（那是 **A5 Step 1** 的活）。A4 跑时按目录取严：
+> `Get-ChildItem -Recurse -File $tpl\backend` 必须零命中，frontend 侧剩这两行属预期，A5 后归零。
 
 - [ ] **Step 9: 提交**
 

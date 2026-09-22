@@ -11,10 +11,10 @@
         <relativePath/>
     </parent>
 
-    <groupId>com.leerysink</groupId>
-    <artifactId>base</artifactId>
+    <groupId>com.zerocode</groupId>
+    <artifactId>{{SLUG}}</artifactId>
     <version>1.0.0</version>
-    <name>base</name>
+    <name>{{APP_NAME}}</name>
     <description>基础管理后台脚手架</description>
 
     <properties>
@@ -28,6 +28,12 @@
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+        <!-- 健康探针：平台按 GET /api/health 判健康（context-path=/api + management base-path=/），
+             缺这个依赖则 /api/health 直接 404，发布体检必失败。 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
         </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>

@@ -1,25 +1,29 @@
-# 公共配置；差异项见 application-dev.yml / application-prod.yml
+# 单一配置：环境差异全部外置为平台注入的环境变量。
+# 标量后不带 `:默认值` 的键（数据源三项、SPRING_DATA_REDIS_HOST、JWT_SECRET、UPLOAD_DIR）一旦
+# 缺失，应用启动即失败——刻意不留「静默连上本地库 / 用仓库公开密钥签 token」的降级路径。
 server:
-  port: 8080
+  port: ${SERVER_PORT:8080}
   servlet:
     context-path: /api
 
 spring:
   application:
-    name: base
-  profiles:
-    active: dev
+    name: {{SLUG}}
   datasource:
     driver-class-name: org.postgresql.Driver
+    url: ${SPRING_DATASOURCE_URL}
+    username: ${SPRING_DATASOURCE_USERNAME}
+    password: ${SPRING_DATASOURCE_PASSWORD}
     hikari:
       maximum-pool-size: 10
       minimum-idle: 2
       connection-timeout: 30000
   data:
     redis:
-      host: localhost
-      port: 6379
-      database: 0
+      host: ${SPRING_DATA_REDIS_HOST}
+      port: ${SPRING_DATA_REDIS_PORT:6379}
+      password: ${SPRING_DATA_REDIS_PASSWORD}
+      database: ${SPRING_DATA_REDIS_DATABASE:0}
       timeout: 5000ms
       lettuce:
         pool:
@@ -43,6 +47,8 @@ mybatis-plus:
   type-aliases-package: com.zerocode.app.entity
   configuration:
     map-underscore-to-camel-case: true
+    # 默认不打 SQL 日志；预览期想看 SQL 就地改成 StdOutImpl（本文件在应用工程内，AI 可编辑）
+    log-impl: org.apache.ibatis.logging.nologging.NoLoggingImpl
   global-config:
     db-config:
       id-type: auto
@@ -50,10 +56,17 @@ mybatis-plus:
       logic-delete-value: 1
       logic-not-delete-value: 0
 
+# 探针与前端同前缀：context-path(/api) + base-path(/) => GET /api/health
+# 只放开 health，绝不暴露 env/beans/metrics
+management:
+  endpoints:
+    web:
+      base-path: /
+      exposure:
+        include: health
+
 jwt:
-  # 本地/测试用默认值；生产必须在 application-prod.yml 里用无默认值的 ${JWT_SECRET} 覆盖，
-  # 否则会用仓库里公开的密钥签发 token，任何拿到源码的人都能离线伪造超管身份
-  secret: ${JWT_SECRET:leerysink-base-jwt-secret-key-please-override-in-prod-1234567890abcd}
+  secret: ${JWT_SECRET}
   expiration: 86400000
   header: Authorization
   token-prefix: "Bearer "
@@ -61,10 +74,21 @@ jwt:
 file:
   allowed-types: jpg,jpeg,png,gif,bmp,webp,pdf
   max-size: 10485760
+  upload-dir: ${UPLOAD_DIR}
 
-# 数据库结构变更不再由应用自动执行：版本化脚本仍归档在 database/changelog/，需手工按文件名升序执行
+# 接口文档默认关（要开就让 AI 把 enabled 改 true，并在 SecurityConfig 放开 /doc.html、/webjars/**）
+springdoc:
+  api-docs:
+    enabled: false
+  swagger-ui:
+    enabled: false
+knife4j:
+  enable: false
+  production: true
 
 logging:
-  path: ${user.dir}/logs
+  path: ${LOG_PATH:${user.dir}/logs}
   max-history: 180
   max-file-size: 100MB
+  level:
+    com.zerocode.app: info
