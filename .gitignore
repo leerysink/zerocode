@@ -24,6 +24,9 @@ apps/
 
 # SDD workspace
 .superpowers/
+# 一次性工单/草稿产物（本机工作记录，不入库）
+.scratch/
+.qoder-tmp/
 
 # Gateway 自签证书（本机生成，不入库）
 gateway/certs/
