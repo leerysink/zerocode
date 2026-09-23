@@ -147,7 +147,7 @@ async def make_app(sf):
 
 
 class _Seams:
-    """engine 的四个外部门（docker / 迁移 / docker 体检 / 健康探针）替身集合；用例只改关心的那一个。"""
+    """engine 的外部门（docker / 迁移 / docker 体检 / 健康探针）替身集合；用例只改关心的那一个。"""
 
     def __init__(self, monkeypatch):
         self.docker = FakeRunner()
@@ -157,10 +157,12 @@ class _Seams:
         self.preflight_calls = 0
         self.health_ok = True
         self.health_calls = []
+        self.joint_calls = []        # B3 的 dev 联合探针（前端 + 后端），与只探前端的那条分开记
         monkeypatch.setattr(engine, "docker", self.docker)
         monkeypatch.setattr(engine, "run_sqlchange", self._run_sqlchange)
         monkeypatch.setattr(engine, "preflight_docker", self._preflight)
         monkeypatch.setattr(engine, "wait_frontend_health", self._health)
+        monkeypatch.setattr(engine, "wait_dev_health", self._dev_health)
 
     async def _run_sqlchange(self, app_dir, env, cred, on_log=None):
         self.mig_calls.append({"app_dir": app_dir, "env": env, "cred": cred, "on_log": on_log})
@@ -176,6 +178,10 @@ class _Seams:
 
     async def _health(self, port, timeout):
         self.health_calls.append((port, timeout))
+        return self.health_ok
+
+    async def _dev_health(self, port, timeout, backend_path):
+        self.joint_calls.append((port, timeout, backend_path))
         return self.health_ok
 
 
@@ -604,3 +610,104 @@ async def test_docker_timeout_raises_504_and_preflight_passes():
     with pytest.raises(DeployError) as ei:
         await engine.docker("run", "--rm", "postgres:16-alpine", "sleep", "5", timeout=2)
     assert ei.value.status == 504 and "超时" in str(ei.value)
+
+
+# ---------- Task B3：dev 联合健康探针 + 按栈超时 ----------
+
+def _client_returning(status_for):
+    """httpx.AsyncClient 替身：按 url 给固定状态码，并把访问过的 url 记下来（不真发网络请求）。"""
+    seen = []
+
+    class FakeClient:
+        def __init__(self, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url):
+            seen.append(url)
+
+            class R:
+                status_code = status_for(url)
+            return R()
+
+    return FakeClient, seen
+
+
+async def test_wait_dev_health_fails_when_backend_not_ready(monkeypatch):
+    """大型栈：前端 200 但后端未就绪时必须等到超时，杜绝「预览已就绪、后端还在编译」的假绿。"""
+    FakeClient, seen = _client_returning(lambda url: 502 if url.endswith("/api/health") else 200)
+    monkeypatch.setattr(engine.httpx, "AsyncClient", FakeClient)
+    assert not await engine.wait_dev_health(8211, 2, "/api/health")
+    assert any(u.endswith("/api/health") for u in seen)          # 后端探针确实打过
+    assert any(u.endswith("8211/") for u in seen)                # 前端也打过（不是只探后端）
+
+
+async def test_wait_dev_health_passes_when_both_200(monkeypatch):
+    FakeClient, seen = _client_returning(lambda url: 200)
+    monkeypatch.setattr(engine.httpx, "AsyncClient", FakeClient)
+    assert await engine.wait_dev_health(8211, 2, "/api/health")
+    assert len(seen) == 2                                        # 一轮内两个探针都过 → 立即返回，不白等
+
+
+async def test_wait_frontend_health_still_only_probes_root(monkeypatch):
+    """只探前端的那条没被顺手改成联合判定（存量小栈的行为一字不动，B3 只动大型栈）。"""
+    FakeClient, seen = _client_returning(lambda url: 200)
+    monkeypatch.setattr(engine.httpx, "AsyncClient", FakeClient)
+    assert await engine.wait_frontend_health(8211, 2)
+    assert seen == ["http://127.0.0.1:8211/"]
+
+
+async def test_health_timeout_by_stack():
+    """冷启动实测 410s（下载 Maven 依赖），默认 240s 会把成功误判成启动失败。
+
+    本文件模块顶有 `pytestmark = asyncio`，所以这个纯逻辑用例也写成 async（写成 def 会被当协程取）。
+    """
+    from app.deploy.settings import DEFAULTS, health_timeout
+    assert DEFAULTS["deploy.health_timeout_large"] == 900
+    cfg = {"deploy.health_timeout": 240, "deploy.health_timeout_large": 900}
+    assert health_timeout(cfg, "vue3-springboot") == 900
+    assert health_timeout(cfg, "vue3-fastapi") == 240
+    assert health_timeout(cfg, "static") == 240
+
+
+async def test_health_timeout_large_falls_back_when_key_absent():
+    """库里只设了旧键时，大型栈跟着走那个值（管理员改一个键就能调两条路径，不必知道还有第二个键）。"""
+    from app.deploy.settings import health_timeout
+    assert health_timeout({"deploy.health_timeout": 300}, "vue3-springboot") == 300
+    assert health_timeout({}, "vue3-springboot") == 240                # 两键都没 → 走与 DEFAULTS 同形的默认
+
+
+async def test_start_dev_large_stack_waits_joint_health_with_long_timeout(sf, make_app, seams):
+    """大型栈起预览：走联合探针 + 900s，而不是只等前端 200。"""
+    app = await make_app("zcb3large", prod_port=8256, dev_port=8257,
+                         stack="vue3-springboot", scale="large")
+    hub, events = _hub_spy()
+    res = await engine.start_dev(sf, app, notify=hub.publish)
+    assert res["status"] == "running"
+    assert seams.joint_calls == [(8257, 900, "/api/health")]
+    assert seams.health_calls == []            # 只探前端那条不得再走（那就是本 Task 要修的假绿）
+    assert "勿重复点" in "\n".join(_dev_logs(events))   # 首次启动要下依赖，不提醒就会被当成卡死去点重启
+
+
+async def test_start_dev_small_stack_stays_frontend_only_with_default_timeout(sf, make_app, seams):
+    """反向钉：小栈不加码（存量应用里有人删过 /api/health，加上去就是把能用的预览变成 240s 后 error）。"""
+    app = await make_app("zcb3small", prod_port=8254, dev_port=8255)
+    await engine.start_dev(sf, app)
+    assert seams.health_calls == [(8255, 240)]
+    assert seams.joint_calls == []
+
+
+async def test_start_dev_large_stack_failure_names_both_probes(sf, make_app, seams):
+    """未就绪的中文引导要能看出「前端与后端都要 200」（只说「前端未就绪」会把人引向错方向）。"""
+    app = await make_app("zcb3fail", prod_port=8252, dev_port=8253,
+                         stack="vue3-springboot", scale="large")
+    seams.health_ok = False
+    with pytest.raises(DeployError) as ei:
+        await engine.start_dev(sf, app)
+    msg = str(ei.value)
+    assert "未就绪" in msg and "/api/health" in msg

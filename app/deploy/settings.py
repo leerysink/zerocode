@@ -8,6 +8,8 @@ DEFAULTS = {
     "deploy.port_max": 8399,
     "deploy.keep_versions": 5,
     "deploy.health_timeout": 240,
+    # 大型应用冷启动要在容器里下载 Maven 依赖（实测 ≈410s），与默认 240s 不是一个量级
+    "deploy.health_timeout_large": 900,
     "deploy.auto_stop_dev_on_exit": True,
     # 商店包是平台资产，默认落在仓库根 store/（与 apps/ 同级）；空串走 store_root() 的兜底。
     "store.root": "",
@@ -27,3 +29,15 @@ async def deploy_cfg(session_factory) -> dict:
 def resolve_apps_root(cfg: dict) -> Path:
     raw = cfg.get("deploy.apps_root") or ""
     return Path(raw) if raw else REPO_ROOT / "apps"
+
+
+def health_timeout(cfg: dict, stack: str) -> int:
+    """按栈取健康等待上限：只有真有长冷启动的栈走 large 值，其余照旧。
+
+    large 键没设时回落到通用键（管理员改一个键就能调两条路径）；回落值从 DEFAULTS 取而不是在此再抄
+    一个字面量：默认值只应有一处。
+    """
+    base = int(cfg.get("deploy.health_timeout") or DEFAULTS["deploy.health_timeout"])
+    if stack == "vue3-springboot":
+        return int(cfg.get("deploy.health_timeout_large") or base)
+    return base

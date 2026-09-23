@@ -2,7 +2,8 @@
 """dev 环境生命周期（规格 03）：preflight → 渲染 → 迁移 → compose up → 健康等待 → 状态落库+事件。
 
 所有 docker 交互经 async `docker()` 封装，便于测试替身；`run_sqlchange` 与 `preflight_docker`、
-`wait_frontend_health` 一律以**模块级名字**在本模块内调用（裁定 D-1），monkeypatch 才生效。
+两个健康探针（`wait_frontend_health` / `wait_dev_health`）一律以**模块级名字**在本模块内调用
+（裁定 D-1），monkeypatch 才生效。
 迁移闸门（D-2）：编排顺序 迁移 → compose up，`sqlrun.run_sqlchange` 自带「sqlchange 目录缺失
 fail-closed」守卫，此处不再重复预检。
 """
@@ -14,11 +15,17 @@ from sqlalchemy import text
 from app.deploy import compose as compose_mod
 from app.deploy.errors import DeployError
 from app.deploy.provision import read_cred
-from app.deploy.settings import deploy_cfg
+from app.deploy.settings import deploy_cfg, health_timeout
 # 迁移入口按模块级名字引入（D-1）：引擎内以 bare name 调用，测试 monkeypatch engine.run_sqlchange 生效
 from app.deploy.sqlrun import run_sqlchange
 
 logger = logging.getLogger(__name__)
+
+# 起预览时要「前端 + 后端一起 200」才报 running 的栈。vue3-fastapi 刻意不在名单里：它的后端
+# （pip install + uvicorn）通常先于前端（npm install + vite）就绪，只探前端今天不成问题；而存量应用
+# 里谁都可能改掉 /api/health 那条路由，给它们补一道探针等于把「能用的预览」变成 240s 后 error。
+# 大型栈没这个顾虑：后端冷启动要数分钟，而它本身就是本次交付的对象。
+JOINT_HEALTH_STACKS = ("vue3-springboot",)
 
 
 async def docker(*args, cwd=None, on_line=None, timeout=600) -> tuple[int, str]:
@@ -144,17 +151,39 @@ async def _step(app_id, notify, message: str, *, since: float | None = None,
     await _notify(notify, app_id, {"type": "dev_log", "line": line})
 
 
-async def wait_frontend_health(port: int, timeout: int) -> bool:
-    """前端健康判定（规格 03 §4.3）：GET http://localhost:<port>/ 拿到 200 即就绪。"""
+async def _all_200(port: int, paths: tuple, timeout: int) -> bool:
+    """轮询到超时为止：给定的一组路径全部 200 才算就绪（任一非 200 就连本轮一起不算过）。
+
+    按 deadline 计时而不是「轮数 × 1s」（与 prod.wait_prod_health 同形）：一轮本身要花时间
+    （httpx 单请求 2s 超时），按轮数计会把「900s」拖成十几分钟。
+    """
     async with httpx.AsyncClient(timeout=2.0) as c:
-        for _ in range(max(int(timeout), 1)):
+        deadline = time.monotonic() + max(int(timeout), 1)
+        while True:
             try:
-                if (await c.get(f"http://127.0.0.1:{port}/")).status_code == 200:
+                codes = [(await c.get(f"http://127.0.0.1:{port}{p}")).status_code for p in paths]
+                if all(code == 200 for code in codes):
                     return True
             except Exception:
-                pass
+                pass                      # 端口没起来时是连接拒绝，与非 200 同判：本轮没过
+            if time.monotonic() >= deadline:
+                return False
             await asyncio.sleep(1)
-    return False
+
+
+async def wait_frontend_health(port: int, timeout: int) -> bool:
+    """前端健康判定（规格 03 §4.3）：GET http://localhost:<port>/ 拿到 200 即就绪。"""
+    return await _all_200(port, ("/",), timeout)
+
+
+async def wait_dev_health(port: int, timeout: int, backend_path: str) -> bool:
+    """dev 联合健康：前端 `/` 与经 dev proxy 打到后端的 `backend_path` 都要 200。
+
+    大型栈后端在容器里 `mvn spring-boot:run`，前端先起、后端后起——只探前端会出现
+    「预览已就绪、后端还在编译」的假绿（规格 §5.4）。两个探针都从 dev 端口进：模板的 vite
+    `server.proxy` 已把 `/api` 转发到 backend 服务，因此这里不必知道后端端口（它也没对外暴）。
+    """
+    return await _all_200(port, ("/", backend_path), timeout)
 
 
 async def start_dev(sf, app: dict, notify=None) -> dict:
@@ -204,11 +233,25 @@ async def start_dev(sf, app: dict, notify=None) -> dict:
         if code != 0:
             raise DeployError(f"dev 栈启动失败:\n{log[-800:]}")
         await _step(app_id, notify, "✓ 容器已启动", since=t0)
-        timeout = int((await deploy_cfg(sf)).get("deploy.health_timeout", 60))
-        await _step(app_id, notify, f"→ 等待前端就绪 http://localhost:{port}（最长 {timeout}s）")
-        ok = await wait_frontend_health(port, timeout)
+        cfg = await deploy_cfg(sf)
+        stack = app.get("stack") or ""
+        timeout = health_timeout(cfg, stack)
+        # 健康路径不抄第三份：取 app_service.HEALTH_BY_STACK（也就是写进 app.json 的那个源）；
+        # deploy → services 就地取用是 prod.py 已有的惯例，提到模块顶会变成循环导入。
+        from app.services.app_service import HEALTH_BY_STACK
+        backend_path = (HEALTH_BY_STACK.get(stack) or "") if stack in JOINT_HEALTH_STACKS else ""
+        if backend_path:
+            await _step(app_id, notify, f"→ 等待预览就绪（前端 / 与后端 {backend_path}，最长 {timeout}s）；"
+                                        f"首次启动可能要数分钟（后端在装依赖与编译），请勿重复点「重启」")
+            ok = await wait_dev_health(port, timeout, backend_path)
+            fail = (f"dev 预览在健康等待期内未就绪（端口 {port}，需前端 / 与后端 {backend_path} 同时 200，"
+                    f"后端可能仍在编译，详情看 dev 日志）")
+        else:
+            await _step(app_id, notify, f"→ 等待前端就绪 http://localhost:{port}（最长 {timeout}s）")
+            ok = await wait_frontend_health(port, timeout)
+            fail = f"dev 前端在健康等待期内未就绪（端口 {port}）"
         if not ok:
-            raise DeployError(f"dev 前端在健康等待期内未就绪（端口 {port}）")
+            raise DeployError(fail)
         await _set_status(sf, app_id, "running")
         await _step(app_id, notify,
                     f"✓ 预览已就绪 http://localhost:{port}，总耗时 {time.monotonic() - t0:.1f}s")

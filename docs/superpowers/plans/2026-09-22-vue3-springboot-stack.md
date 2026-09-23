@@ -1787,11 +1787,21 @@ git commit -m "test(app): pin the large-stack creation path end to end, and refr
 ### Task B3: dev 联合健康判定 + 按栈超时
 
 **Files:**
-- Modify: `app/deploy/settings.py`（DEFAULTS + `health_timeout`）
-- Modify: `app/deploy/engine.py:147-157,207-214`
-- Test: `tests/test_engine.py`
+- Modify: `app/deploy/settings.py`（`DEFAULTS` 加 `deploy.health_timeout_large` + 新函数 `health_timeout(cfg, stack)`）
+- Modify: `app/deploy/engine.py`（两个 waiter 收敛到 `_all_200`；新增 `wait_dev_health` 与 `JOINT_HEALTH_STACKS`；`start_dev` 的健康等待段按栈分支）
+- Test: `tests/test_engine.py`（`_Seams` 多钉一个替身 `wait_dev_health`，新增 `joint_calls`）
 
-- [ ] **Step 1: 写失败测试**（追加到 `tests/test_engine.py`；纯逻辑用例，**不要**加 `needs_docker` 标记）
+- [x] **Step 1: 写失败测试**（追加到 `tests/test_engine.py`；纯逻辑用例，**不要**加 `needs_docker` 标记）
+
+> 落地时的三点差异（都是草稿本身挡得住的）：
+> ① 多写了 5 条：`test_wait_frontend_health_still_only_probes_root`（只探前端那条没被顺手改成联合判定）、
+> `test_start_dev_large_stack_waits_joint_health_with_long_timeout`（接线级：联合探针确实被调、timeout=900、
+> 日志里有「请勿重复点重启」）、`test_start_dev_small_stack_stays_frontend_only_with_default_timeout`（反向钉）、
+> `test_start_dev_large_stack_failure_names_both_probes`（失败引导得点名两个探针）。
+> ② 纯逻辑那个用例写成 `async def` 而非草稿的 `def`：本文件模块顶有 `pytestmark = pytest.mark.asyncio`，
+> 同标给一个同步函数只会自找麻烦（全文件 33 个测试都是 async）。
+> ③ `_Seams` 从「只替 `wait_frontend_health`」扩成两个 waiter 都替（各自一份调用记录）：不替 `wait_dev_health` 的话，
+> 大型栈那条用例会让引擎去跟一个不存在的端口真发 900s HTTP。
 
 ```python
 async def test_wait_dev_health_fails_when_backend_not_ready(monkeypatch):
@@ -1845,12 +1855,15 @@ def test_health_timeout_by_stack():
     assert health_timeout(cfg, "static") == 240
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
-Run: `pytest tests/test_engine.py -q -k "dev_health or health_timeout"`
-Expected: FAIL — `AttributeError: ... has no attribute 'wait_dev_health'` / `ImportError: cannot import name 'health_timeout'`
+Run: `pytest tests/test_engine.py -q -k "dev_health or health_timeout or large_stack or small_stack or only_probes_root"`
+→ **4 failed, 3 errors, 1 passed**：`AttributeError: module 'app.deploy.engine' has no attribute 'wait_dev_health'`
+（三条 start_dev 用例在夹具阶段就错）、`ImportError: cannot import name 'health_timeout'`（两条超时用例），
+红在预期位置。那 1 条 passed 是 `test_wait_frontend_health_still_only_probes_root`——它本来就是**回归钉**（钉旧行为不被改坏），
+红不了才对。
 
-- [ ] **Step 3: 实现按栈超时**
+- [x] **Step 3: 实现按栈超时**
 
 `app/deploy/settings.py` 的 `DEFAULTS` 里 `"deploy.health_timeout": 240,` 之后加：
 
@@ -1869,7 +1882,16 @@ def health_timeout(cfg: dict, stack: str) -> int:
     return int(cfg.get("deploy.health_timeout", 240))
 ```
 
-- [ ] **Step 4: 实现联合探针**
+- [x] **Step 4: 实现联合探针**
+
+> 落地相对草稿的三处收紧（都比草稿更对，不改方向）：
+> ① `_all_200` 用 `time.monotonic()` deadline 计时，不用草稿的 `for _ in range(timeout)`——一轮含 httpx 请求本身要花时间
+> （单请求 2s 超时），按轮数计会把 900s 拖成十几分钟；与 `prod.wait_prod_health` 同形。
+> ② `start_dev` 不硬编码 `"/api/health"`：走 `JOINT_HEALTH_STACKS` 判定 + `app_service.HEALTH_BY_STACK.get(stack)` 取路径
+> （就地 `from app.services...` import，`deploy→services` 是 prod.py 已有惯例，提模块顶会变循环导入），
+> 健康路径不抄第三份。fastapi 不在 `JOINT_HEALTH_STACKS`，无 `backend_path` 时安全降级为只探前端。
+> ③ 失败引导点名两个探针（草稿只说「未就绪（端口 X）」），大型栈要说清「需前端 / 与后端 {path} 同时 200」。
+> 另：`settings.health_timeout` 回落值从 `DEFAULTS["deploy.health_timeout"]` 取，不在此再抄一个 240 字面量（默认值只应有一处）。
 
 `app/deploy/engine.py` 把 `wait_frontend_health` 整体替换为（**保留原函数名与签名**：`test_engine.py:160` 以它为替身注入点）：
 
@@ -1928,12 +1950,12 @@ from app.deploy.settings import deploy_cfg, health_timeout
 
 > 两个 waiter 都按**模块级名字**调用（裁定 D-1），monkeypatch 才生得了。
 
-- [ ] **Step 5: 跑测试确认通过**
+- [x] **Step 5: 跑测试确认通过**
 
-Run: `pytest tests/test_engine.py tests/test_dev_logs.py tests/test_deploy_basics.py -q`
-Expected: PASS
+Run: `pytest tests/test_engine.py tests/test_dev_logs.py tests/test_deploy_basics.py -q` → **60 passed**；
+全量 `pytest -q` → **459 passed**（451 + 本 Task 新增 8，无遗漏）。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 git add app/deploy/engine.py app/deploy/settings.py tests/test_engine.py
