@@ -1,5 +1,6 @@
 # tests/test_compose_render.py
 import copy
+from pathlib import Path
 
 import pytest
 import yaml
@@ -257,26 +258,30 @@ def test_render_dev_compose_springboot_shape():
     doc = yaml.safe_load(y)
     assert doc["name"] == "zc-bigapp-dev"
     svc = doc["services"]
-    assert set(svc) == {"migrate", "redis", "backend", "frontend"}
+    assert set(svc) == {"migrate", "appredis", "backend", "frontend"}
     assert svc["migrate"]["image"] == "zerocode-sqlrunner:1"      # 迁移闸门与 fastapi 栈完全同形
     assert "../schema:/schema:ro" in svc["migrate"]["volumes"]
-    assert svc["redis"]["image"] == "redis:7-alpine"
-    assert "ports" not in svc["redis"]                            # Redis 不出宿主端口，只走 compose 内部网
-    assert "${REDIS_PASSWORD}" in str(svc["redis"]["command"])
+    assert svc["appredis"]["image"] == "redis:7-alpine"
+    assert "ports" not in svc["appredis"]                         # Redis 不出宿主端口，只走 compose 内部网
+    assert svc["appredis"]["networks"] == ["default"]             # 另一半：也不上全平台共享的 zcnet
+    assert "${REDIS_PASSWORD:?" in str(svc["appredis"]["command"])  # 空值必须让 compose 自己拒收
     assert svc["backend"]["image"] == "maven:3.9-eclipse-temurin-17"
     assert "../backend:/src" in svc["backend"]["volumes"]
     assert svc["backend"]["command"] == "mvn -B spring-boot:run"
+    assert svc["backend"]["networks"] == ["default", "zcnet"]     # 上 zcnet 只为访 zerocode-pg16
     env = svc["backend"]["environment"]
     assert env["SPRING_DATASOURCE_URL"].startswith("jdbc:postgresql://zerocode-pg16:5432/${DEV_DB}")
     assert "currentSchema=public" in env["SPRING_DATASOURCE_URL"]
     assert env["SPRING_DATASOURCE_USERNAME"] == "${DEV_USER}"
     assert env["SPRING_DATASOURCE_PASSWORD"] == "${DEV_PASSWORD}"
-    assert env["SPRING_DATA_REDIS_HOST"] == "redis"
-    assert env["SPRING_DATA_REDIS_PASSWORD"] == "${REDIS_PASSWORD}"
-    assert env["JWT_SECRET"] == "${JWT_SECRET}" and env["UPLOAD_DIR"] == "/src/uploads"
+    # 主机名跟着服务名走：不叫裸 redis，免与 zcnet 上的同名容器赌解析
+    assert env["SPRING_DATA_REDIS_HOST"] == "appredis"
+    assert env["SPRING_DATA_REDIS_PASSWORD"].startswith("${REDIS_PASSWORD:?")
+    assert env["JWT_SECRET"].startswith("${JWT_SECRET:?")
+    assert env["UPLOAD_DIR"] == "/src/uploads"
     assert env["SERVER_PORT"] == "8080"
     assert svc["backend"]["depends_on"]["migrate"]["condition"] == "service_completed_successfully"
-    assert svc["backend"]["depends_on"]["redis"]["condition"] == "service_started"
+    assert svc["backend"]["depends_on"]["appredis"]["condition"] == "service_started"
     assert svc["frontend"]["ports"] == ["8211:5173"]              # 仍只有前端对外
     assert "ports" not in svc["backend"] and "ports" not in svc["migrate"]
     assert "__" not in y                                          # 标记零残留
@@ -294,15 +299,29 @@ def test_m2_volume_name_is_single_source_of_truth(monkeypatch):
     assert _named_volume_refs(doc) == set(doc["volumes"])
 
 
-def test_render_dev_compose_springboot_fastapi_untouched():
-    """回归钉：新增分支不得改动 fastapi 产物一个字符。"""
-    expect = (compose._DEV_COMPOSE
-              .replace("__MIGRATE_SVC__", compose._MIGRATE_SVC)
-              .replace("__DEV_PORT__", "8211")
-              .replace("__FE_VOL__", compose._fe_volume())
-              .replace("__FE_VOL_NAME__", compose.VOLUME_NAME)
-              .replace("__SLUG__", "lailiao"))
-    assert compose.render_dev_compose(META) == expect
+def test_legacy_stacks_match_golden_files():
+    """旧栈产物逐字节钉在 golden 文件上：新增分支不得改动它们一个字符（评审 N-4）。
+
+    不用「拿实现重放替换链」的镜像断言：那种写法会跟着模板一起漂（改了模板两边同步，照绿），
+    也会因替换顺序调整而假红。golden 是仓外的硬事实，要动它必须显式重生（重生手段见下）。
+    覆盖两条产物：fastapi 与 static（static 侧此前只有模板级钉子，产物级没人钉）。
+    重生：`python -c "from app.deploy import compose; ..."` 把 render_dev_compose 的结果写回这两个文件。
+    """
+    golden = Path(__file__).parent / "golden"
+    for stack, fname in (("vue3-fastapi", "dev-compose.fastapi.yml"), ("static", "dev-compose.static.yml")):
+        m = copy.deepcopy(META)
+        m["stack"] = stack
+        assert compose.render_dev_compose(m) == (golden / fname).read_text(encoding="utf-8"), fname
+
+
+def test_springboot_gets_no_prod_compose_yet(tmp_path):
+    """Phase B 的「故意不动发布链路」要有人钉：大型栈只渲染 dev，不得提前落一份能 build 的 prod 件。"""
+    compose.ensure_deploy_files(tmp_path, META_SB, CRED)
+    assert (tmp_path / "deploy" / "dev-compose.yml").is_file()
+    assert not (tmp_path / "deploy" / "prod-compose.yml").exists()
+    with pytest.raises(DeployError) as ei:
+        compose.render_prod_compose(META_SB)
+    assert ei.value.status == 400
 
 
 def test_render_env_generates_secrets_once(tmp_path):

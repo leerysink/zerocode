@@ -85,8 +85,11 @@ _MIGRATE_SVC = """  migrate:
     restart: "no"
 """
 
-# 大型栈的 dev 预览：后端不打包、源码挂进去现场 mvn spring-boot:run（依赖走 per-app .m2 卷）；
-# Redis 是本栈的私有运行时，只在 compose 内部网、不对外暴端口（口令走 .env 的 ${REDIS_PASSWORD}）。
+# 大型栈的 dev 预览：后端不打包、源码挂进去现场 mvn spring-boot:run（依赖走 per-app .m2 卷）。
+# Redis 是本栈私有运行时，只挂内部网、不对外暴端口；服务名故意不叫 redis——backend 同时上了全平台
+# 共享的 zcnet，那里若出现另一个同名容器，短名解析就要在两个网络之间赌一个。
+# 三个密钥位都带 `:?`：空值下 compose 直接拒收，而不是起一个 `--requirepass ""` 的无密码 Redis
+# （render_env 产出的就是空位，真值靠 ensure_deploy_files 回填——万一有人手工清过 .env，要响）。
 _DEV_COMPOSE_SB = """name: zc-__SLUG__-dev
 networks:
   default: {}
@@ -94,9 +97,9 @@ networks:
     external: true
 services:
 __MIGRATE_SVC__
-  redis:
+  appredis:
     image: redis:7-alpine
-    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD}"]
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?not backfilled, see deploy/.env}"]
     networks: [default]
   backend:
     image: maven:3.9-eclipse-temurin-17
@@ -108,17 +111,17 @@ __MIGRATE_SVC__
       SPRING_DATASOURCE_URL: jdbc:postgresql://zerocode-pg16:5432/${DEV_DB}?currentSchema=public&stringtype=unspecified
       SPRING_DATASOURCE_USERNAME: ${DEV_USER}
       SPRING_DATASOURCE_PASSWORD: ${DEV_PASSWORD}
-      SPRING_DATA_REDIS_HOST: redis
-      SPRING_DATA_REDIS_PASSWORD: ${REDIS_PASSWORD}
+      SPRING_DATA_REDIS_HOST: appredis
+      SPRING_DATA_REDIS_PASSWORD: ${REDIS_PASSWORD:?not backfilled, see deploy/.env}
       SERVER_PORT: "8080"
-      JWT_SECRET: ${JWT_SECRET}
+      JWT_SECRET: ${JWT_SECRET:?not backfilled, see deploy/.env}
       UPLOAD_DIR: /src/uploads
     command: mvn -B spring-boot:run
     networks: [default, zcnet]
     depends_on:
       migrate:
         condition: service_completed_successfully
-      redis:
+      appredis:
         condition: service_started
   frontend:
     image: node:20-alpine

@@ -1613,6 +1613,19 @@ git commit -m "feat(compose): render vue3-springboot dev stack (private redis, .
 
 > 执行补一笔事故记录（不抹）：改 `compose.py` 时一次 SearchReplace 的 `original_text` 多带了 `_FE_ONLY` 整块，把它整块删掉了（工具报 success，不会提醒）。靠 `git diff --numstat` 发现只有 1 行删除才兑住——预期只有 `return (_ENV_TMPL` → `e = (_ENV_TMPL` 那一行。教训：**改完模板块必得用 numstat 对删除行数**，光看 diff 的新增侧看不出自己删了什么。
 
+- [x] **Step 7: 评审返修**（范围 `96d9185..7019e2f`，无 Blocking；2 Important + 4 Nit 处置如下）
+
+| 编号 | 评审意见 | 复算 | 处置 |
+|---|---|---|---|
+| I-1 | `.env` 里 `REDIS_PASSWORD` 为空时，compose 会起一个 `--requirepass ""` 的**静默无密码** Redis（评审方真跑容器：PING→PONG、requirepass 空）。`ensure_deploy_files` 会回填，但任何人手工清过 `.env` 就静默裸奔 | 成立。`render_env` 产出的恰恰就是空位，回填是事后动作，产物本身必须自己拒收 | 三个密钥位（`appredis.command`、`SPRING_DATA_REDIS_PASSWORD`、`JWT_SECRET`）统一改 `${VAR:?not backfilled, see deploy/.env}`。实测：`--env-file good.env config --quiet` → exit=0；`empty.env` → **exit=1** 且逐条点名三个变量。纠正评审的一处事实：`${VAR:?}` 失败码是 **1**，不是它猜的 15。错误文案先写过中文，因全角括号/花括号有解析风险改成纯 ASCII |
+| I-2 | dev 用「挂源码就地 mvn」，`backend/target`、`backend/logs` 会写回宿主；而 `files.py IGNORE_DIRS` 与 `packages.py EXCLUDE_DIRS` 只认 `build` → 文件树被 .class 页满、`source_hash` 每预览一次就变（分叉误报）、包体背几百 MB | 成立，两条链都读过量目录代码复核 | 两处名单各加 `target`/`logs`，并补测：`test_tree_ignores_and_nests` 扩 `backend/target/classes/App.class` + `backend/logs/app.log`；`test_store_packages.py` 新增 `test_source_hash_ignores_maven_build_churn`。**`uploads/` 刻意不加**——上传件算不算包内容是个产品口径（不加：每次上传都算分叉；加：作者的演示图进不了包），没定下来前不悄悄替它做决定，已就这一条向用户提问 |
+| N-3 | redis 服务名 `redis` 与 zcnet 上可能存在的同名容器有 DNS 歧义（backend 同时挂 default + zcnet） | 成立（平台确实全平台共用 zcnet） | 服务名改 `appredis`，`SPRING_DATA_REDIS_HOST` 跟随；测试补 `svc["appredis"]["networks"] == ["default"]`（redis 连 zcnet 都不上）与 `backend.networks == ["default", "zcnet"]` 两侧断言 |
+| N-4 | 旧栈「不得被改动」用「拿实现重放替换链」的镜像断言——会跟着模板一起漂；镜像断言还漏了 static | 成立 | 改为 golden 文件：新增 `tests/golden/dev-compose.{fastapi,static}.yml`，`test_legacy_stacks_match_golden_files` 逐字节比；`.gitattributes` 加 `tests/golden/*.yml text eol=lf`（否则 Windows 检出翻 CRLF 自找误红） |
+| N-5 | 「SB 目前不落 prod-compose」没有钉子，将来 C 阶段之前被人顺手补上无人察觉 | 成立 | 新增 `test_springboot_gets_no_prod_compose_yet`：`ensure_deploy_files` 后 `prod-compose.yml` 不存在，且 `render_prod_compose` 抛 `DeployError(status=400)` |
+| N-6 | 镜像名断言散在测试里 | 部分采纳 | 镜像名保留在 shape 用例（那是本栈的契约本体，不是回归钉），只把「旧产物回归」这一职责挪给 golden |
+
+> 返修补记：改完 compose 模板必须回去重跑**真 docker 校验**（本 Step 的 good/empty 两跑），不能只看 `yaml.safe_load` 绿——`${VAR:?}` 是 compose 的语法，YAML 层根本看不见它。
+
 ---
 
 ### Task B2: `HEALTH_BY_STACK` 收敛到 `/api/health` + 大型栈创建放行
@@ -1620,6 +1633,15 @@ git commit -m "feat(compose): render vue3-springboot dev stack (private redis, .
 **Files:**
 - Modify: `app/services/app_service.py:22-23,58-61`
 - Test: `tests/test_app_service.py`
+
+> 前提校正（B1 评审 Nit-7 复算后的当下事实）：本 Task 标题里的两件事**都已是既成**——`HEALTH_BY_STACK` 的
+> springboot 条目在 **A4c** 就写成了 `/api/health`；创建闸门 `_check_scale_stack` 只看
+> `(TEMPLATES / stack).is_dir()`，而模板自 **A3** 已落仓，所以大型栈今天已经能建。
+> B2 的真实增量收敛为：① 端到端断言（真建库、真落盘：`app.json` 的 health、`deploy/dev-compose.yml` 的
+> maven/appredis 服务、`deploy/.env` 的两个生成密钥）；② 把 `R-C` 那条注释从「M1 仅交付 vue3-fastapi」
+> 改成当下事实（否则会误导下一个读它的人以为大型栈还被拦着）。
+> 另记一条已确认的局限：B1→B3 之间大型栈预览会「前端 200 就报 running，而后端 mvn 还在下依赖」
+> （`engine.start_dev` 只等前端）——那是 B3 的活，**B4 的验收证据必须等 B3**。
 
 - [ ] **Step 1: 写失败测试**（追加到 `tests/test_app_service.py` 末尾）
 

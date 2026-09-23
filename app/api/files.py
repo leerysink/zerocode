@@ -7,7 +7,10 @@ from pydantic import BaseModel
 from app.agent.tools import BINARY_EXTS, MAX_READ_BYTES, resolve_in_workspace
 
 router = APIRouter(prefix="/api")
-IGNORE_DIRS = {".git", "node_modules", "__pycache__", "dist", ".venv", "build"}
+# target/logs 是大型栈 dev 预览的必然产物：compose 把 backend/ 挂进容器就地跑 mvn，
+# 编译产物与 logback 日志直接落在应用工作区里（fastapi 栈的 uvicorn 不产这些）。
+# 不收进名单，一次预览之后文件树就会被几千个 .class 与滚动的日志页满，模型也会被引去看编译产物。
+IGNORE_DIRS = {".git", "node_modules", "__pycache__", "dist", ".venv", "build", "target", "logs"}
 
 async def _root_of(request: Request, ws_id: int) -> Path:
     from sqlalchemy import text

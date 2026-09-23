@@ -13,7 +13,10 @@ def app_tree(tmp_path):
     for rel in ("backend/app/main.py", "backend/requirements.txt",
                 "frontend/src/App.vue", "frontend/node_modules/dep/index.js",
                 "frontend/dist/assets/a.js", "deploy/prod-compose.yml", "deploy/.env",
-                "sqlchange/V20260920_01_init.sql", "sqlchange/V20260920_02_more.sql"):
+                "sqlchange/V20260920_01_init.sql", "sqlchange/V20260920_02_more.sql",
+                # 大型栈 dev 预览就地跑 mvn 留下的：几百 MB 编译产物 + 一直在滚的日志
+                "backend/target/classes/com/zerocode/app/BaseApplication.class",
+                "backend/target/demo.jar", "backend/logs/spring.log"):
         p = root / rel
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(f"# {rel}\n", encoding="utf-8", newline="")
@@ -41,6 +44,8 @@ def test_write_package_excludes_secrets_and_artifacts(tmp_path, app_tree):
     assert not any("/deploy/" in f or f.startswith("deploy/") for f in files), "包里有 deploy/"
     assert not any("node_modules" in f for f in files)
     assert not any("/dist/" in f for f in files)
+    assert not any("/target/" in f or f.startswith("target/") for f in files), "包里有 maven 编译产物"
+    assert not any("/logs/" in f for f in files), "包里有运行时日志"
     assert "sqlchange/V20260920_02_more.sql" not in files, "未应用的迁移不得进包"
 
 
@@ -77,6 +82,22 @@ def test_source_hash_sensitive_to_src_only(tmp_path, app_tree):
     h2 = packages.source_hash(app_tree)
     (app_tree / "deploy" / ".env").write_text("SECRET=x\n", encoding="utf-8")
     assert packages.source_hash(app_tree) == h2, "平台生成物变化不该算作分叉"
+
+
+def test_source_hash_ignores_maven_build_churn(tmp_path, app_tree):
+    """预览一次就重写一遍 target/：若算进 source_hash，分叉判定会每次预览后误报。"""
+    h = packages.source_hash(app_tree)
+    t = app_tree / "backend" / "target"
+    (t / "new-classes").mkdir(parents=True)
+    (t / "new-classes" / "More.class").write_text("# rebuilt\n", encoding="utf-8", newline="")
+    (t / "demo.jar").write_text("# rebuilt jar\n", encoding="utf-8", newline="")
+    (app_tree / "backend" / "logs" / "spring.log").write_text("# rolled\n", encoding="utf-8", newline="")
+    assert packages.source_hash(app_tree) == h
+    # 但真源码要算数：同一颗 target 旁的 backend 下改一个文件就必须变
+    java = app_tree / "backend" / "src" / "main" / "java"
+    java.mkdir(parents=True)
+    (java / "App.java").write_text("// new\n", encoding="utf-8", newline="")
+    assert packages.source_hash(app_tree) != h
 
 
 def _md5(p):

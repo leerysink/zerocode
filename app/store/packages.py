@@ -14,7 +14,11 @@ SCHEMA = "zc-release/1"
 # 顶层不进 src 的：平台生成物（deploy 含明文凭据）、独立进包的 sqlchange、清单与说明
 EXCLUDE_TOP = {"deploy", "sqlchange", "app.json", "README.md"}
 EXCLUDE_DIRS = {"node_modules", ".venv", "dist", "__pycache__", ".pytest_cache", ".vite",
-                "venv", "build"}
+                "venv", "build",
+                # 大型栈 dev 预览就地跑 mvn：target/ 与 logs/ 直接落在 backend/ 里。不收它们，
+                # 每预览一次 source_hash 就变一次（分叉判定会误报），包体还要背上几百 MB 编译产物。
+                # uploads/ 刻意不在这里：上传件算不算包内容是个产品口径，没定下来前不悄悄替它做决定。
+                "target", "logs"}
 EXCLUDE_FILES = {".env", ".DS_Store", "Thumbs.db"}
 
 

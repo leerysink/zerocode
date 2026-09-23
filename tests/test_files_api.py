@@ -12,12 +12,21 @@ async def test_tree_ignores_and_nests(client, tmp_path):
     (tmp_path / "src" / "a.py").write_text("x=1", encoding="utf-8")
     (tmp_path / ".git").mkdir()
     (tmp_path / "node_modules").mkdir()
+    # 大型栈 dev 预览就地跑 mvn 会在 backend/ 下留这两个：藏掉，否则一次预览就页满文件树
+    (tmp_path / "backend" / "target" / "classes").mkdir(parents=True)
+    (tmp_path / "backend" / "target" / "classes" / "App.class").write_text("x", encoding="utf-8")
+    (tmp_path / "backend" / "logs").mkdir()
+    (tmp_path / "backend" / "logs" / "app.log").write_text("x", encoding="utf-8")
+    (tmp_path / "backend" / "pom.xml").write_text("x", encoding="utf-8")
     ws = await _ws(client, tmp_path)
     r = (await client.get(f"/api/fs/tree?workspace_id={ws['id']}")).json()
     names = [n["name"] for n in r]
     assert "src" in names and ".git" not in names and "node_modules" not in names
     src = next(n for n in r if n["name"] == "src")
     assert src["type"] == "dir" and src["children"][0]["name"] == "a.py"
+    backend = next(n for n in r if n["name"] == "backend")
+    kids = [c["name"] for c in backend["children"]]
+    assert "pom.xml" in kids and "target" not in kids and "logs" not in kids
 
 @pytest.mark.asyncio
 async def test_read_and_save_and_guard(client, tmp_path):

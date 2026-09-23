@@ -16,3 +16,6 @@
 *.woff2 binary
 *.ttf binary
 *.eot binary
+
+# 渲染契约的 golden 文件：测试拿渲染结果与它逐字节比，检出时若被翻成 CRLF 就会自找一条误红。
+tests/golden/*.yml text eol=lf
