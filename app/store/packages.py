@@ -18,8 +18,9 @@ EXCLUDE_DIRS = {"node_modules", ".venv", "dist", "__pycache__", ".pytest_cache",
 # 大型栈 dev 预览就地跑 mvn：backend/target 与 backend/logs 直接落在应用工作区里。不收它们，
 # 每预览一次 source_hash 就变一次（分叉判定会误报），包体还要背上几百 MB 编译产物。
 # 按路径尾屏蔽而非裸名：target / logs 都是业务通用词（目标管理、日志页面），按名屏蔽会把作者的
-# src/views/target 一类目录静默排除出包与指纹。uploads/ 刻意不在这里：上传件算不算包内容是个
-# 产品口径，没定下来前不悄悄替它做决定。
+# src/views/target 一类目录静默排除出包与指纹。落点由「dev 容器把 ../backend 挂成 working_dir」与模板里
+# logging.path 的默认值共同决定，两者任一变动（拆多模块、改日志目录）都要回来对一眼这两份名单。
+# uploads/ 刻意不在这里：上传件算不算包内容是个产品口径，没定下来前不悄悄替它做决定。
 EXCLUDE_PATH_TAILS = (("backend", "target"), ("backend", "logs"))
 EXCLUDE_FILES = {".env", ".DS_Store", "Thumbs.db"}
 

@@ -12,8 +12,9 @@ IGNORE_DIRS = {".git", "node_modules", "__pycache__", "dist", ".venv", "build"}
 # 直接落在应用工作区里（fastapi 栈的 uvicorn 不产这些）。不收它们，一次预览之后文件树就会被
 # 几千个 .class 与滚动的日志页满。
 # 按路径尾屏蔽而非裸名：target / logs 都是业务通用词（目标管理、日志页面），按名屏蔽会把用户
-# 自己的 src/views/target 一类目录在文件管理器里永久藏掉。这两个产物的落点是固定的：
-# maven 默认输出目录 + logback 的 ${user.dir}/logs（dev 容器 working_dir 就是挂载的 backend/）。
+# 自己的 src/views/target 一类目录在文件管理器里永久藏掉。这两个产物的落点由「dev 容器把 ../backend
+# 挂成 working_dir」与模板里 logging.path 的默认值共同决定（${user.dir}/logs 即 backend/logs）；
+# 两者任一变动（拆多模块、改日志目录）都要回来对一眼这两份名单。
 IGNORE_PATH_TAILS = (("backend", "target"), ("backend", "logs"))
 
 
@@ -21,7 +22,8 @@ def _is_ignored_dir(rel_parts: tuple) -> bool:
     """某个目录节点是否不进文件树：按名屏蔽的通用名单，加按路径尾屏蔽的构建产物。
 
     这里判的是目录节点本身（而非 packages.py 那样判文件）：一旦 backend/target 被剪掉，
-    它下面的任何东西都递不到，所以只需尾匹配。
+    它下面的任何东西都递不到，所以只需尾匹配。代价是一条口径差：若 backend/ 下真出现一个叫
+    target 的**文件**（maven 不造这种东西），文件树看得见、而包与 source_hash 不收。
     """
     return (rel_parts[-1] in IGNORE_DIRS
             or any(rel_parts[-len(t):] == t for t in IGNORE_PATH_TAILS))

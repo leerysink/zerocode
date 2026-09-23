@@ -412,6 +412,9 @@ async def test_stop_dev_downs_stack_and_resets_status(sf, make_app, seams):
     assert seams.docker.keys() == ["compose down"]
     down = seams.docker.calls[0]
     assert str(ROOT / "zcstop" / "deploy" / "dev-compose.yml") in " ".join(down["args"])
+    # 补 `--remove-orphans`：down 按**文件里的服务名**移除，一旦本系列自己把 redis 改成 appredis，
+    # 旧名容器就成孤儿（端口不占、状态照样落 stopped）；项目名由 `name: zc-<slug>-dev` 锁定，不会误伤 prod
+    assert "--remove-orphans" in down["args"]
     assert down["cwd"] == str(ROOT / "zcstop")
     assert _statuses(events) == ["stopping", "stopped"]
     assert await _db_status(sf, app["id"]) == "stopped"
@@ -456,10 +459,30 @@ async def test_stop_dev_leaves_a_healthy_env_untouched(sf, make_app, seams):
     compose_mod.ensure_deploy_files(root, engine._compose_meta(app),
                                     {"dev": await engine.read_cred(sf, "zcstopkeep", "dev")})
     env_file = root / "deploy" / ".env"
-    before = env_file.read_bytes()
+    yml_file = root / "deploy" / "dev-compose.yml"
+    before = (env_file.read_bytes(), yml_file.read_bytes())
     await engine.stop_dev(sf, app)
-    assert env_file.read_bytes() == before
+    assert (env_file.read_bytes(), yml_file.read_bytes()) == before
     assert seams.docker.keys() == ["compose down"]
+
+
+async def test_stop_dev_still_downs_when_the_backfill_fails(sf, make_app, seams, monkeypatch):
+    """补位是新加的抛点，它不许把「点得动的停止」变成点不动（复审 N-A）。
+
+    停栈是平台刻意不设 docker 闸门的逃生通道（栈卡死时的唯一自救手段，restart 也走它），
+    而 ensure 理论上会碰磁盘（目录只读 / 权限）与模板（未支持的栈）。补不上位就退回修前行为：
+    拿现有文件照 down，真 down 不了仍走「非零只记 warning」的老收口。
+    """
+    app = await make_app("zcstopboom", prod_port=8294, dev_port=8295,
+                         stack="vue3-springboot", scale="large")
+
+    def boom(*a, **k):                       # 真函数是同步的（写成 async 会造出永不 await 的协程，本测试变空转）
+        raise OSError("deploy/ 写不进去")
+
+    monkeypatch.setattr(compose_mod, "ensure_deploy_files", boom)
+    assert await engine.stop_dev(sf, app) == {"status": "stopped"}
+    assert seams.docker.keys() == ["compose down"]
+    assert await _db_status(sf, app["id"]) == "stopped"
 
 
 async def test_restart_dev_stops_then_starts(sf, make_app, seams):

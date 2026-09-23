@@ -237,6 +237,7 @@ async def stop_dev(sf, app: dict, notify=None) -> dict:
     解析期**闸门——`.env` 被手工清空时连 `down` 都会 exit=1，于是下面这个「非零只记 warning」的收口
     会把一台还在跑的栈报成已停止（端口不释放，restart 跟着挂）。ensure 是幂等的（内容一致就不写），
     正常情形下这一步零成本；凭据照常从库里供给，缺位时 ensure 的单向推进语义会沿用 .env 既有值。
+    `--remove-orphans` 补另一半：down 按文件里的服务名移除，模板改过名（redis → appredis）时旧名容器会留下。
     """
     app_id = app["id"]
     t0 = time.monotonic()
@@ -244,9 +245,14 @@ async def stop_dev(sf, app: dict, notify=None) -> dict:
     root = await _app_root(sf, app)
     await _notify(notify, app_id, {"type": "dev_status", "status": "stopping"})
     cred = await read_cred(sf, app["slug"], "dev") or {}
-    compose_mod.ensure_deploy_files(root, _compose_meta(app), {"dev": cred})
+    try:
+        compose_mod.ensure_deploy_files(root, _compose_meta(app), {"dev": cred})
+    except Exception as e:
+        # 补位是新加的抛点（只读目录、未支持的栈……），它不许把「点得动的停止」变成点不动：
+        # 停栈是栈卡死时唯一的自救通道（restart 也走它），补不上位就拿现有文件照 down。
+        logger.warning("停栈前补位 deploy/ 失败，按现有文件尝试 down: %s\n%s", app.get("slug"), e)
     code, log = await docker("compose", "-f", str(root / "deploy" / "dev-compose.yml"), "down",
-                             cwd=str(root))
+                             "--remove-orphans", cwd=str(root))
     if code != 0:
         logger.warning("dev 栈停止命令返回非零（仍按 stopped 收口）: %s\n%s", app.get("slug"), log[-300:])
     await _set_status(sf, app_id, "stopped")

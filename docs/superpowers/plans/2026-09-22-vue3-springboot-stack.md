@@ -1639,6 +1639,17 @@ git commit -m "feat(compose): render vue3-springboot dev stack (private redis, .
 > 本 Step 的教训：`${VAR:?}` 类「产物自身硬拒」的闸门，必须同时问一句「**除了启动，还有谁要解析这份文件**」。
 > 只验 `config`/`up` 是不够的：`down` 走的是同一个解析器，而平台对 `down` 的失败是吞掉的。
 
+- [x] **Step 9: 三轮收 Nit**（范围 `87acae2..62783b8` 的复审判定无 Blocking/Important，4 条 Nit 全部吃掉）
+
+| 编号 | 意见 | 复算 | 处置 |
+|---|---|---|---|
+| N-A | 补位是 `stop_dev` 新增的抛点（只读目录 / 未支持的栈 / `app["slug"]`），而 `restart_dev` 不像 `prod_restart` 那样 try/except 包停栈 → 可能把「栈卡死时唯一的自救通道」打死，UI 卡在 stopping | 成立（今天不可达：`_check_scale_stack` 已保证 stack 必在两个已交付模板里，库里实测无第三值无 NULL；但路径形状不该依赖这个） | `ensure_deploy_files` 包 try/except，失败只记 warning 后照旧 `down`（退回修前行为）。新测 `test_stop_dev_still_downs_when_the_backfill_fails`——写它时差点自己坑一次：`boom` 先写成了 `async def`，真实函数是同步的，抛出的异常藏在永不 await 的协程里，**不补位也会绿**；改回同步后才见到它先红、实现后转绿才对 |
+| N-B | `down` 前重写 `dev-compose.yml`，而 down 按**文件里的服务名**移除：模板改过名（本系列自己就 `redis`→`appredis`）时旧名容器成孤儿 | 成立，与 I-1′ 同症状类；日常路径被「平台启动一律跑 `cleanup_orphans`（不带文件的 `-p` 按 label 收）」掩着，但窗口存在 | `down` 补 `--remove-orphans`（dev 项目名由 `name: zc-<slug>-dev` 锁定，不误伤 prod）；真 docker 实测不带栈时 `down --remove-orphans` → **exit=0**，幂等前提不破。旧测 `test_stop_dev_downs_stack_and_resets_status` 钉住这个旗标；`test_stop_dev_leaves_a_healthy_env_untouched` 扩到连 `dev-compose.yml` 字节一起钉 |
+| N-C | 两套判据在「产物名落在文件上」时口径不一致（files 判目录、packages 判文件） | 成立且不是新洞（`EXCLUDE_FILES` 早就是这个形状：`deploy/.env` 同样树里看得见、包里不收） | 不改判据，把这行口径差写进 `_is_ignored_dir` 的 docstring，不假装两边完全同形 |
+| N-D | 注释把产物落点说成「固定的」，实际由多处决定：拆多模块则变 `backend/<module>/target`；`application.yml` 在应用工程内、AI 可改 `logging.path` | 成立（逐条查了 pom 是单模块、logback defaultValue 只是兜底），当前不漏但说法撑不住 | 两份注释都改成「落点由 compose 的 `../backend:/src` 挂载 + 模板默认值共同决定，任一变动要回来对一眼名单」；并在 `test_compose_render.py` 给这个前提补一枚钉子（`svc["backend"]["working_dir"] == "/src"`） |
+
+> 另：C1 注记里补一句——`prod_stop`（`app/deploy/prod.py:152`）**目前没有** ensure，prod 模板一旦也带 `${VAR:?}`，I-1′ 会在 prod 侧原样复发。
+
 ---
 
 ### Task B2: `HEALTH_BY_STACK` 收敛到 `/api/health` + 大型栈创建放行
@@ -1946,7 +1957,7 @@ git commit -m "docs(template): record measured dev startup timings from the larg
 > 命名与密钥闸门以 **B1 返修后的 `_DEV_COMPOSE_SB` 为准**（B1c 复审 N-2）：下面这份草稿写于那次返修之前，
 > 当时 redis 服务名还是 `redis`、密钥位还是裸 `${VAR}`。落地时三件事必须同步：服务名用 `appredis`（与 dev 一致，
 > prod 的 backend 同样上 zcnet）、三个密钥位都带 `${VAR:?…}`、以及确认**停栈/健康路径也能解析**
-> （`${VAR:?}` 是文件解析期闸门，`down`/`ps`/`logs` 一样吃；`stop_dev` 因此已在 B1c 里先 ensure）。
+> （`${VAR:?}` 是文件解析期闸门，`down`/`ps`/`logs` 一样吃；`stop_dev` 因此已在 B1c 里先 ensure，而 **`prod_stop`（`prod.py:152`）还没有这一步**）。
 
 - [ ] **Step 1: 写失败测试**（追加到 `tests/test_compose_render.py`，`META_SB` 复用 Task B1 引入的那份）
 

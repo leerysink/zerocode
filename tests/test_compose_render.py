@@ -267,6 +267,9 @@ def test_render_dev_compose_springboot_shape():
     assert "${REDIS_PASSWORD:?" in str(svc["appredis"]["command"])  # 空值必须让 compose 自己拒收
     assert svc["backend"]["image"] == "maven:3.9-eclipse-temurin-17"
     assert "../backend:/src" in svc["backend"]["volumes"]
+    # 钉住「就地 mvn 的产物落在 backend/」这一前提：屏蔽名单（files.py / packages.py）锚的就是 backend/target
+    # 与 backend/logs，它们成立只因为 working_dir 就是挂进去的那目录（logback 写 ${user.dir}/logs）。
+    assert svc["backend"]["working_dir"] == "/src"
     assert svc["backend"]["command"] == "mvn -B spring-boot:run"
     assert svc["backend"]["networks"] == ["default", "zcnet"]     # 上 zcnet 只为访 zerocode-pg16
     env = svc["backend"]["environment"]
