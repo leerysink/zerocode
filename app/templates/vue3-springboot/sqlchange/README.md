@@ -21,8 +21,8 @@ INSERT INTO sys_role_menu (role_id, menu_id) SELECT 1, 1200 ON CONFLICT DO NOTHI
 SELECT setval('sys_menu_id_seq', (SELECT MAX(id) FROM sys_menu));
 ```
 
-- 显式写 id，且**取大于 1072**（基座已占用 `1`、`2`、`100–107`、`1011–1072`）；一个文件一个逻辑变更。
-  不要图省事挑中间的空隙（如 200）：踩到已占用的 id 时，`ON CONFLICT (id) DO NOTHING` 会**静默跳过**，
+- 显式写 id，且**取大于 1072**（基座已占用 `1`、`2`、`100–107`，并预留了 `1011–1072`：1011 起按「父菜单 id ×10 + 序号」编按钮）；一个文件一个逻辑变更。
+  不要图省事挑中间的空隙（如 200、1015）：踩到已占用的 id 时，`ON CONFLICT (id) DO NOTHING` 会**静默跳过**，
   菜单不出现也不报错，是最难查的一类「种子跑了但没生效」。补完记得前移 `sys_menu_id_seq`（基座的 id 是写死的，不前移则后台新增菜单必主键冲突）。
 - 还要给角色授权（上面的 `sys_role_menu`）：基座只给 admin 角色全量授权过一次，新菜单不补这一行就是「菜单存在但谁也没权」。
 - `path` 与路由表同一口径：顶层菜单写片段即可（拼接后是 `/ticket`），子级相对片段会拼上父级完整路径（`system` + `user` → `/system/user`）；

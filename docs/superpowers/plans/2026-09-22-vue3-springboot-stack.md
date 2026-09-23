@@ -1117,6 +1117,21 @@ git commit -m "feat(template): split base-pro baseline into schema track and ide
 
 返修后实跑：`pytest tests/test_scaffold.py -q` → 21 passed；幂等探针仍 `RESULT: PASS`（改动虽只涉种子注释一行，重跑为求证据而非推断）。
 
+- [x] **Step 9: 再复审（CodeReview 范围 `797c8a4..afec884`）与守护收窄**
+
+再复审：上轮两条 Important 确认闭合（对方还把 `git grep` 面扩到了 .java/.vue/.yml，0 命中），无 Blocking；但**我上一轮的修法本身被推翻了一次**：
+
+| 条目 | 自查复算 | 处置 |
+|---|---|---|
+| I-1′ 守护把「机制层禁令」写成「词汇禁令」 | 成立，而且刀口就在脚下：下一个 Task A7 要新增模板 README，而「台账为何叫 `sqlchange_history`、不要引入 Flyway 的 `schema_history`」正是该写进 README 的正面解释，会被我自己刚加的断言判成泄漏 | 收窄成两层：`.sql`（会真进库执行，与 Step 4 体检同口径）依旧全词禁；`.md` 放开台账词，只禁参考仓库的私有假设 |
+| N-2′ `base-pro` 裸子串误伤 `base-production` | 成立（`'base-pro' in 'base-production'` → True） | 改 `base-pro\b` 正则 |
+| N-1′ README 把「有孔的区间」说成整段占用 | 成立（1015–1020、1024–1030 等是空隙） | 改为「已占用 `1`、`2`、`100–107`，并**预留** `1011–1072`」，补上按钮 id 的编号规则（父菜单 ×10 + 序号），空隙例子同步换成 1015 |
+| N-3′ 「默认密码」在本栈有两个所指 | 成立：登录页提示写的是「初始密码 admin123」，而 `SysUserServiceImpl.java:124` 新增用户兜底是 `123456` | 种子注释改「初始密码」，与登录页同口径 |
+
+守护非空转的实测（六个合成用例走同一套判据）：`CREATE TABLE IF NOT EXISTS schema_history` / `与源项目一致` / `init-all.sql` / `derived from base-pro` → **全部 CAUGHT**；`registry/base-production:1.2` 与「不要引入 Flyway 的 schema_history」（.md）→ **allowed**。收完后：`test_scaffold` 21 passed、幂等探针仍 `RESULT: PASS`（`OVERALL=0`）。
+
+> 这一轮的真正教训不是「词汇会误伤」，而是：**守护的尺度要比它保护的不变量窄一级**。判据只看「会不会造成平台后果」，不看「看起来像不像旧名字」；否则下一个 Task 写文档时，它会从护栏变成路障。本轮之所以又重跑一次探针，是因为种子的 L14 再次被改——幂等是这个 Task 的核心证据，不能拿「只改了注释」推断。
+
 ---
 
 ### Task A7: 模板 README + 整栈渲染回归测试

@@ -11,7 +11,7 @@ INSERT INTO sys_dept (id, parent_id, ancestors, dept_name, order_num, leader) VA
 (3, 1, '0,1,',  '实施服务部',   2, NULL)
 ON CONFLICT (id) DO NOTHING;
 
--- 超级管理员（默认密码 admin123 的 BCrypt 哈希；交付后请提示用户首次登录后立即改密）
+-- 超级管理员（初始密码 admin123 的 BCrypt 哈希，与登录页提示同口径；交付后请引导用户首次登录即改密）
 INSERT INTO sys_user (id, username, password, nickname, dept_id, status) VALUES
 (1, 'admin', '$2a$10$7JB720yubVSZvUI0rEqK/.VqGOZTH.ulu33dHOiBE8ByOhJIrdAu2', '超级管理员', 2, 1)
 ON CONFLICT (id) DO NOTHING;

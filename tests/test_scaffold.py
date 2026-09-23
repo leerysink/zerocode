@@ -334,10 +334,15 @@ def test_springboot_template_ships_both_db_tracks(tmp_path):
     assert seed.count("INSERT INTO") == seed.count("ON CONFLICT")   # 每条写入都幂等可重放
     assert (tmp_path / "schema" / "README.md").is_file() and (tmp_path / "sqlchange" / "README.md").is_file()
 
-    # 不变量是「交付物里不该有自带台账概念 / 参考仓库的私有假设」，不限于那两个 .sql：
-    # README 与注释是给后续接手的 AI 读的，漏回去一句就够它把双记账或「源项目」当成事实。
+    # 守护分两层，尺度不同是有意的：
+    #   · .sql 会被平台真放进数据库执行，里面连提都不该提 schema_history（与计划 Step 4 的文本体检同口径）；
+    #   · .md 是给人和 AI 读的操作手册，将来完全可能要写一句「台账为什么叫 sqlchange_history、
+    #     不要引入 Flyway 的 schema_history」——那是正当解释，禁它就是逼文档删掉最有价值的那句。
+    # 参考仓库的私有假设则两类文件一律禁（交付物里不存在「源项目」）；base-pro 要带词边界，
+    # 否则 base-production / base-prod 这种正常词会被误伤。
     for p in list(tmp_path.rglob("*.sql")) + list(tmp_path.rglob("*.md")):
         text = p.read_text(encoding="utf-8")
-        assert "schema_history" not in text, p            # 平台只认 sqlchange_history
-        for leak in ("源项目", "base-pro", "init-all"):   # 参考工程的私有假设 / 文件名
-            assert leak not in text, (p, leak)
+        if p.suffix == ".sql":
+            assert "SCHEMA_HISTORY" not in text.upper(), p     # 平台只认 sqlchange_history，不双记账
+        for leak in ("源项目", "init-all", r"base-pro\b"):       # 参考工程的私有假设 / 文件名
+            assert re.search(leak, text) is None, (p, leak)
