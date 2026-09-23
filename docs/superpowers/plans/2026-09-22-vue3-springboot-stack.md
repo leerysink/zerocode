@@ -1356,6 +1356,10 @@ git commit -m "feat(template): stack README and full-render contract tests for v
 | N-3 | junk 判据只钉 `backend/`、`frontend/` 两个固定子路径，且漏 `.env`/`.DS_Store`/`*.tsbuildinfo`/IDE 目录 | `Get-ChildItem -Recurse -Force` 实测模板树 151 个文件、上述名称 0 命中（今天干净，但深层 `.../target` 会漏检） | 抽 `_junk(tree)` 整棵树 rglob；清单补 `.env`/`.DS_Store`/`Thumbs.db`/`.idea`/`.vscode`/`.tsbuildinfo`/`.pyc`；**刻意不收 `.mvn`**（maven wrapper 是合法件）。新增 `test_guards_are_not_vacuous`：四层深各塞一个杂物必须全数报出、`base-production` 必须放行——干净树上门禁是绿的，没有这条就不知道它是否还在工作 |
 | N-4 | `rf"\b{foreign}"` 缺尾词边界，`\bbase-pro` 仍会命中 `base-production` | 部分采纳：一刀切加 `\b` 尾巴会放过 `leerysink123` 这类带后缀的真实泄漏 | 两条判据按各自误伤风险分开写：`FOREIGN = (r"\bleerysink", r"\bbase-pro\b")`（延续 A6b「守护尺度比不变量窄一级」） |
 
+> 返提交 `5a8acc3` 后的复审（`842d27d..5a8acc3`）又抓到一条 Important：**我对 I-2 的修法本身不合格**。摘掉字面命令 `mvn spring-boot:run` 只删了症状，留下的描述「在容器里用 Maven 现场启动（不打 jar）」依旧与同树的 `backend/Dockerfile` 正面冲突（L7 `mvn -B -DskipTests package` → L11 `COPY target/*.jar` → L14 `java -jar`）。一并还有条 Nit：两个镜像都被归给「两个 Dockerfile」，实则同出后端那一个（前端是 `node:20-alpine` / `nginx:1.27-alpine`）。
+>
+> 修正后的口径：只写**能在树里找到出处**的事实——「首次构建要等几分钟」直接引用后端 Dockerfile 自己的「冷启动 410s」注释与 BuildKit 缓存卷，镜像按前/后端归位列全四个。教训：**返修时要拿它反驳的那份源码再读一遍，而不是只把评审点名的那个词改掉**——只删词不换实质，下一轮评审必定还在同一条上。本次全量 439 passed，复审返修后 `test_springboot_template` + `test_scaffold` 29 passed。
+
 ## Phase B — dev 预览链路
 
 ### Task B1: dev compose 的 springboot 分支 + `.env` 运行密钥
