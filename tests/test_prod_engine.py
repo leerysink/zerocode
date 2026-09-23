@@ -235,6 +235,7 @@ async def test_stop_down_nonzero_still_stopped(monkeypatch, sf, seed, caplog):
     wid, aid = await seed(status_prod="running")
     app = _app(aid)
     seams = Seams(monkeypatch, down_code=1)
+    _cred_and_ensure(monkeypatch, seams)   # 停栈现在会先补位（read_cred+ensure），别让它们真读库/真写盘
     with caplog.at_level(logging.WARNING):
         res = await prod.prod_stop(sf, app, notify=seams.notify)
     assert res == {"status": "stopped"}
@@ -242,6 +243,24 @@ async def test_stop_down_nonzero_still_stopped(monkeypatch, sf, seed, caplog):
     assert seams.events[-1]["type"] == "dev_log" and "已停止" in seams.events[-1]["line"]
     assert any("非零" in r.getMessage() for r in caplog.records)   # 失败可见但不改收口
     assert await _status_prod(sf, aid) == "stopped"
+
+
+async def test_stop_ensures_deploy_files_before_down(monkeypatch, sf, seed):
+    """C1 评审返修（与 stop_dev 的 ensure-before-down 对称）：大型栈的 prod-compose 密钥位带
+    `${VAR:?}`，是 compose 的**解析期**闸门——.env 被手工清空时连 `down` 都会 exit=1，于是
+    「非零只记 warning」的收口会把一台还在跑、仍占端口的栈误报 stopped。停之前先补一次幂等
+    ensure（缺位密钥现场生成、PROD_VERSION 保留），正常情形零成本、补不上位也不阻断停止。"""
+    wid, aid = await seed(status_prod="running")
+    app = _app(aid)
+    seams = Seams(monkeypatch)
+    _cred_and_ensure(monkeypatch, seams)
+    await prod.prod_stop(sf, app, notify=seams.notify)
+    down_at = next(i for i, c in enumerate(seams.calls) if c[0] == "docker" and "down" in c)
+    ens_at = next(i for i, c in enumerate(seams.calls) if c[0] == "ensure")
+    assert ens_at < down_at                                     # 补位先于 down
+    ens = seams.calls[ens_at]
+    assert ens[1] is None                                       # 停栈不推进版本（PROD_VERSION 保留）
+    assert ens[2]["prod"]["db"] == "zcdemo_prod"                # 凭据真读真传（单向推进不冲空）
 
 
 async def test_start_up_failure_sets_error(monkeypatch, sf, seed):

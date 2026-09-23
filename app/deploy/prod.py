@@ -145,10 +145,27 @@ async def prod_start(sf, app: dict, notify=None) -> dict:
 
 
 async def prod_stop(sf, app: dict, notify=None) -> dict:
+    """停止 prod 栈（幂等：栈本就不在时 compose 返回 0，状态同样落 stopped）。
+
+    停之前先 ensure 一遍 deploy/，与 stop_dev 同构：大型栈的 prod-compose 密钥位带 `${VAR:?}`，
+    那是 compose 的**文件解析期**闸门——`.env` 被手工清空时连 `down` 都会 exit=1，于是下面这个
+    「非零只记 warning」的收口会把一台还在跑、仍占端口的栈报成已停止。ensure 是幂等的（内容一致就
+    不写、缺位密钥现场生成、version 缺位保留既有 PROD_VERSION），正常情形这一步零成本；补不上位
+    （只读目录等）时按现有文件照 down，不许把「点得动的停止」变成点不动。
+    """
     app_id = app["id"]
     t0 = time.monotonic()
     await _step(app_id, notify, f"▶ 停止正式环境 {app.get('slug') or app_id}")
-    root = await _app_root(sf, _compose_meta(app))
+    app = _compose_meta(app)
+    root = await _app_root(sf, app)
+    cred = await read_cred(sf, app["slug"], "prod") or {}
+    cred_dev = await read_cred(sf, app["slug"], "dev") or {}
+    try:
+        ensure_deploy_files(root, app, {"dev": cred_dev, "prod": cred})
+    except Exception as e:
+        # 补位是新加的抛点，它不许把「点得动的停止」变成点不动：停栈是栈卡死时唯一的自救通道
+        # （prod_restart 也走它），补不上位就拿现有文件照 down。
+        logger.warning("停栈前补位 deploy/ 失败，按现有文件尝试 down: %s\n%s", app.get("slug"), e)
     code, log = await _docker(*_prod_compose_args(root), "down", cwd=str(root))
     if code != 0:
         logger.warning("prod 栈停止返回非零（仍按 stopped 收口）: %s", log[-300:])

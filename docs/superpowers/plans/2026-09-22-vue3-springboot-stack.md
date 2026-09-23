@@ -2276,8 +2276,8 @@ git commit -m "feat(compose): render vue3-springboot prod stack (built images, u
 
 - **计划 Step 5 漏了一个翻案点**（与 B2 N-2 同类）：`test_compose_render.py::test_springboot_gets_no_prod_compose_yet` 直接钉「大型栈不得提前落 prod 件」+ `render_prod_compose(META_SB)` 抛 400——C1 当天必红。已翻案为 `test_springboot_gets_prod_compose`（断言创建即落 prod 件、render 不再抛错）。
 - **`test_templates_still_carry_markers` 不能把 prod 模板塞进 dev 循环**（Step 5 草稿那么写会假红）：dev 循环体断 `__DEV_PORT__`+`__FE_VOL__`，prod 模板没这些。已另起一段断 prod 自己的标记（`__MIGRATE_PROD__`/`__UPLOADS_VOL__`/`__REDIS_DATA_VOL__` 等）。
-- **顶注 directive #3（prod.py 要不要 ensure）已确认：不需要动。** prod 的三个 `:?` 位全是 JWT/REDIS，而这两个键与 dev 共用同一份 `.env`、创建时就已回填，所以 prod-compose 永远可解析，`prod_stop` 的 `down`/`ps`/`logs` 不受影响。故 C1 仍局限于 `compose.py` + 测试，未越界改 `prod.py`。
-- **回归结果**：全量 `pytest -q` → **464 passed**（基线 459 + 本 Task 3 新测试，0 失败）；定向 `test_compose_render.py` → 27 passed。
+- **顶注 directive #3（prod.py 要不要 ensure）——评审推翻，C1 扩到 `prod.py` 补上。** 原判断「prod 的 `:?` 位与 dev 共用同一份 `.env`、永远可解析，故 `prod_stop` 不需 ensure」在**正常平台路径**下成立（创建/publish/rollback/prod_start 都在 up 前 re-ensure，会自愈）；但 C1 评审指出一个窄 drift：**手工清空 `.env` + 仅点停止** 时，`prod-compose.yml` 的 `${VAR:?}` 解析期闸门会让 `down` 直接 exit=1，而 `prod_stop` 的「非零只记 warning」收口会把一台还在跑、仍占端口的栈误报 stopped。dev 侧 `stop_dev` 在 B1c 已加 ensure-before-down 防护，prod 侧不对称缺失。故 C1 返修把 `prod_stop` 对齐 `stop_dev`：`down` 前补一次幂等 ensure（try/except 包裹、缺位密钥现场生成、失败只 warning 不阻断停止）。**未** 一并搬 `--remove-orphans`——那是 dev 侧为 `redis`→`appredis` 改名留的补丁，prod springboot 栈首落即 `appredis`、无改名史，评审也只 flag ensure 缺口，不越范围。
+- **回归结果**：C1 主体全量 `pytest -q` → **464 passed**；评审返修后（新增 `test_stop_ensures_deploy_files_before_down`）全量 → **465 passed**，0 失败。定向 `test_compose_render.py` → 27 passed、`test_prod_engine.py`+`test_app_service.py` → 66 passed。
 
 ---
 
