@@ -15,6 +15,7 @@ import pytest
 from sqlalchemy import text
 
 from app.db import make_session_factory
+from app.deploy import compose as compose_mod
 from app.deploy import engine, sqlrun
 from app.deploy.errors import DeployError
 from app.deploy.hub import DeployHub
@@ -111,7 +112,8 @@ async def make_app(sf):
     """
     made = []
 
-    async def _make(slug: str, *, prod_port: int, dev_port: int, root: Path | None = None) -> dict:
+    async def _make(slug: str, *, prod_port: int, dev_port: int, root: Path | None = None,
+                    stack: str = "vue3-fastapi", scale: str = "small") -> dict:
         root = root or (ROOT / slug)
         root.mkdir(parents=True, exist_ok=True)
         async with sf() as s:
@@ -120,8 +122,9 @@ async def make_app(sf):
                 {"n": slug, "p": str(root)})).scalar()
             app_id = (await s.execute(text(
                 "INSERT INTO app_project (workspace_id, name, slug, scale, stack, prod_port, dev_port) "
-                "VALUES (:w, :n, :sl, 'small', 'vue3-fastapi', :pp, :dp) RETURNING id"),
-                {"w": wid, "n": slug, "sl": slug, "pp": prod_port, "dp": dev_port})).scalar()
+                "VALUES (:w, :n, :sl, :sc, :st, :pp, :dp) RETURNING id"),
+                {"w": wid, "n": slug, "sl": slug, "sc": scale, "st": stack,
+                 "pp": prod_port, "dp": dev_port})).scalar()
             await s.execute(text(
                 "INSERT INTO app_config (key, value) VALUES (:k, CAST(:v AS JSONB)) "
                 "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()"),
@@ -129,7 +132,7 @@ async def make_app(sf):
                  "v": json.dumps({"db": f"{slug}_dev", "user": f"{slug}_dev", "password": "fake-pw"})})
             await s.commit()
         made.append({"app_id": app_id, "wid": wid, "slug": slug})
-        return {"id": app_id, "workspace_id": wid, "slug": slug, "stack": "vue3-fastapi",
+        return {"id": app_id, "workspace_id": wid, "slug": slug, "stack": stack,
                 "ports": {"prod": prod_port, "dev": dev_port}}
 
     yield _make
@@ -412,6 +415,51 @@ async def test_stop_dev_downs_stack_and_resets_status(sf, make_app, seams):
     assert down["cwd"] == str(ROOT / "zcstop")
     assert _statuses(events) == ["stopping", "stopped"]
     assert await _db_status(sf, app["id"]) == "stopped"
+
+
+async def test_stop_dev_backfills_unbackfilled_secrets_before_down(sf, make_app, seams):
+    """停栈不得被自己渲染物的解析期闸门挡住（B1c 复审 I-1）。
+
+    `${VAR:?}` 是 compose 的**文件解析期**行为，实测 .env 密钥位为空时 `down`/`ps`/`logs` 全部 exit=1
+    （不只 `up`）；而 stop_dev 把非零降级成一条 warning 后照样落 stopped——结果是容器一个没停、
+    宿主 dev 端口仍被占用、UI 却显示「已停止」（restart 更糟：紧接的 up 会因旧端口占用而失败）。
+    所以停栈前先把 deploy/ 走一遍 ensure（幂等，只补未回填的密钥位），让 down 永远拿得到可解析的文件。
+    """
+    app = await make_app("zcstopsec", prod_port=8290, dev_port=8291,
+                         stack="vue3-springboot", scale="large")
+    meta = engine._compose_meta(app)
+    cred = await engine.read_cred(sf, "zcstopsec", "dev")          # 夹具登记的那份假凭据
+    deploy = ROOT / "zcstopsec" / "deploy"
+    deploy.mkdir(parents=True, exist_ok=True)
+    (deploy / "dev-compose.yml").write_text(compose_mod.render_dev_compose(meta),
+                                            encoding="utf-8", newline="")
+    # 模拟「有人手工清过 .env」：render_env 产出的就是空密钥位（真值靠 ensure 回填）
+    (deploy / ".env").write_text(compose_mod.render_env(meta, {"dev": cred}),
+                                  encoding="utf-8", newline="")
+    assert compose_mod._env_get((deploy / ".env").read_text(encoding="utf-8"), "JWT_SECRET") == ""
+    await _set_db_status(sf, app["id"], "running")
+
+    assert await engine.stop_dev(sf, app) == {"status": "stopped"}
+
+    assert seams.docker.keys() == ["compose down"]                 # 补位不是重跑 up，只多一次文件读写
+    after = (deploy / ".env").read_text(encoding="utf-8")
+    assert compose_mod._env_get(after, "JWT_SECRET"), "停栈前必须把密钥位补齐"
+    assert compose_mod._env_get(after, "REDIS_PASSWORD")
+    assert compose_mod._env_get(after, "DEV_PASSWORD") == cred["password"], "补位不得冲空既有凭据"
+
+
+async def test_stop_dev_leaves_a_healthy_env_untouched(sf, make_app, seams):
+    """上条的对面：正常 .env 不能被停栈改一个字节（ensure 的 `_write_if_changed` 在此兼作 noop）。"""
+    app = await make_app("zcstopkeep", prod_port=8292, dev_port=8293,
+                         stack="vue3-springboot", scale="large")
+    root = ROOT / "zcstopkeep"
+    compose_mod.ensure_deploy_files(root, engine._compose_meta(app),
+                                    {"dev": await engine.read_cred(sf, "zcstopkeep", "dev")})
+    env_file = root / "deploy" / ".env"
+    before = env_file.read_bytes()
+    await engine.stop_dev(sf, app)
+    assert env_file.read_bytes() == before
+    assert seams.docker.keys() == ["compose down"]
 
 
 async def test_restart_dev_stops_then_starts(sf, make_app, seams):

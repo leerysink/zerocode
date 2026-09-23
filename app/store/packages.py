@@ -14,12 +14,27 @@ SCHEMA = "zc-release/1"
 # 顶层不进 src 的：平台生成物（deploy 含明文凭据）、独立进包的 sqlchange、清单与说明
 EXCLUDE_TOP = {"deploy", "sqlchange", "app.json", "README.md"}
 EXCLUDE_DIRS = {"node_modules", ".venv", "dist", "__pycache__", ".pytest_cache", ".vite",
-                "venv", "build",
-                # 大型栈 dev 预览就地跑 mvn：target/ 与 logs/ 直接落在 backend/ 里。不收它们，
-                # 每预览一次 source_hash 就变一次（分叉判定会误报），包体还要背上几百 MB 编译产物。
-                # uploads/ 刻意不在这里：上传件算不算包内容是个产品口径，没定下来前不悄悄替它做决定。
-                "target", "logs"}
+                "venv", "build"}
+# 大型栈 dev 预览就地跑 mvn：backend/target 与 backend/logs 直接落在应用工作区里。不收它们，
+# 每预览一次 source_hash 就变一次（分叉判定会误报），包体还要背上几百 MB 编译产物。
+# 按路径尾屏蔽而非裸名：target / logs 都是业务通用词（目标管理、日志页面），按名屏蔽会把作者的
+# src/views/target 一类目录静默排除出包与指纹。uploads/ 刻意不在这里：上传件算不算包内容是个
+# 产品口径，没定下来前不悄悄替它做决定。
+EXCLUDE_PATH_TAILS = (("backend", "target"), ("backend", "logs"))
 EXCLUDE_FILES = {".env", ".DS_Store", "Thumbs.db"}
+
+
+def _has_tail(parts: tuple, tail: tuple) -> bool:
+    """路径里是否连续地出现这段目录序列（文件在更深处，所以不是「以…结尾」）。"""
+    n = len(tail)
+    return any(parts[i:i + n] == tail for i in range(len(parts) - n + 1))
+
+
+def _is_excluded(parts: tuple) -> bool:
+    """某个文件是否不进包也不进 source_hash（三个按名名单 + 一个按路径尾的构建产物名单）。"""
+    return (parts[0] in EXCLUDE_TOP or any(part in EXCLUDE_DIRS for part in parts)
+            or parts[-1] in EXCLUDE_FILES
+            or any(_has_tail(parts, t) for t in EXCLUDE_PATH_TAILS))
 
 
 def package_path(out_root, slug: str, version: str) -> Path:
@@ -32,11 +47,7 @@ def _iter_src(app_root: Path):
         if not p.is_file():
             continue
         parts = p.relative_to(app_root).parts
-        if parts[0] in EXCLUDE_TOP:
-            continue
-        if any(part in EXCLUDE_DIRS for part in parts):
-            continue
-        if parts[-1] in EXCLUDE_FILES:
+        if _is_excluded(parts):
             continue
         yield "/".join(parts), p
 
@@ -82,6 +93,7 @@ def write_package(*, out_root, slug: str, version: str, app_root: Path,
             "anchor": anchor, "fingerprint": manifest_fingerprint(anchor),
             "created_at": datetime.now(timezone.utc).isoformat(),
             "exclude_top": sorted(EXCLUDE_TOP), "exclude_dirs": sorted(EXCLUDE_DIRS),
+            "exclude_path_tails": ["/".join(t) for t in EXCLUDE_PATH_TAILS],
             **manifest_extra,
         }
         (tmp / "manifest.json").write_text(

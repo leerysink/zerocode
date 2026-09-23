@@ -6,6 +6,17 @@ import pytest
 async def _ws(client, tmp_path):
     return (await client.post("/api/workspaces", json={"root_path": str(tmp_path)})).json()
 
+
+def _find(nodes, name):
+    """在树里找第一个同名节点（不递归进被屏蔽的目录，因为它们根本没进树）。"""
+    for n in nodes:
+        if n["name"] == name:
+            return n
+        got = _find(n.get("children") or [], name)
+        if got:
+            return got
+    return None
+
 @pytest.mark.asyncio
 async def test_tree_ignores_and_nests(client, tmp_path):
     (tmp_path / "src").mkdir()
@@ -18,6 +29,9 @@ async def test_tree_ignores_and_nests(client, tmp_path):
     (tmp_path / "backend" / "logs").mkdir()
     (tmp_path / "backend" / "logs" / "app.log").write_text("x", encoding="utf-8")
     (tmp_path / "backend" / "pom.xml").write_text("x", encoding="utf-8")
+    # 反向地雷：target / logs 都是业务通用词，屏蔽判据必须锚在 backend/ 下而不是吃裸名
+    (tmp_path / "frontend" / "src" / "views" / "target").mkdir(parents=True)
+    (tmp_path / "frontend" / "src" / "views" / "target" / "Index.vue").write_text("x", encoding="utf-8")
     ws = await _ws(client, tmp_path)
     r = (await client.get(f"/api/fs/tree?workspace_id={ws['id']}")).json()
     names = [n["name"] for n in r]
@@ -27,6 +41,8 @@ async def test_tree_ignores_and_nests(client, tmp_path):
     backend = next(n for n in r if n["name"] == "backend")
     kids = [c["name"] for c in backend["children"]]
     assert "pom.xml" in kids and "target" not in kids and "logs" not in kids
+    biz = _find(r, "target")
+    assert biz is not None and biz["path"].replace("\\", "/") == "frontend/src/views/target"
 
 @pytest.mark.asyncio
 async def test_read_and_save_and_guard(client, tmp_path):

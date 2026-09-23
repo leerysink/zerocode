@@ -231,12 +231,20 @@ async def start_dev(sf, app: dict, notify=None) -> dict:
 
 
 async def stop_dev(sf, app: dict, notify=None) -> dict:
-    """停止 dev 栈（幂等：栈本就不在时 compose 返回 0，状态同样落 stopped）。"""
+    """停止 dev 栈（幂等：栈本就不在时 compose 返回 0，状态同样落 stopped）。
+
+    停之前先 ensure 一遍 deploy/：大型栈的 dev-compose 里密钥位带 `${VAR:?}`，而那是 compose 的**文件
+    解析期**闸门——`.env` 被手工清空时连 `down` 都会 exit=1，于是下面这个「非零只记 warning」的收口
+    会把一台还在跑的栈报成已停止（端口不释放，restart 跟着挂）。ensure 是幂等的（内容一致就不写），
+    正常情形下这一步零成本；凭据照常从库里供给，缺位时 ensure 的单向推进语义会沿用 .env 既有值。
+    """
     app_id = app["id"]
     t0 = time.monotonic()
     await _step(app_id, notify, f"▶ 停止预览 {app.get('slug') or f'app#{app_id}'}（dev）")
     root = await _app_root(sf, app)
     await _notify(notify, app_id, {"type": "dev_status", "status": "stopping"})
+    cred = await read_cred(sf, app["slug"], "dev") or {}
+    compose_mod.ensure_deploy_files(root, _compose_meta(app), {"dev": cred})
     code, log = await docker("compose", "-f", str(root / "deploy" / "dev-compose.yml"), "down",
                              cwd=str(root))
     if code != 0:

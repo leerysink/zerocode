@@ -16,7 +16,9 @@ def app_tree(tmp_path):
                 "sqlchange/V20260920_01_init.sql", "sqlchange/V20260920_02_more.sql",
                 # 大型栈 dev 预览就地跑 mvn 留下的：几百 MB 编译产物 + 一直在滚的日志
                 "backend/target/classes/com/zerocode/app/BaseApplication.class",
-                "backend/target/demo.jar", "backend/logs/spring.log"):
+                "backend/target/demo.jar", "backend/logs/spring.log",
+                # 反向地雷：target / logs 都是业务通用词（目标管理、日志页面），不该被一起藏掉
+                "frontend/src/views/target/Index.vue", "frontend/src/views/logs/Index.vue"):
         p = root / rel
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(f"# {rel}\n", encoding="utf-8", newline="")
@@ -44,8 +46,11 @@ def test_write_package_excludes_secrets_and_artifacts(tmp_path, app_tree):
     assert not any("/deploy/" in f or f.startswith("deploy/") for f in files), "包里有 deploy/"
     assert not any("node_modules" in f for f in files)
     assert not any("/dist/" in f for f in files)
-    assert not any("/target/" in f or f.startswith("target/") for f in files), "包里有 maven 编译产物"
-    assert not any("/logs/" in f for f in files), "包里有运行时日志"
+    # 两条都锚到 backend/ 下：写成 `"/target/" in f` 会连业务目录一起要（见下两条 in 断言）
+    assert not any(f.startswith("src/backend/target/") for f in files), "包里有 maven 编译产物"
+    assert not any(f.startswith("src/backend/logs/") for f in files), "包里有运行时日志"
+    assert "src/frontend/src/views/target/Index.vue" in files, "业务目录不该被裸名屏蔽"
+    assert "src/frontend/src/views/logs/Index.vue" in files
     assert "sqlchange/V20260920_02_more.sql" not in files, "未应用的迁移不得进包"
 
 
@@ -98,6 +103,19 @@ def test_source_hash_ignores_maven_build_churn(tmp_path, app_tree):
     java.mkdir(parents=True)
     (java / "App.java").write_text("// new\n", encoding="utf-8", newline="")
     assert packages.source_hash(app_tree) != h
+
+
+def test_business_target_and_logs_dirs_stay_in_the_package(app_tree):
+    """窄判据的对面：只钉死 backend/ 下那两个产物目录，不吃同名的业务目录。
+
+    按裸名屏蔽会把作者的 src/views/target 静默排除出包与 source_hash——作者看到的是
+    「包里没有这个页面」且改它不算分叉，比留几份编译产物进包严重得多。
+    """
+    rels = [rel for rel, _ in packages._iter_src(app_tree)]
+    assert "frontend/src/views/target/Index.vue" in rels
+    assert "frontend/src/views/logs/Index.vue" in rels
+    assert not any(r.startswith("backend/target/") for r in rels)
+    assert not any(r.startswith("backend/logs/") for r in rels)
 
 
 def _md5(p):

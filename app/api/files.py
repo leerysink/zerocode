@@ -7,10 +7,24 @@ from pydantic import BaseModel
 from app.agent.tools import BINARY_EXTS, MAX_READ_BYTES, resolve_in_workspace
 
 router = APIRouter(prefix="/api")
-# target/logs 是大型栈 dev 预览的必然产物：compose 把 backend/ 挂进容器就地跑 mvn，
-# 编译产物与 logback 日志直接落在应用工作区里（fastapi 栈的 uvicorn 不产这些）。
-# 不收进名单，一次预览之后文件树就会被几千个 .class 与滚动的日志页满，模型也会被引去看编译产物。
-IGNORE_DIRS = {".git", "node_modules", "__pycache__", "dist", ".venv", "build", "target", "logs"}
+IGNORE_DIRS = {".git", "node_modules", "__pycache__", "dist", ".venv", "build"}
+# 大型栈 dev 预览的必然产物：compose 把 backend/ 挂进容器就地跑 mvn，编译产物与 logback 日志
+# 直接落在应用工作区里（fastapi 栈的 uvicorn 不产这些）。不收它们，一次预览之后文件树就会被
+# 几千个 .class 与滚动的日志页满。
+# 按路径尾屏蔽而非裸名：target / logs 都是业务通用词（目标管理、日志页面），按名屏蔽会把用户
+# 自己的 src/views/target 一类目录在文件管理器里永久藏掉。这两个产物的落点是固定的：
+# maven 默认输出目录 + logback 的 ${user.dir}/logs（dev 容器 working_dir 就是挂载的 backend/）。
+IGNORE_PATH_TAILS = (("backend", "target"), ("backend", "logs"))
+
+
+def _is_ignored_dir(rel_parts: tuple) -> bool:
+    """某个目录节点是否不进文件树：按名屏蔽的通用名单，加按路径尾屏蔽的构建产物。
+
+    这里判的是目录节点本身（而非 packages.py 那样判文件）：一旦 backend/target 被剪掉，
+    它下面的任何东西都递不到，所以只需尾匹配。
+    """
+    return (rel_parts[-1] in IGNORE_DIRS
+            or any(rel_parts[-len(t):] == t for t in IGNORE_PATH_TAILS))
 
 async def _root_of(request: Request, ws_id: int) -> Path:
     from sqlalchemy import text
@@ -35,7 +49,7 @@ async def fs_tree(request: Request, workspace_id: int):
             return []
         for child in children[:500]:
             if child.is_dir():
-                if child.name in IGNORE_DIRS or is_secret_read(root, str(child.relative_to(root))):
+                if _is_ignored_dir(child.relative_to(root).parts) or is_secret_read(root, str(child.relative_to(root))):
                     continue
                 out.append({"name": child.name, "path": str(child.relative_to(root)),
                             "type": "dir", "children": build(child, depth + 1)})
@@ -55,7 +69,7 @@ def _rel_of(p: Path, root: Path) -> str:
 async def fs_ls(request: Request, workspace_id: int, path: str = ""):
     """内置「类桌面」文件管理器的数据源：只列单层（不递归、不拉全树），目录优先 + 名称升序。
 
-    忽略名单与 /fs/tree 共用 IGNORE_DIRS；path 必须是工作区内相对路径，越界/绝对路径 400。
+    忽略判据与 /fs/tree 共用 `_is_ignored_dir`；path 必须是工作区内相对路径，越界/绝对路径 400。
     """
     root = await _root_of(request, workspace_id)
     from app.deploy.guard import is_secret_read
@@ -76,7 +90,8 @@ async def fs_ls(request: Request, workspace_id: int, path: str = ""):
     entries = []
     for child in children:
         is_dir = child.is_dir()
-        if is_dir and (child.name in IGNORE_DIRS or is_secret_read(root, _rel_of(child, root))):
+        if is_dir and (_is_ignored_dir(child.relative_to(root).parts)
+                       or is_secret_read(root, _rel_of(child, root))):
             continue
         try:
             st = child.stat()

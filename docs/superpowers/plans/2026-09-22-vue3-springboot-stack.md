@@ -1626,6 +1626,19 @@ git commit -m "feat(compose): render vue3-springboot dev stack (private redis, .
 
 > 返修补记：改完 compose 模板必须回去重跑**真 docker 校验**（本 Step 的 good/empty 两跑），不能只看 `yaml.safe_load` 绿——`${VAR:?}` 是 compose 的语法，YAML 层根本看不见它。
 
+- [x] **Step 8: 复审返修**（范围 `7019e2f..87acae2`，复审判定 I-2/N-3/N-4/N-5/N-6 合格，但 I-1 的修法撞出一条新的假绿路径）
+
+| 编号 | 复审意见 | 复算（我自己重跑的证据） | 处置 |
+|---|---|---|---|
+| I-1′ | `${VAR:?}` 是 compose 的**文件解析期**闸门，不只 `up`：`.env` 空密钥时 `down`/`ps`/`logs` 全 exit=1。而 `stop_dev` 把非零降级成一条 warning 后照样落 `stopped` → 容器一个没停、dev 端口仍被占用、UI 显示「已停止」（restart 更糟：紧接的 up 因旧端口占用而挂） | 完全成立，独立复算：用 HEAD 渲染的 SB 产物 + 空密钥 `.env`，`down`/`ps` 均 **exit=1** 且错误原文就是 `error while interpolating services.appredis.command.[]: required variable REDIS_PASSWORD is missing a value`（一开头我加了 `--quiet` 跑，怕错的是旗标而不是插值，去掉后同样的 1） | `stop_dev` 在 `down` 前先 `ensure_deploy_files`（幂等，内容一致就不写），凭据从库里取、缺位时沿用 .env 既有值。两条新测：`test_stop_dev_backfills_unbackfilled_secrets_before_down`（红→绿，并钉住补位不冲空凭据、不新增 docker 调用）、`test_stop_dev_leaves_a_healthy_env_untouched`（健康 `.env` 停栈前后字节不变）。**不改** `code != 0 → 只记 warning` 的老收口：那是停栈路径共有的既有语义（prod 侧有同构用例），扩大范围属另一件事 |
+| N-1 | `target`/`logs` 按裸名在任何深度屏蔽，`logs` 是名单里第一个业务通用词 | 复审实测当前零误伤，但风险真实：中文后台里 `target`（目标/KPI）与 `logs`（日志页）都是常见业务目录名，一个 `frontend/src/views/target/` 会被文件树永久藏掉、并被静默排除出包与 `source_hash` | 改为**路径锁窄**：两处名单各自回到裸名集不含 target/logs，新增 `IGNORE_PATH_TAILS`/`EXCLUDE_PATH_TAILS = (("backend","target"),("backend","logs"))`。packages 侧判文件（需「路径里连续出现」），files 侧判目录节点（祖先剪掉后就递不到，尾匹配够）——两边各自注明为什么不写成同一个。manifest 多录一项 `exclude_path_tails`。补两条反向钉子：业务 `views/target`、`views/logs` 必须仍然可见/进包；原 `"/target/" in f` 形式的断言同步改成锁到 `src/backend/target/` |
+| N-3（新） | `files.py` 注释里「模型也会被引去看编译产物」这一半本次没修：`agent/tools.py list_dir` 不吃 `IGNORE_DIRS` | 成立，属同族老洞（`node_modules` 一样对 AI 可见），不是本次引入 | 删掉这半句承诺，不悄悄扩范围 |
+| N-2 | 计划的 C1 草稿仍写 `redis` 服务名、密钥位无 `:?` | 成立（草稿写于返修前） | C1 头部加「以 B1 返修后的 `_DEV_COMPOSE_SB` 为准」注记，并把「停栈路径也要能解析」一并写进去 |
+| N-4 | `EXCLUDE_DIRS` 是持久化指纹（`app_instance_link.baseline_hash`）的输入 | 成立但本次零影响：当前生产代码只写不比（全仓仅 install 写、测试读），且存量树里 0 个 `backend/target`。另：裸名那版从未入库（同一串未发布改动里就被收窄） | 不改代码；已记在本表，将来再动这两份名单就是一次需要重刷 baseline 的迁移事件 |
+
+> 本 Step 的教训：`${VAR:?}` 类「产物自身硬拒」的闸门，必须同时问一句「**除了启动，还有谁要解析这份文件**」。
+> 只验 `config`/`up` 是不够的：`down` 走的是同一个解析器，而平台对 `down` 的失败是吞掉的。
+
 ---
 
 ### Task B2: `HEALTH_BY_STACK` 收敛到 `/api/health` + 大型栈创建放行
@@ -1929,6 +1942,11 @@ git commit -m "docs(template): record measured dev startup timings from the larg
 **Files:**
 - Modify: `app/deploy/compose.py`
 - Test: `tests/test_compose_render.py`
+
+> 命名与密钥闸门以 **B1 返修后的 `_DEV_COMPOSE_SB` 为准**（B1c 复审 N-2）：下面这份草稿写于那次返修之前，
+> 当时 redis 服务名还是 `redis`、密钥位还是裸 `${VAR}`。落地时三件事必须同步：服务名用 `appredis`（与 dev 一致，
+> prod 的 backend 同样上 zcnet）、三个密钥位都带 `${VAR:?…}`、以及确认**停栈/健康路径也能解析**
+> （`${VAR:?}` 是文件解析期闸门，`down`/`ps`/`logs` 一样吃；`stop_dev` 因此已在 B1c 里先 ensure）。
 
 - [ ] **Step 1: 写失败测试**（追加到 `tests/test_compose_render.py`，`META_SB` 复用 Task B1 引入的那份）
 
