@@ -785,6 +785,7 @@ server {
     index index.html;
 
     # 应用后端反代：context-path 已是 /api，URI 原样透传（proxy_pass 不带路径段）
+    # 上传件回读也在这一条里：后端把资源挂在 context 内的 /uploads/**，对外 URL 就是 /api/uploads/**
     location /api/ {
         proxy_pass http://backend:8080;
         proxy_set_header Host $host;
@@ -793,18 +794,16 @@ server {
         client_max_body_size 50m;
     }
 
-    # 上传件回读（prod 落 named volume，后端挂载后经此路径暴露）
-    location /uploads/ {
-        proxy_pass http://backend:8080;
-        proxy_set_header Host $host;
-    }
-
     # SPA 路由回落（history 模式刷新不 404）
     location / {
         try_files $uri $uri/ /index.html;
     }
 }
 ```
+
+> 勘误（A5 评审 I-1 后的交付形状，见 Task A5b）：本 Step 初版在此额外写了一段 `location /uploads/ { proxy_pass http://backend:8080; }`，
+> 那是错的——`addResourceHandler("/uploads/**")` 注册的是 **context 内**路径，真实地址 `/api/uploads/**`，原样透传只会 404。
+> 修法没采「nginx + vite 各补一条改写」（standalone `java -jar` 仍是 404），而是让后端返回自己真实的公开 URL。
 
 > 实跑记注（与 base-pro 版的差异）：原版的 `X-Real-IP` / `X-Forwarded-Proto` / `charset utf-8` /
 > `proxy_read_timeout 60s` 四项**不保留**——`IpUtils` 只读 `x-forwarded-for`（已留）；
@@ -837,7 +836,13 @@ COPY --from=build /src/dist /usr/share/nginx/html
 ```
 node_modules/
 dist/
+# 陈旧编译产物会遮蔽真配置（Vite 读 vite.config.js 优先于 .ts），别让它们进构建上下文
+vite.config.js
+vite.config.d.ts
+*.tsbuildinfo
 ```
+
+（后三条是 A5b 补的：`vue-tsc -b` 的产物重定向进 node_modules 后，本地残留仍在，兜一层。）
 
 - [x] **Step 5: 三处品牌文案吃占位符**
 
@@ -866,9 +871,12 @@ export const appSubtitle = 'Vue3 + Spring Boot 3 基础管理后台'
 > `style/theme.css:2` 的注释），所以本 Step 只需补初始账号 tip 一行。tip 的颜色用组件已有的
 > `var(--text-muted)`（同文件其余 muted 文本都用变量，其值 `#9ca3af` 与计划写的 `#94a3b8` 同级）。
 >
-> **记账（故意不改）**：`style/theme.css:2` 的首行注释与 `backend/pom.xml` 的 `<description>` 仍含
-> 「基础管理后台」字样——都非用户可见、都在应用工程内（AI 可改），改它们超出本 Task 的 Files 边界；
-> 用户可见位已全部收敛到 `{{APP_NAME}}`。
+> **记账（全模板实测 4 处，故意不改）**：`git grep -n "基础管理后台"` 在 A5 收口后仍命中 4 处——
+> `frontend/src/config/index.ts:3`（登录页副标题，用户可见但只是通用技术栈描述、非品牌）、
+> `frontend/src/style/theme.css:2`（首行注释）、`backend/pom.xml:18`（`<description>`）、
+> `frontend/public/favicon.svg:1`（`aria-label`）。初版此处只记了两处，漏了 pom 与 favicon（A5 评审 F-1）。
+> 四处都非品牌泄露、都在应用工程内（生成后 AI 可改），改它们超出本 Task 的 Files 边界；
+> 写死品牌位已全部收敛到 `{{APP_NAME}}`。
 
 - [x] **Step 6: `package.json` 的 name 吃 slug**
 
@@ -879,7 +887,7 @@ export const appSubtitle = 'Vue3 + Spring Boot 3 基础管理后台'
 
 **验收实跑**（证据，不纸面）：
 - 新增 `tests/test_scaffold.py::test_render_springboot_frontend_wiring`（先红：vite 仍 `8082` → 实现后绿）；
-  `pytest tests/test_scaffold.py -q` → **18 passed**。
+  `pytest tests/test_scaffold.py -q` → **18 passed**。（该测试的两条断言在 A5b 被推翻重写，见下。）
 - **全模板**违规字样体检归零（口径比 A4 Step 8 更严：`D:/project|8082|PG_PASSWORD|application-dev|application-local|leerysink|base-pro|snfyxm`）——A4 当时留在
   `vite.config.ts:29-30` 的两行已随本 Task 消失，**backend 与 frontend 都是零命中**；
 - 占位符清单（大小写敏感）：前端只剩 `{{APP_NAME}}`×2（index.html / config）与 `{{SLUG}}`×3（package.json + lock 两处），
@@ -888,6 +896,68 @@ export const appSubtitle = 'Vue3 + Spring Boot 3 基础管理后台'
 ```bash
 git add app/templates/vue3-springboot/frontend
 git commit -m "feat(template): wire vue3-springboot frontend to compose service names and prod nginx reverse proxy"
+```
+
+---
+
+### Task A5b: A5 评审返修（I-1 上传件 URL 打不通 + I-2 vite 配置被静默遮蔽；含 M-1 假绿守卫）
+
+**评审输入**：A5 两阶段评审（范围 `a90797a..684f6f1`）轴一 ✅、轴二 ❌：两条必修 + 一条测试卫生项。
+
+**Files**：`backend/.../service/impl/FileServiceImpl.java`、`backend/.../vo/FileVO.java`、`frontend/nginx.conf`、`frontend/vite.config.ts`（仅注释）、`frontend/tsconfig.node.json`、`frontend/.dockerignore`、`tests/test_scaffold.py`
+
+- [x] **Step 1: I-1 — 上传件 URL 必须是「经那一层反代真能取到」的路径**
+
+事实链（在模板里自己核过，不照抄评审）：`application.yml:7` `context-path: /api` → `WebMvcConfig:24`
+`addResourceHandler("/uploads/**")` 注册的是 **context 内**路径 → 真实地址 `/api/uploads/**`；而
+`FileServiceImpl:81` 返回裸 `/uploads/...`（`FileVO` 还自称「可直接访问的访问地址」——契约本就与实现不符）。
+
+两案里选了改后端：
+- ✗ nginx + vite 各补一条 `/uploads` 改写：能救平台内预览，但 standalone `java -jar`（模板作者本地直跑）仍 404，
+  且从此两处代理要同步维护；
+- ✓ `FileServiceImpl` 用 `@Value("${server.servlet.context-path:}")` 拼出真实公开 URL：代理只留 `/api` 一条规则，
+  dev / prod / 本地直跑三处同形（顺带让 `FileVO.url` 的既有注释成立）。
+
+nginx 侧因此**删掉** A5 初版那段 `location /uploads/`，vite 侧不加特例（两边都写了注释说明为何不需要）。
+
+- [x] **Step 2: I-2 — `vue-tsc -b` 不许往前端根吐 `vite.config.js`**
+
+评审推荐的两案都实测过（探针 `.qoder-tmp/a5b_ts_probe.ps1` + 三个 case 的产物目录，用 base-pro 的 tsc 5.9.3；
+因在 `.qoder-tmp/`（已 gitignore）且不入库，**留着供复核**，`powershell -NoProfile -ExecutionPolicy Bypass -File .qoder-tmp\a5b_ts_probe.ps1` 可重现）：
+
+| 配置 | 结果 |
+|---|---|
+| 现状（composite、不重定向） | exit=0，**根目录出现 `vite.config.js` + `vite.config.d.ts`** → Vite 读 `.js` 优先于 `.ts`，静默遮蔽 |
+| ① `tsconfig.node.json` 加 `"noEmit": true` | **exit=2**：`error TS6310: Referenced project ... may not disable emit` → `npm run build` 直接打死 |
+| ② 只动 `.dockerignore` | 只挡容器，本地 `vite dev` 仍被遮蔽 |
+| ③ `outDir`/`tsBuildInfoFile` 指向 `./node_modules/.tmp/node-cfg`（采纳） | exit=0，根目录无 `.js`，产物全在 node_modules |
+
+即：**评审推荐的 ① 不可行**（`typescript: ^5.4.5` 今天解析到 5.9.x，引用型 composite 子项目不得关 emit），改用 ③；
+`.dockerignore` 再兜 `vite.config.js` / `vite.config.d.ts` / `*.tsbuildinfo` 一层（本地陈旧产物不进容器）。
+`tsconfig.node.json` 里写了 JSONC 注释钉住理由（防后人「清理」掉 outDir 把坑装回去），测试因此按原文断言而不走 `json.loads`。
+
+- [x] **Step 3: M-1 — 拆掉三条只会假绿的 skip 守卫 + 补 lock 断言**
+
+`if not SPRINGBOOT_TEMPLATE.is_dir(): pytest.skip("vue3-springboot 模板尚未落仓")` 在模板落仓后永不触发，
+但它会把「模板目录被误删/改名」这种真事故判成 skip（绿），三条全删；另补 `package-lock.json` 两处 root `name`
+与 `package.json` 同名的断言（`npm ci` 的前置条件，A5 Step 3 只在纸上说过）。
+
+- [x] **Step 4: 验收实跑**
+- 先红：`test_render_springboot_upload_url_is_gateway_visible` + `test_springboot_frontend_config_build_does_not_shadow_vite_config`
+  → `2 failed, 18 passed`；后绿：`pytest tests/test_scaffold.py -q` → **20 passed**。
+- 相关回归：`pytest tests/{test_scaffold,test_app_service,test_compose_render,test_provision,test_deploy_basics,test_publish_api}.py -q` → **89 passed**。
+  （中途一批 setup 报 `ConnectionRefusedError [WinError 1225]`：根因是平台自己的 `zerocode-pg16` 容器在 55 分钟前的
+  Docker 重启里没起来（`docker ps -a` 实查 Exited (255)），与本 diff 无关；`docker start zerocode-pg16`（只 start、不重建）后全绿。）
+- 同族洞自查：fastapi 栈无 `vue-tsc`（build 是纯 `vite build`）、也无静态/上传挂载 → 无同类；
+  `components.d.ts`（unplugin 生成物）本来就在仓，不属遮蔽类，不动。
+
+- [x] **Step 5: 记账（不顺手改）**：M-3 中央网关 `gateway/nginx.conf` 没有 `client_max_body_size`（nginx 默认 **1m**）
+  ——大型栈的 50m 上传会在中央网关层先 413。`gateway/` 是并发会话的在途领域，本 Task 只记账，
+  **移交 C1（prod 反代按栈取源）一并处理**。
+
+```bash
+git add app/templates/vue3-springboot tests/test_scaffold.py docs/superpowers/plans/2026-09-22-vue3-springboot-stack.md
+git commit -m "fix(template): make the upload URL gateway-visible and stop vue-tsc from shadowing vite.config"
 ```
 
 ---
@@ -1857,7 +1927,10 @@ volumes:
 """
 ```
 
-> `/uploads` 由模板 `backend/Dockerfile` 的 `ENV UPLOAD_DIR=/uploads` 与 `WebMvcConfig` 的资源处理器（`/uploads/**`，SecurityConfig 已 permitAll）对齐；nginx 的 `/uploads/` 反代在 Task A5 已接。dev 侧走 `/src/uploads`（挂载卷），两个环境都不把上传件写进容器层。
+> `/uploads` 的容器内文件路径由模板 `backend/Dockerfile` 的 `ENV UPLOAD_DIR=/uploads` 与 prod 卷挂载（`uploads:/uploads`）对齐；
+> dev 侧走 `/src/uploads`（挂载卷），两个环境都不把上传件写进容器层。
+> 勘误（A5 评审 F-2）：本行原文断「nginx 的 `/uploads/` 反代在 Task A5 已接」不成立——那条 location 是坏的（见 A5 Step 2 勘误）；
+> 现状是上传件对外 URL 带 `/api` 前缀，走 nginx 唯一的 `/api/` location，**prod 无需再为 uploads 加东西**。
 
 `render_prod_compose` 整体替换为：
 
@@ -2297,7 +2370,7 @@ git commit -m "docs(ux): tell the truth about large-stack cold start in the wiza
 
 | spec | 落点 |
 |---|---|
-| D-1 模板完整移植 | A3（复制）+ A4/A5（平台约定改造）+ A6（双轨）+ A7（渲染体检） |
+| D-1 模板完整移植 | A3（复制）+ A4/A5（平台约定改造）+ A5b（上传件可达 + 构建产物不遮蔽）+ A6（双轨）+ A7（渲染体检） |
 | D-2 每应用一个 redis | B1（dev）+ C1（prod，带 AOF 命名卷） |
 | D-3 容器内 mvn spring-boot:run | B1（`__M2_VOL__` per-app）+ B4（冷/热计时实测） |
 | D-4 铺底+dev+prod 全链路 | Phase A / Phase B / Phase C 各自收尾 |

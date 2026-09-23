@@ -27,6 +27,7 @@ export default defineConfig({
     port: 5173,
     proxy: {
       // backend 是 compose 服务名；后端 context-path 已是 /api，故不写 rewrite
+      // 上传件回读也走这一条（后端返回的 URL 自带 /api 前缀），无需 /uploads 特例
       '/api': {
         target: 'http://backend:8080',
         changeOrigin: true,

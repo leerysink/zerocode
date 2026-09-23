@@ -5,6 +5,7 @@ import type { ApiResult } from '@/utils/request'
 export interface UploadResult {
   fileName: string
   filePath: string
+  /** 绝对路径且已含后端 context 前缀（如 /api/uploads/...），可直接放进 img src，不要再拼 baseURL */
   url: string
   fileSize: number
   fileType: string

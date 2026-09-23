@@ -1,2 +1,6 @@
 node_modules/
 dist/
+# 陈旧编译产物会遮蔽真配置（Vite 读 vite.config.js 优先于 .ts），别让它们进构建上下文
+vite.config.js
+vite.config.d.ts
+*.tsbuildinfo

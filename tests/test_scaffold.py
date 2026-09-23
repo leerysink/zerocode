@@ -193,9 +193,6 @@ SPRINGBOOT_TEMPLATE = TEMPLATE.parent / "vue3-springboot"
 
 def test_render_springboot_template_end_to_end(tmp_path):
     """整栈真模板必须能渲染干净（残留自检是这道闸的第一道防线，不留到 A7 才发现）。"""
-    import pytest
-    if not SPRINGBOOT_TEMPLATE.is_dir():
-        pytest.skip("vue3-springboot 模板尚未落仓")
     scaffold.render(SPRINGBOOT_TEMPLATE, tmp_path, {
         "SLUG": "bigapp", "APP_NAME": "大型应用", "DEV_PORT": "8211", "PROD_PORT": "8210",
         "DEV_DB": "bigapp_dev", "PROD_DB": "bigapp_prod", "TODAY": "20260922"})
@@ -211,9 +208,6 @@ def test_springboot_banner_keeps_percent_in_app_name_harmless(tmp_path):
     String.formatted 会把格式串里的裸 % 当转换符 —— 名字进了 text block 就是启动即抛
     UnknownFormatConversionException，创建成功、预览永远起不来。
     """
-    import pytest
-    if not SPRINGBOOT_TEMPLATE.is_dir():
-        pytest.skip("vue3-springboot 模板尚未落仓")
     name = "50% 折扣 进度%s完成"
     scaffold.render(SPRINGBOOT_TEMPLATE, tmp_path, {
         "SLUG": "bigapp", "APP_NAME": name, "DEV_PORT": "8211", "PROD_PORT": "8210",
@@ -243,12 +237,9 @@ def test_fastapi_app_vue_name_sits_in_a_double_quoted_host(tmp_path):
 def test_render_springboot_frontend_wiring(tmp_path):
     """前端接线要落进 compose 形状（A5）：容器内监听 + 服务名反代 + prod nginx + 文案吃占位符。
 
-    这些值不是装饰：vite 只听 127.0.0.1 时宿主浏览器访问不到（预览黑屏），nginx 缺 /uploads/ 则
-    上传件回读 404，`client_max_body_size` 不与 multipart 上限对齐就是大文件先在网关层 413。
+    这些值不是装饰：vite 只听 127.0.0.1 时宿主浏览器访问不到（预览黑屏），nginx 缺 /api/ 则所有
+    接口 404，`client_max_body_size` 不与 multipart 上限对齐就是大文件先在网关层 413。
     """
-    import pytest
-    if not SPRINGBOOT_TEMPLATE.is_dir():
-        pytest.skip("vue3-springboot 模板尚未落仓")
     scaffold.render(SPRINGBOOT_TEMPLATE, tmp_path, {
         "SLUG": "bigapp", "APP_NAME": "大型应用", "DEV_PORT": "8211", "PROD_PORT": "8210",
         "DEV_DB": "bigapp_dev", "PROD_DB": "bigapp_prod", "TODAY": "20260922"})
@@ -257,13 +248,60 @@ def test_render_springboot_frontend_wiring(tmp_path):
     assert "host: '0.0.0.0'" in vite and "port: 5173" in vite
     assert "http://backend:8080" in vite and "8082" not in vite and "application-dev" not in vite
     nginx = (fe / "nginx.conf").read_text(encoding="utf-8")
-    assert "location /uploads/" in nginx and "client_max_body_size 50m;" in nginx
+    assert "location /api/" in nginx and "client_max_body_size 50m;" in nginx
     assert "try_files $uri $uri/ /index.html;" in nginx
     assert (fe / "Dockerfile").is_file() and (fe / ".dockerignore").is_file()
     docker = (fe / "Dockerfile").read_text(encoding="utf-8")
     assert "nginx:1.27-alpine" in docker and "/src/dist" in docker
     assert json.loads((fe / "package.json").read_text(encoding="utf-8"))["name"] == "bigapp-frontend"
+    # npm ci 前置：lock 的两处 root name 必须与 package.json 同名，否则装到一半 ENOLOCK
+    lock = json.loads((fe / "package-lock.json").read_text(encoding="utf-8"))
+    assert lock["name"] == "bigapp-frontend" == lock["packages"][""]["name"]
     assert "<title>大型应用</title>" in (fe / "index.html").read_text(encoding="utf-8")
     cfg = (fe / "src" / "config" / "index.ts").read_text(encoding="utf-8")
     assert 'export const appTitle = "大型应用"' in cfg        # 双引号宿主（名字宿主铁则）
     assert "admin123" in (fe / "src" / "views" / "login" / "index.vue").read_text(encoding="utf-8")
+
+
+def test_springboot_frontend_config_build_does_not_shadow_vite_config(tmp_path):
+    """vue-tsc -b 不许把 vite.config.js 吐到前端根目录（评审 A5 I-2）。
+
+    build 脚本是 `vue-tsc -b && vite build`，而 tsconfig.node.json 是被引用的 composite 项目：
+    实测 tsc 5.9 下它**不能**关 emit（Referenced project ... may not disable emit，构建直接红），
+    不重定向就会在前端根生成 vite.config.js —— Vite 解析配置文件时 .js 优先于 .ts，之后所有
+    vite 改动都被这个陈旧产物静默遮蔽。故只能把产物整体赶进 node_modules，.dockerignore 再兜一层。
+    """
+    scaffold.render(SPRINGBOOT_TEMPLATE, tmp_path, {
+        "SLUG": "bigapp", "APP_NAME": "大型应用", "DEV_PORT": "8211", "PROD_PORT": "8210",
+        "DEV_DB": "bigapp_dev", "PROD_DB": "bigapp_prod", "TODAY": "20260922"})
+    fe = tmp_path / "frontend"
+    # 读原文不读 json：这份 tsconfig 靠注释把「为何不能关 emit」钉在案发现场（tsconfig 是 JSONC）
+    node_cfg = (fe / "tsconfig.node.json").read_text(encoding="utf-8")
+    assert '"composite": true' in node_cfg and '"noEmit"' not in node_cfg   # 引用型子项目关 emit = 构建必红
+    assert '"outDir": "./node_modules/' in node_cfg, node_cfg
+    assert '"tsBuildInfoFile": "./node_modules/' in node_cfg, node_cfg
+    dockerignore = (fe / ".dockerignore").read_text(encoding="utf-8").split()
+    assert "vite.config.js" in dockerignore and "*.tsbuildinfo" in dockerignore
+
+
+def test_render_springboot_upload_url_is_gateway_visible(tmp_path):
+    """上传件 URL 必须是「经前端那一层反代真能取到」的路径（评审 A5 I-1）。
+
+    后端 context-path=/api，而 addResourceHandler("/uploads/**") 注册的是 context 内路径 →
+    真实可访问 URL 是 /api/uploads/**。返回裸 /uploads/... 的话，要么 nginx + vite 各写一条特例
+    改写（standalone `java -jar` 时仍是 404），要么图面就是碎。统一吃 /api 前缀：代理只留一条规则，
+    dev / prod / 本地直跑三处同形。
+    """
+    scaffold.render(SPRINGBOOT_TEMPLATE, tmp_path, {
+        "SLUG": "bigapp", "APP_NAME": "大型应用", "DEV_PORT": "8211", "PROD_PORT": "8210",
+        "DEV_DB": "bigapp_dev", "PROD_DB": "bigapp_prod", "TODAY": "20260922"})
+    java = (tmp_path / "backend" / "src" / "main" / "java" / "com" / "zerocode" / "app"
+            / "service" / "impl" / "FileServiceImpl.java").read_text(encoding="utf-8")
+    assert 'setUrl("/uploads/' not in java                        # 裸前缀 = 取不到的 URL
+    assert '@Value("${server.servlet.context-path:}")' in java     # 前缀跟着配置走，不写死
+    assert 'vo.setUrl(contextPath + "/uploads/"' in java
+    yml = (tmp_path / "backend" / "src" / "main" / "resources" / "application.yml").read_text(encoding="utf-8")
+    assert "context-path: /api" in yml
+    fe = tmp_path / "frontend"
+    assert "location /uploads/" not in (fe / "nginx.conf").read_text(encoding="utf-8")
+    assert "'/uploads'" not in (fe / "vite.config.ts").read_text(encoding="utf-8")

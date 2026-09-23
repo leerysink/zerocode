@@ -36,6 +36,15 @@ public class FileServiceImpl implements FileService {
     private long maxSize;
 
     /**
+     * 对外 URL 前缀，跟着 server.servlet.context-path 走。
+     * 静态资源映射（WebMvcConfig 的 /uploads/**）注册的是 context 内路径，真实可访问地址是 /api/uploads/**；
+     * 这里若返回裸 /uploads/...，浏览器就要去 nginx 与 vite 各补一条特例改写才能取到（本地 java -jar 直跑仍是 404）。
+     * 带上 context 前缀后，前后端之间只留 /api 一条代理规则，dev / prod / 本地直跑三处同形。
+     */
+    @Value("${server.servlet.context-path:}")
+    private String contextPath;
+
+    /**
      * 上传文件
      */
     @Override
@@ -78,7 +87,7 @@ public class FileServiceImpl implements FileService {
         FileVO vo = new FileVO();
         vo.setFileName(originalName);
         vo.setFilePath(dateDir + "/" + newFileName);
-        vo.setUrl("/uploads/" + dateDir + "/" + newFileName);
+        vo.setUrl(contextPath + "/uploads/" + dateDir + "/" + newFileName);
         vo.setFileSize(file.getSize());
         vo.setFileType(suffix);
         vo.setFileHash(fileHash);
