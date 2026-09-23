@@ -4,6 +4,7 @@
 发布时追加 deploy/prod-compose.yml 并把 .env 的 PROD_*/PROD_VERSION 补成真值。"""
 from pathlib import Path
 import re
+import secrets
 
 from app.deploy.errors import DeployError
 
@@ -17,6 +18,22 @@ def _fe_volume() -> str:
 
 
 FE_VOLUME = _fe_volume()          # 派生常量，等价于 _fe_volume()；改名只动 VOLUME_NAME
+
+M2_VOLUME_NAME = "m2"             # Maven 本地仓库：per-app（compose 自动加项目前缀），共享会被无锁并发写坏
+M2_MOUNT_PATH = "/root/.m2"
+
+
+def _m2_volume() -> str:
+    """与 _fe_volume() 同构：挂载条目与顶层声明同源。"""
+    return f"{M2_VOLUME_NAME}:{M2_MOUNT_PATH}"
+
+
+M2_VOLUME = _m2_volume()
+
+# 栈私有运行密钥：缺则生成、有则保留。口令不进数据库、不进仓库、AI 禁读（deploy/ 是禁区）。
+# 唯一事实源：.env 的密钥位与生成循环都从 STACK_SECRETS 派生，
+# 不再额外模板化一份占位行（那会让「加一个密钥」变成两处改一处、静默漏位）。
+STACK_SECRETS = {"vue3-springboot": ("JWT_SECRET", "REDIS_PASSWORD")}
 
 _MARKER_RE = re.compile(r"__[A-Z][A-Z0-9_]*__")   # 只认渲染器自己的标记形态，不误伤 yaml 合法内容
 
@@ -66,6 +83,57 @@ _MIGRATE_SVC = """  migrate:
       - ../sqlchange:/sql:ro
     networks: [zcnet]
     restart: "no"
+"""
+
+# 大型栈的 dev 预览：后端不打包、源码挂进去现场 mvn spring-boot:run（依赖走 per-app .m2 卷）；
+# Redis 是本栈的私有运行时，只在 compose 内部网、不对外暴端口（口令走 .env 的 ${REDIS_PASSWORD}）。
+_DEV_COMPOSE_SB = """name: zc-__SLUG__-dev
+networks:
+  default: {}
+  zcnet:
+    external: true
+services:
+__MIGRATE_SVC__
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD}"]
+    networks: [default]
+  backend:
+    image: maven:3.9-eclipse-temurin-17
+    working_dir: /src
+    volumes:
+      - ../backend:/src
+      - __M2_VOL__
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://zerocode-pg16:5432/${DEV_DB}?currentSchema=public&stringtype=unspecified
+      SPRING_DATASOURCE_USERNAME: ${DEV_USER}
+      SPRING_DATASOURCE_PASSWORD: ${DEV_PASSWORD}
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PASSWORD: ${REDIS_PASSWORD}
+      SERVER_PORT: "8080"
+      JWT_SECRET: ${JWT_SECRET}
+      UPLOAD_DIR: /src/uploads
+    command: mvn -B spring-boot:run
+    networks: [default, zcnet]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
+  frontend:
+    image: node:20-alpine
+    working_dir: /src
+    volumes:
+      - ../frontend:/src
+      - __FE_VOL__
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0 --port 5173"
+    ports:
+      - "__DEV_PORT__:5173"
+    depends_on:
+      - backend
+volumes:
+  __FE_VOL_NAME__: {}
+  __M2_VOL_NAME__: {}
 """
 
 _FE_ONLY = """name: zc-__SLUG__-dev
@@ -150,6 +218,8 @@ def render_dev_compose(meta: dict) -> str:
         tpl, fragments = _FE_ONLY, ()
     elif stack == "vue3-fastapi":
         tpl, fragments = _DEV_COMPOSE, (_MIGRATE_SVC,)
+    elif stack == "vue3-springboot":
+        tpl, fragments = _DEV_COMPOSE_SB, (_MIGRATE_SVC,)   # 迁移闸门完全复用（同库同轨同镜像）
     else:
         raise DeployError(f"栈模板未支持: {stack}", status=500)
     sources = tpl + "".join(fragments)          # 本次渲染用到的全部标记面
@@ -158,6 +228,8 @@ def render_dev_compose(meta: dict) -> str:
          .replace("__DEV_PORT__", str(dev_port))
          .replace("__FE_VOL__", _fe_volume())
          .replace("__FE_VOL_NAME__", VOLUME_NAME)
+         .replace("__M2_VOL__", _m2_volume())
+         .replace("__M2_VOL_NAME__", M2_VOLUME_NAME)
          .replace("__SLUG__", slug))
     # 自检：模板声明过的标记必须全部被替换（与 scaffold 的 {{ 残留自检同构，审查 I-3）
     residue = sorted(m for m in _markers_of(sources) if m in y)
@@ -184,7 +256,7 @@ def render_prod_compose(meta: dict) -> str:
 def render_env(meta: dict, creds: dict) -> str:
     dev = creds.get("dev") or {}
     prod = creds.get("prod") or {}
-    return (_ENV_TMPL
+    e = (_ENV_TMPL
             .replace("__DEV_PORT__", str(meta["ports"]["dev"]))
             .replace("__PROD_PORT__", str(meta["ports"]["prod"]))
             .replace("__DEV_DB__", dev.get("db", ""))
@@ -193,6 +265,11 @@ def render_env(meta: dict, creds: dict) -> str:
             .replace("__PROD_DB__", prod.get("db", ""))
             .replace("__PROD_USER__", prod.get("user", ""))
             .replace("__PROD_PASSWORD__", prod.get("password", "")))
+    # 密钥位先留空行（渲染态就是空，真值由 ensure_deploy_files 补），保证健在与否只看栈、不看调用方
+    keys = STACK_SECRETS.get(meta.get("stack"))
+    if keys:
+        e += "".join(f"{k}=\n" for k in keys)
+    return e
 
 def _env_get(text_: str, key: str) -> str | None:
     """.env 里某个键的当前值（无此键返回 None，空值返回空串）。"""
@@ -230,6 +307,11 @@ def ensure_deploy_files(app_root: Path, meta: dict, creds: dict, version: str | 
     pv = version if version is not None else _env_get(prev, "PROD_VERSION")
     if pv is not None:
         e = e + f"PROD_VERSION={pv}\n"
+    # 栈私有密钥：本次没带值 → 沿用 .env 既有值 → 还没有就现场生成
+    # （发布/重启都会重渲染 .env，冲空在跑栈的密钥会让 Redis 与 token 全线失配）
+    for k in STACK_SECRETS.get(meta.get("stack"), ()):
+        if not _env_get(e, k):
+            e = _env_set(e, k, _env_get(prev, k) or secrets.token_urlsafe(32))
     # 已有 .env 的凭据若新 creds 没带（只传 dev / 只传 prod 的调用），保留旧值不冲空
     for k in _CRED_KEYS:
         old = _env_get(prev, k)

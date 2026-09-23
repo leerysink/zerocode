@@ -1368,7 +1368,13 @@ git commit -m "feat(template): stack README and full-render contract tests for v
 - Modify: `app/deploy/compose.py`
 - Test: `tests/test_compose_render.py`
 
-- [ ] **Step 1: 写失败测试**（追加到 `tests/test_compose_render.py`）
+- [x] **Step 1: 写失败测试**（追加到 `tests/test_compose_render.py`）
+
+> 执行勘误（三条，都是动笔前核源码得出的）：
+> 1. 密钥占位行不再单独模板化（计划里那个 `_ENV_SECRETS = "JWT_SECRET=__JWT_SECRET__…"` 没采用）：密钥位与生成循环都从 `STACK_SECRETS` 派生。两处各存一份键列表，将来往 `STACK_SECRETS` 加第三个密钥就会只改一处、静默漏一个位。
+> 2. 补两条计划没有的断言：`test_m2_volume_name_is_single_source_of_truth`（与 `fe_node_modules` 同一条规矩：改卷名只动 `M2_VOLUME_NAME`，挂载条目与顶层声明不脱钩）；生成值的字符集必须不含 ` " $ \`（带 `$` 会被 compose 再展开一次、带空格会碎词）。
+> 3. 旧 `test_render_dev_compose_unknown_stack_raises` 本步**不会变红**（它拿 vue3-springboot 当未知栈，此时确实还不支持），要到 Step 3 实现后才红——计划预告的「同时变红」发生在实现后而不是写测试时，属预期。
+
 
 ```python
 META_SB = {**META, "slug": "bigapp", "scale": "large", "stack": "vue3-springboot",
@@ -1444,12 +1450,14 @@ def test_render_dev_compose_unknown_stack_still_raises():
     assert "vue3-node" in str(ei.value) and ei.value.status == 500
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `pytest tests/test_compose_render.py -q`
 Expected: 新用例 FAIL（`栈模板未支持: vue3-springboot`）；旧 `test_render_dev_compose_unknown_stack_raises` 同时变红——它拿 vue3-springboot 当未知栈，属预期改判，Step 4 处理。
 
-- [ ] **Step 3: 实现卷常量与栈分支**
+实跑：**3 failed / 21 passed**（shape、m2 单源、密钥生成三条红）。新补的 `unknown_stack_still_raises`（vue3-node）与 `fastapi_untouched` 本就是绿的——前者是「未交付栈仍报错」的当前事实，后者是回归钉，它们不该在本次变红。
+
+- [x] **Step 3: 实现卷常量与栈分支**
 
 `app/deploy/compose.py`：`import re` 旁加 `import secrets`。在 `FE_VOLUME = _fe_volume()` 之后插入：
 
@@ -1575,21 +1583,35 @@ REDIS_PASSWORD=__REDIS_PASSWORD__
             e = _env_set(e, k, _env_get(prev, k) or secrets.token_urlsafe(32))
 ```
 
-- [ ] **Step 4: 改掉旧栈闸门用例的改判**
+- [x] **Step 4: 改掉旧栈闸门用例的改判**
 
 `tests/test_compose_render.py`：删除旧 `test_render_dev_compose_unknown_stack_raises`（已被 Step 1 最后一条取代）；`test_render_dev_compose_no_marker_residue` 的栈元组扩为 `("vue3-fastapi", "static", "vue3-springboot")`；`test_templates_still_carry_markers` 的模板元组扩为 `(compose._DEV_COMPOSE, compose._FE_ONLY, compose._DEV_COMPOSE_SB)`。
 
-- [ ] **Step 5: 跑测试确认通过**
+> 执行补强：除了上面三条，另在 `test_templates_still_carry_markers` 里钉住 `__M2_VOL__`/`__M2_VOL_NAME__` **只在** SB 模板里（否则 fastapi/static 产物将来漏带 m2 标记时，零残留断言对它没牙齿）。
 
-Run: `pytest tests/test_compose_render.py -q`
-Expected: PASS
+- [x] **Step 5: 跑测试确认通过**
 
-- [ ] **Step 6: 提交**
+Run: `pytest tests/test_compose_render.py -q` → 实跑 **23 passed**（24 旧集删 1 条 + 新增 5 条）。
+
+额外真校（不靠自家 `yaml.safe_load`）：把渲染出的 SB 产物与一份 `.env` 落到 `.qoder-tmp/b1_compose_check/deploy/`，用 docker 自己的解析器验：
+
+````
+docker compose -p zc-bigapp-dev --env-file .env -f dev-compose.yml config --quiet   → exit=0
+  SPRING_DATASOURCE_URL: jdbc:postgresql://zerocode-pg16:5432/bigapp_dev?currentSchema=public&stringtype=unspecified
+  volumes: {source: m2, target: /root/.m2}        顶层 `m2: {name: zc-bigapp-dev_m2}`   ← per-app 前缀得证
+  ports: published "8211"                          redis command: [redis-server, --requirepass, …]
+```
+
+意义：compose 的 `${}` 插值与命名卷前缀是平台真实行为，不是我们对其的猜测；`zcnet` 外部网络已存在（本机 `docker network ls` 实核）。
+
+- [x] **Step 6: 提交**
 
 ```bash
 git add app/deploy/compose.py tests/test_compose_render.py
 git commit -m "feat(compose): render vue3-springboot dev stack (private redis, .m2 volume, mvn spring-boot:run) with generated runtime secrets"
 ```
+
+> 执行补一笔事故记录（不抹）：改 `compose.py` 时一次 SearchReplace 的 `original_text` 多带了 `_FE_ONLY` 整块，把它整块删掉了（工具报 success，不会提醒）。靠 `git diff --numstat` 发现只有 1 行删除才兑住——预期只有 `return (_ENV_TMPL` → `e = (_ENV_TMPL` 那一行。教训：**改完模板块必得用 numstat 对删除行数**，光看 diff 的新增侧看不出自己删了什么。
 
 ---
 

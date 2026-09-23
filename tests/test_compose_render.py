@@ -68,18 +68,21 @@ def test_volume_name_is_single_source_of_truth(monkeypatch):
     assert _named_volume_refs(doc) == set(doc["volumes"])
 
 def test_render_dev_compose_no_marker_residue():
-    """渲染产物不得残留 __KEY__ 标记（全局约束 16 / 审查 I-3）：两栈产物已无 "__"。"""
-    for stack in ("vue3-fastapi", "static"):
+    """渲染产物不得残留 __KEY__ 标记（全局约束 16 / 审查 I-3）：三栈产物已无 "__"。"""
+    for stack in ("vue3-fastapi", "static", "vue3-springboot"):
         m = copy.deepcopy(META); m["stack"] = stack
         assert "__" not in compose.render_dev_compose(m)
 
 def test_templates_still_carry_markers():
     """上一条断言有牙齿的前提：原始模板常量确实带标记，替换确实发生过。"""
-    for tpl in (compose._DEV_COMPOSE, compose._FE_ONLY):
+    for tpl in (compose._DEV_COMPOSE, compose._FE_ONLY, compose._DEV_COMPOSE_SB):
         assert "__SLUG__" in tpl and "__DEV_PORT__" in tpl
         assert "__FE_VOL__" in tpl and "__FE_VOL_NAME__" in tpl
     assert "__MIGRATE_SVC__" in compose._DEV_COMPOSE
     assert "__MIGRATE_SVC__" not in compose._MIGRATE_SVC
+    # m2 卷只属于大型栈：它的两个标记必须在 SB 模板里，否则上面的零残留断言对它没牙齿
+    assert "__M2_VOL__" in compose._DEV_COMPOSE_SB and "__M2_VOL_NAME__" in compose._DEV_COMPOSE_SB
+    assert "__M2_VOL__" not in compose._DEV_COMPOSE and "__M2_VOL__" not in compose._FE_ONLY
 
 def test_render_rejects_unreplaced_marker(monkeypatch):
     """漏替换的标记必须显式报错而非静默落盘（审查 I-3 / V9-M3 的同型变异）。"""
@@ -87,14 +90,6 @@ def test_render_rejects_unreplaced_marker(monkeypatch):
     with pytest.raises(DeployError) as ei:
         compose.render_dev_compose(META)
     assert "__RUN_USER__" in str(ei.value)
-
-def test_render_dev_compose_unknown_stack_raises():
-    """未知栈显式报错，不再静默按 fastapi 渲染（审查 I-4）：springboot 模板 M2/M3 才交付。"""
-    m = copy.deepcopy(META); m["stack"] = "vue3-springboot"
-    with pytest.raises(DeployError) as ei:
-        compose.render_dev_compose(m)
-    assert "vue3-springboot" in str(ei.value)
-    assert ei.value.status == 500
 
 def test_render_env():
     e = compose.render_env(META, CRED)
@@ -246,3 +241,91 @@ def test_ensure_deploy_files_dev_bytes_unchanged(tmp_path):
     compose.ensure_deploy_files(tmp_path, META, {"dev": CRED["dev"], "prod": PROD_CRED},
                                 version="b20260920120000")
     assert (tmp_path / "deploy" / "dev-compose.yml").read_text(encoding="utf-8") == dev_y
+
+
+# ==== Task B1：dev compose 的 springboot 分支 + 栈私有运行密钥 ====
+
+META_SB = {**META, "slug": "bigapp", "scale": "large", "stack": "vue3-springboot",
+           "database": {"dev": {"name": "bigapp_dev", "user": "bigapp_dev"},
+                        "prod": {"name": "bigapp_prod", "user": "bigapp_prod"}},
+           "health": {"frontend": "/", "backend": "/api/health"}}
+
+
+def test_render_dev_compose_springboot_shape():
+    """大型栈：私有 redis + 源码挂载 + per-app .m2 卷 + 容器内 mvn spring-boot:run。"""
+    y = compose.render_dev_compose(META_SB)
+    doc = yaml.safe_load(y)
+    assert doc["name"] == "zc-bigapp-dev"
+    svc = doc["services"]
+    assert set(svc) == {"migrate", "redis", "backend", "frontend"}
+    assert svc["migrate"]["image"] == "zerocode-sqlrunner:1"      # 迁移闸门与 fastapi 栈完全同形
+    assert "../schema:/schema:ro" in svc["migrate"]["volumes"]
+    assert svc["redis"]["image"] == "redis:7-alpine"
+    assert "ports" not in svc["redis"]                            # Redis 不出宿主端口，只走 compose 内部网
+    assert "${REDIS_PASSWORD}" in str(svc["redis"]["command"])
+    assert svc["backend"]["image"] == "maven:3.9-eclipse-temurin-17"
+    assert "../backend:/src" in svc["backend"]["volumes"]
+    assert svc["backend"]["command"] == "mvn -B spring-boot:run"
+    env = svc["backend"]["environment"]
+    assert env["SPRING_DATASOURCE_URL"].startswith("jdbc:postgresql://zerocode-pg16:5432/${DEV_DB}")
+    assert "currentSchema=public" in env["SPRING_DATASOURCE_URL"]
+    assert env["SPRING_DATASOURCE_USERNAME"] == "${DEV_USER}"
+    assert env["SPRING_DATASOURCE_PASSWORD"] == "${DEV_PASSWORD}"
+    assert env["SPRING_DATA_REDIS_HOST"] == "redis"
+    assert env["SPRING_DATA_REDIS_PASSWORD"] == "${REDIS_PASSWORD}"
+    assert env["JWT_SECRET"] == "${JWT_SECRET}" and env["UPLOAD_DIR"] == "/src/uploads"
+    assert env["SERVER_PORT"] == "8080"
+    assert svc["backend"]["depends_on"]["migrate"]["condition"] == "service_completed_successfully"
+    assert svc["backend"]["depends_on"]["redis"]["condition"] == "service_started"
+    assert svc["frontend"]["ports"] == ["8211:5173"]              # 仍只有前端对外
+    assert "ports" not in svc["backend"] and "ports" not in svc["migrate"]
+    assert "__" not in y                                          # 标记零残留
+    assert compose.M2_VOLUME_NAME in doc["volumes"]
+    assert _named_volume_refs(doc) == set(doc["volumes"])          # 引用↔声明一致（含 m2 卷）
+
+
+def test_m2_volume_name_is_single_source_of_truth(monkeypatch):
+    """与 fe 卷同一条规矩：改 .m2 卷名只动 M2_VOLUME_NAME，挂载条目与顶层声明不脱钩。"""
+    assert compose.M2_VOLUME == f"{compose.M2_VOLUME_NAME}:{compose.M2_MOUNT_PATH}"
+    monkeypatch.setattr(compose, "M2_VOLUME_NAME", "mvn_repo")
+    doc = yaml.safe_load(compose.render_dev_compose(META_SB))
+    assert set(doc["volumes"]) == {compose.VOLUME_NAME, "mvn_repo"}
+    assert "mvn_repo:/root/.m2" in doc["services"]["backend"]["volumes"]
+    assert _named_volume_refs(doc) == set(doc["volumes"])
+
+
+def test_render_dev_compose_springboot_fastapi_untouched():
+    """回归钉：新增分支不得改动 fastapi 产物一个字符。"""
+    expect = (compose._DEV_COMPOSE
+              .replace("__MIGRATE_SVC__", compose._MIGRATE_SVC)
+              .replace("__DEV_PORT__", "8211")
+              .replace("__FE_VOL__", compose._fe_volume())
+              .replace("__FE_VOL_NAME__", compose.VOLUME_NAME)
+              .replace("__SLUG__", "lailiao"))
+    assert compose.render_dev_compose(META) == expect
+
+
+def test_render_env_generates_secrets_once(tmp_path):
+    """密钥语义：缺则生成、有则保留（发布重渲染不得冲空），且只给需要它的栈。"""
+    compose.ensure_deploy_files(tmp_path, META_SB, CRED)
+    env = (tmp_path / "deploy" / ".env").read_text(encoding="utf-8")
+    jwt1, red1 = compose._env_get(env, "JWT_SECRET"), compose._env_get(env, "REDIS_PASSWORD")
+    assert jwt1 and red1 and env.count("JWT_SECRET=") == 1 and env.count("REDIS_PASSWORD=") == 1
+    # 生成值必须是 compose/shell 可直接内联的字符集：带 $ 会被 compose 再展开一次，带空格会碎词
+    for v in (jwt1, red1):
+        assert not any(c in v for c in ' "$\'\\'), v
+    compose.ensure_deploy_files(tmp_path, META_SB, CRED)
+    env2 = (tmp_path / "deploy" / ".env").read_text(encoding="utf-8")
+    assert compose._env_get(env2, "JWT_SECRET") == jwt1           # 有则保留，不重生成
+    assert compose._env_get(env2, "REDIS_PASSWORD") == red1
+    other = tmp_path / "other"
+    compose.ensure_deploy_files(other, META, CRED)
+    assert "JWT_SECRET" not in (other / "deploy" / ".env").read_text(encoding="utf-8")
+
+
+def test_render_dev_compose_unknown_stack_still_raises():
+    """栈闸门不许松成兜底：未交付的栈继续 500 显式报错。"""
+    m = {**META, "stack": "vue3-node"}
+    with pytest.raises(DeployError) as ei:
+        compose.render_dev_compose(m)
+    assert "vue3-node" in str(ei.value) and ei.value.status == 500
