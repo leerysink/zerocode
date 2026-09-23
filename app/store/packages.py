@@ -23,7 +23,8 @@ EXCLUDE_DIRS = {"node_modules", ".venv", "dist", "__pycache__", ".pytest_cache",
 # uploads/ 算运行时数据（用户裁定）：作者传上来的示例图不该算应用内容，安装者上传的那一张更不该
 # 让下一次发布报成分叉。**这条不分栈**（名单里也没有栈信息可分）：小型栈的 vue3-fastapi 模板今天没有
 # 上传功能，将来有人加一个上传接口，backend/uploads 同样是运行时目录而不是代码——真想进包的素材
-# 该放在属于代码的位置（如 frontend/src/assets），否则它会被静默排除出包，而文件树照旧看得见它。
+# 该放在属于代码的位置（模板里今天没有 assets/，要自建；frontend/src/** 两份名单都不碰，放了就进包），
+# 否则它会被静默排除出包，而文件树照旧看得见它。
 # 旁证（只在大型栈成立，不作为本条的依据）：模板自己的 backend/.dockerignore 已把 uploads/ 排除在构建
 # 上下文之外，prod 镜像里的 UPLOAD_DIR 也不是工作区路径（backend/Dockerfile:13）；本条只管 dev 落在
 # backend/uploads 的那一份（compose.py 的 UPLOAD_DIR: /src/uploads）。

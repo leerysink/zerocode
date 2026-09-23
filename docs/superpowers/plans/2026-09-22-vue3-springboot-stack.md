@@ -1671,7 +1671,7 @@ git commit -m "feat(compose): render vue3-springboot dev stack (private redis, .
 ### Task B2: `HEALTH_BY_STACK` 收敛到 `/api/health` + 大型栈创建放行
 
 **Files:**
-- Modify: `app/services/app_service.py`（本次只动 `_check_scale_stack` 里的 R-C 注释，今天在 L67-68；`HEALTH_BY_STACK` 在 L23-24、已随 A4c 到位）
+- Modify: `app/services/app_service.py`（本次只动 `_check_scale_stack` 里的 R-C 注释；`HEALTH_BY_STACK` 已随 A4c 到位）
 - Modify（评审返修）: `app/store/packages.py` / `app/api/files.py` 的名单注释
 - Test: `tests/test_app_service.py`
 
@@ -1757,7 +1757,7 @@ git commit -m "test(app): pin the large-stack creation path end to end, and refr
 
 | 编号 | 评审意见 | 复算 | 处置 |
 |---|---|---|---|
-| I-1 | `EXCLUDE_PATH_TAILS` 不分栈生效（`_is_excluded`/`_iter_src` 不读栈信息），但注释给的三条理由全只在 vue3-springboot 成立；小型栈今天根本没有 uploads 目录，将来 AI 加个上传功能，真素材会被静默排除出包而树里照旧看得见 | 成立，探针直调 `_is_excluded`：`backend/uploads/2026/09/avatar.png` → True，对所有栈同视；`git grep -i uploads -- app/templates` 14 处全在大型栈 | 采纳 (a)「把口径说满」而非 (b)「按栈取名单」：裁定说的是「上传目录 = 运行时」这个语义，不是某个模板的目录约定；按栈取会造出「同一路径在不同栈含义不同」的新不对称。注释改成明写「本条不分栈 + 真素材请放 `frontend/src/assets`」；**配套缺口**登记到 D1（契约里告诉 AI 这是运行时目录，今天契约全文不提 uploads） |
+| I-1 | `EXCLUDE_PATH_TAILS` 不分栈生效（`_is_excluded`/`_iter_src` 不读栈信息），但注释给的三条理由全只在 vue3-springboot 成立；小型栈今天根本没有 uploads 目录，将来 AI 加个上传功能，真素材会被静默排除出包而树里照旧看得见 | 成立，探针直调 `_is_excluded`：`backend/uploads/2026/09/avatar.png` → True，对所有栈同视；`git grep -i uploads -- app/templates` 15 行（11 个文件）全在大型栈 | 采纳 (a)「把口径说满」而非 (b)「按栈取名单」：裁定说的是「上传目录 = 运行时」这个语义，不是某个模板的目录约定；按栈取会造出「同一路径在不同栈含义不同」的新不对称。注释改成明写「本条不分栈 + 真素材请放 `frontend/src/` 下自建目录」；**配套缺口**登记到 D1（契约里告诉 AI 这是运行时目录，今天契约全文不提 uploads） |
 | N-1 | 这条口径差只有单向注释（packages.py 写了 files.py 不含它，反过来没有） | 成立，评审做了变异：往 `IGNORE_PATH_TAILS` 加 uploads 只有 `test_tree_ignores_and_nests` 红 | files.py 名单上方补一句「不收与不可见是两件事，想对齐两边前先读 packages.py 那段」 |
 | N-2 | `assert not prod-compose.yml.exists()` 与 C1 正面冲突，而 C1 Step 5 的改判清单没列它 → C1 当天会红在名字叫「端到端落盘」的用例里，易被误判成回归 | 成立（计划漏项，代码本身没错） | 不改断言（今天它是真的），在该行加「C1 放行后要翻案」+ 把它列入 C1 Step 5 的改判清单 |
 | N-3 | Step 10 「指纹只可能变得更稳定」说满了：`baseline_hash` 是旧名单写下的，新旧一次性不可比 | 成立（`install.py` 只写不比，今天零影响，但 M3-b 要比较） | 计划该段改写为「一次性不可比 + M3-b 前必须重算/迁移」；不改代码 |
@@ -1767,6 +1767,20 @@ git commit -m "test(app): pin the large-stack creation path end to end, and refr
 > ① 端到端用例做了 9 组变异逐条挨打（只有 `DEV_DB` 那句打不红——它钉的是「库里凭据→.env」，不是模板 mapping），
 > 已按这个事实给该行加注释并把 mapping 的锅指给 `test_store_install_seam.py`；
 > ② 共享环境回收与 fastapi 同形（库/角色/dbcred/两表行/目录逐列比对），异常路径也收得干净（插 raise 实跑过）。
+
+- [x] **Step 7: 复审收 Nit**（范围 `b6fc3f0..9dc0015`，复审判定无 Blocking/Important，4 Nit 全部吃掉）
+
+| 编号 | 意见 | 复算 | 处置 |
+|---|---|---|---|
+| Nit-1 | 建议路径 `frontend/src/assets` 在**两个模板里都不存在**（`git ls-files "app/templates/*assets*"` 零命中），写成那样会让读者以为脚手架已有这个目录 | 成立，已自己复算：fastapi 的 `frontend/src` 无子目录，SB 的只有 api/config/layout/router/store/style/utils/views。同时直调名单验过建议本身安全：`_is_excluded(("frontend","src","assets","a.png"))` → False、`_is_ignored_dir(("frontend","src","assets"))` → False | 改成「模板里今天没有 assets/，要自建；`frontend/src/**` 两份名单都不碰，放了就进包」（D1 登记里同一句同步） |
+| Nit-2 | 登记表里的计数「14 处」与当下的树差一；D1 那句「AI 没有任何信息能推出」说满了 | 成立：`git grep -i uploads -- app/templates` → **15 行**（11 个文件）；而 SB 模板的 `WebMvcConfig.java:24`、`FileServiceImpl.java:40/90` 确实把 uploads 当运行时存——信息不是没有，只是不在契约里 | 计数改「15 行（11 个文件）」；D1 那句改成「契约里没有任何一条**规则**这么说（模板代码是给人读的演示，不约束 AI）」 |
+| Nit-3 | N-4 声称「改成不依赖行号」，但新文本仍写死 `L23-24`/`L67-68`（今天都对，但漂的正是这个） | 成立，属自己没做到自己写的道理 | 两处行号删掉，只留符号名 |
+| Nit-4 | N-2 的改判列进了 C1 Step 5，但 C1 Step 7 的 `git add` 没跟着扩 → C1 当天会把刚翻案的断言留在工作区外 | 成立（计划内部不一致） | `git add` 补 `tests/test_app_service.py` 与计划本体，并加一句说明 |
+
+> 复审同时独立确认了三件我本想自己验的事：I-1 选 (a) **不需要动代码**（代码本就不分栈，(a) 的任务是让注释说实话），
+> 且该口径已有测试钉住（`test_store_packages.py` 的 fixture 把 `app.json` 写成 `vue3-fastapi`，而 uploads 断言照旧成立）；
+> 「不分栈」不会被读成「files.py 也不分栈收 uploads」（两边名单都无栈维度，且已互为指针）；
+> 「一次性不可比」不夸大（`baseline_hash` 全仓只有 `install.py` 写入 + 测试读长度，无比较逻辑）。
 
 ---
 
@@ -2186,8 +2200,12 @@ Expected: PASS
 
 - [ ] **Step 7: 提交**
 
+> 本 Step 的 `git add` 已按 B2 评审 N-2 的下游一致性扩上 `tests/test_app_service.py`（prod 件断言翻案）与计划本体；
+> 只圈两个文件会把刚改判的断言留在工作区外。
+
 ```bash
-git add app/deploy/compose.py tests/test_compose_render.py
+git add app/deploy/compose.py tests/test_compose_render.py tests/test_app_service.py \
+        docs/superpowers/plans/2026-09-22-vue3-springboot-stack.md
 git commit -m "feat(compose): render vue3-springboot prod stack (built images, uploads and redis volumes)"
 ```
 
@@ -2428,8 +2446,9 @@ git commit -m "docs(template): record measured publish timings for the large sta
 
 > 追加内容时顺手带上一条（B1c 评审 I-1 的配套）：契约里要告诉 AI **`backend/uploads/` 是运行时目录**
 > ——上传件不进包也不进指纹（Step 10 的裁定，不分栈），当代码素材往这里放会静默丢内容，真素材请放
-> `frontend/src/assets` 一类位置。今天契约全文不提 uploads（`git grep -i upload app/deploy/contract.py` 零命中），
-> 而文件树又照旧看得见它——AI 没有任何信息能推出「这个目录别写代码」。
+> `frontend/src/` 下自建目录（模板里今天没有 assets/，而两份名单都不碰 `frontend/src/**`）。今天契约全文不提 uploads（`git grep -in upload -- app/deploy/contract.py` 零命中），
+> 而文件树又照旧看得见它——契约里没有任何一条**规则**这么说（模板代码里 `FileServiceImpl`/`WebMvcConfig` 确实把 uploads 当运行时存，
+> 但那是给人读的演示，不是约束 AI 的条文）。
 
 - [ ] **Step 1: 写失败测试**（追加到 `tests/test_contract.py`）
 
