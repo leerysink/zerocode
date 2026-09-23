@@ -1680,69 +1680,73 @@ git commit -m "feat(compose): render vue3-springboot dev stack (private redis, .
 > 另记一条已确认的局限：B1→B3 之间大型栈预览会「前端 200 就报 running，而后端 mvn 还在下依赖」
 > （`engine.start_dev` 只等前端）——那是 B3 的活，**B4 的验收证据必须等 B3**。
 
-- [ ] **Step 1: 写失败测试**（追加到 `tests/test_app_service.py` 末尾）
+- [x] **Step 1: 写测试**（追加到 `tests/test_app_service.py` 末尾）
+
+> 落地时改名 `test_create_large_app_opened_with_api_health_probe` → **`test_create_large_app_end_to_end_lands_the_springboot_stack`**：
+> 「放行」与「健康路径」各自都已有窄断言（A3/A4c），本用例的职责是端到端落盘，名字要说清这件事。
+> 断言在下面 Step 的草稿上扩了几处，都按**当下事实**写：`redis:7-alpine` 换成 `appredis`（B1 N-3 已改名）、
+> 种子判定从「今天日期的文件不存在」换成 `sqlchange/*.sql` 全等 `== ["D20260101_01_rbac_seed.sql"]`（后者才真能抓住 demo 让位失效）、
+> 补 `DEV_DB == f"{SLUG}_dev"`、`not prod-compose.yml`（N-5 的端到端版）、README 渲染真端口。
+> 模块头只补了 `import json` 与 `from app.deploy import compose`（`datetime` 最终没用上：日期式断言被全等取代）。
 
 ```python
-async def test_create_large_app_opened_with_api_health_probe():
-    """大型栈放行（模板已落地），健康路径统一 /api/health（决策 D-7：actuator base-path 改为 /）。
-
-    本用例真的建库、真的落盘（由 _clean 夹具回收），所以 Phase B 的编排接线在此已被一次性钉住。
-    """
+async def test_create_large_app_end_to_end_lands_the_springboot_stack():
+    """大型栈端到真创建（B2）：真建库、真渲染、真落盘，把 Phase A+B 的接缝钉住。…"""
     sf = make_session_factory(make_engine())
     app = await app_service.create_app_project(
         sf, name="大型", slug=SLUG, scale="large", stack="vue3-springboot", root=str(ROOT))
     assert app["scale"] == "large" and app["stack"] == "vue3-springboot"
-    assert (ROOT / "backend" / "pom.xml").is_file() and (ROOT / "schema" / "schema.sql").is_file()
-    assert not list((ROOT / "sqlchange").glob(f"D{datetime.date.today():%Y%m%d}*"))   # 不追加 demo 种子
+    assert (ROOT / "backend" / "src" / "main" / "java" / "com" / "zerocode" / "app").is_dir()
+    assert sorted(p.name for p in (ROOT / "sqlchange").glob("*.sql")) == ["D20260101_01_rbac_seed.sql"]
     meta = json.loads((ROOT / "app.json").read_text(encoding="utf-8"))
     assert meta["health"] == {"frontend": "/", "backend": "/api/health"}
     dev_y = (ROOT / "deploy" / "dev-compose.yml").read_text(encoding="utf-8")
-    assert "maven:3.9-eclipse-temurin-17" in dev_y and "redis:7-alpine" in dev_y
+    assert "maven:3.9-eclipse-temurin-17" in dev_y and "appredis" in dev_y
+    assert not (ROOT / "deploy" / "prod-compose.yml").exists()
     env = (ROOT / "deploy" / ".env").read_text(encoding="utf-8")
     assert compose._env_get(env, "JWT_SECRET") and compose._env_get(env, "REDIS_PASSWORD")
+    assert compose._env_get(env, "DEV_DB") == f"{SLUG}_dev"
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert f"http://localhost:{app['dev_port']}" in readme and "{{DEV_PORT}}" not in readme
 ```
 
-模块头补齐（文件里已有 `import shutil`、`from pathlib import Path`）：
+- [x] **Step 2: 跑测试确认失败**（计划写的是红；实测**无红阶段**，缘由如下）
 
-```python
-import datetime, json
-from app.deploy import compose
-```
+Run: `pytest tests/test_app_service.py -q` → **21 passed，本用例落地即绿、没有红阶段**。
 
-- [ ] **Step 2: 跑测试确认失败**
+> 如实记下原因（不假装走过 TDD 的红）：前提校正版已说过——`HEALTH_BY_STACK` 的 springboot 条目在 **A4c** 就是
+> `/api/health`，创建闸门看的是 `(TEMPLATES / stack).is_dir()` 而模板在 **A3** 已落仓，`dev-compose.yml`/`.env` 由 **B1** 渲染。
+> 三条接缝都是既成事实，所以本用例的职责是**回归钉**而不是驱动新实现。
+> 为排除「空转绿」做了变异验证：把 `HEALTH_BY_STACK["vue3-springboot"]` 临时改回 `/actuator/health` → 本用例
+> **失败**（`assert {'backend': '/actuator/health'} != {'backend': '/api/health'}`），改回后复绿。其余读盘断言天然不空转：
+> 文件不在就直接 `FileNotFoundError`，密钥没回填则 `_env_get` 返回空串让 `and` 断言红。
 
-Run: `pytest tests/test_app_service.py::test_create_large_app_opened_with_api_health_probe -q`
+- [x] **Step 3: 改实现**
 
-> 勘误（A4c 已收口）：`HEALTH_BY_STACK` 已改 `/api/health`（与常量同形的窄断言已进 `test_app_service.py`），
-> 本 Step 不再是「health 路径 FAIL」；现在跑不过的是 **Step 1 里依赖 B1 的那半**（dev-compose 的 maven/redis
-> 服务与 `.env` 里的 `JWT_SECRET`/`REDIS_PASSWORD`）。B2 实际验证的是「整栈真创建能走通到落盘」。
-
-- [ ] **Step 3: 改实现**
-
-```python
-HEALTH_BY_STACK = {"vue3-fastapi": "/api/health", "vue3-node": "/api/health",
-                   "vue3-springboot": "/api/health", "static": ""}
-```
-
-> 已随 **Task A4c** 提前完成（I-2 必修），本 Step 只剩下面那条注释。
+`HEALTH_BY_STACK` 已随 **Task A4c** 提前完成（I-2 必修），本次零代码改动。
 
 `_check_scale_stack` 的 R-C 闸门**不删码**（模板目录落地后 `is_dir()` 自然为真，`vue3-node`/`static` 继续 400），只把注释改成当下事实：
 
 ```python
     # 裁定 R-C：模板未交付的栈在此提前 400（不放行则 scaffold.render 会冒「栈模板不存在 500」）。
-    # vue3-springboot 已由 base-pro 移植交付；vue3-node / static 仍未开放。
+    # vue3-springboot 已由 base-pro 移植交付（A3）；vue3-node / static 仍未开放。
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+> 同口径的过期说法在本文件 `test_create_app_rejects_bad_scale_stack` 的注释里也有一处（「M1 仅 vue3-fastapi」），一并改掉；
+> `git grep "M1 仅"`（排除 docs/）现已零命中。向导前端文案里的同类过期说法属 **D2**，不在本 Task 动。
 
-Run: `pytest tests/test_app_service.py tests/test_apps_api.py tests/test_contract.py -q`
-Expected: PASS（`vue3-springboot` 无存量应用，`app.json` 无历史值需迁移）
+- [x] **Step 4: 跑测试确认通过**
 
-- [ ] **Step 5: 提交**
+Run: `pytest tests/test_app_service.py tests/test_apps_api.py tests/test_contract.py -q` → **34 passed**
+（`vue3-springboot` 无存量应用，`app.json` 无历史值需迁移）
+
+- [x] **Step 5: 提交**
+
+> 提交信息改写为当下事实（不写 “open creation / unify health path”——两件事都在 A3/A4c 做完了，本 Task 只加端到端钉 + 改注释）。
 
 ```bash
-git add app/services/app_service.py tests/test_app_service.py
-git commit -m "feat(app): open vue3-springboot creation and unify backend health path to /api/health"
+git add app/services/app_service.py tests/test_app_service.py docs/superpowers/plans/2026-09-22-vue3-springboot-stack.md
+git commit -m "test(app): pin the large-stack creation path end to end, and refresh the stale R-C gating comment"
 ```
 
 ---

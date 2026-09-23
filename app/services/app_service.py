@@ -64,8 +64,8 @@ def _check_scale_stack(scale: str, stack: str) -> None:
         raise DeployError("大型应用锁定 Vue3 + Spring Boot 3")
     if stack not in STACKS:
         raise DeployError(f"技术栈非法: {stack}")
-    # 裁定 R-C：M1 仅交付 vue3-fastapi 模板（vue3-node/static 属 M2/M3），
-    # 不放行则 scaffold.render 会以「栈模板不存在 500」拒绝——这里提前给 400 友好提示。
+    # 裁定 R-C：模板未交付的栈在此提前 400（不放行则 scaffold.render 会冒「栈模板不存在 500」）。
+    # vue3-springboot 已由 base-pro 移植交付（A3）；vue3-node / static 仍未开放。
     if not (TEMPLATES / stack).is_dir():
         raise DeployError(f"该技术栈尚未开放: {stack}（即将上线）", status=400)
 

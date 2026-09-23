@@ -1,10 +1,11 @@
 # tests/test_app_service.py
+import json
 import shutil
 import pytest
 from pathlib import Path
 from sqlalchemy import text
 from app.db import make_engine, make_session_factory
-from app.deploy import ports, provision
+from app.deploy import compose, ports, provision
 from app.deploy.errors import DeployError
 from app.services import app_service
 
@@ -79,7 +80,8 @@ async def test_create_app_rejects_bad_scale_stack():
     with pytest.raises(DeployError):
         await app_service.create_app_project(
             sf, name="x", slug=SLUG, scale="large", stack="vue3-fastapi", root=str(ROOT))  # large 锁定 springboot
-    # 裁定 R-C：模板尚未交付的栈以 400 友好拒绝（M1 仅 vue3-fastapi），且不得留下半成品目录
+    # 裁定 R-C：模板未交付的栈以 400 友好拒绝（vue3-springboot 已交付，vue3-node/static 未交付），
+    # 且不得留下半成品目录
     with pytest.raises(DeployError) as ei:
         await app_service.create_app_project(
             sf, name="x", slug=SLUG, scale="small", stack="vue3-node", root=str(ROOT))
@@ -228,6 +230,41 @@ async def test_large_stack_health_path_matches_template():
     """健康路径必须与模板真实探针同形（决策 D-7：context-path /api + actuator base-path /）。
 
     这个值会写进 app.json，再经 contract.py 原文喂给 AI、经 store/release.py 打进商店包；
-    留 /actuator/health 就是让 AI 按一个 404 的路径去改后端。整栈真创建的端到端断言在 B2。
+    留 /actuator/health 就是让 AI 按一个 404 的路径去改后端。整栈真创建的端到端断言在
+    `test_create_large_app_end_to_end_lands_the_springboot_stack`。
     """
     assert app_service.HEALTH_BY_STACK["vue3-springboot"] == "/api/health"
+
+
+async def test_create_large_app_end_to_end_lands_the_springboot_stack():
+    """大型栈端到真创建（B2）：真建库、真渲染、真落盘，把 Phase A+B 的接缝钉住。
+
+    创建闸门与 `HEALTH_BY_STACK` 单看都不新（A3 落模板、A4c 改健康路径），但没人验过
+    「用户选 large + vue3-springboot」这条路今天真能走到磁盘上：模板缺失、scaffold 渲染报错、
+    compose 忘渲染 dev 件、密钥没回填——都在此处暴露，而不是到 B4 真跑时才发现。
+    """
+    sf = make_session_factory(make_engine())
+    app = await app_service.create_app_project(
+        sf, name="大型", slug=SLUG, scale="large", stack="vue3-springboot", root=str(ROOT))
+    assert app["scale"] == "large" and app["stack"] == "vue3-springboot"
+    # 模板真渲染：后端工程与结构快照都在，包名已改过（不是 base-pro 的 com.leerysink）
+    assert (ROOT / "backend" / "pom.xml").is_file()
+    assert (ROOT / "backend" / "src" / "main" / "java" / "com" / "zerocode" / "app").is_dir()
+    assert (ROOT / "schema" / "schema.sql").is_file()
+    # A2 的让位：本栈自带 RBAC 基线种子，平台不得再追 demo_notes
+    assert sorted(p.name for p in (ROOT / "sqlchange").glob("*.sql")) == ["D20260101_01_rbac_seed.sql"]
+    meta = json.loads((ROOT / "app.json").read_text(encoding="utf-8"))
+    assert meta["health"] == {"frontend": "/", "backend": "/api/health"}
+    # B1 的 compose 分支：maven 就地跑 + 栈私有 redis，且不带 prod 件
+    dev_y = (ROOT / "deploy" / "dev-compose.yml").read_text(encoding="utf-8")
+    assert "maven:3.9-eclipse-temurin-17" in dev_y and "appredis" in dev_y
+    assert not (ROOT / "deploy" / "prod-compose.yml").exists()
+    # 密钥位不是空字（ensure 回填过），否则 compose 的 `${VAR:?}` 会在起栈时直接拒收
+    env = (ROOT / "deploy" / ".env").read_text(encoding="utf-8")
+    assert compose._env_get(env, "JWT_SECRET") and compose._env_get(env, "REDIS_PASSWORD")
+    assert compose._env_get(env, "DEV_DB") == f"{SLUG}_dev"
+    # 裁定 R-A 在大型栈同样成立：README 里是渲染后的真端口，不是 {{DEV_PORT}} 空占位
+    # （平台占位符自检归 scaffold，这里只验「创建路径传对了映射」）
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert f"http://localhost:{app['dev_port']}" in readme
+    assert "{{DEV_PORT}}" not in readme
