@@ -84,6 +84,14 @@ def test_templates_still_carry_markers():
     # m2 卷只属于大型栈：它的两个标记必须在 SB 模板里，否则上面的零残留断言对它没牙齿
     assert "__M2_VOL__" in compose._DEV_COMPOSE_SB and "__M2_VOL_NAME__" in compose._DEV_COMPOSE_SB
     assert "__M2_VOL__" not in compose._DEV_COMPOSE and "__M2_VOL__" not in compose._FE_ONLY
+    # prod 模板也确有标记：residue 自检对 prod 同样有牙齿（计划 Step 5 草稿把 prod 塞进上面 dev 循环是错的：标记集不同）
+    assert "__SLUG__" in compose._PROD_COMPOSE and "__MIGRATE_PROD__" in compose._PROD_COMPOSE
+    assert "__PROD_PORT__" in compose._PROD_COMPOSE
+    assert "__UPLOADS_VOL__" not in compose._PROD_COMPOSE         # 上传/redis 卷只属于大型栈 prod（fastapi 无这两个基座）
+    sbp = compose._PROD_COMPOSE_SB
+    for m in ("__SLUG__", "__MIGRATE_PROD__", "__PROD_PORT__", "__UPLOADS_VOL__",
+              "__UPLOADS_VOL_NAME__", "__REDIS_DATA_VOL__", "__REDIS_DATA_VOL_NAME__"):
+        assert m in sbp, m
 
 def test_render_rejects_unreplaced_marker(monkeypatch):
     """漏替换的标记必须显式报错而非静默落盘（审查 I-3 / V9-M3 的同型变异）。"""
@@ -159,7 +167,7 @@ def test_migrate_mounts_schema_and_sqlchange():
     """P2 Task 5：dev 与 prod 的 migrate 服务都同时挂载声明式结构轨 /schema 与数据轨 /sql。"""
     dev = compose.render_dev_compose(META)
     prod = compose.render_prod_compose(META)
-    for y in (dev, prod):
+    for y in (dev, prod, compose.render_prod_compose(META_SB)):
         doc = yaml.safe_load(y)
         vols = doc["services"]["migrate"]["volumes"]
         assert "../schema:/schema:ro" in vols
@@ -193,16 +201,18 @@ def test_ensure_deploy_files_keeps_creds_of_the_omitted_side(tmp_path):
 
 def test_render_prod_compose_single_service_blocks():
     """服务块只出现一次：migrate 片段经 __MIGRATE_PROD__ 槽注入，模板拼接不得重复追加。"""
-    y = compose.render_prod_compose(META)
-    lines = y.splitlines()
-    for name in ("migrate", "backend", "frontend"):
-        assert lines.count(f"  {name}:") == 1, name          # 行首两空格=服务级键（不误伤 depends_on）
-    assert "__" not in y                                     # 标记残留自检与 dev 同口径
-    assert "external: true" in y
+    for meta, names in ((META, ("migrate", "backend", "frontend")),
+                        (META_SB, ("migrate", "appredis", "backend", "frontend"))):
+        y = compose.render_prod_compose(meta)
+        lines = y.splitlines()
+        for name in names:
+            assert lines.count(f"  {name}:") == 1, f"{meta['stack']}:{name}"   # 行首两空格=服务级键（不误伤 depends_on）
+        assert "__" not in y                                     # 标记残留自检与 dev 同口径
+        assert "external: true" in y
 
 def test_render_prod_compose_static_and_unknown_stack_raise():
-    """static 发布 M3：与 dev 同口径显式报错（brief Interfaces）。"""
-    for stack in ("static", "vue3-springboot"):
+    """未开放发布的栈（static / 尚未交付的 vue3-node）：与 dev 同口径显式报错（brief Interfaces）。"""
+    for stack in ("static", "vue3-node"):
         m = copy.deepcopy(META); m["stack"] = stack
         with pytest.raises(DeployError) as ei:
             compose.render_prod_compose(m)
@@ -317,14 +327,15 @@ def test_legacy_stacks_match_golden_files():
         assert compose.render_dev_compose(m) == (golden / fname).read_text(encoding="utf-8"), fname
 
 
-def test_springboot_gets_no_prod_compose_yet(tmp_path):
-    """Phase B 的「故意不动发布链路」要有人钉：大型栈只渲染 dev，不得提前落一份能 build 的 prod 件。"""
+def test_springboot_gets_prod_compose(tmp_path):
+    """C1 翻案（原 test_springboot_gets_no_prod_compose_yet 钉的是「尚未放行发布」的临时态）：
+    大型栈发布已放行，创建即落一份可 build 的 prod 件，render_prod_compose 不再抛 400。"""
     compose.ensure_deploy_files(tmp_path, META_SB, CRED)
     assert (tmp_path / "deploy" / "dev-compose.yml").is_file()
-    assert not (tmp_path / "deploy" / "prod-compose.yml").exists()
-    with pytest.raises(DeployError) as ei:
-        compose.render_prod_compose(META_SB)
-    assert ei.value.status == 400
+    assert (tmp_path / "deploy" / "prod-compose.yml").is_file()
+    assert "zc-bigapp-backend:prod-${PROD_VERSION}" in \
+        (tmp_path / "deploy" / "prod-compose.yml").read_text(encoding="utf-8")
+    compose.render_prod_compose(META_SB)            # 不再报 400
 
 
 def test_render_env_generates_secrets_once(tmp_path):
@@ -351,3 +362,72 @@ def test_render_dev_compose_unknown_stack_still_raises():
     with pytest.raises(DeployError) as ei:
         compose.render_dev_compose(m)
     assert "vue3-node" in str(ei.value) and ei.value.status == 500
+
+
+# ==== Task C1：prod compose 的 springboot 分支（镜像即产物） ====
+
+
+def test_render_prod_compose_springboot_shape():
+    """大型栈发布：镜像即产物（工程目录一个都不挂），上传件与 Redis 数据落命名卷。
+
+    命名与密钥闸门对齐 **B1 已落地的 dev 约定**（计划顶注的 stale 草稿已被纠正）：redis 服务叫
+    `appredis`（免与 zcnet 上的同名容器赌解析）、三个密钥位都带 `:?`、数据源 PROD_* 保持裸插值。
+    """
+    doc = yaml.safe_load(compose.render_prod_compose(META_SB))
+    assert doc["name"] == "zc-bigapp-prod"
+    assert doc["networks"]["zcnet"] == {"external": True}
+    svc = doc["services"]
+    assert set(svc) == {"migrate", "appredis", "backend", "frontend"}
+    b = svc["backend"]
+    assert b["image"] == "zc-bigapp-backend:prod-${PROD_VERSION}"
+    assert b["build"] == "../backend"
+    assert not any(str(v).startswith("../") for v in b["volumes"])   # 镜像即产物：不挂源码卷
+    assert b["volumes"] == ["uploads:/uploads"]
+    assert b["networks"] == ["default", "zcnet"]                     # 上 zcnet 只为访 zerocode-pg16
+    env = b["environment"]
+    assert env["SPRING_DATASOURCE_URL"].startswith("jdbc:postgresql://zerocode-pg16:5432/${PROD_DB}")
+    assert env["SPRING_DATASOURCE_USERNAME"] == "${PROD_USER}"       # 数据源非密钥：保持裸插值
+    assert env["SPRING_DATASOURCE_PASSWORD"] == "${PROD_PASSWORD}"
+    assert env["SPRING_DATA_REDIS_HOST"] == "appredis"              # 主机名跟着服务名走
+    assert env["SPRING_DATA_REDIS_PASSWORD"].startswith("${REDIS_PASSWORD:?")
+    assert env["JWT_SECRET"].startswith("${JWT_SECRET:?") and env["UPLOAD_DIR"] == "/uploads"
+    assert "ports" not in b                                          # 只有前端对外（规格 05 FR5-06）
+    assert "command" not in b                                        # 无 dev server 命令
+    assert b["depends_on"]["migrate"]["condition"] == "service_completed_successfully"
+    assert b["depends_on"]["appredis"]["condition"] == "service_started"
+    r = svc["appredis"]
+    assert r["image"] == "redis:7-alpine" and "ports" not in r
+    assert r["networks"] == ["default"]                              # 不上全平台共享的 zcnet（与 dev 同）
+    assert r["volumes"] == ["redis-data:/data"]
+    assert "--appendonly" in r["command"] and "yes" in r["command"]   # 缓存型基座也开持久化（command 是 flow 序列，逐元素判）
+    assert "${REDIS_PASSWORD:?" in str(r["command"])                 # 空值让 compose 自己拒收，不起无密码 Redis
+    f = svc["frontend"]
+    assert f["image"] == "zc-bigapp-frontend:prod-${PROD_VERSION}"
+    assert f["build"] == "../frontend" and f["ports"] == ["8210:80"]
+    assert doc["volumes"] == {"uploads": {}, "redis-data": {}}
+    assert _named_volume_refs(doc) == set(doc["volumes"])
+    y = compose.render_prod_compose(META_SB)
+    assert "__" not in y
+    for name in ("migrate", "appredis", "backend", "frontend"):
+        assert y.splitlines().count(f"  {name}:") == 1               # 片段注入不得重复追加
+
+
+def test_ensure_deploy_files_springboot_writes_prod_compose(tmp_path):
+    """落盘闸门按「已支持发布的栈集合」判定，不再写死单栈；密钥与 dev 同源同一份 .env。"""
+    compose.ensure_deploy_files(tmp_path, META_SB, {"dev": CRED["dev"]})
+    text_ = (tmp_path / "deploy" / "prod-compose.yml").read_text(encoding="utf-8")
+    assert "image: zc-bigapp-backend:prod-${PROD_VERSION}" in text_
+    env = (tmp_path / "deploy" / ".env").read_text(encoding="utf-8")
+    assert "JWT_SECRET=" in env and "REDIS_PASSWORD=" in env
+    assert env.count("JWT_SECRET=") == 1                 # 文件只有一行键（prod 与 dev 共用）
+    assert "PROD_PASSWORD=\n" in env                     # 未供给时留空语义不变
+
+
+def test_render_prod_compose_fastapi_matches_golden():
+    """回归钉（替代草稿的「拿实现重放」镜像断言）：新增 SB 分支不得扰动 fastapi prod 产物一个字节。
+
+    与 dev 侧 `test_legacy_stacks_match_golden_files` 同理：golden 是仓外硬事实，要动必须显式重生
+    （重生：`python -c "from app.deploy import compose; ..."` 把 render_prod_compose(META) 写回此文件）。
+    """
+    golden = Path(__file__).parent / "golden" / "prod-compose.fastapi.yml"
+    assert compose.render_prod_compose(META) == golden.read_text(encoding="utf-8")

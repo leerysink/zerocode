@@ -30,6 +30,12 @@ def _m2_volume() -> str:
 
 M2_VOLUME = _m2_volume()
 
+UPLOADS_VOLUME = "uploads"          # 上传件卷：镜像重建不丢历史文件（prod 唯一的文件持久化位）
+REDIS_DATA_VOLUME = "redis-data"    # Redis 命名卷：prod 开 AOF，重启不丢会话/缓存基座
+
+# prod-compose.yml 的落盘与渲染闸门：一个事实源，两处共用（写死单栈会让新栈发布必挂）
+PUBLISHABLE_STACKS = ("vue3-fastapi", "vue3-springboot")
+
 # 栈私有运行密钥：缺则生成、有则保留。口令不进数据库、不进仓库、AI 禁读（deploy/ 是禁区）。
 # 唯一事实源：.env 的密钥位与生成循环都从 STACK_SECRETS 派生，
 # 不再额外模板化一份占位行（那会让「加一个密钥」变成两处改一处、静默漏位）。
@@ -206,6 +212,55 @@ _MIGRATE_PROD = """  migrate:
     restart: "no"
 """
 
+_PROD_COMPOSE_SB = """name: zc-__SLUG__-prod
+networks:
+  default: {}
+  zcnet:
+    external: true
+services:
+__MIGRATE_PROD__
+  appredis:
+    image: redis:7-alpine
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?not backfilled, see deploy/.env}", "--appendonly", "yes"]
+    volumes:
+      - __REDIS_DATA_VOL__:/data
+    networks: [default]
+    restart: unless-stopped
+  backend:
+    image: zc-__SLUG__-backend:prod-${PROD_VERSION}
+    build: ../backend
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://zerocode-pg16:5432/${PROD_DB}?currentSchema=public&stringtype=unspecified
+      SPRING_DATASOURCE_USERNAME: ${PROD_USER}
+      SPRING_DATASOURCE_PASSWORD: ${PROD_PASSWORD}
+      SPRING_DATA_REDIS_HOST: appredis
+      SPRING_DATA_REDIS_PASSWORD: ${REDIS_PASSWORD:?not backfilled, see deploy/.env}
+      SERVER_PORT: "8080"
+      JWT_SECRET: ${JWT_SECRET:?not backfilled, see deploy/.env}
+      UPLOAD_DIR: /uploads
+    volumes:
+      - __UPLOADS_VOL__:/uploads
+    networks: [default, zcnet]
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      appredis:
+        condition: service_started
+  frontend:
+    image: zc-__SLUG__-frontend:prod-${PROD_VERSION}
+    build: ../frontend
+    networks: [default]
+    ports:
+      - "__PROD_PORT__:80"
+    restart: unless-stopped
+    depends_on:
+      - backend
+volumes:
+  __UPLOADS_VOL_NAME__: {}
+  __REDIS_DATA_VOL_NAME__: {}
+"""
+
 # 凭据键：单向推进语义的适用范围（端口/版本不在此列，由 meta 与发布流程各自决定）
 _CRED_KEYS = ("DEV_DB", "DEV_USER", "DEV_PASSWORD", "PROD_DB", "PROD_USER", "PROD_PASSWORD")
 
@@ -244,12 +299,20 @@ def render_prod_compose(meta: dict) -> str:
     """prod 栈（规格 03 §4.3 / 07）：镜像即产物，不挂源码卷、无 dev server 命令；
     仅前端对外（prod 端口 -> 容器 80，backend 经 nginx 反代，T3b）；migrate 闸门指 PROD_*。"""
     stack = meta.get("stack")
-    if stack != "vue3-fastapi":
-        raise DeployError(f"栈发布未支持（M2 范围）: {stack}", status=400)
-    sources = _PROD_COMPOSE + _MIGRATE_PROD     # 本次渲染用到的全部标记面
-    y = (_PROD_COMPOSE
+    if stack == "vue3-fastapi":
+        tpl, fragments = _PROD_COMPOSE, (_MIGRATE_PROD,)
+    elif stack == "vue3-springboot":
+        tpl, fragments = _PROD_COMPOSE_SB, (_MIGRATE_PROD,)   # migrate 片段逐字复用（同库同轨同镜像）
+    else:
+        raise DeployError(f"栈发布未支持: {stack}", status=400)
+    sources = tpl + "".join(fragments)              # 本次渲染用到的全部标记面
+    y = (tpl
          .replace("__MIGRATE_PROD__", _MIGRATE_PROD)
          .replace("__PROD_PORT__", str(meta["ports"]["prod"]))
+         .replace("__UPLOADS_VOL__", UPLOADS_VOLUME)
+         .replace("__UPLOADS_VOL_NAME__", UPLOADS_VOLUME)
+         .replace("__REDIS_DATA_VOL__", REDIS_DATA_VOLUME)
+         .replace("__REDIS_DATA_VOL_NAME__", REDIS_DATA_VOLUME)
          .replace("__SLUG__", meta["slug"]))
     residue = sorted(m for m in _markers_of(sources) if m in y)
     if residue:
@@ -322,5 +385,5 @@ def ensure_deploy_files(app_root: Path, meta: dict, creds: dict, version: str | 
             e = _env_set(e, k, old)
     _write_if_changed(d / "dev-compose.yml", y)
     _write_if_changed(ef, e)
-    if meta.get("stack") == "vue3-fastapi":
+    if meta.get("stack") in PUBLISHABLE_STACKS:
         _write_if_changed(d / "prod-compose.yml", render_prod_compose(meta))

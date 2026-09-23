@@ -2063,7 +2063,12 @@ git commit -m "docs(template): record measured dev startup timings from the larg
 > prod 的 backend 同样上 zcnet）、三个密钥位都带 `${VAR:?…}`、以及确认**停栈/健康路径也能解析**
 > （`${VAR:?}` 是文件解析期闸门，`down`/`ps`/`logs` 一样吃；`stop_dev` 因此已在 B1c 里先 ensure，而 **`prod_stop`（`prod.py:152`）还没有这一步**）。
 
-- [ ] **Step 1: 写失败测试**（追加到 `tests/test_compose_render.py`，`META_SB` 复用 Task B1 引入的那份）
+- [x] **Step 1: 写失败测试**（追加到 `tests/test_compose_render.py`，`META_SB` 复用 Task B1 引入的那份）
+
+> 落地相对草稿的三处纠偏（都是技术判断，不改变意图）：
+>  ① 命名/闸门口径对齐 **B1 已落地的 dev**（顶注已裁定）：redis 服务叫 `appredis`、三个密钥位带 `${VAR:?…}`、数据源 `PROD_*` 保持裸插值；草稿里的 `redis` / 裸 `${VAR}` 都被纠正。
+>  ② `test_render_prod_compose_springboot_shape` 里草稿的 `"--appendonly yes" in str(r["command"])` 断言打不中（command 是 YAML flow 序列，元素被逗号分隔）——改逐元素判。
+>  ③ 草稿的 `test_render_prod_compose_springboot_fastapi_untouched` 是「拿实现重放替换链」的镜像断言，本仓 `test_legacy_stacks_match_golden_files` 已点名这个反模式（会跟着模板一起漂）——改为 **golden 文件钉**（新增 `tests/golden/prod-compose.fastapi.yml`），顺带补上 prod 侧此前无 golden 的缺口。
 
 ```python
 def test_render_prod_compose_springboot_shape():
@@ -2124,12 +2129,12 @@ def test_ensure_deploy_files_springboot_writes_prod_compose(tmp_path):
     assert "PROD_PASSWORD=\n" in env                     # 未供给时留空语义不变
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `pytest tests/test_compose_render.py -q -k "prod"`
 Expected: 新用例 FAIL（`栈发布未支持（M2 范围）: vue3-springboot`）；旧 `test_render_prod_compose_static_and_unknown_stack_raise` 同时变红——它拿 vue3-springboot 当未知栈，属预期改判，Step 5 处理。
 
-- [ ] **Step 3: 卷常量与栈集合闸门**
+- [x] **Step 3: 卷常量与栈集合闸门**
 
 `app/deploy/compose.py` 在 `M2_VOLUME = _m2_volume()` 之后插入：
 
@@ -2141,7 +2146,7 @@ REDIS_DATA_VOLUME = "redis-data"    # Redis 命名卷：prod 开 AOF，重启不
 PUBLISHABLE_STACKS = ("vue3-fastapi", "vue3-springboot")
 ```
 
-- [ ] **Step 4: 新增 `_PROD_COMPOSE_SB`**
+- [x] **Step 4: 新增 `_PROD_COMPOSE_SB`**
 
 在 `_MIGRATE_PROD` 定义**之后**插入（migrate 片段与 fastapi 栈逐字复用：同库、同双轨、同镜像）：
 
@@ -2236,7 +2241,7 @@ def render_prod_compose(meta: dict) -> str:
         _write_if_changed(d / "prod-compose.yml", render_prod_compose(meta))
 ```
 
-- [ ] **Step 5: 改掉旧栈闸门用例的改判**
+- [x] **Step 5: 改掉旧栈闸门用例的改判**
 
 `tests/test_compose_render.py`：
 - `test_render_prod_compose_static_and_unknown_stack_raise` 的栈元组 `("static", "vue3-springboot")` → `("static", "vue3-node")`，docstring 里的「M3」措辞保持（static 仍未开发布）；
@@ -2247,12 +2252,14 @@ def render_prod_compose(meta: dict) -> str:
 - `assert not (ROOT / "deploy" / "prod-compose.yml").exists()` 必须在 C1 落地当天**翻案**为 `.is_file()`（它钉的就是「尚未放行发布」这个临时状态）。
   不列进本 Step 的话，它会红在一个名字叫「端到端落盘」的用例里，很容易被误判成回归而回退模板。
 
-- [ ] **Step 6: 跑测试确认通过**
+- [x] **Step 6: 跑测试确认通过**
 
 Run: `pytest tests/test_compose_render.py -q`
 Expected: PASS
 
-- [ ] **Step 7: 提交**
+> 实跑：`test_compose_render.py` → 27 passed；全量 464 passed（见本节末「回归结果」）。
+
+- [x] **Step 7: 提交**
 
 > 本 Step 的 `git add` 已按 B2 评审 N-2 的下游一致性扩上 `tests/test_app_service.py`（prod 件断言翻案）与计划本体；
 > 只圈两个文件会把刚改判的断言留在工作区外。
@@ -2262,6 +2269,15 @@ git add app/deploy/compose.py tests/test_compose_render.py tests/test_app_servic
         docs/superpowers/plans/2026-09-22-vue3-springboot-stack.md
 git commit -m "feat(compose): render vue3-springboot prod stack (built images, uploads and redis volumes)"
 ```
+
+---
+
+#### C1 落地补充：计划漏项与 directive#3 确认
+
+- **计划 Step 5 漏了一个翻案点**（与 B2 N-2 同类）：`test_compose_render.py::test_springboot_gets_no_prod_compose_yet` 直接钉「大型栈不得提前落 prod 件」+ `render_prod_compose(META_SB)` 抛 400——C1 当天必红。已翻案为 `test_springboot_gets_prod_compose`（断言创建即落 prod 件、render 不再抛错）。
+- **`test_templates_still_carry_markers` 不能把 prod 模板塞进 dev 循环**（Step 5 草稿那么写会假红）：dev 循环体断 `__DEV_PORT__`+`__FE_VOL__`，prod 模板没这些。已另起一段断 prod 自己的标记（`__MIGRATE_PROD__`/`__UPLOADS_VOL__`/`__REDIS_DATA_VOL__` 等）。
+- **顶注 directive #3（prod.py 要不要 ensure）已确认：不需要动。** prod 的三个 `:?` 位全是 JWT/REDIS，而这两个键与 dev 共用同一份 `.env`、创建时就已回填，所以 prod-compose 永远可解析，`prod_stop` 的 `down`/`ps`/`logs` 不受影响。故 C1 仍局限于 `compose.py` + 测试，未越界改 `prod.py`。
+- **回归结果**：全量 `pytest -q` → **464 passed**（基线 459 + 本 Task 3 新测试，0 失败）；定向 `test_compose_render.py` → 27 passed。
 
 ---
 

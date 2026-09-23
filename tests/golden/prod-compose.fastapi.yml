@@ -1,0 +1,38 @@
+name: zc-lailiao-prod
+networks:
+  default: {}
+  zcnet:
+    external: true
+services:
+  migrate:
+    image: zerocode-sqlrunner:1
+    environment:
+      TARGET_DB: ${PROD_DB}
+      TARGET_USER: ${PROD_USER}
+      TARGET_PASSWORD: ${PROD_PASSWORD}
+    volumes:
+      - ../schema:/schema:ro
+      - ../sqlchange:/sql:ro
+    networks: [zcnet]
+    restart: "no"
+
+  backend:
+    image: zc-lailiao-backend:prod-${PROD_VERSION}
+    build: ../backend
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${PROD_USER}:${PROD_PASSWORD}@zerocode-pg16:5432/${PROD_DB}
+      APP_PORT: "8000"
+    networks: [default, zcnet]
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+  frontend:
+    image: zc-lailiao-frontend:prod-${PROD_VERSION}
+    build: ../frontend
+    networks: [default]
+    ports:
+      - "8210:80"
+    restart: unless-stopped
+    depends_on:
+      - backend
