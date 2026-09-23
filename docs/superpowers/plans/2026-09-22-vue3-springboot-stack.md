@@ -1962,6 +1962,19 @@ git add app/deploy/engine.py app/deploy/settings.py tests/test_engine.py
 git commit -m "feat(dev): joint frontend+backend health gate and per-stack timeout for large apps"
 ```
 
+> 落地时 `git add` 多带一个计划本体（本 Task 同步回写了 Step 1-6 的标记与差异注记）。
+
+- [x] **Step 7: 评审**（范围 `f459ad5..6a527d3`；无 Blocking / Important，2 条 Nit）
+
+| 编号 | 评审意见 | 复算 | 处置 |
+|---|---|---|---|
+| N1 | 超时按栈（`settings.health_timeout` 里的 `stack == "vue3-springboot"`）与探针按栈（`engine.JOINT_HEALTH_STACKS`）是两处字面量，新增栈时易只改一处而漂移 | 成立（评审自己点明「两套独立谓词」：一个管等待时长、一个管探不探后端，今天只是恰好重合） | **不合并**（合并会把两个不同语义强投一个名单，将来「要联合探针但不需长超时」的栈反而表达不出）；在 `health_timeout` docstring 补一句交叉引用，标清同步义务 |
+| N2 | 小栈探针从「轮数 ×（请求+1s）」改为 deadline，最坏墙钟从 ~3×timeout 收紧到 1×timeout：配 240 但旧代码实际能等 ~720s，一个需要 240–720s 才起的前端会从旧「成功」变新「超时 error」 | 成立且已逐项核实：timeout 取值（`deploy_cfg` 恒合并 DEFAULTS → `.get(...,60)` 与 `health_timeout` 产出的 240 等价）、探针路径（仍仅 `http://127.0.0.1:{port}/`）、错误文案 三者逐字不变；变的只有等待总时长 | **可接受、不改**：这是 Step 4「收敛到 `_all_200`」的必然结果，与 `prod.wait_prod_health` 同形；且「配 240 就 240 封顶」比旧的隐性 3× 更对；vite dev 实际远快于 240s |
+
+> 评审独立确认的设计点（无需行动）：deadline 循环必终止（timeout 0/负/float 走 `max(int(...),1)`、deadline 检查在 sleep 前）；`JOINT_HEALTH_STACKS` + `HEALTH_BY_STACK.get()` 组合 fail-safe（在名单但无健康路径→降级只探前端，不崩不假绿）；
+> 本地 `from app.services.app_service import HEALTH_BY_STACK` 无循环导入（app_service 不反向 import engine，与 prod.py 惯例一致）；
+> 联合探针前提成立（SB 模板 vite `proxy['/api']→backend:8080` + context-path `/api` + SecurityConfig 放行 `/health`，后端未就绪时代理回 5xx → 非 200，不假绿也不因 401 假红）；新增 8 条测试均实断非空转。
+
 ---
 
 ### Task B4: 端到真跑——创建大型应用并登录预览（验收证据）

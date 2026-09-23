@@ -36,6 +36,10 @@ def health_timeout(cfg: dict, stack: str) -> int:
 
     large 键没设时回落到通用键（管理员改一个键就能调两条路径）；回落值从 DEFAULTS 取而不是在此再抄
     一个字面量：默认值只应有一处。
+
+    这里的「长超时的栈」与 engine.JOINT_HEALTH_STACKS「要联合探针的栈」是两套独立语义（一个管等待时长、
+    一个管探不探后端），只是今天都恰好只有 vue3-springboot；新增需长冷启动的栈时记得同步这里，
+    否则会出现「联合探针却只给 240s」的漂移。
     """
     base = int(cfg.get("deploy.health_timeout") or DEFAULTS["deploy.health_timeout"])
     if stack == "vue3-springboot":
