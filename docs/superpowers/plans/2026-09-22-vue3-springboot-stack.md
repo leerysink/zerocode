@@ -1650,6 +1650,19 @@ git commit -m "feat(compose): render vue3-springboot dev stack (private redis, .
 
 > 另：C1 注记里补一句——`prod_stop`（`app/deploy/prod.py:152`）**目前没有** ensure，prod 模板一旦也带 `${VAR:?}`，I-1′ 会在 prod 侧原样复发。
 
+- [x] **Step 10: 产品裁定落地——`backend/uploads/` 不进市场包**（I-2 留下的待决口径，已向用户确认）
+
+用户选的口径：**不收，算运行时数据**（与 `target`/`logs` 同族）。两个后果各自钉住：
+
+- 不进包：安装者不被塞作者的示例图（`test_write_package_excludes_secrets_and_artifacts` 扩一条）。
+- 不进 `source_hash`：装完之后有人在应用里传一张图，不会让下一次发布报成分叉
+  （新测 `test_runtime_uploads_are_not_packaged_and_not_fingerprinted`：新增 + 覆盖两张图，指纹不变）。
+- **但文件树照旧看得见它们**：`files.py` 的名单刻意不含 uploads（`test_tree_ignores_and_nests` 钉住 `uploads in kids`）。
+  不进包 ≠ 不让用户看到自己的文件，两侧不同形是有意的，两边注释各写明一句。
+- 旁证（不拿未落地的 C1 草稿当事实）：模板自己的 `backend/.dockerignore:3` 已把 `uploads/` 排除在构建上下文之外，
+  `backend/Dockerfile:13` 的 `UPLOAD_DIR=/uploads` 也不是工作区路径——本条只管 dev 的 `UPLOAD_DIR: /src/uploads`。
+- 存量影响：两个模板下都没有 track 的 `backend/uploads/**` 文件（`git ls-files` 实核 0 命中），指纹只可能因「少收了运行时上传」而变得更稳定。
+
 ---
 
 ### Task B2: `HEALTH_BY_STACK` 收敛到 `/api/health` + 大型栈创建放行

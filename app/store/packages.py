@@ -20,8 +20,12 @@ EXCLUDE_DIRS = {"node_modules", ".venv", "dist", "__pycache__", ".pytest_cache",
 # 按路径尾屏蔽而非裸名：target / logs 都是业务通用词（目标管理、日志页面），按名屏蔽会把作者的
 # src/views/target 一类目录静默排除出包与指纹。落点由「dev 容器把 ../backend 挂成 working_dir」与模板里
 # logging.path 的默认值共同决定，两者任一变动（拆多模块、改日志目录）都要回来对一眼这两份名单。
-# uploads/ 刻意不在这里：上传件算不算包内容是个产品口径，没定下来前不悄悄替它做决定。
-EXCLUDE_PATH_TAILS = (("backend", "target"), ("backend", "logs"))
+# uploads/ 算运行时数据（用户裁定）：作者传上来的示例图不该算应用内容，安装者上传的那一张更不该
+# 让下一次发布报成分叉。同口径的先前事实：模板自己的 backend/.dockerignore 已经把 uploads/ 排除在
+# 构建上下文之外，prod 镜像里的 UPLOAD_DIR 也不是工作区路径（backend/Dockerfile:13）。本条只管 dev
+# 落在 backend/uploads 的那一份（compose.py 的 UPLOAD_DIR: /src/uploads）。
+# 注意 files.py 的名单刻意不包含它：不进包 ≠ 不让用户在内置文件管理器里看到它们。
+EXCLUDE_PATH_TAILS = (("backend", "target"), ("backend", "logs"), ("backend", "uploads"))
 EXCLUDE_FILES = {".env", ".DS_Store", "Thumbs.db"}
 
 

@@ -29,6 +29,9 @@ async def test_tree_ignores_and_nests(client, tmp_path):
     (tmp_path / "backend" / "logs").mkdir()
     (tmp_path / "backend" / "logs" / "app.log").write_text("x", encoding="utf-8")
     (tmp_path / "backend" / "pom.xml").write_text("x", encoding="utf-8")
+    # 上传件与包名单相反：不进包也不进指纹，但文件树照旧看得见（用户要在内置管理器里找到它们）
+    (tmp_path / "backend" / "uploads").mkdir()
+    (tmp_path / "backend" / "uploads" / "avatar.png").write_text("x", encoding="utf-8")
     # 反向地雷：target / logs 都是业务通用词，屏蔽判据必须锚在 backend/ 下而不是吃裸名
     (tmp_path / "frontend" / "src" / "views" / "target").mkdir(parents=True)
     (tmp_path / "frontend" / "src" / "views" / "target" / "Index.vue").write_text("x", encoding="utf-8")
@@ -41,6 +44,7 @@ async def test_tree_ignores_and_nests(client, tmp_path):
     backend = next(n for n in r if n["name"] == "backend")
     kids = [c["name"] for c in backend["children"]]
     assert "pom.xml" in kids and "target" not in kids and "logs" not in kids
+    assert "uploads" in kids, "上传件只算运行时数据，不意味着要把它们藏起来"
     biz = _find(r, "target")
     assert biz is not None and biz["path"].replace("\\", "/") == "frontend/src/views/target"
 
