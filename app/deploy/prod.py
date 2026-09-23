@@ -272,7 +272,7 @@ async def _ensure_prod_proxy_conf(root: Path, stack: str = "vue3-fastapi") -> bo
     构建会**静默成功**并产出 stock nginx 配置（无 /api 反代），体检 api 探针 404 直到超时。
     故 conf 补齐后顺带幂等补 Dockerfile 接线；两者任一发生即返回 True（播报补齐事件）。
     模板源取 `app_service.TEMPLATES`——平台唯一写入方就地补文件，不造 parents 链（控制者裁定）。
-    补齐源按栈取（C2）：给大型应用刷 fastapi 那份 = 把 `python:8000` 的 upstream 塞进它镜像，
+    补齐源按栈取（C2）：给大型应用刷 fastapi 那份 = 把 `backend:8000` 的 upstream 塞进它镜像，
     必须跟着 app 自己的 stack 走；`stack` 默认 vue3-fastapi 保旧调用形状不变。
     """
     from app.services.app_service import TEMPLATES

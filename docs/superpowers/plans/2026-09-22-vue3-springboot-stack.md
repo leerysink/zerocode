@@ -2361,6 +2361,12 @@ git commit -m "fix(prod): backfill nginx.conf from the app's own stack template 
 - **调用点取栈的兜底**：发布时 `app` 已过 `_compose_meta`，但 M1 老行的 `stack` 可能为 None（建库时该列未填），故 `app.get("stack") or "vue3-fastapi"`——那时补的确实该是 fastapi 那份，不是懒人兜底。
 - **回归**：定向 `test_prod_engine.py -k "ensure_prod_proxy or nginx or publish_wires_legacy or publish_keeps"` → 4 passed；整文件 47 passed；全量见提交前后台跑。
 
+#### C2 评审（CodeReview 92f36c9..8ced62f）
+
+- **结论：通过**，无 Blocking / 无 Important；grep 确认全库只有一个生产调用点（已传栈），rollback 不重建 conf、本就不该调。
+- **Nit-1（未改）**：极端脏数据（历史行 stack=无模板值 且 自建删了 nginx.conf）会拿「模板缺失 500」报一个其实是配置问题；评审确认旧行为是静默塞错 conf、最终仍在 `render_prod_compose` 400，新行为只是在 preflight 更早失败、无回归。想更干净可提前判 `stack not in PUBLISHABLE_STACKS` 抛 400，但那是超出 C2 意图的防御，暂不。
+- **Nit-2（已改）**：注释/测试文档串把 fastapi upstream 误写为 `python:8000`，实际是 `backend:8000`（区分点是端口）——已改 prod.py 与测试两处，不影响任何断言。
+
 ---
 
 ### Task C3: 发布链按栈取超时（build 与 health 两处都是长冷启动）
