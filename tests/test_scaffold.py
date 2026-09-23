@@ -305,3 +305,31 @@ def test_render_springboot_upload_url_is_gateway_visible(tmp_path):
     fe = tmp_path / "frontend"
     assert "location /uploads/" not in (fe / "nginx.conf").read_text(encoding="utf-8")
     assert "'/uploads'" not in (fe / "vite.config.ts").read_text(encoding="utf-8")
+
+
+def test_springboot_template_ships_both_db_tracks(tmp_path):
+    """大型栈自带双轨（A6）：结构轨是纯幂等 DDL、数据轨是幂等 RBAC 种子。
+
+    两个后果都是实的：模板 `sqlchange/` 一旦自带 .sql，平台就不再追加 demo_notes 种子
+    （那张表只存在于 fastapi 栈，追加进来就是首迁移必红）；而 base-pro 自带的第 12 张
+    `schema_history` 台账表必须剔干净——平台只认自己的 `sqlchange_history`，双记账不可共存。
+    """
+    scaffold.render(SPRINGBOOT_TEMPLATE, tmp_path, {
+        "SLUG": "bigapp", "APP_NAME": "大型应用", "DEV_PORT": "8211", "PROD_PORT": "8210",
+        "DEV_DB": "bigapp_dev", "PROD_DB": "bigapp_prod", "TODAY": "20260922"})
+    schema = (tmp_path / "schema" / "schema.sql").read_text(encoding="utf-8")
+    # 行首计数，不用裸子串：文件头注释里就写着 CREATE TABLE IF NOT EXISTS / 永不 DROP，子串计数会被它污染
+    assert schema.count("\nCREATE TABLE IF NOT EXISTS ") == 11   # 基座 11 张 sys_* 表（含 sys_role_dept）
+    assert "sys_dept" in schema and "sys_role_dept" in schema and "sys_login_log" in schema
+    assert "schema_history" not in schema                          # 自带台账机制已削离
+    assert "INSERT" not in schema.upper()                          # 结构轨不写数据
+    for killer in ("DROP TABLE", "DROP COLUMN", "DROP INDEX"):
+        assert killer not in schema.upper(), killer                # 也不写破坏性 DDL
+    assert "大型应用" in schema and "{{" not in schema                    # 文件头吃占位符且渲染干净
+    seeds = sorted(p.name for p in (tmp_path / "sqlchange").glob("*.sql"))
+    assert seeds == ["D20260101_01_rbac_seed.sql"]                 # 数据轨自带 → demo_notes 让位
+    seed = (tmp_path / "sqlchange" / seeds[0]).read_text(encoding="utf-8")
+    assert "demo_notes" not in seed and "schema_history" not in seed
+    assert seed.count("SELECT setval(") == 6                       # 显式 id 预置后必须前移序列
+    assert seed.count("INSERT INTO") == seed.count("ON CONFLICT")   # 每条写入都幂等可重放
+    assert (tmp_path / "schema" / "README.md").is_file() and (tmp_path / "sqlchange" / "README.md").is_file()

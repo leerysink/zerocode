@@ -975,7 +975,11 @@ git commit -m "fix(template): make the upload URL gateway-visible and stop vue-t
 
 来源 `$ref\database\init-postgres.sql`（298 行、12 表 + 索引 + COMMENT + 种子 + 6 条 `setval`）。基线**已是幂等形态**（`CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS` / `ON CONFLICT DO NOTHING`），所以本 Task 是「按边界切两刀」而不是重写 DDL。
 
-- [ ] **Step 1: 按文本标记切两段（不手数行号）**
+- [x] **Step 1: 按文本标记切两段（不手数行号）**
+
+> 执行勘误（两处，都是计划没算到的文本事实）：
+> 1. 数据轨的切点**不能**取 `-- 预置数据` 那一行本身——它上一行是 `-- =====` 横幅的收尾，从标记行切会把这条横幅劈成两半（结构轨留个尾巴、种子文件缺个头）。实际从标记行的**前一行**切入，让整条横幅跟数据走。
+> 2. 结构轨不是「第 1–11 张表」这么干净：基线里第 12 张是 base-pro 自己的台账表 `schema_history`，连同它的「初始台账登记」INSERT 一起位于种子段之后，切法为 `[0..iStruct)` / `[iData..iHist)` 正好把它整段排除。
 
 ```powershell
 cd d:\project\zerocode
@@ -992,7 +996,9 @@ New-Item -ItemType Directory -Force app\templates\vue3-springboot\schema, app\te
 
 Expected: `schema.sql` = 第 1–11 张 `sys_*` 表（含索引与 COMMENT）；种子文件 = 预置数据 + 6 条 `setval`。
 
-- [ ] **Step 2: 换掉结构轨文件头**（原头注释讲的是 base-pro 自己的台账机制）
+- [x] **Step 2: 换掉结构轨文件头**（原头注释讲的是 base-pro 自己的台账机制）
+
+> 执行勘误：横幅里**不写** `app/deploy/sqlrunner/run.sh` 这类平台内部路径——生成的应用交给人/模型看，不该知道平台仓库结构；fastapi 模板的同名文件也是只说「平台每次预览与发布前全量重放」。另补两条本栈才需要的口径：列定义与后端实体逐列对齐（写查询前先读本文件取权威列）、PG16 且需 12+（依赖 identity 序列 / 部分唯一索引 / `CREATE INDEX IF NOT EXISTS`）。
 
 用 SearchReplace 把 `schema/schema.sql` 开头到第一条建表语句前的注释块替换为：
 
@@ -1008,14 +1014,16 @@ Expected: `schema.sql` = 第 1–11 张 `sys_*` 表（含索引与 COMMENT）；
 -- =====================================================
 ```
 
-- [ ] **Step 3: 给数据轨种子补文件头**（保留原有中文注释）
+- [x] **Step 3: 给数据轨种子补文件头**（保留原有中文注释）
+
+> 执行勘误：种子正文 L283 附近原有的中文注释里**写着 `schema_history`**（“不像 schema_history 那样…”一类的自述）。不改写它，Step 4 的「零命中」判据必然失败——而这条判据要的恰恰是「本模板不再有任何自带台账概念」。故把该注释改写为只提「平台账本」的中性说法。另：6 条 `setval` 的适用范围注释也补了「两张日志表无预置数据、三张关联表没有 id 列，不要重置成 0（`setval` 对 MINVALUE 1 的序列传 0 会报错）」。
 
 ```sql
 -- D20260101_01_rbac_seed.sql —— 基座 RBAC 种子（幂等可重放；一经应用不得修改，只能追加新 D 文件）
 -- 固定日期 20260101：文件名不经占位替换（渲染器只改内容不改路径），保证永远排在本应用新增文件之前。
 ```
 
-- [ ] **Step 4: 平台账本唯一性体检（规格 §4 的收口）**
+- [x] **Step 4: 平台账本唯一性体检（规格 §4 的收口）**
 
 ```powershell
 Get-ChildItem app\templates\vue3-springboot\schema\schema.sql, app\templates\vue3-springboot\sqlchange\*.sql | Select-String -Pattern 'schema_history' | ForEach-Object { $_.Filename + ":" + $_.LineNumber }
@@ -1024,22 +1032,40 @@ Select-String -Path app\templates\vue3-springboot\schema\schema.sql -Pattern 'IN
 
 Expected: 两条都**无输出**——base-pro 自带的第 12 张 `schema_history` 表与其台账 INSERT 已剔除（与平台 `sqlchange_history` 双记账不可共存）；结构轨无数据、无 DROP。
 
-- [ ] **Step 5: 幂等性实测（纸面通过不算通过）**
+实测：两条命令均无输出（平台账本真名经 `app/deploy/sqlrunner/run.sh:14` 核实为 `sqlchange_history`，不叫 `schema_history`，所以模板里出现 `schema_history` 就是自带台账残留）。
+
+- [x] **Step 5: 幂等性实测（纸面通过不算通过）**
 
 本机 `zerocode-pg16` 需为运行态（不在则 `docker start zerocode-pg16`）：
 
+> 执行勘误（计划这段命令在本机**跑不起来**，三条事实）：
+> 1. 容器超用户不是 `postgres`——`docker exec zerocode-pg16 env` 实测 `POSTGRES_USER=zerocode`（与 `app/config.py` 的 DSN 一致），写 `-U postgres` 直接 `FATAL: role "postgres" does not exist`。
+> 2. `Get-Content ... -Raw | docker exec -i ... psql -f -` 这条管道会把中文洗成乱码（PowerShell 5.1 控制台编码写进 stdin），种子一多字符就进库了。改用 `docker cp` 文件 + `psql -f` + `-e PGCLIENTENCODING=UTF8`，字节直接进容器不经管道。
+> 3. 脚本本身得把所有字符串字面量写成 ASCII：无 BOM 的 `.ps1` 被 PS 5.1 按 GBK 读，全角 `）`（UTF-8 `EF BC 89`）的尾字节会吃掉紧跟的单引号，直接解不开。另外 `docker exec` 的 `-e` 必须在容器名**之前**，`psql -tAc` 必须把 SQL 紧跟在**后面**（否则 `-c` 吞掉 `-U`）。
+>
+> 还有一条坑不属于脚本、但会误判：**psql 的 NOTICE 走 stderr**，外层 `2>&1` 会被 PowerShell 包成 ErrorRecord 让脚本整体 `ExitCode=1`——幂等重放本来就该吐 24 条 “already exists, skipping”，把它当失败就本末倒置了。故探针内部自行捕获 stderr，只对 `ERROR` 计数。
+
+落地的探针（留在 `.qoder-tmp` 供复核，不删）：
+
 ```powershell
-docker exec zerocode-pg16 psql -U postgres -c "CREATE DATABASE zc_tpl_probe"
-Get-Content app\templates\vue3-springboot\schema\schema.sql -Raw | docker exec -i zerocode-pg16 psql -q -v ON_ERROR_STOP=1 -U postgres -d zc_tpl_probe -f -
-Get-Content app\templates\vue3-springboot\sqlchange\D20260101_01_rbac_seed.sql -Raw | docker exec -i zerocode-pg16 psql -q -v ON_ERROR_STOP=1 -U postgres -d zc_tpl_probe -f -
-Get-Content app\templates\vue3-springboot\schema\schema.sql -Raw | docker exec -i zerocode-pg16 psql -q -v ON_ERROR_STOP=1 -U postgres -d zc_tpl_probe -f -
-docker exec zerocode-pg16 psql -U postgres -d zc_tpl_probe -tAc "SELECT count(*) FROM sys_menu"
+powershell -NoProfile -ExecutionPolicy Bypass -File .qoder-tmp\a6_idempotency_probe.ps1
 ```
 
-Expected: 三次 `-f` 退出码 0、无 ERROR；最后一条输出 `30`（10 目录/菜单 + 20 按钮）。
-探针库 `zc_tpl_probe` 是一次性验证物，用完由人工 `DROP DATABASE zc_tpl_probe`（它是探针，不是平台产物）。
+实测结果（全绿，进程 `OVERALL=0`）：
 
-- [ ] **Step 6: 两份 README 沿用 fastapi 口径 + 补本栈特有的菜单条款**
+| 检查 | 实测 | 期望 |
+|---|---|---|
+| schema#1 / seed#1 / schema#2 / seed#2 四次重放 | 全 `exit=0`、`ERROR=0`（schema#2 NOTICE=24，即逐条跳过） | 幂等可重放 |
+| `sys_*` 表数 | 11 | 11（无第 12 张台账表） |
+| `schema_history` 表数 | 0 | 0 |
+| `sys_menu` | 30 | 30 = 10 菜单/目录 + 20 按钮 |
+| `sys_role_menu` | 41 | 41 = admin 全量 30 + common 11 |
+| `sys_menu_id_seq.last_value` | 1072 | 1072（`setval` 前移生效，新菜单不会撞基座 id） |
+| `octet_length(dept_name)/length` | 9B/3c | 9B/3c（UTF-8 三汉字未被洗） |
+
+探针库 `zc_tpl_probe` 由脚本自己 `DROP DATABASE ... WITH (FORCE)` 收尾，不留残留。
+
+- [x] **Step 6: 两份 README 沿用 fastapi 口径 + 补本栈特有的菜单条款**
 
 ```powershell
 Copy-Item app\templates\vue3-fastapi\schema\README.md app\templates\vue3-springboot\schema\README.md
@@ -1065,7 +1091,11 @@ SELECT setval('sys_menu_id_seq', (SELECT MAX(id) FROM sys_menu));
 显式写 id（避开基座占用的 1–1072），一个文件一个逻辑变更。
 ````
 
-- [ ] **Step 7: 提交**
+> 执行勘误：追加前先逐条核过这段的断言（写给 AI 看的操作手册不能想当然）——路由确实是 `frontend/src/router/index.ts` 静态注册；同文件 `beforeEach`（L139–149）确实「当前路径命中不了菜单集合就跳 `/403`」；`path` 拼接口径在 `frontend/src/utils/menuPath.ts`（顶层写片段即可，拼接后是 `/ticket`）；后端**没有** `@PreAuthorize`，按钮级是 `useUserStore().hasPermission()` 且 admin 恒过。据此把这段扩成「一条 SQL + 4 条注意点」，比计划的两句 more actionable。
+
+- [x] **Step 7: 提交**
+
+> 执行补记：本次一并提交 `tests/test_scaffold.py` 的 `test_springboot_template_ships_both_db_tracks`（红→绿：先 FileNotFoundError 红，拆完 21 passed）。断言口径要经得起文件头反问——**不能**用裸子串计数，因为新写的结构轨横幅本身就写着 “CREATE TABLE IF NOT EXISTS” 与 “永不 DROP”；改为行首 `\nCREATE TABLE IF NOT EXISTS ` 计数 == 11，并显式禁 `DROP TABLE|COLUMN|INDEX` 三种写法。
 
 ```bash
 git add app/templates/vue3-springboot/schema app/templates/vue3-springboot/sqlchange
