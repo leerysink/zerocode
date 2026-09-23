@@ -265,20 +265,22 @@ async def _step_ev(app_id, notify, rid_step_cb, step: str, state: str) -> None:
         await rid_step_cb(step)
 
 
-async def _ensure_prod_proxy_conf(root: Path) -> bool:
+async def _ensure_prod_proxy_conf(root: Path, stack: str = "vue3-fastapi") -> bool:
     """存量应用补齐生产反代接线（T3b 之前创建的工程没有 nginx.conf，更没把它 COPY 进镜像）。
 
     终审 C-1：只补 conf 不够——M1 存量 frontend/Dockerfile 没有 `COPY nginx.conf` 那行，
     构建会**静默成功**并产出 stock nginx 配置（无 /api 反代），体检 api 探针 404 直到超时。
     故 conf 补齐后顺带幂等补 Dockerfile 接线；两者任一发生即返回 True（播报补齐事件）。
     模板源取 `app_service.TEMPLATES`——平台唯一写入方就地补文件，不造 parents 链（控制者裁定）。
+    补齐源按栈取（C2）：给大型应用刷 fastapi 那份 = 把 `python:8000` 的 upstream 塞进它镜像，
+    必须跟着 app 自己的 stack 走；`stack` 默认 vue3-fastapi 保旧调用形状不变。
     """
     from app.services.app_service import TEMPLATES
     fe = root / "frontend"
     conf = fe / "nginx.conf"
     patched = False
     if fe.is_dir() and not conf.is_file():
-        src = TEMPLATES / "vue3-fastapi" / "frontend" / "nginx.conf"
+        src = TEMPLATES / stack / "frontend" / "nginx.conf"
         if not src.is_file():
             raise DeployError(f"生产反代模板缺失：{src}", status=500)
         conf.write_text(src.read_text(encoding="utf-8"), encoding="utf-8", newline="")
@@ -355,7 +357,7 @@ async def publish(sf, app: dict, notify=None, *, force: bool = False,
             raise DeployError(f"sqlchange 文件名不规范：{bad}（应为 V<日期>_<两位序号>_<说明>.sql）")
         if not (root / "app.json").is_file():
             raise DeployError("app.json 缺失，无法发布")
-        if await _ensure_prod_proxy_conf(root):
+        if await _ensure_prod_proxy_conf(root, app.get("stack") or "vue3-fastapi"):
             await _step(app_id, notify, "✓ 已为存量应用补齐 frontend 生产反代（nginx.conf / Dockerfile COPY 接线）")
         # 1.x dev/prod 结构等价校验（P1 止血；并入 preflight，不改步序）：
         #     dev 实际结构必须等于 fold(sqlchange 文件)，否则视为漂移，硬阻断发布。

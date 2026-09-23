@@ -724,6 +724,33 @@ async def test_publish_keeps_existing_nginx_conf(monkeypatch, sf, seed, pub_root
     assert not any("补齐" in ln for ln in seams.logs)
 
 
+async def test_ensure_prod_proxy_conf_picks_template_by_stack(tmp_path):
+    """补齐源必须跟着栈走：给大型应用刷 fastapi 反代 = 把 python:8000 的 upstream 塞进它镜像。
+
+    新建的大型应用自带 nginx.conf，走不到这个分支；它是给「自己删了 nginx.conf」的存量兜底的，
+    所以按纯函数级直测，不绕发布流水线。
+    """
+    from app.services import app_service
+    fe = tmp_path / "frontend"
+    fe.mkdir()
+    assert await prod._ensure_prod_proxy_conf(fe.parent, "vue3-springboot") is True
+    conf = (fe / "nginx.conf").read_text(encoding="utf-8")
+    assert conf == (app_service.TEMPLATES / "vue3-springboot" / "frontend" / "nginx.conf"
+                    ).read_text(encoding="utf-8")
+    assert "backend:8080" in conf and "8000" not in conf
+
+
+async def test_ensure_prod_proxy_conf_default_stack_untouched(tmp_path):
+    """回归钉：不传栈的旧调用形状（存量 fastapi 路径）行为逐字不变。"""
+    from app.services import app_service
+    fe = tmp_path / "frontend"
+    fe.mkdir()
+    assert await prod._ensure_prod_proxy_conf(fe.parent) is True
+    assert (fe / "nginx.conf").read_text(encoding="utf-8") == (
+        app_service.TEMPLATES / "vue3-fastapi" / "frontend" / "nginx.conf"
+    ).read_text(encoding="utf-8")
+
+
 async def test_publish_blocks_on_bad_sqlchange_name(monkeypatch, sf, seed, pub_root):
     """命名规范闸门在 preflight（全局约束/07）：坏名一条都不起栈，且失败必收口 publish_done。"""
     wid, aid = await seed(slug="zcpub", prod_port=8982, dev_port=8983,

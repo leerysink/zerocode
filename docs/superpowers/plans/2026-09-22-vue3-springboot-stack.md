@@ -2287,7 +2287,7 @@ git commit -m "feat(compose): render vue3-springboot prod stack (built images, u
 - Modify: `app/deploy/prod.py:248-268,338`
 - Test: `tests/test_prod_engine.py`
 
-- [ ] **Step 1: 写失败测试**（追加到 `tests/test_prod_engine.py`，紧邻 `test_publish_keeps_existing_nginx_conf`）
+- [x] **Step 1: 写失败测试**（追加到 `tests/test_prod_engine.py`，紧邻 `test_publish_keeps_existing_nginx_conf`）
 
 ```python
 async def test_ensure_prod_proxy_conf_picks_template_by_stack(tmp_path):
@@ -2317,12 +2317,12 @@ async def test_ensure_prod_proxy_conf_default_stack_untouched(tmp_path):
     ).read_text(encoding="utf-8")
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `pytest tests/test_prod_engine.py -q -k ensure_prod_proxy`
 Expected: FAIL — `TypeError: _ensure_prod_proxy_conf() takes 1 positional argument but 2 were given`
 
-- [ ] **Step 3: 实现按栈取源**
+- [x] **Step 3: 实现按栈取源**
 
 `app/deploy/prod.py`：函数签名与模板源两行改为（**形参带默认值**，`test_prod_engine.py:665` 的存量 fastapi 断言与所有旧调用形状都不必动）：
 
@@ -2342,17 +2342,24 @@ async def _ensure_prod_proxy_conf(root: Path, stack: str = "vue3-fastapi") -> bo
 
 > `or "vue3-fastapi"` 不是兜底懒人：`_compose_meta` 之前，老行的 `stack` 可能为 None（M1 建库时该列还没填），此时补的确实该是 fastapi 那份。
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `pytest tests/test_prod_engine.py -q`
 Expected: PASS（含 ⑨ 号存量断言、`test_publish_keeps_existing_nginx_conf`、`test_publish_wires_legacy_dockerfile_and_idempotent` 全部原样绿）
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add app/deploy/prod.py tests/test_prod_engine.py
 git commit -m "fix(prod): backfill nginx.conf from the app's own stack template instead of hardcoding vue3-fastapi"
 ```
+
+#### C2 落地补充
+
+- **行号漂移（事实校正）**：计划写的 `prod.py:248-268,338` 已被 C1 的 ensure 改动推下——实际落点是函数 `_ensure_prod_proxy_conf`（现 L268）与发布步调用（现 L358）。判据不变，只改签名 + 模板源 + 传栈三处。
+- **默认形参保旧调用形状**：`stack: str = "vue3-fastapi"` 让 ⑨ 号存量断言（走 fastapi 应用的 publish）与两条纯函数回归钉（`_ensure_prod_proxy_conf(root)` 不传栈）都零改动原样绿；新测试 `test_ensure_prod_proxy_conf_picks_template_by_stack` 才走 SB 分支。
+- **调用点取栈的兜底**：发布时 `app` 已过 `_compose_meta`，但 M1 老行的 `stack` 可能为 None（建库时该列未填），故 `app.get("stack") or "vue3-fastapi"`——那时补的确实该是 fastapi 那份，不是懒人兜底。
+- **回归**：定向 `test_prod_engine.py -k "ensure_prod_proxy or nginx or publish_wires_legacy or publish_keeps"` → 4 passed；整文件 47 passed；全量见提交前后台跑。
 
 ---
 
