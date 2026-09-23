@@ -1981,7 +1981,7 @@ git commit -m "feat(dev): joint frontend+backend health gate and per-stack timeo
 
 本 Task 无代码改动，只跑真环境并归档证据。跳不过就说明前面有错，**不允许注销售过**。
 
-- [ ] **Step 1: 前置体检**
+- [x] **Step 1: 前置体检**
 
 ```powershell
 docker info --format ok
@@ -1992,7 +1992,7 @@ docker manifest inspect docker.m.daocloud.io/library/redis:7-alpine
 
 Expected: 三条均成功。拉不到镜像时先 `docker pull docker.m.daocloud.io/library/<image>` 再 `docker tag` 回标准名（本机 Docker Hub 不可直连），并把这一前置写进模板 README 的「开始之前」。
 
-- [ ] **Step 2: 走平台真创建**
+- [x] **Step 2: 走平台真创建**
 
 启动平台后端（`start.bat` 或 `.venv\Scripts\python -m uvicorn app.main:app --port 8000`），在向导里选「大型」建一个应用（名字自取，如「工调系统」），确认：
 
@@ -2001,13 +2001,13 @@ Expected: 三条均成功。拉不到镜像时先 `docker pull docker.m.daocloud
 3. `deploy/dev-compose.yml` 含 redis/backend(maven)/frontend/migrate 四个服务
 4. `deploy/.env` 里 `JWT_SECRET`、`REDIS_PASSWORD` 已生成非空值
 
-- [ ] **Step 3: 起预览并等冷启动**
+- [x] **Step 3: 起预览并等冷启动**
 
 点「预览」，观察 dev 日志面板：迁移段应打出 `FOLD schema.sql` → `OK D20260101_01_rbac_seed.sql` → `ALL DONE`；首次编译下载依赖，**等到底（最长 900s）**，不重复点重启。
 
 Expected: 状态到 `running`，总耗时 ≤900s（实测基线 ≈410s）。
 
-- [ ] **Step 4: 登录验收（必留截图）**
+- [x] **Step 4: 登录验收（必留截图）**
 
 1. 浏览器打开 `http://localhost:<dev_port>`，用 `admin` / `admin123` 登录成功
 2. 七张基座页面逐个打开：首页、个人中心、用户管理、角色管理、菜单管理、部门管理、字典管理、操作日志、登录日志
@@ -2016,11 +2016,11 @@ Expected: 状态到 `running`，总耗时 ≤900s（实测基线 ≈410s）。
 
 截图存到 `.qoder-tmp/t14_`（`t14_login.png`、`t14_pages.png`、`t14_loginlog.png`），并在本 Task 收尾写下实测耗时。
 
-- [ ] **Step 5: 热重启计时**
+- [x] **Step 5: 热重启计时**
 
 停栈→再起栈，记录耗时（实测基线 77s）写入模板 README 的「开始之前」，替换估计值「之后约 1 分钟」为实测数字。
 
-- [ ] **Step 6: 全量回归 + 提交**
+- [x] **Step 6: 全量回归 + 提交**
 
 ```bash
 cd frontend; npm run test; npm run build; cd ..
@@ -2030,6 +2030,25 @@ cd frontend; npm run test; npm run build; cd ..
 git add app/templates/vue3-springboot/README.md
 git commit -m "docs(template): record measured dev startup timings from the large-stack preview run"
 ```
+
+---
+
+#### B4 实测证据（验收结论）
+
+被验对象：今天（2026-09-23 10:07:56Z）通过平台向导真建的 vue3-springboot 应用「来料」（slug `lailiao`，dev 端口 8217）。未另建第二个应用：一个真实、跑着、可登录的大型应用已是本 Task 要的全部证据，重跑向导只多一个同质实例。
+
+| 验收点 | 实测结果 |
+|---|---|
+| 创建落盘 | `app.json`：`scale=large`/`stack=vue3-springboot`/`health.backend=/api/health`/库双轨 `lailiao_dev`+`lailiao_prod`；`deploy/.env` 的 `JWT_SECRET`、`REDIS_PASSWORD` 非空；compose 含 migrate/appredis/backend/frontend 四服务 |
+| 冷启动 | 后端日志 `Started BaseApplication in 45.014 seconds`（10:12:55 起好）；从创建到就绪 ≈ 5 分钟（含 Maven 下依赖），远低于 900s 上限 |
+| migrate | 首次 `Exited (0)` + `FOLD schema.sql`→`SKIP/OK D20260101_01_rbac_seed.sql`→`ALL DONE`；重跑幂等（全 `already exists, skipping`） |
+| 数据轨 | 直查 `lailiao_dev`：`admin` 用户 status=1、sys_user 1 行、sys_menu 30 行（RBAC 种子已入） |
+| B3 联合健康（真栈） | `http://127.0.0.1:8217/` → 200 且 `/api/health` → 200（经 vite dev proxy 打到后端） |
+| 登录验收 | `admin`/`admin123` 登录成功（本 build 未启用 captcha）；9 张基座页全渲染（30 菜单/1 用户/2 角色/3 部门/字典）；登录日志新增一条 `admin·172.24.0.4·成功·10:40:53`（写链路通）；全程 80 请求全 200、Console 0 错 |
+| 热重启 | down→up→前后端双 200 = **87s**（基线 77s 同量级；本次是 Docker 守护重启后恢复、偏慢一点），已写入模板 README |
+
+> 事故记录（非代码缺陷）：热重启时 `zerocode-pg16`（共享平台库，不属于应用 compose）因 Docker 守护进程重启而 `Exited (255)`，导致 migrate 报 `could not translate host name "zerocode-pg16"`。`docker start zerocode-pg16` 后重跑即正常。这也是 Step 1 把 `docker start zerocode-pg16` 列为前置的理由。
+> 一个待确认项（不属本 Task、不阻断）：登录日志的时间按 **UTC** 落库并原样展示（比操作者本地 GMT+8 早 8 小时）；seed 数据的创建时间同理。功能不受影响，是 base-pro 基座的时区展示行为，如需按用户时区渲染属后续独立话题。
 
 ## Phase C — prod 发布链路
 

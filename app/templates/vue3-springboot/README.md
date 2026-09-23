@@ -12,6 +12,8 @@ zerocode 大型应用（Vue3 + Spring Boot 3.2.5 管理后台），自带登录 
 - **首次构建要等几分钟**：后端镜像第一次要把 Maven 依赖全部下载下来（后端 `Dockerfile` 里那句
   「冷启动 410s」就是这个），它挂了 BuildKit 缓存卷复用容器里的 `/root/.m2`，之后的构建不再重下
   （改了 `pom.xml` 的依赖版本或缓存被清掉时除外）。期间日志面板一直滚，**不要重复点「重启」**。
+- **起好之后再重启约一分半**：依赖已进缓存卷、不再重下，实测「停止 → 再起 → 前端与后端 `/api/health`
+  同时 200」就绪耗时约 **90s**（首次那几分钟的冷启动只发生一次）。
 - 拉不到基础镜像（后端 `maven:3.9-eclipse-temurin-17` / `eclipse-temurin:17-jre-alpine`，前端
   `node:20-alpine` / `nginx:1.27-alpine`）时说明本机直连 Docker Hub 不通，先配镜像加速源再重试。
 
