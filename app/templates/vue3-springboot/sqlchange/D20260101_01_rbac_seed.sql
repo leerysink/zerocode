@@ -11,7 +11,7 @@ INSERT INTO sys_dept (id, parent_id, ancestors, dept_name, order_num, leader) VA
 (3, 1, '0,1,',  '实施服务部',   2, NULL)
 ON CONFLICT (id) DO NOTHING;
 
--- 超级管理员（密码 admin123 的 BCrypt 哈希，与源项目 init-all.sql 一致）
+-- 超级管理员（默认密码 admin123 的 BCrypt 哈希；交付后请提示用户首次登录后立即改密）
 INSERT INTO sys_user (id, username, password, nickname, dept_id, status) VALUES
 (1, 'admin', '$2a$10$7JB720yubVSZvUI0rEqK/.VqGOZTH.ulu33dHOiBE8ByOhJIrdAu2', '超级管理员', 2, 1)
 ON CONFLICT (id) DO NOTHING;
@@ -70,7 +70,7 @@ INSERT INTO sys_role_menu (role_id, menu_id) VALUES
 (2, 1), (2, 2), (2, 100), (2, 104), (2, 1041), (2, 1042), (2, 1043), (2, 105), (2, 1051), (2, 1052), (2, 1053)
 ON CONFLICT DO NOTHING;
 
--- 样例字典（证明字典管理开箱可用；源项目的业务字典不迁移）
+-- 样例字典（证明字典管理开箱可用；业务字典由本应用自行追加或替换）
 INSERT INTO sys_dict_type (id, dict_name, dict_type, remark) VALUES
 (1, '系统是否', 'sys_yes_no', '通用是否选项')
 ON CONFLICT (id) DO NOTHING;

@@ -333,3 +333,11 @@ def test_springboot_template_ships_both_db_tracks(tmp_path):
     assert seed.count("SELECT setval(") == 6                       # 显式 id 预置后必须前移序列
     assert seed.count("INSERT INTO") == seed.count("ON CONFLICT")   # 每条写入都幂等可重放
     assert (tmp_path / "schema" / "README.md").is_file() and (tmp_path / "sqlchange" / "README.md").is_file()
+
+    # 不变量是「交付物里不该有自带台账概念 / 参考仓库的私有假设」，不限于那两个 .sql：
+    # README 与注释是给后续接手的 AI 读的，漏回去一句就够它把双记账或「源项目」当成事实。
+    for p in list(tmp_path.rglob("*.sql")) + list(tmp_path.rglob("*.md")):
+        text = p.read_text(encoding="utf-8")
+        assert "schema_history" not in text, p            # 平台只认 sqlchange_history
+        for leak in ("源项目", "base-pro", "init-all"):   # 参考工程的私有假设 / 文件名
+            assert leak not in text, (p, leak)

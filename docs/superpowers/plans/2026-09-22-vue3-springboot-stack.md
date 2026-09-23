@@ -1102,6 +1102,21 @@ git add app/templates/vue3-springboot/schema app/templates/vue3-springboot/sqlch
 git commit -m "feat(template): split base-pro baseline into schema track and idempotent RBAC seed track"
 ```
 
+已提交 `797c8a4`（6 文件 +397/−14）；提交前回归 `test_scaffold / test_contract / test_app_service / test_deploy_basics / test_sqlrunner / test_publish_api` → **83 passed**（新增两个模板目录不会打破任何枚举模板文件的测试）。
+
+- [x] **Step 8: 复审返修（CodeReview 范围 `668b28f..797c8a4`）**
+
+复审结论：无 Blocking，2 Important + 2 Nit。对方亲自重跑了探针与 pytest（未采信转述），并独立确认了 11 vs 12 的差集恰为台账表、`setval` 空表路径不可达、`{{APP_NAME}}` 无法从 `--` 注释越狱（`check_name` 拒控制字符故插不进换行）。
+
+| 条目 | 自查复算 | 处置 |
+|---|---|---|
+| I-1 种子残留 `与源项目 init-all.sql 一致` / `源项目的业务字典不迁移` | 成立。且 `init-all.sql` 连文件名都对不上本 Task 的真实基线 `init-postgres.sql`；与本 Task Step 2 自己立的口径（不泄漏仓库结构）直接冲突 | 两处改中性说法（提醒默认密码需改 / 业务字典由本应用自行追加或替换） |
+| I-2 README 范例 id=200 与「避开 1–1072」自相矛盾 | 成立，但**根因不是 200 不可用**。实查 `sys_menu` 占用集 = {1, 2, 100–107, 1011–1072}，200 确实是空隙（能跑通）；错在「粗区间 + 区间内范例」示范了到占用区挑号这个危险模式 | 规则与范例两头对齐：范例抬到 1200，规则改写精确占用集 + 「取 >1072」，并补上为何危险（踩到已用 id 时 `ON CONFLICT DO NOTHING` **静默跳过**，菜单不出现也不报错） |
+| N-3 `schema_history` 守护只盖两个 .sql | 成立，全树 grep 目前 0 命中，只是守护面缺口 | 断言扩到渲染产物的全部 `.sql`/`.md`，并顺带把 I-1 的泄漏词（源项目/base-pro/init-all）一同钉住 |
+| N-4 结构轨横幅内插 `{{APP_NAME}}`与 fastapi（零占位）口径分叉 | 已核实安全，纯风格 | 不改。文件头带应用名便于定位归属，代价只是注释级文本差异 |
+
+返修后实跑：`pytest tests/test_scaffold.py -q` → 21 passed；幂等探针仍 `RESULT: PASS`（改动虽只涉种子注释一行，重跑为求证据而非推断）。
+
 ---
 
 ### Task A7: 模板 README + 整栈渲染回归测试
