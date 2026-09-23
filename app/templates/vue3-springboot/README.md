@@ -9,9 +9,9 @@ zerocode 大型应用（Vue3 + Spring Boot 3.2.5 管理后台），自带登录 
 
 ## 开始之前
 
-- **首次预览要等几分钟**：后端在容器里跑 `mvn spring-boot:run`，第一次要把 Maven 依赖全下载下来
+- **首次预览要等几分钟**：后端在容器里用 Maven 现场启动（不打 jar），第一次要把依赖全部下载下来
   （spike 实测约 7 分钟，之后约 1 分钟）。期间日志面板一直滚，**不要重复点「重启」**。
-- 拉不到 `maven:3.9-eclipse-temurin-17` / `eclipse-temurin:17-jre-alpine` / `redis:7-alpine`
+- 拉不到 `maven:3.9-eclipse-temurin-17` / `eclipse-temurin:17-jre-alpine`（两个 `Dockerfile` 里的基础镜像）
   时说明本机直连 Docker Hub 不通，先配镜像加速源再重试。
 
 ## 目录
@@ -39,6 +39,8 @@ zerocode 大型应用（Vue3 + Spring Boot 3.2.5 管理后台），自带登录 
 
 - 想看 SQL 日志：`backend/src/main/resources/application.yml` 里把 `mybatis-plus.configuration.log-impl`
   改成 `org.apache.ibatis.logging.stdout.StdOutImpl`（默认不打日志）
-- 想开接口文档：同文件把 `springdoc.*.enabled` 与 `knife4j.enable` 改 true，并在
-  `backend/.../config/SecurityConfig.java` 放开 `/doc.html`、`/webjars/**`、`/v3/api-docs/**`
+- 想开接口文档：改 `application.yml` 三处——`springdoc.api-docs.enabled`、`springdoc.swagger-ui.enabled` 改 true，
+  并把 `knife4j.production` 改 false（**真正屏蔽文档的是它**，只翻 `knife4j.enable` 出不来）。
+  `SecurityConfig` 已预先放开 `/doc.html`、`/swagger-ui/**`、`/v3/api-docs/**`、`/webjars/**`，无需再改；
+  对外完整地址同样带 context 前缀：`http://localhost:{{DEV_PORT}}/api/doc.html`
 - 想改结构：只编辑 `schema/schema.sql` 的目标态；要改数据或加菜单，才往 `sqlchange/` 追加 `D*.sql`

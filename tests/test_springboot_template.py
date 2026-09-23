@@ -26,6 +26,31 @@ FAVICON_SHA256 = "e7773a393ad260e7d434e37dc57501207880984e8e313a1afa8e73c77c6f38
 # 那样写会把产品形态判成残留。字节版（不是 str 版）才能连着二进制文件一起扫。
 RESIDUE = re.compile(rb"\{\{\s*[A-Z][A-Z0-9_]*\s*\}\}")
 
+# 杂物清单：构建产物与本机残留会随**每一个**生成的应用一起分发，藏在任意一层都同样有害，
+# 所以判据是「整棵树 rglob」而不是钉 backend/、frontend/ 两个固定子路径（钉法会漏掉
+# backend/src/main/java/... /target 这类深层命中）。刻意不收 .mvn——maven wrapper 是合法件。
+JUNK_DIRS = {"target", "node_modules", "dist", "logs", ".idea", ".vscode", ".scratch"}
+JUNK_FILES = {".env", ".DS_Store", "Thumbs.db"}     # .env：密钥只能由平台注入，模板里留一份即泄漏
+JUNK_SUFFIXES = {".tsbuildinfo", ".pyc"}             # vue-tsc / python 增量构建缓存
+
+
+def _junk(tree: Path):
+    bad = []
+    for p in sorted(tree.rglob("*")):
+        rel = str(p.relative_to(tree))
+        if p.is_dir() and p.name in JUNK_DIRS:
+            bad.append(rel)
+        elif p.is_file() and (p.name in JUNK_FILES or p.suffix in JUNK_SUFFIXES):
+            bad.append(rel)
+    return bad
+
+
+# 作者用户名 / 参考工程名。尾词边界按各自的误伤风险分别定，不一刀切：
+#   · base-pro 不收尾会误伤 base-production、base-prod 这类正常词；
+#   · leerysink 不会与合法标识符共前缀，反倒 `leerysink123` 这种带后缀的写法是真会漏的，
+#     给它加 \b 等于放水。
+FOREIGN = (r"\bleerysink", r"\bbase-pro\b")
+
 
 def _render(tmp_path):
     out = tmp_path / "app"
@@ -39,10 +64,7 @@ def test_template_shape():
     assert (TEMPLATE / "frontend" / "src" / "main.ts").is_file()
     assert (TEMPLATE / "schema" / "schema.sql").is_file()
     assert (TEMPLATE / "sqlchange").is_dir()
-    for junk in ("target", "logs", ".scratch"):
-        assert not (TEMPLATE / "backend" / junk).exists(), junk
-    for junk in ("dist", "node_modules"):
-        assert not (TEMPLATE / "frontend" / junk).exists(), junk
+    assert _junk(TEMPLATE) == []
     assert not (TEMPLATE / "frontend" / "vite.config.js").exists()      # vue-tsc 产物不带（A5b）
     # 环境差异走平台注入的环境变量，不留第二份 profile 文件
     assert not (TEMPLATE / "backend" / "src" / "main" / "resources" / "application-dev.yml").exists()
@@ -56,8 +78,30 @@ def test_render_has_no_residue_and_no_foreign_brand(tmp_path):
         rel = p.relative_to(out)
         assert not RESIDUE.search(p.read_bytes()), rel                  # 字节扫，二进制文件也不放过
         text = p.read_text(encoding="utf-8", errors="replace")
-        for foreign in ("leerysink", "base-pro"):                       # 作者用户名 / 参考工程名
-            assert not re.search(rf"\b{foreign}", text), (rel, foreign)
+        for foreign in FOREIGN:
+            assert re.search(foreign, text) is None, (rel, foreign)
+
+
+def test_guards_are_not_vacuous(tmp_path):
+    """自证：把每类杂物各种一个在深层目录里，扫描必须全数报出来。
+
+    没有这条，`_junk(TEMPLATE) == []` 与 FOREIGN 判据都可能悄悄退化成永真（清单写错、
+    正则不匹配），而模板干净时它们本来就该是绿的——绿得没有信息量。
+    """
+    (tmp_path / "backend" / "src" / "main" / "java" / "target").mkdir(parents=True)
+    (tmp_path / "backend" / "Dockerfile.tsbuildinfo").write_text("x", encoding="utf-8")
+    (tmp_path / ".env").write_text("JWT_SECRET=leaked", encoding="utf-8")
+    (tmp_path / "frontend" / "public" / ".DS_Store").parent.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "frontend" / "public" / ".DS_Store").write_text("x", encoding="utf-8")
+    caught = _junk(tmp_path)
+    assert len(caught) == 4, caught
+    # 同时确认它不误伤：正常文件与 base-production 这种词都得放行
+    (tmp_path / "frontend" / "src" / "main.ts").parent.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "frontend" / "src" / "main.ts").write_text("// base-production registry\n", encoding="utf-8")
+    assert len(_junk(tmp_path)) == 4
+    text = (tmp_path / "frontend" / "src" / "main.ts").read_text(encoding="utf-8")
+    assert [f for f in FOREIGN if re.search(f, text)] == []
+    assert re.search(FOREIGN[0], "user leerysink123 did it") is not None
 
 
 def test_render_replaces_coordicates_and_title(tmp_path):

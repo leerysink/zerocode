@@ -1347,6 +1347,15 @@ git add app/templates/vue3-springboot/README.md tests/test_springboot_template.p
 git commit -m "feat(template): stack README and full-render contract tests for vue3-springboot template"
 ```
 
+- [x] **Step 7: 复审返修**（评审范围 `7bf8220..842d27d`，无 Blocking，2 Important + 2 Nit 全部收口）
+
+| # | 评审意见 | 复算结果 | 处置 |
+| --- | --- | --- | --- |
+| I-1 | README 把「SecurityConfig 需放开文档路径」写成待办，且真正的文档屏蔽开关是 `knife4j.production` 而非 `knife4j.enable` | 实读 `SecurityConfig.java:57-59` 确认 `/doc.html`、`/swagger-ui/**`、`/v3/api-docs/**`、`/webjars/**` **已** permitAll；WebSearch knife4j 官方配置参考证实 `production=true` 才使 `/doc.html`、`/v3/api-docs` 返回错误 JSON | README「想开接口文档」改成三处开关并注明屏蔽的是哪一个；同时改掉 `application.yml:79` 头注里同一条陈旧说法（同族洞自查，不只在 README 修） |
+| I-2 | README 讲了 Phase B 才存在的事实：`redis:7-alpine` 与「容器里 `mvn spring-boot:run`」 | `grep -r` 整棵模板树：`redis` 0 命中（compose 尚未写），`mvn spring-boot:run` 0 命中 | 摘掉 `redis:7-alpine`，只留两个 Dockerfile 实读镜像；命令改成不写死的描述「用 Maven 现场启动（不打 jar）」。Step 3 勘误里那条「三个镜像名（含 redis:7-alpine）」是当时误记，保留原文不改，由本条钉住 |
+| N-3 | junk 判据只钉 `backend/`、`frontend/` 两个固定子路径，且漏 `.env`/`.DS_Store`/`*.tsbuildinfo`/IDE 目录 | `Get-ChildItem -Recurse -Force` 实测模板树 151 个文件、上述名称 0 命中（今天干净，但深层 `.../target` 会漏检） | 抽 `_junk(tree)` 整棵树 rglob；清单补 `.env`/`.DS_Store`/`Thumbs.db`/`.idea`/`.vscode`/`.tsbuildinfo`/`.pyc`；**刻意不收 `.mvn`**（maven wrapper 是合法件）。新增 `test_guards_are_not_vacuous`：四层深各塞一个杂物必须全数报出、`base-production` 必须放行——干净树上门禁是绿的，没有这条就不知道它是否还在工作 |
+| N-4 | `rf"\b{foreign}"` 缺尾词边界，`\bbase-pro` 仍会命中 `base-production` | 部分采纳：一刀切加 `\b` 尾巴会放过 `leerysink123` 这类带后缀的真实泄漏 | 两条判据按各自误伤风险分开写：`FOREIGN = (r"\bleerysink", r"\bbase-pro\b")`（延续 A6b「守护尺度比不变量窄一级」） |
+
 ## Phase B — dev 预览链路
 
 ### Task B1: dev compose 的 springboot 分支 + `.env` 运行密钥

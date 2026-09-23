@@ -76,7 +76,9 @@ file:
   max-size: 10485760
   upload-dir: ${UPLOAD_DIR}
 
-# 接口文档默认关（要开就让 AI 把 enabled 改 true，并在 SecurityConfig 放开 /doc.html、/webjars/**）
+# 接口文档默认关。要开改三处：下面两个 enabled 置 true + knife4j.production 置 false
+# （屏蔽文档的是 production，不是 enable）；SecurityConfig 已预先放开 /doc.html、/swagger-ui/**、
+# /v3/api-docs/**、/webjars/**，无需再改。对外地址带 context 前缀：/api/doc.html
 springdoc:
   api-docs:
     enabled: false
