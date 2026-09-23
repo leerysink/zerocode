@@ -2376,7 +2376,7 @@ git commit -m "fix(prod): backfill nginx.conf from the app's own stack template 
 - Modify: `app/deploy/prod.py:21,128,384,410,557`
 - Test: `tests/test_deploy_basics.py`
 
-- [ ] **Step 1: 写失败测试**（追加到 `tests/test_deploy_basics.py`）
+- [x] **Step 1: 写失败测试**（追加到 `tests/test_deploy_basics.py`）
 
 ```python
 def test_build_timeout_by_stack():
@@ -2392,12 +2392,12 @@ def test_build_timeout_by_stack():
     assert build_timeout({}, "vue3-springboot") == 600         # 配置读空退回默认，不炸发布
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `pytest tests/test_deploy_basics.py -q -k build_timeout`
 Expected: FAIL — `ImportError: cannot import name 'build_timeout'`
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 `app/deploy/settings.py` 的 `DEFAULTS` 里 Task B3 新增的 `"deploy.health_timeout_large": 900,` 之后加：
 
@@ -2440,17 +2440,24 @@ build 调用点（`prod.py:384`）显式给超时（**关键字传参**：`test_
                                                                       app.get("stack", "")))
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `pytest tests/test_deploy_basics.py tests/test_prod_engine.py tests/test_engine.py -q`
 Expected: PASS（`test_prod_engine.py` 的 `("health", 8998, "vue3-fastapi")` 与 `PROD_VERSION=` 尾项断言均不受影响：替身只记端口与栈，超时不进调用记录）
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add app/deploy/settings.py app/deploy/prod.py tests/test_deploy_basics.py
 git commit -m "feat(prod): take build and health timeouts per stack (large cold start exceeds the 600s default)"
 ```
+
+#### C3 落地补充（两处偏离草稿）
+
+- **`build_timeout` 的退回值从 DEFAULTS 取，不在函数里再抄 600 字面量**：草稿 `... or 600` 硬写两遍默认，与 B3 定下的「默认值只应有一处」（`health_timeout` 取 `DEFAULTS["deploy.health_timeout"]`）相左。改成与 `health_timeout` 逐行同构（`base = cfg.get("deploy.build_timeout") or DEFAULTS["deploy.build_timeout"]`，large 缺位回 base）；四个断言结果不变，额外加了一条「只设旧键时走旧键」的语义钉。
+- **行号漂移**：计划写的 `prod.py:21,128,384,410,557` 已被 C1/C2 推下——实际：导入 L22、三处体检 L131/432/579（`replace_all` 一次改全）、build 调用 L406（关键字传 `timeout=`，PubSeams 的 docker 替身 L476 按 `timeout=600` 形参收，不破调用记录断言）。
+- **health 侧本就在 prod 走 `deploy_cfg().get("deploy.health_timeout", 240)` 平铺取默认**，C3 才把三处接上 `health_timeout(cfg, stack)`——小栈退回值仍为 240（行为不变），大型栈现在拿 900，与 dev 侧 B3 对齐。
+- **回归**：定向 `test_deploy_basics.py tests/test_prod_engine.py tests/test_engine.py` → 92 passed；全量见提交前后台跑。
 
 ---
 

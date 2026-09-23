@@ -19,7 +19,7 @@ from app.deploy.errors import DeployError
 from app.deploy.engine import (preflight_docker, _app_root, _compose_meta, _notify,
                                LOG_PREFIX)
 from app.deploy.provision import read_cred, provision_env
-from app.deploy.settings import deploy_cfg
+from app.deploy.settings import deploy_cfg, health_timeout, build_timeout
 from app.deploy.sqlrun import run_sqlchange
 from app.deploy.schemacheck import verify_dev_matches_files, parity_block_message
 from app.deploy import schemadiff
@@ -128,7 +128,7 @@ async def prod_start(sf, app: dict, notify=None) -> dict:
         code, log = await _docker(*_prod_compose_args(root), "up", "-d", cwd=str(root))
         if code != 0:
             raise DeployError(f"正式栈启动失败:\n{log[-800:]}")
-        timeout = int((await deploy_cfg(sf)).get("deploy.health_timeout", 240))
+        timeout = health_timeout(await deploy_cfg(sf), app.get("stack", ""))
         ok, checks = await wait_prod_health(root, _prod_port(app), timeout, app.get("stack", ""))
         if not ok:
             raise DeployError(f"正式环境体检未通过（{checks}），容器保持运行供排查")
@@ -403,7 +403,9 @@ async def publish(sf, app: dict, notify=None, *, force: bool = False,
                               "请先在预览环境启动一次再发布", status=500)
         cred0 = await read_cred(sf, slug, "prod")
         ensure_deploy_files(root, app, {"dev": cred_dev, "prod": cred0 or {}}, version=version)
-        code, log = await _docker("compose", "-f", compose_file, "build", cwd=str(root), on_line=blog)
+        code, log = await _docker("compose", "-f", compose_file, "build", cwd=str(root),
+                                  on_line=blog, timeout=build_timeout(await deploy_cfg(sf),
+                                                                      app.get("stack", "")))
         if code != 0:
             raise DeployError(f"镜像构建失败:\n{log[-1500:]}")
         await _step_ev(app_id, notify, rst, "build", "ok")
@@ -429,7 +431,7 @@ async def publish(sf, app: dict, notify=None, *, force: bool = False,
         await _step_ev(app_id, notify, rst, "deploy", "ok")
         # 6 health：失败自动回退旧 tag（04 §4.3 / S-04-2）——程序回退，数据库永不回滚
         await _step_ev(app_id, notify, rst, "health", "running")
-        timeout = int((await deploy_cfg(sf)).get("deploy.health_timeout", 240))
+        timeout = health_timeout(await deploy_cfg(sf), app.get("stack", ""))
         ok, checks = await wait_prod_health(root, _prod_port(app), timeout, app.get("stack", ""))
         if not ok:
             has_prev = bool(prev_version)
@@ -576,7 +578,7 @@ async def rollback(sf, app: dict, version: str, notify=None) -> dict:
         code, log = await _docker(*_prod_compose_args(root), "up", "-d", cwd=str(root))
         if code != 0:
             raise DeployError(f"回滚起栈失败:\n{log[-800:]}")
-        timeout = int((await deploy_cfg(sf)).get("deploy.health_timeout", 240))
+        timeout = health_timeout(await deploy_cfg(sf), app.get("stack", ""))
         ok, checks = await wait_prod_health(root, _prod_port(app), timeout, app.get("stack", ""))
         async with sf() as s:
             await s.execute(text("UPDATE app_project SET current_version=:v, status_prod=:st, "

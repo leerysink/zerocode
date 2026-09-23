@@ -10,6 +10,9 @@ DEFAULTS = {
     "deploy.health_timeout": 240,
     # 大型应用冷启动要在容器里下载 Maven 依赖（实测 ≈410s），与默认 240s 不是一个量级
     "deploy.health_timeout_large": 900,
+    # 大型栈首次 prod build：容器内下载整套 Maven 依赖 + npm ci + vue-tsc 类型检查（spike 实测 ≈350s 起）
+    "deploy.build_timeout": 600,
+    "deploy.build_timeout_large": 1800,
     "deploy.auto_stop_dev_on_exit": True,
     # 商店包是平台资产，默认落在仓库根 store/（与 apps/ 同级）；空串走 store_root() 的兜底。
     "store.root": "",
@@ -44,4 +47,17 @@ def health_timeout(cfg: dict, stack: str) -> int:
     base = int(cfg.get("deploy.health_timeout") or DEFAULTS["deploy.health_timeout"])
     if stack == "vue3-springboot":
         return int(cfg.get("deploy.health_timeout_large") or base)
+    return base
+
+
+def build_timeout(cfg: dict, stack: str) -> int:
+    """镜像构建上限：与 health_timeout 同构，只有真有长构建的栈走 large 值。
+
+    退回值取 `deploy.build_timeout`（可运维下调），两者都读空才落到 DEFAULTS 里的硬默认（默认值只应有一处）。
+    这里的「长构建的栈」与 health_timeout「长冷启动的栈」今天恰好都只有 vue3-springboot，但同样是两套
+    独立语义（一个管构建时长、一个管启动等待），新增需长构建的栈时记得同步这里。
+    """
+    base = int(cfg.get("deploy.build_timeout") or DEFAULTS["deploy.build_timeout"])
+    if stack == "vue3-springboot":
+        return int(cfg.get("deploy.build_timeout_large") or base)
     return base

@@ -69,6 +69,20 @@ async def test_deploy_cfg_defaults(test_engine):
     assert cfg["deploy.health_timeout"] == 240      # 默认 240s：首次冷启动需在容器内安装依赖
     assert settings.resolve_apps_root(cfg).name == "apps"
 
+
+def test_build_timeout_by_stack():
+    """大型栈的首次 prod build 要在构建期下载整套 Maven 依赖（spike 实测 ≈350s）+ npm ci + vue-tsc，
+    600s 默认上限会把成功构建误杀成「镜像构建失败」——而且这刀切在半成品上，比体检超时更难查。"""
+    from app.deploy.settings import DEFAULTS, build_timeout
+    assert DEFAULTS["deploy.build_timeout"] == 600
+    assert DEFAULTS["deploy.build_timeout_large"] == 1800
+    cfg = {"deploy.build_timeout": 600, "deploy.build_timeout_large": 1800}
+    assert build_timeout(cfg, "vue3-springboot") == 1800
+    assert build_timeout(cfg, "vue3-fastapi") == 600
+    assert build_timeout(cfg, "") == 600                       # 栈缺失（M1 老行）走默认
+    assert build_timeout({}, "vue3-springboot") == 600         # 配置读空退回默认，不炸发布
+    assert build_timeout({"deploy.build_timeout": 900}, "vue3-springboot") == 900   # 只设旧键时大型栈跟着走那个值（与 health_timeout 同构）
+
 async def test_allocate_pair_skips_used(test_engine):
     """已登记的端口对必须被跳过，且取到的是紧随其后的最早可用对。
 
