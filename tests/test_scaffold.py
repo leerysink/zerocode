@@ -1,4 +1,5 @@
 # tests/test_scaffold.py
+import json
 import re
 from pathlib import Path
 from app.deploy import scaffold
@@ -237,3 +238,32 @@ def test_fastapi_app_vue_name_sits_in_a_double_quoted_host(tmp_path):
         "DEV_DB": "lailiao_dev", "PROD_DB": "lailiao_prod", "TODAY": "20260922"})
     vue = (tmp_path / "frontend" / "src" / "App.vue").read_text(encoding="utf-8")
     assert 'title="O\'Brien 仓库"' in vue and ":title=\"'" not in vue
+
+
+def test_render_springboot_frontend_wiring(tmp_path):
+    """前端接线要落进 compose 形状（A5）：容器内监听 + 服务名反代 + prod nginx + 文案吃占位符。
+
+    这些值不是装饰：vite 只听 127.0.0.1 时宿主浏览器访问不到（预览黑屏），nginx 缺 /uploads/ 则
+    上传件回读 404，`client_max_body_size` 不与 multipart 上限对齐就是大文件先在网关层 413。
+    """
+    import pytest
+    if not SPRINGBOOT_TEMPLATE.is_dir():
+        pytest.skip("vue3-springboot 模板尚未落仓")
+    scaffold.render(SPRINGBOOT_TEMPLATE, tmp_path, {
+        "SLUG": "bigapp", "APP_NAME": "大型应用", "DEV_PORT": "8211", "PROD_PORT": "8210",
+        "DEV_DB": "bigapp_dev", "PROD_DB": "bigapp_prod", "TODAY": "20260922"})
+    fe = tmp_path / "frontend"
+    vite = (fe / "vite.config.ts").read_text(encoding="utf-8")
+    assert "host: '0.0.0.0'" in vite and "port: 5173" in vite
+    assert "http://backend:8080" in vite and "8082" not in vite and "application-dev" not in vite
+    nginx = (fe / "nginx.conf").read_text(encoding="utf-8")
+    assert "location /uploads/" in nginx and "client_max_body_size 50m;" in nginx
+    assert "try_files $uri $uri/ /index.html;" in nginx
+    assert (fe / "Dockerfile").is_file() and (fe / ".dockerignore").is_file()
+    docker = (fe / "Dockerfile").read_text(encoding="utf-8")
+    assert "nginx:1.27-alpine" in docker and "/src/dist" in docker
+    assert json.loads((fe / "package.json").read_text(encoding="utf-8"))["name"] == "bigapp-frontend"
+    assert "<title>大型应用</title>" in (fe / "index.html").read_text(encoding="utf-8")
+    cfg = (fe / "src" / "config" / "index.ts").read_text(encoding="utf-8")
+    assert 'export const appTitle = "大型应用"' in cfg        # 双引号宿主（名字宿主铁则）
+    assert "admin123" in (fe / "src" / "views" / "login" / "index.vue").read_text(encoding="utf-8")

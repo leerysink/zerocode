@@ -69,6 +69,9 @@
             <span v-else>登录中...</span>
           </a-button>
         </a-form>
+
+        <!-- 基座种子的初始账号：不提示则首次预览不知道能进（登录后即可改，见「个人中心」） -->
+        <p class="login-tip">初始账号 admin / 初始密码 admin123，登录后请到「个人中心」修改</p>
       </div>
     </div>
   </div>
@@ -275,6 +278,13 @@ async function handleLogin() {
 .login-btn:hover {
   filter: brightness(1.05);
   transform: translateY(-1px);
+}
+
+.login-tip {
+  color: var(--text-muted);
+  font-size: 12px;
+  margin-top: 8px;
+  text-align: center;
 }
 
 /* 响应式 */

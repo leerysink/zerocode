@@ -740,7 +740,7 @@ HEALTH_BY_STACK = {"vue3-fastapi": "/api/health", "vue3-node": "/api/health",
 - Modify: `frontend/vite.config.ts`、`frontend/index.html`、`frontend/package.json`、`frontend/src/config/index.ts`、`frontend/src/views/login/index.vue`
 - Create: `frontend/nginx.conf`（覆盖 base-pro 版）、`frontend/Dockerfile`、`frontend/.dockerignore`
 
-- [ ] **Step 1: `vite.config.ts` 的 `server` 块换成 compose 形状（C-7）**
+- [x] **Step 1: `vite.config.ts` 的 `server` 块换成 compose 形状（C-7）**
 
 把
 
@@ -775,7 +775,7 @@ HEALTH_BY_STACK = {"vue3-fastapi": "/api/health", "vue3-node": "/api/health",
   },
 ```
 
-- [ ] **Step 2: 整文件重写 `frontend/nginx.conf`**
+- [x] **Step 2: 整文件重写 `frontend/nginx.conf`**
 
 ```nginx
 server {
@@ -806,7 +806,12 @@ server {
 }
 ```
 
-- [ ] **Step 3: 新增 `frontend/Dockerfile`**
+> 实跑记注（与 base-pro 版的差异）：原版的 `X-Real-IP` / `X-Forwarded-Proto` / `charset utf-8` /
+> `proxy_read_timeout 60s` 四项**不保留**——`IpUtils` 只读 `x-forwarded-for`（已留）；
+> `X-Forwarded-Proto $scheme` 在平台中央网关（外部 HTTPS、本地 http）下会把 scheme 误报成 `http`，
+> 宁缺毋滥；`charset` 对 SPA（HTML 自带 UTF-8 meta + JSON）无必要；`proxy_read_timeout 60s` 就是 nginx 默认值。
+
+- [x] **Step 3: 新增 `frontend/Dockerfile`**
 
 ```dockerfile
 FROM node:20-alpine AS build
@@ -823,14 +828,18 @@ COPY --from=build /src/dist /usr/share/nginx/html
 
 （`npm run build` = `vue-tsc -b && vite build`，spike 已在容器内跑通过一次；类型不过即构建失败——这是要的。）
 
-- [ ] **Step 4: 新增 `frontend/.dockerignore`**
+> `npm ci` 比 fastapi 栈的 `npm install` 严格，**lock 与 package.json 必须同改名**：Step 6 改了
+> `package.json` 的 `name` 后，`package-lock.json` 的两处 root `name`（顶层与 `packages[""]`）也同步吃
+> `{{SLUG}}-frontend`，否则渲染出的产物两边名字不一致（铺底期是 `base-frontend`，两边一致所以看不出来）。
+
+- [x] **Step 4: 新增 `frontend/.dockerignore`**
 
 ```
 node_modules/
 dist/
 ```
 
-- [ ] **Step 5: 三处品牌文案吃占位符**
+- [x] **Step 5: 三处品牌文案吃占位符**
 
 - `index.html`：`<title>基础管理后台</title>` → `<title>{{APP_NAME}}</title>`
 - `src/config/index.ts` 整文件重写：
@@ -852,11 +861,29 @@ export const appSubtitle = 'Vue3 + Spring Boot 3 基础管理后台'
 
 配套样式追加到该组件 `<style scoped>` 末尾：`.login-tip { color: #94a3b8; font-size: 12px; margin-top: 8px; text-align: center; }`
 
-- [ ] **Step 6: `package.json` 的 name 吃 slug**
+> 实跑记注：登录页**没有写死的品牌字样**——base-pro 早已把 logo 标题、副标题、dashboard 欢迎语、
+> `document.title` 全走 `appTitle`/`appSubtitle`（`Select-String` 实测：只剩 `config/index.ts:2` 与
+> `style/theme.css:2` 的注释），所以本 Step 只需补初始账号 tip 一行。tip 的颜色用组件已有的
+> `var(--text-muted)`（同文件其余 muted 文本都用变量，其值 `#9ca3af` 与计划写的 `#94a3b8` 同级）。
+>
+> **记账（故意不改）**：`style/theme.css:2` 的首行注释与 `backend/pom.xml` 的 `<description>` 仍含
+> 「基础管理后台」字样——都非用户可见、都在应用工程内（AI 可改），改它们超出本 Task 的 Files 边界；
+> 用户可见位已全部收敛到 `{{APP_NAME}}`。
 
-`"name"` 现值 → `"name": "{{SLUG}}-frontend"`（与 fastapi 栈同形）。
+- [x] **Step 6: `package.json` 的 name 吃 slug**
 
-- [ ] **Step 7: 提交**
+`"name"` 现值 → `"name": "{{SLUG}}-frontend"`（与 fastapi 栈同形）。实跑连带改了 `package-lock.json` 的
+两处 root `name`（Step 3 的 `npm ci` 同步要求）。
+
+- [x] **Step 7: 提交** — `feat(template): wire vue3-springboot frontend to compose service names and prod nginx reverse proxy`
+
+**验收实跑**（证据，不纸面）：
+- 新增 `tests/test_scaffold.py::test_render_springboot_frontend_wiring`（先红：vite 仍 `8082` → 实现后绿）；
+  `pytest tests/test_scaffold.py -q` → **18 passed**。
+- **全模板**违规字样体检归零（口径比 A4 Step 8 更严：`D:/project|8082|PG_PASSWORD|application-dev|application-local|leerysink|base-pro|snfyxm`）——A4 当时留在
+  `vite.config.ts:29-30` 的两行已随本 Task 消失，**backend 与 frontend 都是零命中**；
+- 占位符清单（大小写敏感）：前端只剩 `{{APP_NAME}}`×2（index.html / config）与 `{{SLUG}}`×3（package.json + lock 两处），
+  全在注册键里（整栈渲染绿即证明 `PLACEHOLDER` 不报 `KeyError`、`RESIDUE` 无残留）。
 
 ```bash
 git add app/templates/vue3-springboot/frontend
