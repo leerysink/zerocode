@@ -1140,7 +1140,17 @@ git commit -m "feat(template): split base-pro baseline into schema track and ide
 - Create: `app/templates/vue3-springboot/README.md`
 - Test: `tests/test_springboot_template.py`（新建）
 
-- [ ] **Step 1: 写失败测试**（新建 `tests/test_springboot_template.py`）
+- [x] **Step 1: 写失败测试**（新建 `tests/test_springboot_template.py`）
+
+> 执行勘误（计划的这段测试代码有三处不能照抄，都已改）：
+> 1. **同一步里两个测试互相矛盾**：本步第二个测试断言整棵树 `"{{" not in text`，而最后 `test_template_files_are_strict_utf8_or_known_resource` 自己注明「不能断言 `b"{{" not in`：Vue 插值本就该活到产物里（见 Task A3b）」。模板里确实有 `{{ appTitle }}`、`{{ userStore.userInfo?.nickname }}` 这样的产品形态，按前者的写法直接红。→ 统一收到 `RESIDUE = rb"\{\{\s*[A-Z][A-Z0-9_]*\s*\}\}"`（与 `scaffold.RESIDUE` 同口径），并改成**字节版**以便连着二进制文件一起扫。
+> 2. **测试不得依赖仓库之外的路径**：计划写 `REF_FAVICON = D:/project/private/base-pro/...` + `skipif 不在就跳`，换台机器就静默 skip，而「二进制有没有被当文本重新编码」恰恰只在别的机器上才容易出现。→ 改为 pin 基线指纹（`FAVICON_SHA256 = e7773a39…f3821`，已实测与参考工程同哈希）+ 断言「渲染产物字节 == 模板字节」，两道都不依赖仓外文件。
+> 3. **`@pytest.mark.skipif(not TEMPLATE.is_dir())` ×7 全部去掉**：模板早在 A3 就落仓了，这层守卫现在只会把「目录真的丢了」判成通过（永久静默 skip 的测试等于没测试）。同时丢掉计划里那个未使用的 `gates` 变量。
+>
+> 另外：`base-pro` 的判据带词边界（与 A6b 同口径，避免误伤 `base-production`）；根 README 只留导览与铁律，双轨细则**只在** `schema/README.md` 与 `sqlchange/README.md` 里各写一份（两处各写一遍就是将来漂移的来源）。
+
+
+计划草稿（以下代码按上面三条勘误落地，与最终的 `tests/test_springboot_template.py` 不完全一致）：
 
 ```python
 # tests/test_springboot_template.py
@@ -1275,12 +1285,18 @@ def test_template_files_are_strict_utf8_or_known_resource(tmp_path):
             assert not re.search(rb"\{\{\s*[A-Z][A-Z0-9_]*\s*\}\}", p.read_bytes()), p.relative_to(out)
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `pytest tests/test_springboot_template.py -q`
 Expected: `test_render_replaces_coordicates_and_title` FAIL（缺 `README.md` → FileNotFoundError），其余已绿。
 
-- [ ] **Step 3: 写 `app/templates/vue3-springboot/README.md`**
+实跑：**2 failed, 5 passed**。第二条不是模板缺陷，是我自己写错的——`TypeError: cannot use a string pattern on a bytes-like object`（拿 str 正则去扫 `read_bytes()`）。改完得 1 failed / 6 passed，红的恰好只剩「缺 README」那一条，才进入 Step 3。教训：看到「预期外多一条红」不要当噪声抹掉，也不要当成模板问题去改模板。
+
+- [x] **Step 3: 写 `app/templates/vue3-springboot/README.md`**
+
+> 执行勘误：草稿里的每条断言落笔前先核过源码/配置，不照抄——接口前缀（`application.yml:7` `context-path: /api` + `utils/request.ts:5` `baseURL: '/api'`）、SQL 日志开关的真实键名（`mybatis-plus.configuration.log-impl`，默认 `NoLoggingImpl`）、接口文档的开关与要放开的三个路径（`springdoc.*.enabled` / `knife4j.enable` + `/doc.html`、`/webjars/**`、`/v3/api-docs/**`）、三个镜像名（两个 Dockerfile 实读：`maven:3.9-eclipse-temurin-17` / `eclipse-temurin:17-jre-alpine` / `redis:7-alpine`）、环境变量缺值即启动失败的既有设计（yml 头注就是这个意思，直接引用）。同时把草稿里的「数据变更写 `sqlchange/V*.sql`」按本栈实情改成 `D*.sql` + 菜单三件套，且不与子 README 重复细则。
+
+计划草稿正文（以下为原计划内容，实际落笔按上面勘误调整）：
 
 ```markdown
 # {{APP_NAME}}（{{SLUG}}）
@@ -1316,17 +1332,15 @@ zerocode 大型应用：Vue3 + Spring Boot 3 管理后台，自带登录 / 部�
 - 连接串、Redis 地址、`JWT_SECRET`、上传目录全部由平台注入环境变量，代码里不要写死
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
-Run: `pytest tests/test_springboot_template.py tests/test_scaffold.py -q`
-Expected: PASS
+Run: `pytest tests/test_springboot_template.py tests/test_scaffold.py -q`→ 实跑 `test_springboot_template` **7 passed**（与 `test_scaffold` 21 passed 分两次跑，共 28）。
 
-- [ ] **Step 5: 全量回归**
+- [x] **Step 5: 全量回归**
 
-Run: `pytest tests -q`
-Expected: 全绿（Phase A 未碰编排，任何红都是本相引入，就地修）。
+Run: `pytest tests -q` → **438 passed**（263s，全绿，无 fail 无 skip 新增）。Phase A 未碰编排，任何红都是本相引入——本次没有。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 git add app/templates/vue3-springboot/README.md tests/test_springboot_template.py
