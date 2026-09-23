@@ -15,6 +15,8 @@ IGNORE_DIRS = {".git", "node_modules", "__pycache__", "dist", ".venv", "build"}
 # 自己的 src/views/target 一类目录在文件管理器里永久藏掉。这两个产物的落点由「dev 容器把 ../backend
 # 挂成 working_dir」与模板里 logging.path 的默认值共同决定（${user.dir}/logs 即 backend/logs）；
 # 两者任一变动（拆多模块、改日志目录）都要回来对一眼这两份名单。
+# 本名单刻意不含 backend/uploads：上传件不进包也不进指纹（packages.py 的裁定），但用户得在文件
+# 管理器里看见自己传上去的东西。“不收”与“不可见”是两件事，想顺手把两边对齐前先读 packages.py 那段。
 IGNORE_PATH_TAILS = (("backend", "target"), ("backend", "logs"))
 
 

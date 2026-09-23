@@ -255,13 +255,16 @@ async def test_create_large_app_end_to_end_lands_the_springboot_stack():
     assert sorted(p.name for p in (ROOT / "sqlchange").glob("*.sql")) == ["D20260101_01_rbac_seed.sql"]
     meta = json.loads((ROOT / "app.json").read_text(encoding="utf-8"))
     assert meta["health"] == {"frontend": "/", "backend": "/api/health"}
-    # B1 的 compose 分支：maven 就地跑 + 栈私有 redis，且不带 prod 件
+    # B1 的 compose 分支：maven 就地跑 + 栈私有 redis（B1 N-3 改名后的名字），且不带 prod 件
+    # （N-5 的端到端版；Task C1 放行发布栈后这一句要跟着翻案为 .is_file()）
     dev_y = (ROOT / "deploy" / "dev-compose.yml").read_text(encoding="utf-8")
     assert "maven:3.9-eclipse-temurin-17" in dev_y and "appredis" in dev_y
     assert not (ROOT / "deploy" / "prod-compose.yml").exists()
     # 密钥位不是空字（ensure 回填过），否则 compose 的 `${VAR:?}` 会在起栈时直接拒收
     env = (ROOT / "deploy" / ".env").read_text(encoding="utf-8")
     assert compose._env_get(env, "JWT_SECRET") and compose._env_get(env, "REDIS_PASSWORD")
+    # 库里的凭据 → `deploy/.env`（建库后供给 ensure 的那一段）；模板 mapping 里的 DEV_DB 不靠这句钉，
+    # 它在 test_store_install_seam.py::test_materialize_replaces_template_render 那里有钉。
     assert compose._env_get(env, "DEV_DB") == f"{SLUG}_dev"
     # 裁定 R-A 在大型栈同样成立：README 里是渲染后的真端口，不是 {{DEV_PORT}} 空占位
     # （平台占位符自检归 scaffold，这里只验「创建路径传对了映射」）

@@ -1661,14 +1661,18 @@ git commit -m "feat(compose): render vue3-springboot dev stack (private redis, .
   不进包 ≠ 不让用户看到自己的文件，两侧不同形是有意的，两边注释各写明一句。
 - 旁证（不拿未落地的 C1 草稿当事实）：模板自己的 `backend/.dockerignore:3` 已把 `uploads/` 排除在构建上下文之外，
   `backend/Dockerfile:13` 的 `UPLOAD_DIR=/uploads` 也不是工作区路径——本条只管 dev 的 `UPLOAD_DIR: /src/uploads`。
-- 存量影响：两个模板下都没有 track 的 `backend/uploads/**` 文件（`git ls-files` 实核 0 命中），指纹只可能因「少收了运行时上传」而变得更稳定。
+- 存量影响：两个模板下都没有 track 的 `backend/uploads/**` 文件（`git ls-files` 实核 0 命中）。但得说准：
+  已装实例的 `app_instance_link.baseline_hash` 是用**旧名单**写下的（`app/store/install.py` 写入），名单一变，同一棵工作区
+  下一次算出的 `source_hash` 就与它**一次性不可比**。今天零影响（全仓只有写入处与测试读取，无比较逻辑），但 M3-b 落地
+  分叉判定之前必须先重算/迁移 baseline，不能拿新旧值直接比。
 
 ---
 
 ### Task B2: `HEALTH_BY_STACK` 收敛到 `/api/health` + 大型栈创建放行
 
 **Files:**
-- Modify: `app/services/app_service.py:22-23,58-61`
+- Modify: `app/services/app_service.py`（本次只动 `_check_scale_stack` 里的 R-C 注释，今天在 L67-68；`HEALTH_BY_STACK` 在 L23-24、已随 A4c 到位）
+- Modify（评审返修）: `app/store/packages.py` / `app/api/files.py` 的名单注释
 - Test: `tests/test_app_service.py`
 
 > 前提校正（B1 评审 Nit-7 复算后的当下事实）：本 Task 标题里的两件事**都已是既成**——`HEALTH_BY_STACK` 的
@@ -1748,6 +1752,21 @@ Run: `pytest tests/test_app_service.py tests/test_apps_api.py tests/test_contrac
 git add app/services/app_service.py tests/test_app_service.py docs/superpowers/plans/2026-09-22-vue3-springboot-stack.md
 git commit -m "test(app): pin the large-stack creation path end to end, and refresh the stale R-C gating comment"
 ```
+
+- [x] **Step 6: 评审返修**（范围 `995db8b..b6fc3f0`，把 `26e95b5` 的 uploads 切片一并交审；无 Blocking，1 Important + 4 Nit）
+
+| 编号 | 评审意见 | 复算 | 处置 |
+|---|---|---|---|
+| I-1 | `EXCLUDE_PATH_TAILS` 不分栈生效（`_is_excluded`/`_iter_src` 不读栈信息），但注释给的三条理由全只在 vue3-springboot 成立；小型栈今天根本没有 uploads 目录，将来 AI 加个上传功能，真素材会被静默排除出包而树里照旧看得见 | 成立，探针直调 `_is_excluded`：`backend/uploads/2026/09/avatar.png` → True，对所有栈同视；`git grep -i uploads -- app/templates` 14 处全在大型栈 | 采纳 (a)「把口径说满」而非 (b)「按栈取名单」：裁定说的是「上传目录 = 运行时」这个语义，不是某个模板的目录约定；按栈取会造出「同一路径在不同栈含义不同」的新不对称。注释改成明写「本条不分栈 + 真素材请放 `frontend/src/assets`」；**配套缺口**登记到 D1（契约里告诉 AI 这是运行时目录，今天契约全文不提 uploads） |
+| N-1 | 这条口径差只有单向注释（packages.py 写了 files.py 不含它，反过来没有） | 成立，评审做了变异：往 `IGNORE_PATH_TAILS` 加 uploads 只有 `test_tree_ignores_and_nests` 红 | files.py 名单上方补一句「不收与不可见是两件事，想对齐两边前先读 packages.py 那段」 |
+| N-2 | `assert not prod-compose.yml.exists()` 与 C1 正面冲突，而 C1 Step 5 的改判清单没列它 → C1 当天会红在名字叫「端到端落盘」的用例里，易被误判成回归 | 成立（计划漏项，代码本身没错） | 不改断言（今天它是真的），在该行加「C1 放行后要翻案」+ 把它列入 C1 Step 5 的改判清单 |
+| N-3 | Step 10 「指纹只可能变得更稳定」说满了：`baseline_hash` 是旧名单写下的，新旧一次性不可比 | 成立（`install.py` 只写不比，今天零影响，但 M3-b 要比较） | 计划该段改写为「一次性不可比 + M3-b 前必须重算/迁移」；不改代码 |
+| N-4 | B2 的 Files 行号已漂（写的 22-23,58-61，实为 23-24、60-70） | 成立 | 改成不依赖行号的说法，并补上本次动的两个文件 |
+
+> 本轮回评审额外交到的两件事实（不需要行动，但记下来免得后人重查）：
+> ① 端到端用例做了 9 组变异逐条挨打（只有 `DEV_DB` 那句打不红——它钉的是「库里凭据→.env」，不是模板 mapping），
+> 已按这个事实给该行加注释并把 mapping 的锅指给 `test_store_install_seam.py`；
+> ② 共享环境回收与 fastapi 同形（库/角色/dbcred/两表行/目录逐列比对），异常路径也收得干净（插 raise 实跑过）。
 
 ---
 
@@ -2156,6 +2175,10 @@ def render_prod_compose(meta: dict) -> str:
 - `test_render_prod_compose_single_service_blocks` 与 `test_migrate_mounts_schema_and_sqlchange` 各加一条 springboot 变体：前者直接 `compose.render_prod_compose(META_SB)` 再走同样的行数计数，后者把循环改成 `for y in (dev, prod, compose.render_prod_compose(META_SB))`；
 - `test_templates_still_carry_markers` 的模板元组扩为 `(compose._DEV_COMPOSE, compose._FE_ONLY, compose._DEV_COMPOSE_SB, compose._PROD_COMPOSE, compose._PROD_COMPOSE_SB)`。
 
+`tests/test_app_service.py`（B2 补的端到端用例，评审 N-2）：
+- `assert not (ROOT / "deploy" / "prod-compose.yml").exists()` 必须在 C1 落地当天**翻案**为 `.is_file()`（它钉的就是「尚未放行发布」这个临时状态）。
+  不列进本 Step 的话，它会红在一个名字叫「端到端落盘」的用例里，很容易被误判成回归而回退模板。
+
 - [ ] **Step 6: 跑测试确认通过**
 
 Run: `pytest tests/test_compose_render.py -q`
@@ -2402,6 +2425,11 @@ git commit -m "docs(template): record measured publish timings for the large sta
 **Files:**
 - Modify: `app/deploy/contract.py`
 - Test: `tests/test_contract.py`
+
+> 追加内容时顺手带上一条（B1c 评审 I-1 的配套）：契约里要告诉 AI **`backend/uploads/` 是运行时目录**
+> ——上传件不进包也不进指纹（Step 10 的裁定，不分栈），当代码素材往这里放会静默丢内容，真素材请放
+> `frontend/src/assets` 一类位置。今天契约全文不提 uploads（`git grep -i upload app/deploy/contract.py` 零命中），
+> 而文件树又照旧看得见它——AI 没有任何信息能推出「这个目录别写代码」。
 
 - [ ] **Step 1: 写失败测试**（追加到 `tests/test_contract.py`）
 

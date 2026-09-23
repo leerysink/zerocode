@@ -21,9 +21,12 @@ EXCLUDE_DIRS = {"node_modules", ".venv", "dist", "__pycache__", ".pytest_cache",
 # src/views/target 一类目录静默排除出包与指纹。落点由「dev 容器把 ../backend 挂成 working_dir」与模板里
 # logging.path 的默认值共同决定，两者任一变动（拆多模块、改日志目录）都要回来对一眼这两份名单。
 # uploads/ 算运行时数据（用户裁定）：作者传上来的示例图不该算应用内容，安装者上传的那一张更不该
-# 让下一次发布报成分叉。同口径的先前事实：模板自己的 backend/.dockerignore 已经把 uploads/ 排除在
-# 构建上下文之外，prod 镜像里的 UPLOAD_DIR 也不是工作区路径（backend/Dockerfile:13）。本条只管 dev
-# 落在 backend/uploads 的那一份（compose.py 的 UPLOAD_DIR: /src/uploads）。
+# 让下一次发布报成分叉。**这条不分栈**（名单里也没有栈信息可分）：小型栈的 vue3-fastapi 模板今天没有
+# 上传功能，将来有人加一个上传接口，backend/uploads 同样是运行时目录而不是代码——真想进包的素材
+# 该放在属于代码的位置（如 frontend/src/assets），否则它会被静默排除出包，而文件树照旧看得见它。
+# 旁证（只在大型栈成立，不作为本条的依据）：模板自己的 backend/.dockerignore 已把 uploads/ 排除在构建
+# 上下文之外，prod 镜像里的 UPLOAD_DIR 也不是工作区路径（backend/Dockerfile:13）；本条只管 dev 落在
+# backend/uploads 的那一份（compose.py 的 UPLOAD_DIR: /src/uploads）。
 # 注意 files.py 的名单刻意不包含它：不进包 ≠ 不让用户在内置文件管理器里看到它们。
 EXCLUDE_PATH_TAILS = (("backend", "target"), ("backend", "logs"), ("backend", "uploads"))
 EXCLUDE_FILES = {".env", ".DS_Store", "Thumbs.db"}
@@ -36,7 +39,7 @@ def _has_tail(parts: tuple, tail: tuple) -> bool:
 
 
 def _is_excluded(parts: tuple) -> bool:
-    """某个文件是否不进包也不进 source_hash（三个按名名单 + 一个按路径尾的构建产物名单）。"""
+    """某个文件是否不进包也不进 source_hash（三个按名名单 + 一个按路径尾屏蔽的产物与运行时目录名单）。"""
     return (parts[0] in EXCLUDE_TOP or any(part in EXCLUDE_DIRS for part in parts)
             or parts[-1] in EXCLUDE_FILES
             or any(_has_tail(parts, t) for t in EXCLUDE_PATH_TAILS))
