@@ -4,7 +4,8 @@
     // 产物必须重定向：本文件是被 tsconfig.json 引用的 composite 子项目，实测 tsc 5.9 下
     // 不许关 emit（Referenced project ... may not disable emit，一开 vue-tsc -b 就报错），
     // 而默认 emit 会往前端根吐一个 vite.config.js —— Vite 解析配置文件时 .js 优先于 .ts，
-    // 之后改 vite.config.ts 会被这个陈旧产物静默遮蔽。故 js/d.ts/tsbuildinfo 全赶进 node_modules。
+    // 之后改 vite.config.ts 会被这个陈旧产物静默遮蔽。故本子项目的 js/d.ts/tsbuildinfo 全赶进 node_modules
+    // （root 项目自己的 tsconfig.tsbuildinfo 仍会落在根目录，不遮蔽任何东西，由 .dockerignore 的 *.tsbuildinfo 兜）。
     "outDir": "./node_modules/.tmp/node-cfg",
     "tsBuildInfoFile": "./node_modules/.tmp/node-cfg/tsconfig.node.tsbuildinfo",
     "skipLibCheck": true,

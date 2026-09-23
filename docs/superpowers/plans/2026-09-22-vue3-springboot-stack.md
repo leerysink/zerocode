@@ -930,7 +930,7 @@ nginx 侧因此**删掉** A5 初版那段 `location /uploads/`，vite 侧不加�
 | 现状（composite、不重定向） | exit=0，**根目录出现 `vite.config.js` + `vite.config.d.ts`** → Vite 读 `.js` 优先于 `.ts`，静默遮蔽 |
 | ① `tsconfig.node.json` 加 `"noEmit": true` | **exit=2**：`error TS6310: Referenced project ... may not disable emit` → `npm run build` 直接打死 |
 | ② 只动 `.dockerignore` | 只挡容器，本地 `vite dev` 仍被遮蔽 |
-| ③ `outDir`/`tsBuildInfoFile` 指向 `./node_modules/.tmp/node-cfg`（采纳） | exit=0，根目录无 `.js`，产物全在 node_modules |
+| ③ `outDir`/`tsBuildInfoFile` 指向 `./node_modules/.tmp/node-cfg`（采纳） | exit=0，根目录无 `.js`，子项目产物全在 node_modules（root 自己的 `tsconfig.tsbuildinfo` 仍在根，不遮蔽任何东西，.dockerignore 兜） |
 
 即：**评审推荐的 ① 不可行**（`typescript: ^5.4.5` 今天解析到 5.9.x，引用型 composite 子项目不得关 emit），改用 ③；
 `.dockerignore` 再兜 `vite.config.js` / `vite.config.d.ts` / `*.tsbuildinfo` 一层（本地陈旧产物不进容器）。
@@ -959,6 +959,11 @@ nginx 侧因此**删掉** A5 初版那段 `location /uploads/`，vite 侧不加�
 git add app/templates/vue3-springboot tests/test_scaffold.py docs/superpowers/plans/2026-09-22-vue3-springboot-stack.md
 git commit -m "fix(template): make the upload URL gateway-visible and stop vue-tsc from shadowing vite.config"
 ```
+
+- [x] **Step 6: A5b 复审跟进（Nit 收口）** —— 复审确认 I-1/I-2/M-1 三条均闭环（对方自己重跑了探针，
+  独立证实 TS6310 与「root 改 solution-style `files: []` 也救不了①」），只留一条注释措辞 Nit：
+  「产物全赶进 node_modules」写得偏满（root 项目自己的 `tsconfig.tsbuildinfo` 仍在根目录），
+  已把 `tsconfig.node.json` 的注释与本表改成准确口径（行为不变，无需新断言）。
 
 ---
 
