@@ -15,7 +15,7 @@ from sqlalchemy import text
 from app.deploy import compose, engine as deploy_engine
 from app.deploy import prod as deploy_prod, provision, records, sqlrun
 from app.deploy.errors import DeployError
-from app.deploy.settings import deploy_cfg
+from app.deploy.settings import deploy_cfg, build_timeout
 from app.deploy.slugs import suggest_slug
 from app.services import app_service
 from app.store import anchor as anchor_mod, packages
@@ -121,7 +121,10 @@ async def install_release(sf, *, release_row: dict, applicant_actor_id: int,
                                     version=release_row["version"])
         code, log = await deploy_engine.docker(
             "compose", "-f", str(root / "deploy" / "prod-compose.yml"), "build",
-            cwd=str(root), on_line=on_log)
+            cwd=str(root), on_line=on_log,
+            # 按栈取超时（与 prod 发布链同族）：大型栈包的 build 要在构建期下整套 Maven 依赖，
+            # 吃 engine 默认 600 会把成功构建误杀成「镜像构建失败」。
+            timeout=build_timeout(await deploy_cfg(sf), app.get("stack", "")))
         if code != 0:
             raise DeployError(f"实例镜像构建失败：{log[-600:]}")
         await _set_current_version(sf, app["id"], release_row["version"])

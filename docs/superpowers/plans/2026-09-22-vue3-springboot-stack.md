@@ -2374,7 +2374,8 @@ git commit -m "fix(prod): backfill nginx.conf from the app's own stack template 
 **Files:**
 - Modify: `app/deploy/settings.py`（`DEFAULTS` + `build_timeout`）
 - Modify: `app/deploy/prod.py:21,128,384,410,557`
-- Test: `tests/test_deploy_basics.py`
+- Modify（评审同族缺口扩）: `app/store/install.py`（安装链 build 超时按栈取）
+- Test: `tests/test_deploy_basics.py`、`tests/test_store_install_flow.py`
 
 - [x] **Step 1: 写失败测试**（追加到 `tests/test_deploy_basics.py`）
 
@@ -2455,9 +2456,18 @@ git commit -m "feat(prod): take build and health timeouts per stack (large cold 
 #### C3 落地补充（两处偏离草稿）
 
 - **`build_timeout` 的退回值从 DEFAULTS 取，不在函数里再抄 600 字面量**：草稿 `... or 600` 硬写两遍默认，与 B3 定下的「默认值只应有一处」（`health_timeout` 取 `DEFAULTS["deploy.health_timeout"]`）相左。改成与 `health_timeout` 逐行同构（`base = cfg.get("deploy.build_timeout") or DEFAULTS["deploy.build_timeout"]`，large 缺位回 base）；四个断言结果不变，额外加了一条「只设旧键时走旧键」的语义钉。
-- **行号漂移**：计划写的 `prod.py:21,128,384,410,557` 已被 C1/C2 推下——实际：导入 L22、三处体检 L131/432/579（`replace_all` 一次改全）、build 调用 L406（关键字传 `timeout=`，PubSeams 的 docker 替身 L476 按 `timeout=600` 形参收，不破调用记录断言）。
+- **行号漂移**：计划写的 `prod.py:21,128,384,410,557` 已被 C1/C2 推下——实际：导入 L22、三处体检 L131/434/581（`replace_all` 一次改全）、build 调用 L406（关键字传 `timeout=`，PubSeams 的 docker 替身 L476 按 `timeout=600` 形参收，不破调用记录断言）。
 - **health 侧本就在 prod 走 `deploy_cfg().get("deploy.health_timeout", 240)` 平铺取默认**，C3 才把三处接上 `health_timeout(cfg, stack)`——小栈退回值仍为 240（行为不变），大型栈现在拿 900，与 dev 侧 B3 对齐。
 - **回归**：定向 `test_deploy_basics.py tests/test_prod_engine.py tests/test_engine.py` → 92 passed；全量见提交前后台跑。
+
+#### C3 评审（CodeReview 513fcc1..e721a17）+ 同族缺口扩到 install.py
+
+- **结论：无 Blocking**；一个 Important 同族缺口（范围外）。
+- **Important（已修，C3 扩到 `app/store/install.py`）**：商店安装链 `install.py:122` 的自有镜像 `compose build` 也没按栈取超时（吃 engine 默认 600），而它的栈来自包 manifest（`stack=manifest.get("stack") or "vue3-fastapi"`）——**从市场装一个 vue3-springboot 包就会复现发布链那个「长构建被误杀」的洞**；health 侧因 `prod_start` 已委托 prod。评审诚实定性：本次未引入（C3 Files 只列 settings/prod），但是新语义的直接邻居。经用户裁定「现在就修」：同法改 `install.py` 导入 `build_timeout` + build 调用传 `timeout=build_timeout(await deploy_cfg(sf), app.get("stack", ""))`。配套：`release_row` 夹具加 `stack` 参、`stubs.fake_docker` 连 timeout 一起录，新增 `test_install_build_timeout_follows_stack`（SB 安装→build 收到 1800、反向钉 fastapi→600）。
+- **Nit-1（未改）**：prod.py 用 `app.get("stack", "")` 而 dev 用 `app.get("stack") or ""`；仅当键存在但值为 None 时分叉，而 `app_project.stack` NOT NULL、今天不可达，`None` 落两函数也只走 base——且 prod.py 内已自洽（多处既有 `app.get("stack", "")`），不扰。
+- **Nit-2（未改）**：三处接线本身无回归钉（只测了纯函数），与 B3 `test_health_timeout_by_stack` 同套路；但 build 侧现已被 install 测试钉住了传参路径（timeout 进调用记录）。
+- **验证环境插曲**：跑到一半 Docker Desktop 守护进程未起（同 B4 的瞬时问题），install 测试因 `provision_env` 要连 zerocode-pg16 报 ConnectionRefused；拉起 Docker Desktop + `docker start zerocode-pg16` 后转红为绿。
+- **返修后回归**：`test_store_install_flow.py` → 4 passed；store 四文件 → 13 passed；全量见后台。
 
 ---
 

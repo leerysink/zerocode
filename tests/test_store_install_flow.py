@@ -38,7 +38,7 @@ def release_row(sf, tmp_path, monkeypatch):
     checksum 一律按写盘内容重算（write_package 会逐个校验锚点 md5，假值过不了它自己）；
     bodies 传 {filename: 内容}，不传则每个锚点文件落 "SELECT 1;\\n"。
     """
-    async def _mk(anchor=None, bodies=None):
+    async def _mk(anchor=None, bodies=None, stack="vue3-fastapi"):
         slug = _slug()
         version = "b20260922000001"
         anchor = [dict(e) for e in (anchor or [{"filename": "V20260920_01_init.sql",
@@ -58,13 +58,13 @@ def release_row(sf, tmp_path, monkeypatch):
         monkeypatch.setattr(release_svc, "store_root", lambda cfg: pkg_root)
         packages.write_package(out_root=pkg_root, slug=slug, version=version, app_root=src,
                                anchor=anchor, manifest_extra={"title": "演示", "stack":
-                                   "vue3-fastapi", "app_id": 0, "health": {}})
+                                   stack, "app_id": 0, "health": {}})
         async with sf() as s:
             rid = (await s.execute(text(
                 "INSERT INTO app_release (app_id, slug, version, title, stack, anchor, "
-                "fingerprint) VALUES (0, :sl, :v, '演示', 'vue3-fastapi', CAST(:a AS JSONB), :f) "
+                "fingerprint) VALUES (0, :sl, :v, '演示', :st, CAST(:a AS JSONB), :f) "
                 "RETURNING id, app_id, slug, version, title, stack, anchor, fingerprint"),
-                {"sl": slug, "v": version, "a": json.dumps(anchor),
+                {"sl": slug, "v": version, "st": stack, "a": json.dumps(anchor),
                  "f": anchor_mod.fingerprint(anchor)})).mappings().first()
             await s.commit()
         return dict(rid)
@@ -81,7 +81,7 @@ def stubs(monkeypatch, sf):
         return {"ok": True, "code": 0, "log": "ALL DONE"}
 
     async def fake_docker(*args, cwd=None, on_line=None, timeout=600):
-        calls["build"].append(args)
+        calls["build"].append((args, timeout))     # 连 timeout 一起记（钉按栈取超时）
         return 0, "build ok"
 
     async def fake_prod_start(session_factory, app, notify=None):
@@ -134,6 +134,31 @@ async def test_install_creates_instance_and_link(sf, stubs, release_row):
         assert stubs["start"] == [app["id"]]
     finally:
         await install._teardown(sf, app["id"], app["slug"])
+
+
+async def test_install_build_timeout_follows_stack(sf, stubs, release_row):
+    """商店安装链的自有镜像 build 也要按栈取超时（与 prod 发布链同族）：
+    装一个 vue3-springboot 包，build 调用必须拿到 large 上限（1800），而不是 engine 默认的 600
+    ——否则大型栈包安装会复现发布链那个「长构建被误杀成镜像构建失败」的洞。反向钉 fastapi 仍 600。"""
+    from app.store import identity
+    actor = await identity.create_actor(sf, "装机人")
+    big = await release_row(stack="vue3-springboot")
+    app = await install.install_release(sf, release_row=big, applicant_actor_id=actor["id"],
+                                        want_name="大型实例")
+    try:
+        assert app["stack"] == "vue3-springboot"
+        build_timeouts = [t for _args, t in stubs["build"] if "build" in _args]
+        assert build_timeouts == [1800]
+    finally:
+        await install._teardown(sf, app["id"], app["slug"])
+    small = await release_row(stack="vue3-fastapi")
+    app2 = await install.install_release(sf, release_row=small, applicant_actor_id=actor["id"],
+                                         want_name="小栈实例")
+    try:
+        build_timeouts2 = [t for _args, t in stubs["build"] if "build" in _args]
+        assert build_timeouts2[-1] == 600              # 非大型栈走通用上限
+    finally:
+        await install._teardown(sf, app2["id"], app2["slug"])
 
 
 async def test_migrate_failure_rolls_back_everything(sf, monkeypatch, release_row):
