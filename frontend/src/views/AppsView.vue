@@ -44,7 +44,7 @@ let timer = null
 
 const scaleCards = [
   { value: 'small', title: '小型', desc: '表单/台账/查询类，选一种轻量后端' },
-  { value: 'large', title: '大型', desc: '多角色/流程类业务系统，Vue3 + Spring Boot 3' },
+  { value: 'large', title: '大型', desc: '多角色/流程类系统，Vue3 + Spring Boot 3（自带登录与权限基座）' },
 ]
 
 // silent=true：后台 5s 轮询只悄悄换数据、不翻 loading 态——否则每 5 秒整片卡片被 <a-spin>
@@ -452,6 +452,7 @@ async function doRelease() {
           </a-form-item>
         </a-form>
         <p class="zc-tip">数据库将自动使用 PostgreSQL（dev / prod 两套独立库）。</p>
+        <p v-if="form.scale === 'large'" class="zc-tip">已预置登录、RBAC 菜单、部门/字典/操作日志基座（admin / admin123，登录后请改密）。首次预览需在容器内下载依赖，约 5–15 分钟，请等到状态变绿后再刷新。</p>
         <div class="zc-wizard-foot">
           <a-button style="margin-right: 8px" @click="current = 1">上一步</a-button>
           <a-button type="primary" @click="submit">创建应用</a-button>

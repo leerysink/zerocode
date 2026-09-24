@@ -2717,7 +2717,7 @@ git commit -m "feat(contract): append baseplate rules (menu triple-set, /api pre
 - Modify: `docs/superpowers/specs/2026-09-18-zerocode-deploy-suite/02-技术栈模板与生成规范.md`
 - Test: `frontend/tests/appsForm.test.js`（若现有用例断言了 `scaleCards` 文案则同步改）
 
-- [ ] **Step 1: 规模卡补一句真实代价**
+- [x] **Step 1: 规模卡补一句真实代价**
 
 `scaleCards` 里大型那行改为（卡片描述区域不换行，控制在一行内）：
 
@@ -2725,7 +2725,7 @@ git commit -m "feat(contract): append baseplate rules (menu triple-set, /api pre
   { value: 'large', title: '大型', desc: '多角色/流程类系统，Vue3 + Spring Boot 3（自带登录与权限基座）' },
 ```
 
-- [ ] **Step 2: 第 3 步预览提醒长冷启动**
+- [x] **Step 2: 第 3 步预览提醒长冷启动**
 
 第 3 步现有的 `<p class="zc-tip">数据库将自动使用 PostgreSQL（dev / prod 两套独立库）。</p>` 之后追加一条同样式段落（用 `v-if` 只在大型上出现，不给小型栈添噪）：
 
@@ -2735,12 +2735,12 @@ git commit -m "feat(contract): append baseplate rules (menu triple-set, /api pre
 
 > 数字不写死：写「首次约 5–15 分钟，之后约 1 分钟」是估计值，Task B4/C4 实测后以 README 为准；向导文案只给量级，不做承诺。
 
-- [ ] **Step 3: 跑前端测试与构建**
+- [x] **Step 3: 跑前端测试与构建**
 
 Run: `cd frontend; npm run test; npm run build`
 Expected: PASS + 构建成功（若 `tests/` 里有断言旧 desc 的用例，按新文案改断言，不反向改文案迁就）。
 
-- [ ] **Step 4: 旧规格四处改注（不抹历史，用勘误注）**
+- [x] **Step 4: 旧规格四处改注（不抹历史，用勘误注）**
 
 `docs/superpowers/specs/2026-09-18-zerocode-deploy-suite/02-技术栈模板与生成规范.md` 四处各补一句「勘误」，**保留原文**（它是当时的决策现场）：
 
@@ -2751,12 +2751,23 @@ Expected: PASS + 构建成功（若 `tests/` 里有断言旧 desc 的用例，�
 | §4.3 版本锁定表 `vue3-springboot` 行（72 行） | `spring-boot ^3.3` | 追加：「**勘误**：以 spike 实测基线 spring-boot 3.2.5 / mybatis-plus 3.5.6 为准（§4.3 写定时基座尚未选型）；锁定的意思是「不得降级替换」，不是「必须追到最高）」 |
 | §3 FR2-06（33 行） | M3 补齐 vue3-node / static / vue3-springboot 模板 | 追加：「**进展（2026-09-22）**：vue3-springboot 已交付（见 `specs/2026-09-22-vue3-springboot-stack-design.md`）；vue3-node / static 模板仍待补，创建时继续被 `_check_scale_stack` 拦下」 |
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add frontend/src/views/AppsView.vue frontend/tests docs/superpowers/specs/2026-09-18-zerocode-deploy-suite/02-技术栈模板与生成规范.md
 git commit -m "docs(ux): tell the truth about large-stack cold start in the wizard; annotate spec 02 divergences"
 ```
+
+#### D2 落地补充
+
+- **无测试需同步改**：`frontend/tests/` 下无 `appsForm.test.js`，且全库 `grep` 确认无用例断言 `scaleCards` 旧文案
+  （`src/views/AppsView.test.js` 只测发布接线/折叠菜单，不钉描述文字），故 Step 1/2 纯文案改不触发断言。
+- **前端验证**：`npm run build` ✓（39.4s）；`npm run test -- --run` → **181 passed / 25 files**（那条 `a-textarea`
+  resolve 警告是其它用例预存的 stub 问题，与本次无关）。
+- **Step 4 四处改注（保留原文 + 后缀勘误）**：§4.2 vue3-springboot 行健康探针收敛 `/api/health` + 包名固定
+  `com.zerocode.app` + actuator 依赖/上传体大小对齐（计划行 1+2 同一物理行，合并一段）；§4.3 版本表
+  spring-boot 3.2.5/mybatis-plus 3.5.6 基线勘误；§3 FR2-06 进展注（vue3-springboot 已交付、node/static 仍拦）。
+- **无 schema 变更**：本 Task 只改文案与勘误，**不涉任何平台表/列变更**，`changelog/` 无需新版本。
 
 ---
 
