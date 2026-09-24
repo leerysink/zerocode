@@ -100,7 +100,9 @@ describe('NewSessionModal 只能选应用', () => {
     expect(text).not.toContain('新建工作区')
     expect(text).not.toContain('目录路径')
     expect(wrapper.find('.zc-ns-path').exists()).toBe(false)
-    expect(wrapper.findAll('.stub-input')).toHaveLength(1)   // 只剩会话名称一个输入框
+    // 自动命名（2026-09-21）：会话名称输入框下线——只剩应用下拉，没有任何文本输入框
+    expect(wrapper.findAll('.stub-input')).toHaveLength(0)
+    expect(text).not.toContain('会话名称')
   })
 
   it('下拉选项来自应用列表，选中值就是应用关联的 workspace_id', async () => {
@@ -121,13 +123,13 @@ describe('NewSessionModal 只能选应用', () => {
     expect(createWorkspace).not.toHaveBeenCalled()
   })
 
-  it('填了会话名称就带着标题创建，并打开该会话（带 workspace_id 供右栏渲染门）', async () => {
+  it('创建一律不带 title：标题由后端按首条消息自动派生，并打开该会话（带 workspace_id 供右栏渲染门）', async () => {
     const { wrapper, store } = await mountModal()
     await wrapper.find('.stub-option').trigger('click')
-    await wrapper.find('.stub-input').setValue('录入表单怎么搭')
     await wrapper.find('.stub-modal-ok').trigger('click')
     await flushPromises()
-    expect(createSession).toHaveBeenCalledWith({ workspace_id: 11, title: '录入表单怎么搭' })
+    expect(createSession).toHaveBeenCalledWith({ workspace_id: 11 })
+    expect(createSession.mock.calls[0][0].title).toBeUndefined()
     expect(store.openSession).toHaveBeenCalledWith(900, 11)
   })
 

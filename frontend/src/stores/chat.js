@@ -3,7 +3,8 @@
 // 下行事件类型与后端 loop.py / hub.py 协议一致：
 // token / reasoning_delta / tool_call / tool_result / ask_user(多问题) / confirm_request / message_done
 // / error / status / file_change / todo_sync / compacting / compaction_done / notice(压缩 skip 终态)
-// / busy(执行中被拒的非终态提示) / steering_done(插话已在工具边界被模型看见)；
+// / busy(执行中被拒的非终态提示) / steering_done(插话已在工具边界被模型看见)
+// / session_title(首条消息自动命名，就地更新侧栏标题)；
 // 终态 = error / status(idle|error)，busy、status(running) 与 steering_done 都不是。
 import { defineStore } from 'pinia'
 import { getMessages, getSessionDetail, listModels, listWorkspaces, patchSessionModel, wsUrl } from '../api'
@@ -76,6 +77,15 @@ export function applyEvent(store, ev) {
       if (store.pendingEcho === ev.content) store.pendingEcho = '' // 已落库，不再是待回滚的乐观气泡
       break
     }
+    case 'session_title': // 后端自动命名（首条消息顶掉默认「新会话」）：就地更新侧栏列表项，不等重拉
+      for (const list of Object.values(store.sessionsByWs || {})) {
+        const hit = list.find((x) => x.id === store.currentSessionId)
+        if (hit) {
+          hit.title = ev.title
+          break
+        }
+      }
+      break
     case 'error':
       store.messages.push({ role: 'error', content: ev.message })
       store.running = false

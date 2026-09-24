@@ -1,7 +1,8 @@
 """Agent 循环：流式对话 + 工具调度 + ask_user 挂起恢复 + 写入确认 + 取消。
 
 事件协议（send 下发）：token/tool_call/tool_result/file_change/message_done/error，
-另有 confirm_request（写入确认请求）、status（终态回执）与 compaction_done（自动压缩完成）。
+另有 confirm_request（写入确认请求）、status（终态回执）、compaction_done（自动压缩完成）
+与 session_title（首条消息自动命名后的新标题，前端就地刷新侧栏）。
 """
 import asyncio, datetime, inspect, itertools, json
 from pathlib import Path
@@ -10,6 +11,7 @@ from app.agent.tools import ToolContext, ToolError, execute_tool
 from app.agent.mentions import expand_mentions
 from app.services import compaction_service as _comp
 from app.services.message_service import add_message
+from app.services.session_title_service import ensure_session_title
 from sqlalchemy import text
 
 def _normalize_questions(args: dict) -> list[dict]:
@@ -169,6 +171,12 @@ class AgentRunner:
         await self._drain_steering(session_id, root, [])
         expanded = expand_mentions(root, user_text)
         await add_message(self.sf, session_id, "user", content=user_text, context_content=expanded)
+        # 自动命名（2026-09-21）：首条用户消息落库后，仍叫默认「新会话」就按内容派生改名
+        # （条件更新 WHERE title=默认：用户手动改过名的永不覆盖）；改名随即下发 session_title
+        # 供侧栏就地刷新，不等重拉列表。
+        titled = await ensure_session_title(self.sf, session_id, user_text)
+        if titled:
+            await self.send({"type": "session_title", "title": titled})
         messages = await self._build_messages(session_id, root, cfg, self.send)
         ctx = ToolContext(root=root, session_id=session_id, session_factory=self.sf, send=self.send)
         max_rounds = int(cfg.get("agent.max_tool_rounds", 30))

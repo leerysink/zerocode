@@ -3,6 +3,8 @@
 // 只能从已有应用里选一个来开会话。应用列表由父级 SideBar 传入（同一次 /api/apps 的结果，
 // 不再自己发第二个请求），选项值就是应用关联的 workspace_id：会话表的外键仍是 workspace，
 // 「应用 = 一个带工程目录的工作区」这层关系由 app_service 建应用时一并插入。
+// 2026-09-21 自动命名：会话名称输入框下线（跟 DSH 一样无须自己起名），
+// 标题由后端在首条用户消息落库时按内容派生（session_title_service）。
 import { computed, reactive, watch } from 'vue'
 import { message } from 'ant-design-vue'
 import { createSession } from '../api'
@@ -12,7 +14,7 @@ const props = defineProps({ open: Boolean, apps: { type: Array, default: () => [
 const emit = defineEmits(['update:open', 'created'])
 
 const store = useChatStore()
-const form = reactive({ wsId: null, title: '' })
+const form = reactive({ wsId: null })
 
 const options = computed(() => props.apps.map((a) => ({ label: a.name, value: a.workspace_id })))
 const canSubmit = computed(() => !!form.wsId)
@@ -22,7 +24,6 @@ watch(
   () => props.open,
   (v) => {
     if (!v) return
-    form.title = ''
     form.wsId = props.apps.length === 1 ? props.apps[0].workspace_id : null
   },
   { immediate: true }
@@ -37,10 +38,8 @@ async function submit() {
     message.warning('请先选择一个应用')
     return
   }
-  const title = form.title.trim()
   try {
-    const { data: session } = await createSession(
-      title ? { workspace_id: form.wsId, title } : { workspace_id: form.wsId })
+    const { data: session } = await createSession({ workspace_id: form.wsId })
     await store.openSession(session.id, form.wsId) // 同步记录 currentWorkspaceId（渲染门，Task 13/14）
     message.success('会话已创建')
     emit('created', session)
@@ -77,10 +76,7 @@ async function submit() {
           class="zc-ns-select"
         />
       </div>
-      <div class="zc-ns-field">
-        <div class="zc-ns-label">会话名称（可留空）</div>
-        <a-input v-model:value="form.title" placeholder="留空即为「新会话」，创建后可在会话列表改名" />
-      </div>
+      <p class="zc-ns-hint">会话将在你发出第一句话时按内容自动命名。</p>
     </template>
   </a-modal>
 </template>
@@ -96,6 +92,11 @@ async function submit() {
 }
 .zc-ns-select {
   width: 100%;
+}
+.zc-ns-hint {
+  margin: 4px 0 0;
+  color: var(--zc-text-sub);
+  font-size: 12px;
 }
 .zc-ns-empty {
   color: var(--zc-text-sub);

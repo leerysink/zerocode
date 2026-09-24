@@ -2,6 +2,8 @@ from fastapi import APIRouter, Request, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import text
 
+from app.services.session_title_service import DEFAULT_TITLE
+
 router = APIRouter(prefix="/api/sessions")
 
 class SessionIn(BaseModel):
@@ -22,7 +24,7 @@ async def create_session(request: Request, body: SessionIn):
             raise HTTPException(404, "工作区不存在")
         row = (await s.execute(text(
             "INSERT INTO chat_session (workspace_id, title) VALUES (:w, :t) RETURNING id, workspace_id, title, status, created_at, updated_at"),
-            {"w": body.workspace_id, "t": body.title or "新会话"})).mappings().first()
+            {"w": body.workspace_id, "t": body.title or DEFAULT_TITLE})).mappings().first()
         await s.commit()
     return dict(row)
 

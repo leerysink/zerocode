@@ -52,9 +52,42 @@ def test_ws_plain_flow(client):
          {"type": "done", "message": {"role": "assistant", "content": "你好", "tool_calls": None}}]])
     with client.websocket_connect(f"/ws/chat/{client.zc_sid}") as ws:
         ws.send_json({"type": "user_message", "content": "打个招呼"})
-        evs = [ws.receive_json() for _ in range(4)]  # token,token,message_done,status
+        evs = [ws.receive_json() for _ in range(5)]  # session_title,token,token,message_done,status
     types = [e["type"] for e in evs]
+    assert types[0] == "session_title" and evs[0]["title"] == "打个招呼"  # 自动命名走在模型输出前
     assert "token" in types and "message_done" in types and "status" in types
+
+def test_ws_autotitles_default_session_on_first_message(client):
+    """自动命名（2026-09-21）：「新会话」收到首条用户消息 → 改名并下行 session_title，
+    侧栏不必重拉列表即可实时刷新（事件排在模型输出之前）。"""
+    client.app.state.llm_factory = lambda cfg: ScriptedLLM([done("好的")])
+    with client.websocket_connect(f"/ws/chat/{client.zc_sid}") as ws:
+        ws.send_json({"type": "user_message", "content": "帮我写一个待办清单应用\n再加个导出按钮"})
+        evs = []
+        for _ in range(4):
+            ev = ws.receive_json()
+            evs.append(ev)
+            if ev["type"] == "status":
+                break
+    assert evs[0] == {"type": "session_title", "title": "帮我写一个待办清单应用"}
+    assert client.get(f"/api/sessions/{client.zc_sid}").json()["title"] == "帮我写一个待办清单应用"
+
+
+def test_ws_skips_autotitle_for_renamed_session(client):
+    """用户手动改过名的会话永不被自动命名覆盖：不改库、也不发 session_title 帧。"""
+    client.patch(f"/api/sessions/{client.zc_sid}", json={"title": "我起的名字"})
+    client.app.state.llm_factory = lambda cfg: ScriptedLLM([done("好的")])
+    with client.websocket_connect(f"/ws/chat/{client.zc_sid}") as ws:
+        ws.send_json({"type": "user_message", "content": "随便一句开场白"})
+        types = []
+        for _ in range(4):
+            ev = ws.receive_json()
+            types.append(ev["type"])
+            if ev["type"] == "status":
+                break
+    assert "session_title" not in types
+    assert client.get(f"/api/sessions/{client.zc_sid}").json()["title"] == "我起的名字"
+
 
 def test_ws_ask_flow(client):
     client.app.state.llm_factory = lambda cfg: ScriptedLLM([

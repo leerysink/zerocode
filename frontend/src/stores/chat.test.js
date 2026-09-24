@@ -40,4 +40,19 @@ describe('applyEvent 新事件', () => {
     applyEvent(s, { type: 'status', status: 'idle' })
     expect(s.streamingThinking).toBe('')
   })
+  it('session_title 就地更新侧栏列表中当前会话的标题（不等重新拉取）', () => {
+    const s = {
+      ...mk(),
+      currentSessionId: 5,
+      currentWorkspaceId: 2,
+      sessionsByWs: { 2: [{ id: 5, title: '新会话' }, { id: 6, title: '别的会话' }] },
+    }
+    applyEvent(s, { type: 'session_title', title: '待办清单应用' })
+    expect(s.sessionsByWs[2][0].title).toBe('待办清单应用')
+    expect(s.sessionsByWs[2][1].title).toBe('别的会话') // 只动当前会话
+  })
+  it('session_title 找不到对应条目时安全忽略（未加载的分组/已删会话）', () => {
+    const s = { ...mk(), currentSessionId: 99, currentWorkspaceId: 2, sessionsByWs: {} }
+    expect(() => applyEvent(s, { type: 'session_title', title: 'x' })).not.toThrow()
+  })
 })
