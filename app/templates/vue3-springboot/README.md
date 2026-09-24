@@ -14,6 +14,12 @@ zerocode 大型应用（Vue3 + Spring Boot 3.2.5 管理后台），自带登录 
   （改了 `pom.xml` 的依赖版本或缓存被清掉时除外）。期间日志面板一直滚，**不要重复点「重启」**。
 - **起好之后再重启约一分半**：依赖已进缓存卷、不再重下，实测「停止 → 再起 → 前端与后端 `/api/health`
   同时 200」就绪耗时约 **90s**（首次那几分钟的冷启动只发生一次）。
+- **正式环境首次发布约 3 分 17 秒，二次发布约 1 分 23 秒**：本机实测（prod 端口 8216、lailiao 栈）——
+  一次「一键发布」的七步（preflight → build → provision → migrate → deploy → health）冷缓存耗时
+  **197s**（后端镜像第一次把整套 Maven 依赖下进 BuildKit `/root/.m2` 缓存卷），改一处前端文案再发布的
+  第二次仅 **83s**（依赖与 `npm ci` 层全部命中缓存，只重跑前端 `npm run build`）。发布走 Task C3 的
+  `deploy.build_timeout_large`（1800s）上限，冷构建远超旧的 600s 默认会被误杀成「镜像构建失败」。
+  回滚只切程序（`PROD_VERSION` 回指旧 tag、容器起旧镜像），**数据库永不回滚**——发布期写入的数据仍在。
 - 拉不到基础镜像（后端 `maven:3.9-eclipse-temurin-17` / `eclipse-temurin:17-jre-alpine`，前端
   `node:20-alpine` / `nginx:1.27-alpine`）时说明本机直连 Docker Hub 不通，先配镜像加速源再重试。
 

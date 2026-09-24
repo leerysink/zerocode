@@ -2476,7 +2476,7 @@ git commit -m "feat(prod): take build and health timeouts per stack (large cold 
 **Files:**
 - Modify: `app/templates/vue3-springboot/README.md`（回写实测耗时）
 
-- [ ] **Step 1: 前置体检**
+- [x] **Step 1: 前置体检**
 
 ```powershell
 docker info --format ok
@@ -2487,7 +2487,7 @@ docker manifest inspect docker.m.daocloud.io/library/nginx:1.27-alpine
 
 Expected: 均成功。拉不到的镜像按 Task B4 Step 1 的同一手法 retag（本机 Docker Hub 不可直连）。
 
-- [ ] **Step 2: 发布 Task B4 建好的那个大型应用**
+- [x] **Step 2: 发布 Task B4 建好的那个大型应用**
 
 点「发布」，逐条核对七步进度条与日志：
 
@@ -2500,7 +2500,7 @@ Expected: 均成功。拉不到的镜像按 Task B4 Step 1 的同一手法 retag
 
 Expected: `publish_done ok=true`，总耗时记进 README（首次 build 冷缓存按 Task C3 的 1800s 上限等，**不要中途点第二下**）。
 
-- [ ] **Step 3: 正式入口登录与业务真写**
+- [x] **Step 3: 正式入口登录与业务真写**
 
 1. 浏览器打开 `http://localhost:<prod_port>`，`admin` / `admin123` 登录成功（prod 侧与 dev 侧口令可以不同——两侧都读同一份 `.env` 的 `JWT_SECRET`，但数据库是两个）
 2. 在「部门管理」新建一个部门 → 刷新仍在（写进 prod 库，证明 FOLD + 数据轨在 prod 也真跑）
@@ -2509,19 +2509,19 @@ Expected: `publish_done ok=true`，总耗时记进 README（首次 build 冷缓�
 
 截图存 `.qoder-tmp/t14_prod_`（`t14_prod_login.png`、`t14_prod_write.png`、`t14_prod_steps.png`）。
 
-- [ ] **Step 4: 二次发布验构建缓存**
+- [x] **Step 4: 二次发布验构建缓存**
 
 改一处无关痛痒的前端文案（如 `src/config/index.ts` 的 `appSubtitle`）再发布一次，对比两次的 build 耗时。
 
 Expected: 第二次**显著快于**第一次（BuildKit 的 `/root/.m2` 缓存挂载跨版本复用，`npm ci` 层因 package-lock 未变命中镜像层）。若两次同量级，说明 cache mount 没生效——回去查 `# syntax=docker/dockerfile:1` 那行是否被 A4 漏写，别改计时了事。
 
-- [ ] **Step 5: 回滚链验（不要求失败，只验切换器认栈）**
+- [x] **Step 5: 回滚链验（不要求失败，只验切换器认栈）**
 
 在发布记录里对上一个版本点「回滚」，Expected: 状态回 `running`、`prod-compose.yml` 未变、`PROD_VERSION` 回指旧版、页面可访问；再点回最新版。
 
 > 数据库**不回滚**是平台既有纪律（07），回滚后新写入的那条部门仍在——这是预期行为，不要当成 bug 去改。想清账就 `dev reset`（只作用于 dev）。
 
-- [ ] **Step 6: 全量回归 + 提交**
+- [x] **Step 6: 全量回归 + 提交**
 
 ```bash
 .venv\Scripts\python -m pytest -q
@@ -2533,6 +2533,38 @@ Expected: 全绿（含 fastapi 栈全部既有断言）。
 git add app/templates/vue3-springboot/README.md
 git commit -m "docs(template): record measured publish timings for the large stack"
 ```
+
+#### C4 验收证据（真环境端到，非 hermetic）
+
+**执行方式裁定**：控制者选「现在完整跑 + 平台 API 触发」（`POST /api/apps/{id}/publish`、`/rollback`），
+贴近真实链路且可脚本化；发布/回滚走后台执行，进度按 `/api/apps/1070` 的 `status_prod` + `/records` 轮询核对。
+
+**前置补位**：`nginx:1.27-alpine` 本机缺（temurin/maven/redis/node 均在），按 B4 同一手法从 daocloud 镜像源
+`docker pull` + `docker tag` retag（本机 Docker Hub 不可直连）；起平台后端 `uvicorn app.main:app :8100`；
+`zerocode-pg16` 已在跑。lailiao（id=1070、stack=vue3-springboot、prod :8216）的 `prod-compose.yml` 由发布
+期 `ensure_deploy_files` 自愈落盘，非阻塞。
+
+- **Step 2（首发）**：`publish_done ok=true`，记录 `b20260924103252` `status=success`，
+  `02:32:52.545 → 02:36:09.530` UTC = **197.0s**（3m17s 冷构建）。preflight 打出
+  `✓ dev 结构与 sqlchange 文件等价校验通过`（首版无 prev、破坏性闸门 None 直接放过）；三容器 Up——
+  `zc-lailiao-prod-frontend-1` / `-backend-1` / **`-appredis-1`**（C1 的 springboot redis 命名）；
+  `http://localhost:8216/api/health` → 200 `{"status":"UP"}`（actuator，证 nginx→backend:8080 反代通、D-7 无 401）。
+- **Step 3（登录真写）**：Browser 子代理走查——`admin/admin123` 登录进 dashboard、部门管理新建「验收部门C4」
+  → `POST /api/system/dept` 200、「共 3」变「共 4」、**F5 刷新仍在**（`fetch /api/system/dept/list` 直连后端核对到
+  `id:4`，证 prod 库真落非前端态）、登录日志/操作日志各见本次记录；全程 8 个 `/api` 接口全 200、0 条 console error、
+  无 404/5xx（若干 `304` 是协商缓存命中，非失败）。截图 7 张存 `.qoder-tmp/t14_prod/`。
+- **Step 4（缓存）**：改 `frontend/src/views/login/index.vue` 一处文案再发布，记录 `b20260924104923`
+  `02:49:23.403 → 02:50:46.464` = **83.1s**（1m23s）。**197s → 83s（约 -58%）**，证 BuildKit `/root/.m2`
+  缓存卷 + `npm ci` 层跨版本复用生效，只重跑前端 `npm run build`（判据成立，未去动计时）。
+- **Step 5（回滚）**：`POST /rollback {version:"b20260924103252"}` → `status=running`、`current_version` 与
+  `deploy/.env` 的 `PROD_VERSION` 均回指 `b20260924103252`、运行中前端容器镜像 tag =
+  `zc-lailiao-frontend:prod-b20260924103252`（旧版重新在服）、`/` 200。数据库未回滚，「验收部门C4」仍在（07 纪律，预期行为）。
+- **Step 6**：全量 `pytest -q` → **469 passed**（C4 纯验收、零代码改动，计数与 C3 收口时一致）。测试文案改动已回退；
+  `apps/` 整目录 gitignore，实例源码改动不入仓。提交仅 `app/templates/vue3-springboot/README.md`（实测耗时）与本计划。
+
+> **验收期发现的模板级小瑕疵（非阻断、超移植范围，仅记不改）**：① TreeSelect「上级部门」初值显示原始 `parentId=0`
+> 而非根标签；② 1280px 视口下日志表格需横向滚动、状态/时间列首屏被裁；③ 新建部门 `phone` 落库为 `""` 而非 `null`。
+> 均为 base-pro 自带页面的既有表现，与本栈移植（发布/回滚/反代/超时）无关，留待基座上游处理。
 
 ---
 
