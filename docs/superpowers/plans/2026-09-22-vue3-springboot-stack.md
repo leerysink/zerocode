@@ -2582,7 +2582,7 @@ git commit -m "docs(template): record measured publish timings for the large sta
 > 而文件树又照旧看得见它——契约里没有任何一条**规则**这么说（模板代码里 `FileServiceImpl`/`WebMvcConfig` 确实把 uploads 当运行时存，
 > 但那是给人读的演示，不是约束 AI 的条文）。
 
-- [ ] **Step 1: 写失败测试**（追加到 `tests/test_contract.py`）
+- [x] **Step 1: 写失败测试**（追加到 `tests/test_contract.py`）
 
 ```python
 META_SB = {**VALID_META, "scale": "large", "stack": "vue3-springboot",
@@ -2615,12 +2615,12 @@ def test_contract_small_stack_text_byte_identical(tmp_path):
     assert "Redis、JWT_SECRET、UPLOAD_DIR" not in c
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `pytest tests/test_contract.py -q`
 Expected: FAIL —大型栈用例里 `"8)" in c` 不成立（文本只到 7)）
 
-- [ ] **Step 3: 实现按栈裁剪的附加段**
+- [x] **Step 3: 实现按栈裁剪的附加段**
 
 `app/deploy/contract.py` 的 `ENV_HINT` 里那一行改为：
 
@@ -2661,17 +2661,29 @@ STACK_EXTRA = {
             + STACK_EXTRA.get(stack, ""))
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `pytest tests/test_contract.py tests/test_prompts.py -q`
 Expected: PASS
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add app/deploy/contract.py tests/test_contract.py
 git commit -m "feat(contract): append baseplate rules (menu triple-set, /api prefix, sys_* immutability) to large-stack app contracts"
 ```
+
+#### D1 落地补充
+
+- **计划草稿与自己的测试有一处反引号不一致（已以测试为准修正）**：Step-1 测试断言的是裸短语
+  `"sys_* 表不可改名" in c`（`sys_*` 后直接跟空格），而 Step-3 草稿文本把 `sys_*` 包了 markdown 反引号
+  （`` `sys_*` 表`` → 星号与空格之间多一个反引号），两者对不上、照草稿实现必红。按 TDD「测试即行为规格」
+  的优先级改实现：把这一处 `sys_*` 的反引号去掉（其余 `sys_menu`/`sys_role_menu`/`sys_user` 的反引号原样保留），
+  不动断言。
+- **fastapi 逐字不变的机制**：每条附加文本自带前导 `\n8)`，`STACK_EXTRA.get("vue3-fastapi", "")` 取到空串，
+  契约尾部与旧文**逐字节相同**——回归钉 `test_contract_small_stack_text_byte_identical` 已钉死（含
+  `"8)"/"三件套"/"sys_menu" not in c` 与尾行 endswith 断言）。
+- **回归**：定向 `test_contract.py`+`test_prompts.py` → 13 passed；全量见提交前后台跑。
 
 ---
 
