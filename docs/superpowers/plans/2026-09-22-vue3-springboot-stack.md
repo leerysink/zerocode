@@ -2685,6 +2685,29 @@ git commit -m "feat(contract): append baseplate rules (menu triple-set, /api pre
   `"8)"/"三件套"/"sys_menu" not in c` 与尾行 endswith 断言）。
 - **回归**：定向 `test_contract.py`+`test_prompts.py` → 13 passed；全量见提交前后台跑。
 
+#### D1 评审（CodeReview 55e6169..0b71155）与返修
+
+评审提出 1 Blocking + 3 Important + 3 Nit；逐条复算后除 1 个口味 Nit 外全接。
+
+- **Blocking（已修，且是评审最值钱的一刀）**：10) 原文教 AI 用 `@RequiresPermission` 注解——**全仓根本不存在**
+  （`grep` 只命中契约文本与本计划草稿；模板 annotation/ 只有 `Log`/`BusinessType`）。真实机制是
+  `SecurityConfig` 已开 `@EnableMethodSecurity(prePostEnabled=true)`、`LoginUser.getAuthorities()` 把
+  `sys_menu.permission` 装成 `SimpleGrantedAuthority` → 正确写法是 `@PreAuthorize("hasAuthority('模块:实体:动作')")`。
+  契约是 AI 的唯一权威注入源，写错符号 = AI 照写必编译失败（或自造注解正好违反同一条「基座只增不改」）。已改指
+  `@PreAuthorize`，并补测试 `"@PreAuthorize" in c and "@RequiresPermission" not in c` 防回潮。
+- **Important-2（已修）**：8)–11) 原本只在 8) 前带一个 `\n`，四条挤成 ~700 字符一行，与 1)–7)「一条一行」自相矛盾。
+  已在 9)/10)/11) 前各补 `\n`（11) 结尾仍不加、与 7) 对齐），并加测试 `"\n9)"/"\n10)"/"\n11)" in c`。
+- **Important-3（已修）**：ENV_HINT 新句零正向覆盖；且小栈负向断言用的串 `Redis、JWT_SECRET、UPLOAD_DIR` 与实现
+  `Redis 与 JWT_SECRET`（「与」而非「、」）对不上，是一条**恒真无牙**的断言（计划草稿自带此 bug）。改为正向钉
+  springboot 取到真句、负向钉小栈不含真实子串「已由平台注入，代码不得自行拼接或硬编码」。
+- **Important-4（已修）**：契约内部「三件套」一词两用（8) 菜单三件套 vs 11) 审计列三件套），与同工作区 README 的
+  第三种口径撞车。把 11) 改为「审计三列」，8) 的「三件套」（测试钉住）不动。
+- **Nit（已顺手改）**：8)③「路由不存在就是 404」与本栈症状不符（无 404 视图/无 catch-all，未注册路径实为空白页 +
+  控制台 No match found，而菜单缺失那条才是 403）——改为准确描述，免得诱导 AI 去补 404 页。
+- **Nit（未改，口味）**：`byte_identical` 用名强于实检（关键字不出现 + endswith，未与旧文全文比）；评审已实测
+  旧/新渲染 fastapi 契约 `EQUAL True 1230 1230`，逐字节不变性成立。加 sha256 golden 是锦上添花，本次不动。
+- **返修后回归**：`test_contract.py` → 10 passed；全量见下。
+
 ---
 
 ### Task D2: 向导文案与旧规格改注（入口说清代价，规格不骗人）
