@@ -100,6 +100,7 @@ def test_contract_large_stack_carries_baseplate_rules(tmp_path):
     assert "SPRING_DATASOURCE_URL" in c            # ENV_HINT 仍指对方向
     assert "Redis 与 JWT_SECRET、UPLOAD_DIR 已由平台注入" in c   # ENV_HINT 新句正向钉
     assert "@PreAuthorize" in c and "@RequiresPermission" not in c  # 10) 指真实存在的注解，不教 AI 写编译不过的符号
+    assert "只对「新登录」生效" in c and "退出重登" in c  # 10) 补：数据轨权限不刷旧会话，堵住「为绕 403 去改 SecurityConfig」的失败路径
     assert "\n9)" in c and "\n10)" in c and "\n11)" in c          # 8)–11) 各自成行，与 1)–7) 同层级
 
 
@@ -109,3 +110,4 @@ def test_contract_small_stack_text_byte_identical(tmp_path):
     assert c and "8)" not in c and "三件套" not in c and "sys_menu" not in c
     assert c.rstrip().endswith("正式使用请点「发布」。")     # 1)–7) 尾行未变
     assert "已由平台注入，代码不得自行拼接或硬编码" not in c   # 负向 pin 用真实子串（springboot 专属那句不得漏进小栈）
+    assert "退出重登" not in c                                  # 10) 补的 LoginUser 缓存句只跟大型栈走

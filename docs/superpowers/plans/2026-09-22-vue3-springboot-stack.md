@@ -2708,6 +2708,22 @@ git commit -m "feat(contract): append baseplate rules (menu triple-set, /api pre
   旧/新渲染 fastapi 契约 `EQUAL True 1230 1230`，逐字节不变性成立。加 sha256 golden 是锦上添花，本次不动。
 - **返修后回归**：`test_contract.py` → 10 passed；全量见下。
 
+#### 收尾全链评审（CodeReview 55e6169..0322da5）与 Important 补修
+
+终审覆盖 D1+D2，**无 Blocking**，逐维度均通过（含 fastapi/其它栈逐字节不变性实测全等、8)–11) 事实一致性逐条核实）。
+提出 1 Important（本段补修）+ 5 Nit：
+
+- **Important（已修）**：契约 8)②/10) 漏讲一个失败路径——**数据轨补的菜单/权限只对「新登录」生效**。复算属实：
+  `JwtAuthenticationFilter` 从 Redis 读 `LoginUser` 快照的 authorities，不重查 DB（`security/JwtAuthenticationFilter.java:37-41`）；
+  失效方法 `LoginUserCache.clearAll()` **只被菜单管理 UI（`SysMenuServiceImpl:166/178`）调用**，sqlchange 数据轨直写表不过 Java 服务层→不清缓存；
+  `jwt.expiration: 86400000`=24h。故发布后仍在线的旧会话命中新接口必 403 且不自愈，退出重登才修好。
+  危害：403 后 AI 最省事的自救就是改 `SecurityConfig` 白名单或自造鉴权注解——**正好撞 10) 的两条禁令**。
+  修复：在 10) 末尾补一句（插在段内、不改 `\n` 序号结构，保 fastapi 逐字节不变），并补正向断言
+  `"只对「新登录」生效" in c and "退出重登" in c` + 小栈负向 `"退出重登" not in c`。
+- **Nits（5，多为口味/可选）**：`byte_identical` 不守中段；「5–15 分钟」上界是超时红线非典型值；本计划草稿仍留着被 729a903 推翻的
+  `@RequiresPermission` 旧块（历史现场，不抹）；规格 §5 未随 8)–11) 同步。均未阻断，保留。
+- **补修后回归**：`test_contract.py` → 10 passed；全量 `pytest -q` → **471 passed**（计数不变，纯注入文本追加）。
+
 ---
 
 ### Task D2: 向导文案与旧规格改注（入口说清代价，规格不骗人）
@@ -2773,7 +2789,7 @@ git commit -m "docs(ux): tell the truth about large-stack cold start in the wiza
 
 ## Self-Review（计划落盘后的自查，不写代码）
 
-- [ ] **规格覆盖对照**：逐条把 spec 的 11 节往回指，每项至少一个 Task——
+- [x] **规格覆盖对照**：逐条把 spec 的 11 节往回指，每项至少一个 Task——
 
 | spec | 落点 |
 |---|---|
@@ -2791,10 +2807,10 @@ git commit -m "docs(ux): tell the truth about large-stack cold start in the wiza
 | spec §11 不做清单 | 无 Task——这是“不做”的，写到即边界（模板不动 vue3-fastapi、不拆 base-pro 功能、不加前端测试框架） |
 
 - [x] **占位符扫描**（已执行）：`Select-String -Path docs\superpowers\plans\2026-09-22-vue3-springboot-stack.md -Pattern 'TODO','待补','省略'` → 2 命中，均为合法内容：Task D2 规格改注里的「vue3-node / static 模板仍待补」（陈述别的栈的现状）与本行自己的模式串。模板里的 `{{SLUG}}/{{APP_NAME}}` 是产品形态不是占位。
-- [ ] **跳 Task 一致性**：`wait_frontend_health(port, timeout)` 签名在 B3 保留且在 `test_engine.py:160` 仍为唯一替身点；`health_timeout(cfg, stack)` 定稿于 B3、引用于 B3 Step 5 与 C3；`build_timeout(cfg, stack)` 定稿于 C3；`META_SB` 定义于 B1、复用于 C1（同一文件同一名字，不重复定义）；`PUBLISHABLE_STACKS` 只在 C1 定义一次，`ensure_deploy_files` 与 `render_prod_compose` 共用。
-- [ ] **测试纪律复查**：每个改动 Task 都是「先写失败测试 → 跑一次看红 → 实现 → 跑一次看绿 → 提交」；B4/C4 是纯验收 Task，不写新断言，只留实测证据。
-- [ ] **SQL 变更纪律复查**：本计划**不新增平台表、不改平台列**（密钥落 `.env` 文件，不落 `app_credential`）→ `changelog/` 无需新版本。若执行时改变主意（比如把 JWT_SECRET 存进库），必须补 `changelog/V<日期>_01_*.sql` 并开一份新 spec。
-- [ ] **工作区纪律复查**：全程只用 `DeleteFile` 工具删文件（不用 shell rm）；提交一律路径限定器 `git add <具体文件>`；不 push 远端。
+- [x] **跳 Task 一致性**：`wait_frontend_health(port, timeout)` 签名在 B3 保留且在 `test_engine.py:160` 仍为唯一替身点；`health_timeout(cfg, stack)` 定稿于 B3、引用于 B3 Step 5 与 C3；`build_timeout(cfg, stack)` 定稿于 C3；`META_SB` 定义于 B1、复用于 C1（同一文件同一名字，不重复定义）；`PUBLISHABLE_STACKS` 只在 C1 定义一次，`ensure_deploy_files` 与 `render_prod_compose` 共用。
+- [x] **测试纪律复查**：每个改动 Task 都是「先写失败测试 → 跑一次看红 → 实现 → 跑一次看绿 → 提交」；B4/C4 是纯验收 Task，不写新断言，只留实测证据。
+- [x] **SQL 变更纪律复查**：本计划**不新增平台表、不改平台列**（密钥落 `.env` 文件，不落 `app_credential`）→ `changelog/` 无需新版本。若执行时改变主意（比如把 JWT_SECRET 存进库），必须补 `changelog/V<日期>_01_*.sql` 并开一份新 spec。
+- [x] **工作区纪律复查**：全程只用 `DeleteFile` 工具删文件（不用 shell rm）；提交一律路径限定器 `git add <具体文件>`；不 push 远端。
 
 ---
 
