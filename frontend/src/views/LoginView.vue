@@ -3,7 +3,8 @@
     <a-card class="login-card" :bordered="false">
       <div class="login-brand">zerocode</div>
       <div class="login-subtitle">{{ mode === 'login' ? '登录你的工作台' : '创建一个账号，开始构建你的应用' }}</div>
-      <a-form layout="vertical" @finish="submit">
+      <!-- :model 必须绑：antd Form 无 model 时 finish 永不触发，登录/注册按钮会静默失效（Ticket 010 冒烟回归） -->
+      <a-form :model="form" layout="vertical" @finish="submit">
         <a-form-item name="nickname" label="昵称">
           <a-input v-model:value="form.nickname" placeholder="怎么称呼你" size="large" autocomplete="username" />
         </a-form-item>
