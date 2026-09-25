@@ -1,6 +1,5 @@
 # tests/test_store_api.py
 """商店 REST：身份 cookie、商店列表、申请审批。Docker 不参与（安装用例见 test_store_install.py）。"""
-import pytest
 from sqlalchemy import text
 
 
@@ -15,28 +14,24 @@ async def test_store_requires_identity(anon_client):
     assert r.status_code == 401
 
 
-@pytest.mark.skip(reason="匿名 identify 已被登录态取代（guard 前置）；Ticket 008 合流后重写")
-async def test_identify_sets_cookie_and_reuses_actor(client):
-    r = await client.post("/api/store/identify", json={"nickname": "陌如玉的用户"})
-    assert r.status_code == 200, r.text
-    actor = r.json()
-    assert actor["nickname"] == "陌如玉的用户"
-    assert "zc_actor" in r.cookies or client.cookies.get("zc_actor")
-    # 同一 cookie 再访问 → 同一个人（cookie 即设备标识，不重复建行）
-    r2 = await client.get("/api/store/me")
-    assert r2.status_code == 200
-    assert r2.json()["id"] == actor["id"]
+async def test_匿名identify建号端点已退役(client):
+    """Ticket 008 合流：不再面向前端匿名建号（注册端点收编），路由已删。
+
+    404 或 405 均算数：POST 不匹配任何 API 路由时，SPA 的 GET catch-all 会接住路径回 405，
+    语义都是「这个端点不存在了」。"""
+    r = await client.post("/api/store/identify", json={"nickname": "看客"})
+    assert r.status_code in (404, 405)
 
 
-@pytest.mark.skip(reason="匿名 identify 已被登录态取代（guard 前置）；Ticket 008 合流后重写")
-async def test_identify_rejects_blank(client):
-    r = await client.post("/api/store/identify", json={"nickname": "  "})
-    assert r.status_code == 400
+async def test_商店身份即登录用户没有第二套actor(client):
+    """两套身份合流：/store/me 与 /auth/me 必须是同一个人（cookie 同一、行同一）。"""
+    me = (await client.get("/api/auth/me")).json()
+    actor = (await client.get("/api/store/me")).json()
+    assert actor["id"] == me["id"] and actor["nickname"] == me["nickname"]
 
 
 async def test_releases_list_only_published(client):
     """未上架时是空列表而不是 404；withdrawn 不出现。"""
-    await client.post("/api/store/identify", json={"nickname": "看客"})
     r = await client.get("/api/store/releases")
     assert r.status_code == 200
     assert r.json() == []
@@ -50,7 +45,6 @@ async def test_release_endpoint_requires_identity_and_publish(anon_client):
 
 async def test_store_releases_lists_published(client, monkeypatch):
     """列表不触发 Docker：直接往 app_release 插行，验形状与 withdrawn 过滤。"""
-    await client.post("/api/store/identify", json={"nickname": "看客"})
     sf = client.app.state.session_factory
     from sqlalchemy import text
     async with sf() as s:

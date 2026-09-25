@@ -56,6 +56,5 @@ async def test_list_apps_carries_origin_and_link(sf):
 
 
 async def test_store_link_endpoint_404_for_non_store_app(client):
-    await client.post("/api/store/identify", json={"nickname": "看客"})
     r = await client.get("/api/store/link/999999")
     assert r.status_code == 404

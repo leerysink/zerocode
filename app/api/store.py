@@ -3,14 +3,15 @@
 
 两套前缀放一个文件：`/api/store/*` 是商店本体，`/api/apps/{id}/release` 是应用侧的上架入口，
 后者复用 apps 的鉴权/闸门语境，但实现全在 app/store/*，这里仍是薄层。
-身份 401 的 detail 是字典 `{code, message}`——与 M2 chat 闸门（apps.py 的 409 detail 契约）
-同一条纪律：前端要按 code 分支弹昵称框，不能只吃字符串。
+
+身份（Ticket 008 合流 / ADR-0003）：actor 即登录用户——全局 guard（main.py）已把无会话请求
+拦成 401 并把 actor 挂上 request.state；匿名 identify 建号端点已退役，前端的 401 统一
+由 axios 拦截器引导到登录页，不再弹昵称框。
 """
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy import text
 from app.deploy.errors import DeployError
-from app.store import identity
 from app.store import release as release_svc
 from app.store import applications as apps_svc
 
@@ -22,43 +23,15 @@ def _http(e: DeployError):
     return HTTPException(e.status, str(e))
 
 
-class IdentifyIn(BaseModel):
-    nickname: str
-
-
-class IdentityRequired(HTTPException):
-    def __init__(self):
-        super().__init__(401, {"code": "identity_required", "message": "请先留下名字"})
-
-
 async def current_actor(request: Request) -> dict:
-    """身份依赖：cookie 无效即 401 + code=identity_required，前端据此弹昵称框。
+    """身份依赖：直接取 guard 挂上的登录主体（Ticket 008 后与 /api/auth/* 同一人）。
 
-    401 而不是 403：本期没有任何授权语义，只是「我不知道你是谁」。
+    能走到这里的请求必已过全局 guard（无会话根本进不来），所以不再二次 by_token。
     """
-    sf = request.app.state.session_factory
-    actor = await identity.by_token(sf, request.cookies.get(identity.ACTOR_COOKIE))
-    if actor is None:
-        raise IdentityRequired()
-    return actor
+    return request.state.actor
 
 
 Actor = Depends(current_actor)
-
-
-@router.post("/identify")
-async def identify(request: Request, response: Response, body: IdentifyIn):
-    """一次调用既建身份又下发 cookie。已带有效 cookie 时不新建（刷新页面不该多出一堆人）。"""
-    sf = request.app.state.session_factory
-    existing = await identity.by_token(sf, request.cookies.get(identity.ACTOR_COOKIE))
-    try:
-        actor = existing or await identity.create_actor(sf, body.nickname)
-    except DeployError as e:
-        raise _http(e)
-    if not existing:
-        response.set_cookie(identity.ACTOR_COOKIE, actor["token"],
-                            max_age=identity.COOKIE_MAX_AGE, httponly=True, samesite="lax")
-    return {"id": actor["id"], "nickname": actor["nickname"]}
 
 
 @router.get("/me")

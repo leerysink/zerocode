@@ -1,8 +1,10 @@
 # app/store/identity.py
-"""轻身份 actor（规格 M3-a §6.2 / D8）：昵称 + 随机 token，token 即设备标识，不鉴权。
+"""actor 存取（Ticket 008 合流 / ADR-0003）：actor 即登录用户，cookie `zc_actor`
+是会话凭据而非设备标识；身份建立收编到 /api/auth/register，授权收口在各业务查询
+的 owner_user_id 过滤（Tickets 005-007）——本模块只提供「由 token 得人」的认证入口。
 
-本期刻意不做密码与登录：商店闭环只需要「谁申请的、这实例归谁」。
-因此这里**不得**演化成授权依据——越权收口在 applications/install 侧按 owner_actor 与 origin 判。
+历史注脚：M3-a 期商店的「弹层留名」轻身份已退役（匿名 identify 端点删除）；
+create_actor 仅剩测试/内部初始化可用，不得再接入任何面向前端的建号路径。
 """
 import datetime, secrets
 import bcrypt
@@ -46,6 +48,7 @@ def _row_to_dict(r) -> dict:
 
 
 async def create_actor(session_factory, nickname: str) -> dict:
+    """建 actor 行（无口令）。面向前端的入口已退役（Ticket 008），仅留给测试与服务内部。"""
     name = _clean(nickname)
     async with session_factory() as s:
         r = (await s.execute(text(

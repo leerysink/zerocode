@@ -97,10 +97,8 @@ export const deleteRecord = (id, rid) => http.delete(`/apps/${id}/records/${rid}
 export const appUrls = (id) => http.get(`/apps/${id}/urls`)
 export const systemNics = () => http.get('/system/nics')
 
-// ---- 应用商店 M3-a（轻身份 / 上架 / 申请审批）----
-// 注：identify/昵称弹层在 Ticket 008 与登录态合流，此处暂保留原调用。
-export const storeIdentify = (nickname) => http.post('/store/identify', { nickname })
-export const storeMe = () => http.get('/store/me')
+// ---- 应用商店 M3-a（上架 / 申请审批）----
+// Ticket 008 身份合流：identify/storeMe 已退役，身份一律走 /api/auth/me（authMe）。
 export const storeReleases = () => http.get('/store/releases')
 export const storeWithdraw = (id) => http.post(`/store/releases/${id}/withdraw`)
 export const storeApplications = (box = 'mine') => http.get('/store/applications', { params: { box } })

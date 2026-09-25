@@ -1,10 +1,10 @@
 <script setup>
-// 应用商店（规格 M3-a §9）：列表/申请/审批一页三视图。身份缺失弹昵称框，不进登录页。
+// 应用商店（规格 M3-a §9）：列表/申请/审批一页三视图。
+// 身份（Ticket 008 合流 / ADR-0003）：actor 即登录用户，昵称弹层已退役——401 统一去登录页。
 import { onMounted, ref } from 'vue'
 import { message } from 'ant-design-vue'
-import { AppstoreOutlined, PlusOutlined, SendOutlined } from '@ant-design/icons-vue'
+import { AppstoreOutlined, PlusOutlined, SendOutlined, UserOutlined } from '@ant-design/icons-vue'
 import * as api from '../api'
-import ActorNameModal from '../components/ActorNameModal.vue'
 import BackButton from '../components/BackButton.vue'
 
 const tab = ref('store')
@@ -12,7 +12,6 @@ const releases = ref([])
 const mine = ref([])
 const review = ref([])
 const me = ref(null)
-const actorOpen = ref(false)
 const applyOpen = ref(false)
 const applyTarget = ref(null)
 const applyName = ref('')
@@ -26,18 +25,14 @@ async function load () {
 
 onMounted(async () => {
   try {
-    me.value = (await api.storeMe()).data
+    me.value = (await api.authMe()).data   // 复用登录态接缝（/api/auth/me），不再有第二套身份
     await load()
   } catch (e) {
-    if (e?.response?.status === 401) actorOpen.value = true
+    // 非 auth 接口的 401 由 axios 拦截器统一跳转；authMe 在豁免名单里，这里自己引导
+    if (e?.response?.status === 401) window.location.assign('/login')
     else message.error('商店加载失败：' + (e?.message || e))
   }
 })
-
-async function onIdentify (nickname) {
-  me.value = (await api.storeIdentify(nickname)).data
-  await load()
-}
 
 function openApply (r) { applyTarget.value = r; applyName.value = r.title; applyOpen.value = true }
 
@@ -75,6 +70,7 @@ function gotoApps () { window.location.href = '/apps' }
         <h2><appstore-outlined /> 应用商店</h2>
       </div>
       <a-space>
+        <span data-test="me-nickname" class="zc-store-meta"><user-outlined /> {{ me?.nickname || '' }}</span>
         <a-button @click="load">刷新</a-button>
         <a-button type="primary" @click="gotoApps"><plus-outlined /> 新建应用</a-button>
       </a-space>
@@ -132,8 +128,6 @@ function gotoApps () { window.location.href = '/apps' }
       <p class="zc-store-tip">获批后会为你单独建一套代码目录与数据库，数据与发布者无关。</p>
       <a-button type="primary" @click="submitApply">提交申请</a-button>
     </a-modal>
-
-    <ActorNameModal v-model:open="actorOpen" @submit="onIdentify" />
   </div>
 </template>
 

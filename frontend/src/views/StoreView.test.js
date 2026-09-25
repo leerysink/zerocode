@@ -1,5 +1,5 @@
 // @vitest-environment happy-dom
-// Task 12：商店页三视图（列表/我的申请/待审批）与轻身份弹窗的接线契约。
+// Task 12 + Ticket 008：商店页三视图（列表/我的申请/待审批）与登录态身份的接线契约。
 // 真 Antd 插件挂载（与 AppsView 的桩件模式不同：商店页无 WS/进度流，交互全在 tabs/modal 上）。
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { flushPromises, mount } from '@vue/test-utils'
@@ -28,7 +28,7 @@ function mountView () {
 
 beforeEach(() => {
   vi.clearAllMocks()
-  api.storeMe.mockResolvedValue({ data: { id: 1, nickname: '我' } })
+  api.authMe.mockResolvedValue({ data: { id: 1, nickname: '我' } })
   api.storeReleases.mockResolvedValue({ data: releases })
   api.storeApplications.mockResolvedValue({ data: applications })
   api.storeMyReleases.mockResolvedValue({ data: [] })
@@ -52,17 +52,27 @@ describe('StoreView', () => {
     expect(w.findAll('button').some((b) => b.text().includes('申请'))).toBe(false)
   })
 
-  it('未登录（401 identity_required）弹昵称框，提交后重新拉列表', async () => {
-    api.storeMe.mockRejectedValue({ response: { status: 401 } })
-    api.storeIdentify.mockResolvedValue({ data: { id: 2, nickname: '新人' } })
+  it('已登录：页头显示当前账号昵称（身份合流，无昵称弹层）', async () => {
     const w = mountView()
     await flushPromises()
-    expect(w.find('[data-test="actor-modal"]').exists()).toBe(true)
-    await w.find('[data-test="actor-name"]').setValue('新人')
-    await w.find('[data-test="actor-submit"]').trigger('click')
-    await flushPromises()
-    expect(api.storeIdentify).toHaveBeenCalledWith('新人')
-    expect(api.storeReleases).toHaveBeenCalled()
+    expect(w.find('[data-test="me-nickname"]').text()).toContain('我')
+    expect(w.find('[data-test="actor-modal"]').exists()).toBe(false)
+  })
+
+  it('未登录（authMe 401）引导去登录页，不再弹昵称框', async () => {
+    api.authMe.mockRejectedValue({ response: { status: 401 } })
+    const assign = vi.fn()
+    const saved = window.location
+    // happy-dom 的 location 不可直接改写：换整对象，测完还原
+    Object.defineProperty(window, 'location', { value: { assign }, writable: true, configurable: true })
+    try {
+      const w = mountView()
+      await flushPromises()
+      expect(assign).toHaveBeenCalledWith('/login')
+      expect(w.find('[data-test="actor-modal"]').exists()).toBe(false)
+    } finally {
+      Object.defineProperty(window, 'location', { value: saved, writable: true, configurable: true })
+    }
   })
 
   it('审批：驳回必须填原因才可调接口', async () => {
