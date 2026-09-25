@@ -7,10 +7,10 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { message } from 'ant-design-vue'
 import {
-  AppstoreOutlined, DeleteOutlined, EllipsisOutlined, FolderOutlined, LogoutOutlined, PlusOutlined,
-  SettingOutlined, ShopOutlined, UserOutlined,
+  AppstoreOutlined, DeleteOutlined, EllipsisOutlined, FolderOutlined, PlusOutlined,
+  SettingOutlined, ShopOutlined,
 } from '@ant-design/icons-vue'
-import { authLogout, authMe, createSession, deleteApp, deleteSession, listApps, listSessions, renameApp } from '../api'
+import { createSession, deleteApp, deleteSession, listApps, listSessions, renameApp } from '../api'
 import { useChatStore } from '../stores/chat'
 import { relativeTime } from '../utils/time'
 import NewSessionModal from './NewSessionModal.vue'
@@ -25,21 +25,6 @@ const rename = reactive({ open: false, app: null, name: '' })
 const del = reactive({ open: false, app: null, typed: '' })
 
 const VISIBLE = 5 // brief：默认每组显 5 个
-
-// 账户区（Ticket 010 / spec 故事13）：昵称回显 + 登出。身份单源 /api/auth/me，
-// 与商店页同一接缝；authMe 在拦截器豁免名单里，未登录不会自动跳，这里兜底引导。
-const me = ref(null)
-async function loadMe() {
-  try {
-    me.value = (await authMe()).data
-  } catch (e) {
-    if (e?.response?.status === 401) window.location.assign('/login')
-  }
-}
-async function doLogout() {
-  try { await authLogout() } catch { /* 服务端本就无会话：当作登出成功 */ }
-  window.location.assign('/login') // token 已轮换，留在原地只会处处 401
-}
 
 const sessionsOf = (wsId) => store.sessionsByWs[wsId] || []
 function visibleSessions(wsId) {
@@ -77,7 +62,7 @@ async function loadAll() {
     loading.value = false
   }
 }
-onMounted(() => { loadAll(); loadMe() })
+onMounted(loadAll)
 
 async function removeSession(wsId, s) {
   try {
@@ -204,10 +189,6 @@ async function doDelete() {
         <router-link to="/apps"><appstore-outlined /> 应用</router-link>
         <router-link to="/store"><shop-outlined /> 商店</router-link>
         <router-link to="/settings"><setting-outlined /> 设置</router-link>
-      </div>
-      <div class="zc-account-row">
-        <span class="zc-account-name" data-test="account-nickname"><user-outlined /> {{ me?.nickname || '' }}</span>
-        <a class="zc-logout" data-test="logout-btn" @click="doLogout"><logout-outlined /> 登出</a>
       </div>
     </div>
     <NewSessionModal v-model:open="showNew" :apps="apps" @created="loadAll" />
@@ -390,35 +371,6 @@ async function doDelete() {
 .zc-footer-row {
   display: flex;
   justify-content: space-between;
-}
-/* 账户区（Ticket 010）：昵称居左、登出居右，弱于导航行一档 */
-.zc-account-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-top: 8px;
-  padding: 0 2px;
-  font-size: 12px;
-  color: var(--zc-text-sub);
-}
-.zc-account-name {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.zc-logout {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  flex-shrink: 0;
-  color: var(--zc-text-sub);
-  cursor: pointer;
-}
-.zc-logout:hover {
-  color: var(--zc-primary);
 }
 .zc-footer a {
   display: inline-flex;

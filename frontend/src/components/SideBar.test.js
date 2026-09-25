@@ -14,8 +14,6 @@ vi.mock('../api', () => ({
   // SideBar 直接使用
   listSessions: vi.fn(), deleteSession: vi.fn(), createSession: vi.fn(),
   listApps: vi.fn(), renameApp: vi.fn(), deleteApp: vi.fn(),
-  // 账户区（Ticket 010）：昵称回显与登出
-  authMe: vi.fn(), authLogout: vi.fn(),
   // chat store 使用（loadAll 仍要拉工作区名给文件面板/输入区做名称回显）
   listWorkspaces: vi.fn(), getMessages: vi.fn(), getSessionDetail: vi.fn(),
   listModels: vi.fn(), patchSessionModel: vi.fn(),
@@ -23,7 +21,7 @@ vi.mock('../api', () => ({
 }))
 vi.mock('ant-design-vue', () => ({ message: { success: vi.fn(), error: vi.fn(), warning: vi.fn() } }))
 
-import { listApps, listSessions, listWorkspaces, createSession, renameApp, deleteApp, authMe, authLogout } from '../api'
+import { listApps, listSessions, listWorkspaces, createSession, renameApp, deleteApp } from '../api'
 import { message } from 'ant-design-vue'
 import SideBar from './SideBar.vue'
 import { useChatStore } from '../stores/chat'
@@ -127,7 +125,6 @@ async function mountSideBar({ appRows = [APP], wsRows = [LEGACY_WS], sessionRows
   listApps.mockResolvedValue({ data: appRows })
   listWorkspaces.mockResolvedValue({ data: wsRows })
   listSessions.mockImplementation(async (wsId) => ({ data: sessionRows ?? sessions(8, wsId) }))
-  authMe.mockResolvedValue({ data: { id: 1, nickname: '小明' } })   // 账户区默认已登录
   const wrapper = mount(SideBar, { global: { plugins: [pinia], stubs: STUBS } })
   await flushPromises()
   const store = useChatStore()
@@ -302,27 +299,4 @@ describe('SideBar 删除应用', () => {
   })
 })
 
-// Ticket 010 / spec 故事13：侧栏账户区——当前账号昵称回显 + 登出入口。
-describe('SideBar 账户区', () => {
-  it('页脚显示当前账号昵称（authMe）', async () => {
-    const { wrapper } = await mountSideBar()
-    expect(authMe).toHaveBeenCalled()
-    expect(wrapper.find('[data-test="account-nickname"]').text()).toContain('小明')
-  })
-
-  it('点登出：调接口后整页跳登录页（登出后 cookie 已作废，留在原地只会处处 401）', async () => {
-    const assign = vi.fn()
-    const saved = window.location
-    Object.defineProperty(window, 'location', { value: { assign }, writable: true, configurable: true })
-    try {
-      authLogout.mockResolvedValue({})
-      const { wrapper } = await mountSideBar()
-      await wrapper.find('[data-test="logout-btn"]').trigger('click')
-      await flushPromises()
-      expect(authLogout).toHaveBeenCalled()
-      expect(assign).toHaveBeenCalledWith('/login')
-    } finally {
-      Object.defineProperty(window, 'location', { value: saved, writable: true, configurable: true })
-    }
-  })
-})
+// 账户区已迁至右上角顶栏 AccountBar，用例见 AccountBar.test.js（Ticket 010 后的位置调整）。
