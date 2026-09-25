@@ -31,9 +31,14 @@ def _is_ignored_dir(rel_parts: tuple) -> bool:
             or any(rel_parts[-len(t):] == t for t in IGNORE_PATH_TAILS))
 
 async def _root_of(request: Request, ws_id: int) -> Path:
+    """工作区根目录统一接缝（fs_tree/fs_ls/download/read/save 共用）：
+    隔离收口（Ticket 005）——不属于自己的工作区与不存在同一 404。"""
     from sqlalchemy import text
+    uid = request.state.actor["id"]
     async with request.app.state.session_factory() as s:
-        row = (await s.execute(text("SELECT root_path FROM workspace WHERE id=:i"), {"i": ws_id})).first()
+        row = (await s.execute(text(
+            "SELECT root_path FROM workspace WHERE id=:i AND owner_user_id=:u"),
+            {"i": ws_id, "u": uid})).first()
     if not row:
         raise HTTPException(404, "工作区不存在")
     return Path(row[0])

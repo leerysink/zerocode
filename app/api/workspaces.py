@@ -43,18 +43,26 @@ async def create_workspace(request: Request, body: WsIn):
 
 @router.get("/workspaces")
 async def list_workspaces(request: Request):
+    # 隔离收口（Ticket 005）：列表只认自己的归属行
+    uid = request.state.actor["id"]
     async with request.app.state.session_factory() as s:
         rows = (await s.execute(text(
             "SELECT w.id, w.name, w.root_path, w.created_at, "
             "(SELECT count(*) FROM chat_session cs WHERE cs.workspace_id = w.id) AS session_count "
-            "FROM workspace w ORDER BY w.id DESC"))).mappings().all()
+            "FROM workspace w WHERE w.owner_user_id = :u ORDER BY w.id DESC"),
+            {"u": uid})).mappings().all()
     return [dict(r) for r in rows]
 
 @router.delete("/workspaces/{ws_id}")
 async def delete_workspace(request: Request, ws_id: int):
+    uid = request.state.actor["id"]
     async with request.app.state.session_factory() as s:
-        await s.execute(text("DELETE FROM workspace WHERE id = :i"), {"i": ws_id})
+        r = await s.execute(text("DELETE FROM workspace WHERE id = :i AND owner_user_id = :u"),
+                            {"i": ws_id, "u": uid})
         await s.commit()
+        if r.rowcount == 0:
+            # 不存在与他人的行同一 404，不给探测留差异
+            raise HTTPException(404, "工作区不存在")
     return {"ok": True}
 
 @router.post("/fs/browse")
