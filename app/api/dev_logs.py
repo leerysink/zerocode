@@ -45,7 +45,7 @@ async def dev_logs(request: Request, app_id: int, tail: int = 200, since_seq: in
     sf = request.app.state.session_factory
     hub = request.app.state.deploy_hub
     try:
-        app = await app_service.get_app(sf, app_id)
+        app = await app_service.get_app(sf, app_id, owner_user_id=request.state.actor["id"])
     except DeployError as e:
         raise HTTPException(e.status, str(e))
     n = min(max(int(tail), 1), MAX_TAIL)

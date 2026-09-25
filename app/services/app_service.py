@@ -214,18 +214,24 @@ async def _rollback(session_factory, root_path: Path, slug: str, app_id: int | N
     shutil.rmtree(root_path, ignore_errors=True)
 
 
-async def list_apps(session_factory) -> list[dict]:
+async def list_apps(session_factory, *, owner_user_id: int | None = None) -> list[dict]:
     """应用列表（应用页与侧栏分组共用）。带上 workspace.root_path：
     侧栏一行就是一个应用，确认删除时要当场把「工程目录还在哪儿」说清楚。
+
+    `owner_user_id`（Ticket 006）：HTTP 层传当前账号做隔离，不传保持全局语义——
+    validate-slug 的 taken 预检读的是全局 UNIQUE，必须看全量。
 
     store 键：商店实例的绑定摘要（来源包/通道/已应用指纹），列表卡片角标与升级入口靠它；
     一次性拉全部 link 再拼，不在循环里查库。"""
     async with session_factory() as s:
-        rows = (await s.execute(text(
-            "SELECT a.id, a.workspace_id, a.name, a.slug, a.scale, a.stack, a.prod_port, a.dev_port, "
-            "a.status_dev, a.status_prod, a.current_version, a.origin, a.created_at, a.updated_at, w.root_path "
-            "FROM app_project a LEFT JOIN workspace w ON w.id = a.workspace_id "
-            "ORDER BY a.id DESC"))).mappings().all()
+        sql = ("SELECT a.id, a.workspace_id, a.name, a.slug, a.scale, a.stack, a.prod_port, a.dev_port, "
+               "a.status_dev, a.status_prod, a.current_version, a.origin, a.created_at, a.updated_at, w.root_path "
+               "FROM app_project a LEFT JOIN workspace w ON w.id = a.workspace_id ")
+        params: dict = {}
+        if owner_user_id is not None:
+            sql += "WHERE a.owner_user_id = :u "
+            params["u"] = owner_user_id
+        rows = (await s.execute(text(sql + "ORDER BY a.id DESC"), params)).mappings().all()
         links = (await s.execute(text(
             "SELECT l.app_id, l.release_id, l.channel, l.detach_reason, l.applied_fingerprint, "
             "l.last_upgraded_at, r.version AS release_version, r.slug AS release_slug, "
@@ -240,13 +246,20 @@ async def list_apps(session_factory) -> list[dict]:
     return out
 
 
-async def get_app(session_factory, app_id: int) -> dict:
-    """单应用详情：与 list_apps 同形状携带 origin/store，前端一处判定逻辑两处复用。"""
+async def get_app(session_factory, app_id: int, *, owner_user_id: int | None = None) -> dict:
+    """单应用详情：与 list_apps 同形状携带 origin/store，前端一处判定逻辑两处复用。
+
+    `owner_user_id`（Ticket 006）：HTTP 层传当前账号，别人的行按 404 处理（不区分 403——
+    存在性本身就是要藏的信息）；内部受控链路（install/publish/rollback 引擎侧）不传。"""
     async with session_factory() as s:
-        row = (await s.execute(text(
-            "SELECT id, workspace_id, name, slug, scale, stack, prod_port, dev_port, "
-            "status_dev, status_prod, current_version, origin, created_at, updated_at "
-            "FROM app_project WHERE id = :i"), {"i": app_id})).mappings().first()
+        sql = ("SELECT id, workspace_id, name, slug, scale, stack, prod_port, dev_port, "
+               "status_dev, status_prod, current_version, origin, created_at, updated_at "
+               "FROM app_project WHERE id = :i")
+        params: dict = {"i": app_id}
+        if owner_user_id is not None:
+            sql += " AND owner_user_id = :u"
+            params["u"] = owner_user_id
+        row = (await s.execute(text(sql), params)).mappings().first()
         if not row:
             raise DeployError("应用不存在", status=404)
         link = (await s.execute(text(
@@ -260,23 +273,30 @@ async def get_app(session_factory, app_id: int) -> dict:
     return d
 
 
-async def rename_app(session_factory, app_id: int, name: str) -> dict:
+async def rename_app(session_factory, app_id: int, name: str, *,
+                     owner_user_id: int | None = None) -> dict:
     """应用改名：app_project.name 与 workspace.name 同事务更新，slug/端口/目录不动。
 
     两张表都写是这里唯一的非显然处：应用页读 app_project.name，侧栏分组名与文件面板面包屑读
     workspace.name（GET /workspaces 直接取自该列），只改一边就会出现「应用页新名、侧栏旧名」。
+
+    `owner_user_id`（Ticket 006）：入口即取即验，别人的行 404，UPDATE 永远摸不到。
     """
     new_name = check_name(name)
     async with session_factory() as s:
-        wid = (await s.execute(text("SELECT workspace_id FROM app_project WHERE id = :i"),
-                              {"i": app_id})).scalar()
+        sql = "SELECT workspace_id FROM app_project WHERE id = :i"
+        params: dict = {"i": app_id}
+        if owner_user_id is not None:
+            sql += " AND owner_user_id = :u"
+            params["u"] = owner_user_id
+        wid = (await s.execute(text(sql), params)).scalar()
         if wid is None:
             raise DeployError("应用不存在", status=404)
         await s.execute(text("UPDATE app_project SET name = :n, updated_at = now() WHERE id = :i"),
                         {"n": new_name, "i": app_id})
         await s.execute(text("UPDATE workspace SET name = :n WHERE id = :i"), {"n": new_name, "i": wid})
         await s.commit()
-    return await get_app(session_factory, app_id)
+    return await get_app(session_factory, app_id, owner_user_id=owner_user_id)
 
 
 def ensure_deletable(app: dict) -> None:

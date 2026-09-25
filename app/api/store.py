@@ -209,7 +209,7 @@ async def store_link(request: Request, app_id: int, actor: dict = Actor):
     sf = request.app.state.session_factory
     from app.services import app_service
     try:
-        app = await app_service.get_app(sf, app_id)
+        app = await app_service.get_app(sf, app_id, owner_user_id=actor["id"])
         if not app.get("store"):
             raise DeployError("该应用不是商店实例", status=404)
     except DeployError as e:

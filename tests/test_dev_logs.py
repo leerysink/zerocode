@@ -46,13 +46,15 @@ async def sf(test_engine):
 async def dev_app(client, sf):
     """测试库里造一个应用（不建工程目录：容器侧被替身接管，平台侧只读 DB 与 hub）。"""
     ROOT.mkdir(parents=True, exist_ok=True)
+    uid = (await client.get("/api/auth/me")).json()["id"]   # 行归属当前账号，隔离过滤后 HTTP 才读得到（Ticket 006）
     async with sf() as s:
-        wid = (await s.execute(text("INSERT INTO workspace (name, root_path) VALUES ('logs', :r) "
-                                    "RETURNING id"), {"r": str(ROOT)})).scalar()
+        wid = (await s.execute(text("INSERT INTO workspace (name, root_path, owner_user_id) "
+                                    "VALUES ('logs', :r, :o) RETURNING id"),
+                                    {"r": str(ROOT), "o": uid})).scalar()
         aid = (await s.execute(text(
-            "INSERT INTO app_project (workspace_id, name, slug, scale, stack, prod_port, dev_port) "
-            "VALUES (:w, '日志应用', :sl, 'small', 'vue3-fastapi', 8264, 8265) RETURNING id"),
-            {"w": wid, "sl": SLUG})).scalar()
+            "INSERT INTO app_project (workspace_id, name, slug, scale, stack, prod_port, dev_port, "
+            "owner_user_id) VALUES (:w, '日志应用', :sl, 'small', 'vue3-fastapi', 8264, 8265, :o) RETURNING id"),
+            {"w": wid, "sl": SLUG, "o": uid})).scalar()
         await s.commit()
     yield aid
     async with sf() as s:

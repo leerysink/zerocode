@@ -69,6 +69,10 @@ def _reject_if_task_running(request: Request, app_id: int) -> None:
         raise DeployError("该应用有部署任务进行中，请稍候", status=409)
 
 
+# 隔离接缝（Ticket 006）：以下端点内的 get_app 均传当前账号，别人的应用 404；
+# validate-slug 的 taken 故意不传——slug 全局 UNIQUE，预检必须看全量。
+
+
 @router.post("", status_code=201)   # brief Interfaces：创建成功返回 201（示例代码漏写，测试为契约）
 async def create_app(request: Request, body: AppIn):
     try:
@@ -94,13 +98,15 @@ async def validate(request: Request, body: SlugIn):
 
 @router.get("")
 async def list_all(request: Request):
-    return await app_service.list_apps(request.app.state.session_factory)
+    return await app_service.list_apps(request.app.state.session_factory,
+                                       owner_user_id=request.state.actor["id"])
 
 
 @router.get("/{app_id}")
 async def detail(request: Request, app_id: int):
     try:
-        return await app_service.get_app(request.app.state.session_factory, app_id)
+        return await app_service.get_app(request.app.state.session_factory, app_id,
+                                         owner_user_id=request.state.actor["id"])
     except DeployError as e:
         raise _http(e)
 
@@ -109,7 +115,8 @@ async def detail(request: Request, app_id: int):
 async def rename(request: Request, app_id: int, body: AppRenameIn):
     """应用改名（只改显示名）：slug 不可改——它是工程目录名、库名与镜像名的共同锚点。"""
     try:
-        return await app_service.rename_app(request.app.state.session_factory, app_id, body.name)
+        return await app_service.rename_app(request.app.state.session_factory, app_id, body.name,
+                                            owner_user_id=request.state.actor["id"])
     except DeployError as e:
         raise _http(e)
 
@@ -124,7 +131,7 @@ async def remove(request: Request, app_id: int):
     """
     sf = request.app.state.session_factory
     try:
-        app = await app_service.get_app(sf, app_id)
+        app = await app_service.get_app(sf, app_id, owner_user_id=request.state.actor["id"])
         app_service.ensure_deletable(app)
         _reject_if_task_running(request, app_id)
         if app["status_dev"] in app_service.STOPPABLE:
@@ -192,7 +199,7 @@ async def _dev_task(request: Request, app_id: int, action, *, docker_gate: bool 
     sf = request.app.state.session_factory
     hub = request.app.state.deploy_hub
     try:
-        app = await app_service.get_app(sf, app_id)
+        app = await app_service.get_app(sf, app_id, owner_user_id=request.state.actor["id"])
         if docker_gate and env == "prod" and app["status_prod"] == "publishing":
             raise DeployError("发布/回滚进行中，请等待完成", status=409)
         if docker_gate:
@@ -225,7 +232,7 @@ async def dev_restart(request: Request, app_id: int):
 async def dev_status(request: Request, app_id: int):
     sf = request.app.state.session_factory
     try:
-        app = await app_service.get_app(sf, app_id)
+        app = await app_service.get_app(sf, app_id, owner_user_id=request.state.actor["id"])
         return await engine.dev_status(sf, app)
     except DeployError as e:
         raise _http(e)
@@ -236,7 +243,7 @@ async def app_urls(request: Request, app_id: int):
     """应用 prod 访问地址（规格 05 §5 / 通配域名网关）：只回 domain=https://{slug}.zerocode.com，无副作用只读。"""
     sf = request.app.state.session_factory
     try:
-        app = await app_service.get_app(sf, app_id)
+        app = await app_service.get_app(sf, app_id, owner_user_id=request.state.actor["id"])
         from app.deploy import nics
         return await nics.app_urls(sf, app)
     except DeployError as e:
@@ -285,7 +292,7 @@ async def sql_apply(request: Request, app_id: int):
     sf = request.app.state.session_factory
     hub = request.app.state.deploy_hub
     try:
-        app = await app_service.get_app(sf, app_id)
+        app = await app_service.get_app(sf, app_id, owner_user_id=request.state.actor["id"])
         _spawn(request, app_id, lambda: _run_sqlchange(sf, app, hub))
     except DeployError as e:
         raise _http(e)
@@ -318,7 +325,7 @@ async def dev_reset(request: Request, app_id: int):
     sf = request.app.state.session_factory
     hub = request.app.state.deploy_hub
     try:
-        app = await app_service.get_app(sf, app_id)
+        app = await app_service.get_app(sf, app_id, owner_user_id=request.state.actor["id"])
         _spawn(request, app_id, lambda: _reset_dev(sf, app, hub))
     except DeployError as e:
         raise _http(e)
@@ -331,7 +338,7 @@ async def sql_records(request: Request, app_id: int, env: str = "dev"):
         raise HTTPException(400, "env 仅支持 dev/prod")
     sf = request.app.state.session_factory
     try:
-        app = await app_service.get_app(sf, app_id)
+        app = await app_service.get_app(sf, app_id, owner_user_id=request.state.actor["id"])
     except DeployError as e:
         raise _http(e)
     cred = await read_cred(sf, app["slug"], env)
@@ -355,7 +362,7 @@ async def sql_files(request: Request, app_id: int):
     口径只影响本 UI 列表——商店上架锚点取自 sqlchange_history（DB），与本目录 glob 无关（不伤打包）。"""
     sf = request.app.state.session_factory
     try:
-        app = await app_service.get_app(sf, app_id)
+        app = await app_service.get_app(sf, app_id, owner_user_id=request.state.actor["id"])
         root = await engine._app_root(sf, app)
     except DeployError as e:
         raise _http(e)
@@ -382,7 +389,7 @@ async def scaffold_backfill(request: Request, app_id: int):
     from app.deploy import schemadiff
     sf = request.app.state.session_factory
     try:
-        app = await app_service.get_app(sf, app_id)
+        app = await app_service.get_app(sf, app_id, owner_user_id=request.state.actor["id"])
         root = await engine._app_root(sf, app)
     except DeployError as e:
         raise _http(e)
@@ -424,7 +431,7 @@ async def publish(request: Request, app_id: int, body: PublishIn):
     sf = request.app.state.session_factory
     hub = request.app.state.deploy_hub
     try:
-        app = await app_service.get_app(sf, app_id)
+        app = await app_service.get_app(sf, app_id, owner_user_id=request.state.actor["id"])
         _reject_if_task_running(request, app_id)
         if app["status_prod"] == "publishing":
             # _spawn 只挡本进程在跑的任务；publishing 可能是上一进程遗留，按状态再挡一道
@@ -457,7 +464,7 @@ async def rollback(request: Request, app_id: int, body: RollbackIn):
     sf = request.app.state.session_factory
     hub = request.app.state.deploy_hub
     try:
-        app = await app_service.get_app(sf, app_id)
+        app = await app_service.get_app(sf, app_id, owner_user_id=request.state.actor["id"])
         _reject_if_task_running(request, app_id)
         if app["status_prod"] == "publishing":
             # 终审 I-2：与 publish 端点同款二次闸——_spawn 只挡本进程，publishing 可能是
@@ -490,7 +497,7 @@ async def prod_status(request: Request, app_id: int):
     """直返引擎结果（含 urls 块）：端点不裁字段、不加包装（04 §5 接口表）。"""
     sf = request.app.state.session_factory
     try:
-        app = await app_service.get_app(sf, app_id)
+        app = await app_service.get_app(sf, app_id, owner_user_id=request.state.actor["id"])
         return await prod.prod_status(sf, app)
     except DeployError as e:
         raise _http(e)
@@ -501,7 +508,7 @@ async def list_records(request: Request, app_id: int, limit: int = 50):
     """发布历史（04 §4.5）：新→旧，UI 历史抽屉与排查入口共用。"""
     sf = request.app.state.session_factory
     try:
-        await app_service.get_app(sf, app_id)
+        await app_service.get_app(sf, app_id, owner_user_id=request.state.actor["id"])
         return await records.list_for(sf, app_id, limit=limit)
     except DeployError as e:
         raise _http(e)
@@ -517,7 +524,7 @@ async def delete_record(request: Request, app_id: int, rid: int):
     """
     sf = request.app.state.session_factory
     try:
-        app = await app_service.get_app(sf, app_id)
+        app = await app_service.get_app(sf, app_id, owner_user_id=request.state.actor["id"])
     except DeployError as e:
         raise _http(e)
     async with sf() as s:

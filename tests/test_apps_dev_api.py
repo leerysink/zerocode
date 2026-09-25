@@ -77,13 +77,15 @@ async def dev_app(client, test_engine):
     sf = make_session_factory(test_engine)
     ROOT.mkdir(parents=True, exist_ok=True)
     prod_port, dev_port = await _free_pair(sf)
+    uid = (await client.get("/api/auth/me")).json()["id"]   # 行必须归属当前账号，否则隔离过滤后 HTTP 读不到（Ticket 006）
     async with sf() as s:
-        wid = (await s.execute(text("INSERT INTO workspace (name, root_path) VALUES ('api', :r) "
-                                    "RETURNING id"), {"r": str(ROOT)})).scalar()
+        wid = (await s.execute(text("INSERT INTO workspace (name, root_path, owner_user_id) "
+                                    "VALUES ('api', :r, :o) RETURNING id"),
+                                    {"r": str(ROOT), "o": uid})).scalar()
         aid = (await s.execute(text(
-            "INSERT INTO app_project (workspace_id, name, slug, scale, stack, prod_port, dev_port) "
-            "VALUES (:w, 'api', :sl, 'small', 'vue3-fastapi', :pp, :dp) RETURNING id"),
-            {"w": wid, "sl": SLUG, "pp": prod_port, "dp": dev_port})).scalar()
+            "INSERT INTO app_project (workspace_id, name, slug, scale, stack, prod_port, dev_port, "
+            "owner_user_id) VALUES (:w, 'api', :sl, 'small', 'vue3-fastapi', :pp, :dp, :o) RETURNING id"),
+            {"w": wid, "sl": SLUG, "pp": prod_port, "dp": dev_port, "o": uid})).scalar()
         await s.commit()
     yield aid
     async with sf() as s:
