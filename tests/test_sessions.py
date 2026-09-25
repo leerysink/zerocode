@@ -83,9 +83,9 @@ async def test_patch_session_model(client):
     # 回退默认：null
     await client.patch(f"/api/sessions/{sid}/model", json={"model_config_id": None})
     assert ((await client.get(f"/api/sessions/{sid}")).json())["model_config_id"] is None
-    # 不存在的模型 → 400
+    # 不存在/他人的模型 → 404（Ticket 007 越权统一口径，不泄露存在性）
     r = await client.patch(f"/api/sessions/{sid}/model", json={"model_config_id": 999})
-    assert r.status_code == 400
+    assert r.status_code == 404
 
 async def test_messages_include_reasoning(client):
     ws = (await client.post("/api/workspaces", json={"root_path": "D:/tmp"})).json()

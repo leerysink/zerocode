@@ -88,10 +88,12 @@ async def set_session_model(request: Request, session_id: int, body: ModelIn):
     async with request.app.state.session_factory() as s:
         await _require_session(s, session_id, uid)
         if body.model_config_id is not None:
-            ok = (await s.execute(text("SELECT 1 FROM model_config WHERE id=:i"),
-                                  {"i": body.model_config_id})).first()
+            # 档案存在性按当前账号验（Ticket 007）：别人的档案与不存在同口径 404，不泄露存在性
+            ok = (await s.execute(text(
+                "SELECT 1 FROM model_config WHERE id=:i AND owner_user_id=:u"),
+                {"i": body.model_config_id, "u": uid})).first()
             if not ok:
-                raise HTTPException(400, "模型不存在")
+                raise HTTPException(404, "模型不存在")
         r = await s.execute(text(
             "UPDATE chat_session SET model_config_id=:m WHERE id=:i"),
             {"m": body.model_config_id, "i": session_id})

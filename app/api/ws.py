@@ -47,8 +47,14 @@ async def ws_chat(ws: WebSocket, session_id: int):
         await emit(session_id, {"type": "status", "status": "running"})
 
     async def config_getter():
+        # 用户视图（Ticket 007）：会话经 workspace 取 owner，llm.* 读自己的/回落全局；
+        # agent.* 等平台级键所有人共享，owner 为 NULL 时等价纯全局视图
         async with app.state.session_factory() as s:
-            return await config_service.get_all(s)
+            uid = (await s.execute(_sql(
+                "SELECT w.owner_user_id FROM chat_session cs "
+                "JOIN workspace w ON w.id = cs.workspace_id WHERE cs.id=:i"),
+                {"i": session_id})).scalar()
+            return await config_service.get_all(s, owner_user_id=uid)
 
     def llm_factory(cfg, model_cfg=None):
         if hasattr(app.state, "llm_factory"):

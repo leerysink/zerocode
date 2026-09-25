@@ -1,5 +1,8 @@
 """模型库 CRUD：多模型配置（名称/接入点/密钥/模型名/默认标记）。api_key 永远掩码回显；
-PUT 传掩码哨兵 "sk-***" 表示保留原密钥；is_default=true 时清除其他默认（部分唯一索引兜底）。"""
+PUT 传掩码哨兵 "sk-***" 表示保留原密钥；is_default=true 时清除其他默认。
+
+隔离（Ticket 007）：全部查询按当前账号 owner 过滤，越权按 id 直取一律 404；
+每用户各自唯一默认（DB 侧由部分唯一索引 ux_model_default_per_owner 兜底）。"""
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy import text
@@ -24,8 +27,11 @@ _SELECT = ("SELECT id, name, base_url, api_key, model, is_default, created_at "
 
 @router.get("")
 async def list_models(request: Request):
+    uid = request.state.actor["id"]
     async with request.app.state.session_factory() as s:
-        rows = (await s.execute(text(_SELECT + " ORDER BY is_default DESC, id"))).mappings().all()
+        rows = (await s.execute(text(_SELECT + " WHERE owner_user_id = :u "
+                                    "ORDER BY is_default DESC, id"),
+                                    {"u": uid})).mappings().all()
     return [_row_out(r) for r in rows]
 
 @router.post("")
@@ -49,8 +55,11 @@ async def create_model(request: Request, body: ModelIn):
 
 @router.put("/{model_id}")
 async def update_model(request: Request, model_id: int, body: ModelIn):
+    uid = request.state.actor["id"]
     async with request.app.state.session_factory() as s:
-        old = (await s.execute(text("SELECT api_key FROM model_config WHERE id=:i"), {"i": model_id})).first()
+        old = (await s.execute(text("SELECT api_key FROM model_config "
+                                    "WHERE id=:i AND owner_user_id=:u"),
+                                    {"i": model_id, "u": uid})).first()
         if not old:
             raise HTTPException(404, "模型不存在")
         new_key = old[0] if body.api_key == MASK else body.api_key
@@ -62,15 +71,21 @@ async def update_model(request: Request, model_id: int, body: ModelIn):
                 "AND owner_user_id IS NOT DISTINCT FROM (SELECT owner_user_id FROM model_config WHERE id = :i)"),
                 {"i": model_id})
         await s.execute(text(
-            "UPDATE model_config SET name=:n, base_url=:b, api_key=:k, model=:m, is_default=:d WHERE id=:i"),
+            "UPDATE model_config SET name=:n, base_url=:b, api_key=:k, model=:m, is_default=:d "
+            "WHERE id=:i AND owner_user_id=:u"),
             {"n": body.name, "b": body.base_url, "k": new_key, "m": body.model,
-             "d": body.is_default, "i": model_id})
+             "d": body.is_default, "i": model_id, "u": uid})
         await s.commit()
     return {"ok": True}
 
 @router.delete("/{model_id}")
 async def delete_model(request: Request, model_id: int):
+    uid = request.state.actor["id"]
     async with request.app.state.session_factory() as s:
-        await s.execute(text("DELETE FROM model_config WHERE id=:i"), {"i": model_id})
+        hit = (await s.execute(text(
+            "DELETE FROM model_config WHERE id=:i AND owner_user_id=:u RETURNING id"),
+            {"i": model_id, "u": uid})).first()
         await s.commit()
+    if not hit:
+        raise HTTPException(404, "模型不存在")
     return {"ok": True}

@@ -8,14 +8,17 @@ router = APIRouter(prefix="/api/config")
 
 @router.get("")
 async def get_config(request: Request):
+    # 用户视图（Ticket 007）：平台级键打底 + 自己的 llm.* 覆盖，别人的 llm.* 永不外显
+    uid = request.state.actor["id"]
     async with request.app.state.session_factory() as s:
-        return config_service.mask(await config_service.get_all(s))
+        return config_service.mask(await config_service.get_all(s, owner_user_id=uid))
 
 @router.put("")
 async def put_config(request: Request, body: dict):
+    uid = request.state.actor["id"]
     body = {k: v for k, v in body.items() if not (k == "llm.api_key" and v == "sk-***")}
     async with request.app.state.session_factory() as s:
-        await config_service.set_many(s, body)
+        await config_service.set_many(s, body, owner_user_id=uid)
         await s.commit()
     return {"ok": True}
 
