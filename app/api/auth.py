@@ -44,10 +44,27 @@ async def register(request: Request, response: Response, body: CredIn):
     token = secrets.token_urlsafe(24)
     try:
         async with request.app.state.session_factory() as s:
+            # 创始人判定与承接同事务（Ticket 004 / ADR-0003）：首账号把无主存量划归自己，
+            # 中途失败不留半划归。本地单实例并发注册撞车概率极低，不另加锁。
+            is_first = (await s.execute(text("SELECT NOT EXISTS (SELECT 1 FROM actor)"))).scalar()
             row = (await s.execute(text(
-                "INSERT INTO actor (nickname, token, password_hash) "
-                "VALUES (:n, :t, :p) RETURNING id, nickname, is_founder"),
-                {"n": nickname, "t": token, "p": hash_password(password)})).mappings().first()
+                "INSERT INTO actor (nickname, token, password_hash, is_founder) "
+                "VALUES (:n, :t, :p, :f) RETURNING id, nickname, is_founder"),
+                {"n": nickname, "t": token, "p": hash_password(password),
+                 "f": is_first})).mappings().first()
+            if is_first:
+                founder_id = row["id"]
+                for table in ("workspace", "app_project", "model_config"):
+                    # 表名白名单硬编码，不接外部输入
+                    await s.execute(text(
+                        f"UPDATE {table} SET owner_user_id = :i WHERE owner_user_id IS NULL"),
+                        {"i": founder_id})
+                # 全局 llm.* 配置划归（UPDATE 非复制）：后来用户看不到创始人密钥；
+                # agent.*/deploy.*/store.*/dbcred.% 留 NULL = 平台级
+                await s.execute(text(
+                    "UPDATE app_config SET owner_user_id = :i "
+                    "WHERE owner_user_id IS NULL AND key LIKE 'llm.%'"),
+                    {"i": founder_id})
             await s.commit()
     except IntegrityError:
         raise HTTPException(409, "昵称已被占用")
