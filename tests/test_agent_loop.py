@@ -315,3 +315,89 @@ async def test_no_current_todos_block_when_empty(test_engine, tmp_path):
                          lambda *a, **k: asyncio.sleep(0, None), lambda *a, **k: True)
     await runner.run(sid, "你好", asyncio.Event())
     assert "\n\n<current_todos>" not in llm.received[0][0]["content"]
+
+
+# ---- Ticket 004：prompt 注入 <available_skills>（session → workspace.owner_user_id → 已启用技能）----
+
+async def _mk_owned_session(test_engine, tmp_path, token="tok-loop") -> tuple[int, int]:
+    """建 actor + 带 owner_user_id 的 workspace + chat_session，返回 (sid, uid)。"""
+    sf = make_session_factory(test_engine)
+    async with sf() as s:
+        uid = (await s.execute(sql(
+            "INSERT INTO actor (nickname, token) VALUES ('loop-owner', :t) RETURNING id"),
+            {"t": token})).scalar()
+        ws = (await s.execute(sql(
+            "INSERT INTO workspace (name, root_path, owner_user_id) VALUES ('t', :p, :u) RETURNING id"),
+            {"p": str(tmp_path), "u": uid})).scalar()
+        sid = (await s.execute(sql(
+            "INSERT INTO chat_session (workspace_id) VALUES (:w) RETURNING id"), {"w": ws})).scalar()
+        await s.commit()
+    return sid, uid
+
+
+async def _add_skill(test_engine, uid, slug, name, desc, path, enabled=True):
+    sf = make_session_factory(test_engine)
+    async with sf() as s:
+        await s.execute(sql(
+            "INSERT INTO user_skill (owner_user_id, slug, name, description, source_type, "
+            "source_url, skill_dir, enabled) "
+            "VALUES (:u, :sl, :n, :d, 'url', 'https://x.invalid/sk', :p, :e)"),
+            {"u": uid, "sl": slug, "n": name, "d": desc, "p": path, "e": enabled})
+        await s.commit()
+
+
+async def _system_content(test_engine, sf, sid, text_="继续") -> str:
+    llm = ScriptedLLM([[delta("好"), *done("好了")]])
+    runner = AgentRunner(sf, llm, cfg_provider(), Recorder(),
+                         lambda *a, **k: asyncio.sleep(0, None), lambda *a, **k: True)
+    await runner.run(sid, text_, asyncio.Event())
+    return llm.received[0][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_enabled_skill_injected(test_engine, tmp_path):
+    sid, uid = await _mk_owned_session(test_engine, tmp_path)
+    sf = make_session_factory(test_engine)
+    await _add_skill(test_engine, uid, "pdf", "PDF 导出", "生成 PDF 报告",
+                     str(tmp_path / "skills" / "pdf"), enabled=True)
+    c = await _system_content(test_engine, sf, sid)
+    assert "<available_skills>" in c and "PDF 导出" in c and "生成 PDF 报告" in c
+    assert str(tmp_path / "skills" / "pdf") in c  # 母本目录绝对路径入清单
+
+
+@pytest.mark.asyncio
+async def test_disabled_skill_not_injected(test_engine, tmp_path):
+    # 故事10：停用技能不出现在块中（enabled 布尔驱动）
+    sid, uid = await _mk_owned_session(test_engine, tmp_path, token="tok-2")
+    sf = make_session_factory(test_engine)
+    await _add_skill(test_engine, uid, "on", "启用技能", "在用", str(tmp_path / "a"), enabled=True)
+    await _add_skill(test_engine, uid, "off", "停用技能", "停用", str(tmp_path / "b"), enabled=False)
+    c = await _system_content(test_engine, sf, sid)
+    assert "启用技能" in c
+    assert "停用技能" not in c
+
+
+@pytest.mark.asyncio
+async def test_no_available_skills_block_without_enabled(test_engine, tmp_path):
+    # 无启用技能（全部停用）不注入空块，与 current_todos 空守卫同口径
+    sid, uid = await _mk_owned_session(test_engine, tmp_path, token="tok-3")
+    sf = make_session_factory(test_engine)
+    await _add_skill(test_engine, uid, "off", "停用技能", "停用", str(tmp_path / "b"), enabled=False)
+    c = await _system_content(test_engine, sf, sid)
+    assert "<available_skills>" not in c
+
+
+@pytest.mark.asyncio
+async def test_skill_injection_is_user_scoped(test_engine, tmp_path):
+    # 隔离：会话归属 alice，只注入 alice 的技能；bob 的同 owner 表技能不得泄露
+    sid, alice = await _mk_owned_session(test_engine, tmp_path, token="tok-alice")
+    sf = make_session_factory(test_engine)
+    async with sf() as s:
+        bob = (await s.execute(sql(
+            "INSERT INTO actor (nickname, token) VALUES ('bob', 'tok-bob') RETURNING id"))).scalar()
+        await s.commit()
+    await _add_skill(test_engine, alice, "a", "Alice技能", "属于A", str(tmp_path / "a"))
+    await _add_skill(test_engine, bob, "b", "Bob技能", "属于B", str(tmp_path / "b"))
+    c = await _system_content(test_engine, sf, sid)
+    assert "Alice技能" in c
+    assert "Bob技能" not in c

@@ -1,4 +1,5 @@
-def build_system_prompt(root: str, date: str, app_contract: str | None = None) -> str:
+def build_system_prompt(root: str, date: str, app_contract: str | None = None,
+                       skills: list[dict] | None = None) -> str:
     text = (
         f"你是 zerocode 编程助手，运行在本地 Web 应用中。今天是 {date}。\n"
         f"当前工作区根目录：{root}\n"
@@ -13,6 +14,29 @@ def build_system_prompt(root: str, date: str, app_contract: str | None = None) -
         "system 尾部 <current_todos> 是当前清单的最新快照，据此继续更新。\n"
         "7. 用户消息中的 @\"path\" 已内联为 <file> 块（大文件仅给出路径提示，用 read_file 分段读取）。\n"
         "8. 上下文可能被压缩：system 尾部 <context_summary> 是更早对话的摘要，据此衔接工作。")
+    if skills:
+        text += _render_available_skills(skills)
     if app_contract:
         text += app_contract
     return text
+
+
+def _render_available_skills(skills: list[dict]) -> str:
+    """已启用技能清单（spec §3 故事10 / §8）：name+description+母本目录绝对路径。
+
+    附一条使用规则，渐进披露：列表只给索引，Agent 判断相关时才 read_file 读全文。
+    空清单不渲染（调用方已门控，这里再兜底避免畸形空块）。
+    """
+    lines = [
+        "\n\n<available_skills>",
+        "以下是当前账户已启用的技能。技能是已验证的扩展指令：判断某个技能与当前任务相关时，"
+        "用 read_file 读取其 path 目录下的 SKILL.md 全文，再按其说明执行；"
+        "技能目录及其 references/assets 只读，不要向其中写入。",
+    ]
+    for s in skills:
+        name = (s.get("name") or "").strip() or "(未命名)"
+        desc = (s.get("description") or "").strip()
+        path = (s.get("path") or "").strip()
+        lines.append(f"- name: {name} | description: {desc} | path: {path}")
+    lines.append("</available_skills>")
+    return "\n".join(lines)

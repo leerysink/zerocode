@@ -44,6 +44,22 @@ class AgentRunner:
                 {"i": session_id})).first()
         return Path(row[0])  # DB 返回 str；工具层与 send/file_change 均需 Path（f-string 渲染结果不变）
 
+    async def _enabled_skills_of(self, session_id: int) -> list[dict]:
+        """session → workspace.owner_user_id → 该用户已启用技能清单（spec §5 prompt 注入）。
+
+        一条 join 反查归属再取 enabled 技能；owner 为 NULL 的历史工作区自然查不到，
+        返回空（不注入空块）。技能目录绝对路径直接给 skill_dir，Agent 用 read_file 读全文。
+        """
+        async with self.sf() as s:
+            rows = (await s.execute(text(
+                "SELECT us.name, us.description, us.skill_dir FROM user_skill us "
+                "JOIN workspace w ON w.owner_user_id = us.owner_user_id "
+                "JOIN chat_session cs ON cs.workspace_id = w.id "
+                "WHERE cs.id = :i AND us.enabled ORDER BY us.id"),
+                {"i": session_id})).mappings().all()
+        return [{"name": r["name"], "description": r["description"], "path": r["skill_dir"]}
+                for r in rows]
+
     async def run(self, session_id: int, user_text: str, cancel: asyncio.Event) -> str:
         status = "idle"
         try:
@@ -124,8 +140,9 @@ class AgentRunner:
                 summary = res["summary"]
         history, _ = await self._history(session_id, int(cfg.get("agent.history_window", 40)))
         from app.deploy.contract import build_app_contract
+        skills = await self._enabled_skills_of(session_id)
         system_text = build_system_prompt(str(root), datetime.date.today().isoformat(),
-                                          app_contract=build_app_contract(root))
+                                          app_contract=build_app_contract(root), skills=skills)
         if summary:
             system_text += f"\n\n<context_summary>\n{summary}\n</context_summary>"
         # 当前任务清单回灌：todo_write 调用会被历史窗口截掉，模型跨运行就"看不见"清单，
