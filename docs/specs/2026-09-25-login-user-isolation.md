@@ -71,11 +71,13 @@ zerocode 平台目前是"无主"的：workspace、会话、应用（app_project�
 
 ## 5. 实现要点
 
-- **迁移 SQL**（规则要求版本化）：`changelog/V20260925_01_login_user.sql`——
-  actor 加 `password_hash`/`is_founder`、nickname 加 UNIQUE；workspace/app_project 加
-  `owner_user_id`；root_path 唯一约束改联合；app_config 主键改 `(owner_user_id, key)`
-  （owner_user_id 可空，NULL=平台级，`dbcred.%`、`agent.*` 保持平台级）。
-  两步走原则：先加列/约束，旧约束在新约束建立后删除。
+- **迁移 SQL**（规则要求版本化）：`changelog/V20260925_01_actor_auth.sql`（actor 加
+  `password_hash`/`is_founder`、nickname 加 UNIQUE）与 `V20260925_02_owner_columns.sql`
+  （归属列与约束改造，见下）。两步走原则：先加列/新约束，旧约束确认无依赖后再删。
+- [归属表清单] workspace、app_project、**model_config（模型档案库，含 api_key，实现时补遗）**
+  加 `owner_user_id`；app_config 主键改 `(owner_user_id, key)`。另：model_config 现有的
+  `uk_model_default` 全局唯一默认索引（同库仅一行 is_default）与多账号冲突，改为按用户
+  部分唯一 `(owner_user_id, is_default) WHERE is_default`；存量无主 model_config 行并入创始人。
 - **认证会话**：沿用 cookie 名 `zc_actor`（现有 store 代码已在发），语义从"设备标识"
   升级为"会话凭据"；`by_token()` 改造为认证入口（命中即续期的行为保留）。
 - **FastAPI 收口**：新增 `app/api/auth.py` + 依赖注入 `current_actor`；`request.state.actor`

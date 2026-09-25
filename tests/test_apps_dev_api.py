@@ -385,6 +385,8 @@ async def test_ws_deploy_streams_engine_events(client, dev_app, monkeypatch):
 
     monkeypatch.setattr(eng_mod, "start_dev", fake_start)
     with TestClient(client.app) as tc:
+        # guard（Ticket 002）：裸 TestClient 无会话，复用 client fixture 的 owner cookie 同 app 同库
+        tc.cookies.set("zc_actor", client.cookies.get("zc_actor"))
         with tc.websocket_connect(f"/ws/deploy/{dev_app}") as ws:
             assert ws.receive_json()["type"] == "hello"
             assert tc.post(f"/api/apps/{dev_app}/dev/start").status_code == 202
@@ -441,6 +443,7 @@ async def test_lifespan_startup_wires_deploy_state_and_never_blocks(test_engine,
     app = create_app(test_engine.url.render_as_string(hide_password=False))
     with caplog.at_level(logging.WARNING):
         with TestClient(app) as tc:
+            tc.post("/api/auth/register", json={"nickname": "lifespan-看门", "password": "pw"})  # guard 会话
             assert isinstance(app.state.deploy_hub, DeployHub)   # WS 与引擎共用的事件总线
             assert app.state.dev_tasks == {}                     # 长任务句柄表
             assert tc.get("/api/apps").status_code == 200        # 启动清理失败没把平台卡死

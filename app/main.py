@@ -121,6 +121,9 @@ def create_app(database_url: str | None = None) -> FastAPI:
     from app.api import workspaces, sessions, files, models
     from app.api.ws import router as ws_router
     app = FastAPI(title="zerocode", lifespan=lifespan)
+    # 登录体系（Ticket 002 / ADR-0003）：/api/auth register/login/logout/me（guard 中间件在后续票接入）
+    from app.api import auth as auth_api
+    app.include_router(auth_api.router)
     app.include_router(config_router)
     app.include_router(workspaces.router)
     app.include_router(sessions.router)
@@ -143,6 +146,24 @@ def create_app(database_url: str | None = None) -> FastAPI:
     app.include_router(store_api.router)
     app.include_router(store_api.apps_ext)
     app.include_router(ws_router)
+
+    # ---- 全局登录 guard（Ticket 002 / ADR-0003）：/api/* 除 /api/auth/* 外一律要求会话 ----
+    # /ws/* 属 WebSocket scope 不经 http 中间件，收口在 Ticket 009；静态资源（SPA）不拦。
+    # actor 挂 request.state.actor 供业务层取用；by_token 命中即续期（store 侧既有同款语义）。
+    from fastapi.responses import JSONResponse
+
+    @app.middleware("http")
+    async def auth_guard(request, call_next):
+        path = request.url.path
+        if path.startswith("/api") and not path.startswith("/api/auth"):
+            from app.store import identity
+            actor = await identity.by_token(
+                request.app.state.session_factory,
+                request.cookies.get(identity.ACTOR_COOKIE))
+            if actor is None:
+                return JSONResponse({"detail": "未登录"}, status_code=401)
+            request.state.actor = actor
+        return await call_next(request)
 
     # ---- 前端静态托管（Task 15）：挂载 frontend/dist，SPA 回退 index.html ----
     import os

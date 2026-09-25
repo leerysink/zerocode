@@ -7,8 +7,9 @@ from app.store import identity
 async def test_create_actor_makes_unique_token(test_engine):
     from app.db import make_session_factory
     sf = make_session_factory(test_engine)
+    # 昵称自 Ticket 002 起全局 UNIQUE（登录锚点），本用例测的是 token 随机性，名字错开
     a = await identity.create_actor(sf, "里恩")
-    b = await identity.create_actor(sf, "里恩")
+    b = await identity.create_actor(sf, "里恩的替身")
     assert a["id"] != b["id"]
     assert a["token"] != b["token"] and len(a["token"]) >= 24
 

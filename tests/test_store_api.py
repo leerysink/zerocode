@@ -1,5 +1,6 @@
 # tests/test_store_api.py
 """商店 REST：身份 cookie、商店列表、申请审批。Docker 不参与（安装用例见 test_store_install.py）。"""
+import pytest
 from sqlalchemy import text
 
 
@@ -7,12 +8,14 @@ async def _sf(client):
     return client.app.state.session_factory
 
 
-async def test_store_requires_identity(client):
-    r = await client.get("/api/store/me")
+async def test_store_requires_identity(anon_client):
+    # Ticket 002 起无身份先被全局 guard 拦 401（detail 为字符串）；
+    # store 自身的 identity_required 依赖在 008 身份合流后一并收口。
+    r = await anon_client.get("/api/store/me")
     assert r.status_code == 401
-    assert r.json()["detail"]["code"] == "identity_required"
 
 
+@pytest.mark.skip(reason="匿名 identify 已被登录态取代（guard 前置）；Ticket 008 合流后重写")
 async def test_identify_sets_cookie_and_reuses_actor(client):
     r = await client.post("/api/store/identify", json={"nickname": "陌如玉的用户"})
     assert r.status_code == 200, r.text
@@ -25,6 +28,7 @@ async def test_identify_sets_cookie_and_reuses_actor(client):
     assert r2.json()["id"] == actor["id"]
 
 
+@pytest.mark.skip(reason="匿名 identify 已被登录态取代（guard 前置）；Ticket 008 合流后重写")
 async def test_identify_rejects_blank(client):
     r = await client.post("/api/store/identify", json={"nickname": "  "})
     assert r.status_code == 400
@@ -38,9 +42,10 @@ async def test_releases_list_only_published(client):
     assert r.json() == []
 
 
-async def test_release_endpoint_requires_identity_and_publish(client):
-    r = await client.post("/api/apps/1/release", json={"title": "x", "summary": ""})
-    assert r.status_code == 401 and r.json()["detail"]["code"] == "identity_required"
+async def test_release_endpoint_requires_identity_and_publish(anon_client):
+    # 同 store_requires_identity：401 现在由 guard 给出（detail 字符串），不再断言 code 形状
+    r = await anon_client.post("/api/apps/1/release", json={"title": "x", "summary": ""})
+    assert r.status_code == 401
 
 
 async def test_store_releases_lists_published(client, monkeypatch):

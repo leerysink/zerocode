@@ -4,6 +4,7 @@ sqlalchemy>=2.0.30
 asyncpg>=0.29
 pydantic>=2.7
 openai>=1.40
+bcrypt>=4.1
 asgi-lifespan>=0.1.0
 pytest
 pytest-asyncio

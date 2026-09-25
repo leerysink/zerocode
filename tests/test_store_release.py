@@ -113,9 +113,11 @@ def images_ok(monkeypatch):
 
 @pytest.fixture
 def actor(sf):
+    import secrets
     from app.store import identity
     async def _mk():
-        return (await identity.create_actor(sf, "发布者"))["id"]
+        # 昵称已全局 UNIQUE（Ticket 002）；同一用例内多次取身份，后缀错开
+        return (await identity.create_actor(sf, f"发布者{secrets.token_hex(3)}"))["id"]
     return _mk
 
 

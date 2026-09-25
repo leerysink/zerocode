@@ -3,6 +3,20 @@ import axios from 'axios'
 
 const http = axios.create({ baseURL: '/api' })
 
+// 会话失效统一拦截（Ticket 002 guard）：业务接口 401 → 登录页；
+// auth 端点自身的 401（口令错/me 未登录）交给调用方自行处置，不跳转。
+// 用 location 而非 import router，避免 api→router→store→api 循环依赖。
+http.interceptors.response.use(
+  (r) => r,
+  (err) => {
+    const url = err.config?.url || ''
+    if (err.response?.status === 401 && !url.startsWith('/auth/')) {
+      window.location.assign('/login')
+    }
+    return Promise.reject(err)
+  },
+)
+
 // WS 地址构造：传从 /api 前缀起算的路径（/ws/chat/{id}、/ws/deploy/{id}…，T9 泛化）；
 // 不在 /api 前缀下，dev 由 vite proxy 转发到 8100。
 export function wsUrl(path) {
@@ -84,6 +98,7 @@ export const appUrls = (id) => http.get(`/apps/${id}/urls`)
 export const systemNics = () => http.get('/system/nics')
 
 // ---- 应用商店 M3-a（轻身份 / 上架 / 申请审批）----
+// 注：identify/昵称弹层在 Ticket 008 与登录态合流，此处暂保留原调用。
 export const storeIdentify = (nickname) => http.post('/store/identify', { nickname })
 export const storeMe = () => http.get('/store/me')
 export const storeReleases = () => http.get('/store/releases')
@@ -97,3 +112,9 @@ export const storeReject = (id, reason) =>
   http.post(`/store/applications/${id}/reject`, { approve: false, reason })
 export const releaseToStore = (appId, data) => http.post(`/apps/${appId}/release`, data)
 export const storeLink = (appId) => http.get(`/store/link/${appId}`)
+
+// ---- 登录体系（Ticket 002 / ADR-0003：actor 即登录用户）----
+export const authRegister = (data) => http.post('/auth/register', data) // {nickname, password}
+export const authLogin = (data) => http.post('/auth/login', data)
+export const authLogout = () => http.post('/auth/logout')
+export const authMe = () => http.get('/auth/me')

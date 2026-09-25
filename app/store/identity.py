@@ -5,12 +5,27 @@
 因此这里**不得**演化成授权依据——越权收口在 applications/install 侧按 owner_actor 与 origin 判。
 """
 import datetime, secrets
+import bcrypt
 from sqlalchemy import text
 from app.deploy.errors import DeployError
 
 NICK_MAX = 50
 ACTOR_COOKIE = "zc_actor"
 COOKIE_MAX_AGE = 60 * 60 * 24 * 365
+BCRYPT_KEY_MAX_BYTES = 72  # bcrypt 算法截断线，哈希/验证两侧必须同口径，故显式截断而非抛错
+
+
+def hash_password(plain: str) -> str:
+    return bcrypt.hashpw(plain.encode("utf-8")[:BCRYPT_KEY_MAX_BYTES], bcrypt.gensalt()).decode("ascii")
+
+
+def verify_password(plain: str, hashed: str | None) -> bool:
+    if not hashed:
+        return False
+    try:
+        return bcrypt.checkpw(plain.encode("utf-8")[:BCRYPT_KEY_MAX_BYTES], hashed.encode("ascii"))
+    except ValueError:
+        return False
 
 
 def _clean(nickname) -> str:
@@ -53,7 +68,7 @@ async def by_token(session_factory, token: str | None) -> dict | None:
     async with session_factory() as s:
         r = (await s.execute(text(
             "UPDATE actor SET last_seen_at = now() WHERE token = :t "
-            "RETURNING id, nickname, token, created_at, last_seen_at"),
+            "RETURNING id, nickname, token, created_at, last_seen_at, is_founder"),
             {"t": token})).mappings().first()
         await s.commit()
     return _row_to_dict(r) if r else None

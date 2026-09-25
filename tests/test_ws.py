@@ -7,7 +7,7 @@
 依次补发 tool_result({"cancelled": true}) → error("已取消") → status(idle)，
 读 3 条才与「tail 含 error(已取消)+status」断言自洽。
 """
-import asyncio, json, tempfile
+import asyncio, json, secrets, tempfile
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import text as _sql
@@ -34,6 +34,11 @@ def client(monkeypatch):
     monkeypatch.setattr(sqlrun, "build_if_missing", _noop)
     app = create_app()  # 开发库；lifespan 负责迁移
     with TestClient(app) as c:
+        # Ticket 002 全局 guard：业务接口需登录态。开发库无清理机制，随机昵称注册不跨轮冲突；
+        # 遗留账号无口令/不入生产语义，仅测试痕迹。
+        reg = c.post("/api/auth/register",
+                     json={"nickname": f"ws-test-{secrets.token_hex(4)}", "password": "test-pw"})
+        assert reg.status_code == 200, reg.text
         tmp = tempfile.mkdtemp()
         ws = c.post("/api/workspaces", json={"root_path": tmp}).json()
         sess = c.post("/api/sessions", json={"workspace_id": ws["id"]}).json()

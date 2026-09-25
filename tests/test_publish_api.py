@@ -363,6 +363,7 @@ async def test_lifespan_reconciles_prod_on_startup(test_engine, monkeypatch):
 
     app = create_app(test_engine.url.render_as_string(hide_password=False))
     with TestClient(app) as tc:
+        tc.post("/api/auth/register", json={"nickname": "lifespan-对账", "password": "pw"})  # guard 会话（Ticket 002）
         assert tc.get("/api/apps").status_code == 200
     assert seen["notify"] == app.state.deploy_hub.publish
     assert seen["sf"] is app.state.session_factory
@@ -385,6 +386,7 @@ async def test_lifespan_prod_reconcile_failure_is_not_fatal(test_engine, monkeyp
     app = create_app(test_engine.url.render_as_string(hide_password=False))
     with caplog.at_level(logging.WARNING):
         with TestClient(app) as tc:
+            tc.post("/api/auth/register", json={"nickname": "lifespan-对账", "password": "pw"})  # guard 会话（Ticket 002）
             assert tc.get("/api/apps").status_code == 200
     assert "prod 启动对账失败" in caplog.text
 
