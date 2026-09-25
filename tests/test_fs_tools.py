@@ -1,6 +1,7 @@
 import dataclasses, json, pytest
 from pathlib import Path
-from app.agent.tools import ToolContext, ToolError, resolve_in_workspace, execute_tool
+from app.agent.tools import (ToolContext, ToolError, resolve_in_workspace, resolve_skill_path,
+                             is_skill_scripts, execute_tool)
 
 @dataclasses.dataclass
 class FakeSF:  # 不落库的最小替代：execute_tool 内写 file_change 需 session_factory
@@ -97,3 +98,108 @@ async def test_write_preserves_line_endings(tmp_path):
     ctx = make_ctx(tmp_path)
     await execute_tool(ctx, "write_file", {"path": "lf.txt", "content": "l1\nl2\n"})
     assert (tmp_path / "lf.txt").read_bytes() == b"l1\nl2\n"
+
+
+# ---- Ticket 005：受控读面——技能目录绝对路径白名单 read_file（spec §3 故事11）----
+
+def _skills_fixture(tmp_path):
+    """造一个与工作区分离的技能根：users/1/skills/pdf（含 SKILL.md / references / scripts / 非白名单件）。"""
+    skills = tmp_path / "users" / "1" / "skills"
+    pdf = skills / "pdf"
+    (pdf / "references").mkdir(parents=True)
+    (pdf / "SKILL.md").write_text("# PDF 技能\n读我全文", encoding="utf-8")
+    (pdf / "references" / "guide.md").write_text("指南正文", encoding="utf-8")
+    (pdf / "scripts").mkdir()
+    (pdf / "scripts" / "run.py").write_text("print(1)", encoding="utf-8")
+    (pdf / "blob.pdf").write_bytes(b"%PDF-1.4 fake")
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    return skills, pdf, ws
+
+
+def _mk_skill_ctx(ws, skills_root):
+    return ToolContext(root=ws, session_id=1, session_factory=None, send=Recorder(),
+                       skills_root=skills_root)
+
+
+def test_resolve_skill_path_fence(tmp_path):
+    # 单元级路径围栏：根内命中、根外/相对/根缺失/None 一律 None（不开第二读面）
+    root = tmp_path / "users" / "1" / "skills"
+    inner = root / "pdf" / "SKILL.md"
+    assert resolve_skill_path(root, str(inner)) == inner.resolve()
+    assert resolve_skill_path(root, str(root)) == root.resolve()  # 根目录本身不算越界
+    assert resolve_skill_path(root, str(tmp_path / "elsewhere.md")) is None  # 根外
+    assert resolve_skill_path(root, "pdf/SKILL.md") is None  # 非绝对（工作区相对面管）
+    assert resolve_skill_path(root, None) is None
+    assert resolve_skill_path(None, str(inner)) is None  # 无读面默认关
+    assert is_skill_scripts(root / "pdf" / "scripts" / "run.py") is True
+    assert is_skill_scripts(root / "pdf" / "SKILL.md") is False
+
+
+@pytest.mark.asyncio
+async def test_skill_absolute_path_readable(tmp_path):
+    skills, pdf, ws = _skills_fixture(tmp_path)
+    ctx = _mk_skill_ctx(ws, skills)
+    r = await execute_tool(ctx, "read_file", {"path": str(pdf / "SKILL.md")})
+    assert "PDF 技能" in r["content"]
+    r2 = await execute_tool(ctx, "read_file", {"path": str(pdf / "references" / "guide.md")})
+    assert "指南正文" in r2["content"]  # references 相对链接支撑文件可读
+
+
+@pytest.mark.asyncio
+async def test_skill_scripts_denied(tmp_path):
+    skills, pdf, ws = _skills_fixture(tmp_path)
+    ctx = _mk_skill_ctx(ws, skills)
+    with pytest.raises(ToolError) as e:
+        await execute_tool(ctx, "read_file", {"path": str(pdf / "scripts" / "run.py")})
+    assert "scripts" in str(e.value)
+
+
+@pytest.mark.asyncio
+async def test_skill_non_whitelist_ext_denied(tmp_path):
+    skills, pdf, ws = _skills_fixture(tmp_path)
+    ctx = _mk_skill_ctx(ws, skills)
+    with pytest.raises(ToolError):
+        await execute_tool(ctx, "read_file", {"path": str(pdf / "blob.pdf")})
+
+
+@pytest.mark.asyncio
+async def test_skill_out_of_root_absolute_denied(tmp_path):
+    # 技能根外的绝对路径：回落不命中→维持原「必须是相对工作区的相对路径」错（不开二读面）
+    skills, pdf, ws = _skills_fixture(tmp_path)
+    ctx = _mk_skill_ctx(ws, skills)
+    outside = tmp_path / "secret.txt"
+    outside.write_text("不得读", encoding="utf-8")
+    with pytest.raises(ToolError) as e:
+        await execute_tool(ctx, "read_file", {"path": str(outside)})
+    assert "相对" in str(e.value) or "越界" in str(e.value)
+
+
+@pytest.mark.asyncio
+async def test_write_not_allowed_into_skill_dir(tmp_path):
+    # 无双开口：写类工具对技能母本不回落（只读）；绝对路径仍按越界拒绝且母本未变
+    skills, pdf, ws = _skills_fixture(tmp_path)
+    ctx = _mk_skill_ctx(ws, skills)
+    target = pdf / "SKILL.md"
+    with pytest.raises(ToolError):
+        await execute_tool(ctx, "write_file", {"path": str(target), "content": "篡改"})
+    assert "读我全文" in target.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_no_skills_root_means_no_read_face(tmp_path):
+    # 默认 skills_root=None（历史工作区/无技能用户）：绝对路径无读面，同旧行为拒绝
+    skills, pdf, ws = _skills_fixture(tmp_path)
+    ctx = ToolContext(root=ws, session_id=1, session_factory=None, send=Recorder())
+    with pytest.raises(ToolError):
+        await execute_tool(ctx, "read_file", {"path": str(pdf / "SKILL.md")})
+
+
+@pytest.mark.asyncio
+async def test_workspace_relative_read_unchanged_with_skill_root(tmp_path):
+    # 回归：开技能读面不影响工作区相对路径读取（既有行为零变化）
+    skills, pdf, ws = _skills_fixture(tmp_path)
+    ctx = _mk_skill_ctx(ws, skills)
+    (ws / "a.txt").write_text("工作区内容", encoding="utf-8")
+    r = await execute_tool(ctx, "read_file", {"path": "a.txt"})
+    assert "工作区内容" in r["content"]

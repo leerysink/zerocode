@@ -60,6 +60,20 @@ class AgentRunner:
         return [{"name": r["name"], "description": r["description"], "path": r["skill_dir"]}
                 for r in rows]
 
+    async def _skills_root_of(self, session_id: int):
+        """会话所属用户的技能母本根（受控读面）：session → workspace.owner_user_id。
+
+        owner 为 NULL 的历史工作区返回 None（无读面，与不注入技能一致）。
+        """
+        async with self.sf() as s:
+            uid = (await s.execute(text(
+                "SELECT w.owner_user_id FROM chat_session cs JOIN workspace w ON w.id = cs.workspace_id "
+                "WHERE cs.id = :i"), {"i": session_id})).scalar()
+        if uid is None:
+            return None
+        from app.skills.library import skills_root
+        return skills_root(uid)
+
     async def run(self, session_id: int, user_text: str, cancel: asyncio.Event) -> str:
         status = "idle"
         try:
@@ -195,7 +209,8 @@ class AgentRunner:
         if titled:
             await self.send({"type": "session_title", "title": titled})
         messages = await self._build_messages(session_id, root, cfg, self.send)
-        ctx = ToolContext(root=root, session_id=session_id, session_factory=self.sf, send=self.send)
+        ctx = ToolContext(root=root, session_id=session_id, session_factory=self.sf, send=self.send,
+                          skills_root=await self._skills_root_of(session_id))
         max_rounds = int(cfg.get("agent.max_tool_rounds", 30))
         # <=0 = 不限工具轮数（与超时参数 <=0 不限制的约定一致），不再 range(0) 零轮即错
         rounds = itertools.count() if max_rounds <= 0 else range(max_rounds)
