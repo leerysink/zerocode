@@ -167,6 +167,7 @@ async function save() {
     <div class="zc-page-head">
       <a-button type="text" class="zc-back" @click="goBack"><arrow-left-outlined /> 返回</a-button>
       <h2 class="zc-page-title">设置</h2>
+      <router-link to="/settings/skills" class="zc-skills-link" style="margin-left: auto">技能管理 →</router-link>
     </div>
 
     <a-tabs v-model:activeKey="activeTab" class="zc-tabs">

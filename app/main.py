@@ -96,6 +96,8 @@ def create_app(database_url: str | None = None) -> FastAPI:
         app.state.engine = engine
         app.state.session_factory = make_session_factory(engine)
         app.state.hub = ChatHub()
+        # 技能安装器出站 httpx transport：生产为 None（真实网络），测试注入 httpx.MockTransport。
+        app.state.skills_http_transport = None
         # 部署发布套件（Task 12）：事件总线（WS /ws/deploy/{app_id} 的订阅源）+ 长任务句柄表
         app.state.deploy_hub = DeployHub()
         app.state.dev_tasks = {}
@@ -145,6 +147,9 @@ def create_app(database_url: str | None = None) -> FastAPI:
     from app.api import store as store_api
     app.include_router(store_api.router)
     app.include_router(store_api.apps_ext)
+    # 账户级技能库（Ticket 001 / ADR-0004）：/api/skills 列表 + 直链安装
+    from app.api import skills as skills_api
+    app.include_router(skills_api.router)
     app.include_router(ws_router)
 
     # ---- 全局登录 guard（Ticket 002 / ADR-0003）：/api/* 除 /api/auth/* 外一律要求会话 ----

@@ -22,6 +22,9 @@ frontend/dist/
 apps/
 .pnpm-store/
 
+# 平台数据区（技能母本等运行时落盘，本机生成不入库）
+data/
+
 # SDD workspace
 .superpowers/
 # 一次性工单/草稿产物（本机工作记录，不入库）

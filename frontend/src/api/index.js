@@ -116,3 +116,7 @@ export const authRegister = (data) => http.post('/auth/register', data) // {nick
 export const authLogin = (data) => http.post('/auth/login', data)
 export const authLogout = () => http.post('/auth/logout')
 export const authMe = () => http.get('/auth/me')
+
+// ---- 账户级技能库（Ticket 001 / ADR-0004）----
+export const listSkills = () => http.get('/skills')
+export const installSkill = (data) => http.post('/skills/install', data) // {url}，subpath 随 002 兑现
