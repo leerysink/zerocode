@@ -7,7 +7,6 @@
 import { onMounted } from 'vue'
 import { useChatStore } from '../stores/chat'
 import SideBar from '../components/SideBar.vue'
-import AccountBar from '../components/AccountBar.vue'
 import ChatMessages from '../components/ChatMessages.vue'
 import ChatInput from '../components/ChatInput.vue'
 import TodoBar from '../components/TodoBar.vue'
@@ -20,42 +19,27 @@ onMounted(() => store.loadWorkspaces())
 <template>
   <a-layout class="zc-layout" has-sider>
     <SideBar />
-    <!-- 普通 div 而非 a-layout：外层 has-sider 会把 a-layout 子项一律按列排，账户顶栏要横跨中栏+右栏上方 -->
-    <div class="zc-right">
-      <AccountBar />
-      <a-layout class="zc-body" has-sider>
-        <a-layout class="zc-center">
-          <ChatMessages
-            :messages="store.messages"
-            :streaming="store.streamingContent"
-            :streaming-thinking="store.streamingThinking"
-            :pending-ask="store.pendingAsk"
-            :pending-confirm="store.pendingConfirm"
-            :has-session="!!store.currentSessionId"
-          />
-          <TodoBar v-if="store.todoList.length" :todos="store.todoList" />
-          <!-- 发送决策在 chat store（被拦时保留输入框文本 + 给 hint），故不再冒泡 send -->
-          <ChatInput :running="store.running" @cancel="store.cancel" />
-        </a-layout>
-        <FilePanel v-if="store.currentWorkspaceId" :workspace-id="store.currentWorkspaceId" />
-      </a-layout>
-    </div>
+    <a-layout class="zc-center">
+      <ChatMessages
+        :messages="store.messages"
+        :streaming="store.streamingContent"
+        :streaming-thinking="store.streamingThinking"
+        :pending-ask="store.pendingAsk"
+        :pending-confirm="store.pendingConfirm"
+        :has-session="!!store.currentSessionId"
+      />
+      <TodoBar v-if="store.todoList.length" :todos="store.todoList" />
+      <!-- 发送决策在 chat store（被拦时保留输入框文本 + 给 hint），故不再冒泡 send -->
+      <ChatInput :running="store.running" @cancel="store.cancel" />
+    </a-layout>
+    <FilePanel v-if="store.currentWorkspaceId" :workspace-id="store.currentWorkspaceId" />
   </a-layout>
 </template>
 
 <style scoped>
 .zc-layout {
-  height: 100vh;
-}
-.zc-right {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-}
-.zc-body {
-  flex: 1;
-  min-height: 0;
+  /* 壳层全局账户顶栏占 40px（App.vue/AccountBar），三栏占余下满高 */
+  height: calc(100vh - 40px);
 }
 .zc-center {
   min-width: 0;

@@ -52,10 +52,10 @@ describe('StoreView', () => {
     expect(w.findAll('button').some((b) => b.text().includes('申请'))).toBe(false)
   })
 
-  it('已登录：页头显示当前账号昵称（身份合流，无昵称弹层）', async () => {
+  it('已登录：页头不再显示昵称（身份入口已上全局顶栏），也没有昵称弹层', async () => {
     const w = mountView()
     await flushPromises()
-    expect(w.find('[data-test="me-nickname"]').text()).toContain('我')
+    expect(w.find('[data-test="me-nickname"]').exists()).toBe(false)
     expect(w.find('[data-test="actor-modal"]').exists()).toBe(false)
   })
 

@@ -3,7 +3,7 @@
 // 身份（Ticket 008 合流 / ADR-0003）：actor 即登录用户，昵称弹层已退役——401 统一去登录页。
 import { onMounted, ref } from 'vue'
 import { message } from 'ant-design-vue'
-import { AppstoreOutlined, PlusOutlined, SendOutlined, UserOutlined } from '@ant-design/icons-vue'
+import { AppstoreOutlined, PlusOutlined, SendOutlined } from '@ant-design/icons-vue'
 import * as api from '../api'
 import BackButton from '../components/BackButton.vue'
 
@@ -11,7 +11,6 @@ const tab = ref('store')
 const releases = ref([])
 const mine = ref([])
 const review = ref([])
-const me = ref(null)
 const applyOpen = ref(false)
 const applyTarget = ref(null)
 const applyName = ref('')
@@ -25,7 +24,7 @@ async function load () {
 
 onMounted(async () => {
   try {
-    me.value = (await api.authMe()).data   // 复用登录态接缝（/api/auth/me），不再有第二套身份
+    await api.authMe()   // 登录门禁：401 走下方 catch 引导去登录页；昵称回显已上全局顶栏（AccountBar）
     await load()
   } catch (e) {
     // 非 auth 接口的 401 由 axios 拦截器统一跳转；authMe 在豁免名单里，这里自己引导
@@ -70,7 +69,6 @@ function gotoApps () { window.location.href = '/apps' }
         <h2><appstore-outlined /> 应用商店</h2>
       </div>
       <a-space>
-        <span data-test="me-nickname" class="zc-store-meta"><user-outlined /> {{ me?.nickname || '' }}</span>
         <a-button @click="load">刷新</a-button>
         <a-button type="primary" @click="gotoApps"><plus-outlined /> 新建应用</a-button>
       </a-space>
