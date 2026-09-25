@@ -138,8 +138,12 @@ def delete_skill_dir(uid, skill_dir: str) -> None:
     路径围栏：DB 行理论上只由我们写入，但残行/手工改库也不能让 DELETE
     接口变成任意目录删除器。越界/失败抛 SkillError，调用方不得继续删行。
     """
-    root = skills_root(uid).resolve()
-    p = Path(skill_dir).resolve()
+    root = skills_root(uid)
+    try:
+        root = root.resolve()
+        p = Path(skill_dir).resolve()
+    except (OSError, RuntimeError) as e:  # 死链接/reparse 点等让 resolve 本身炸（复审 M-1）
+        raise SkillError("技能目录路径异常，已拒绝删除") from e
     if root not in p.parents or p == root:
         raise SkillError("技能目录路径异常，已拒绝删除")
     if not p.exists():

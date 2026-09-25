@@ -3,6 +3,7 @@
 鉴权沿用全局 guard（/api/skills 非白名单即要求会话）；归属一律按 request.state.actor["id"]
 过滤，PATCH/DELETE 带 owner 条件、越权返 404（不区分 403，沿用登录项目裁定）。
 """
+import logging
 import shutil
 
 from fastapi import APIRouter, HTTPException, Request
@@ -16,6 +17,7 @@ from app.skills.library import (SkillError, delete_skill_dir, next_free_slug,
                                 slugify, write_skill_dir)
 
 router = APIRouter(prefix="/api/skills")
+logger = logging.getLogger(__name__)
 
 _COLUMNS = ("id, slug, name, description, source_type, source_url, "
             "subpath, skill_dir, enabled, created_at, updated_at")
@@ -126,6 +128,8 @@ async def delete_skill(request: Request, skill_id: int):
     try:
         delete_skill_dir(uid, row[0])
     except SkillError as e:
+        # 删母本失败是数据不一致信号（磁盘占用/DATA_DIR 漂移），留服务端线索（复审 M-2）
+        logger.warning("删除技能母本失败 id=%s uid=%s: %s", skill_id, uid, e)
         raise HTTPException(400, str(e))
     async with request.app.state.session_factory() as s:
         await s.execute(text(

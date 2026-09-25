@@ -340,6 +340,22 @@ async def test_delete_removes_row_and_disk(client, tmp_path):
     assert (await client.delete(f"/api/skills/{sk['id']}")).status_code == 404
 
 
+async def test_delete_removes_only_target_skill_dir(client, tmp_path):
+    """删目标不误伤兄弟母本：并存两技能，删一个只清它那目录，另一个目录与行完好（复审 M-3）。"""
+    a = await _install_one(client)
+    b = await _install_one(client)
+    assert a["skill_dir"] != b["skill_dir"]
+    da, db = Path(a["skill_dir"]), Path(b["skill_dir"])
+    assert da.is_dir() and db.is_dir()
+
+    r = await client.delete(f"/api/skills/{a['id']}")
+    assert r.status_code == 200, r.text
+    assert not da.exists()  # 目标母本删除
+    assert db.is_dir() and (db / "SKILL.md").is_file()  # 兄弟母本未受波及
+    rows = (await client.get("/api/skills")).json()
+    assert [x["id"] for x in rows] == [b["id"]]  # 只删了目标行
+
+
 async def test_cross_account_patch_and_delete_404(two_auth_clients, tmp_path):
     alice, bob = two_auth_clients
     sk = await _install_one(alice)

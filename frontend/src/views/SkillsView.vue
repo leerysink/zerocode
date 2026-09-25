@@ -26,7 +26,7 @@ const columns = [
   { title: '名称', dataIndex: 'name' },
   { title: '描述', dataIndex: 'description' },
   { title: '来源', dataIndex: 'source_type', width: 90 },
-  { title: '状态', dataIndex: 'enabled', key: 'enabled', width: 80 },
+  { title: '状态', dataIndex: 'enabled', key: 'enabled', width: 110 },
   { title: '操作', key: 'ops', width: 72 },
 ]
 
@@ -97,16 +97,24 @@ function finishInstall(data) {
   load()
 }
 
-// 启用开关（003）：PATCH 失败回滚开关状态，不做乐观常驻
+// 启用开关（003）：整列互斥锁防在飞并发翻转，PATCH 失败回滚到 prev（非取反），
+// 越权/已删返回 404 时按已删就地移除（复审 I-1/M-4）。
 const toggling = ref(null)
 async function toggleEnabled(record, checked) {
+  if (toggling.value !== null) return // 在飞时忽略其他行的开关，避免多请求乱序覆盖
+  const prev = record.enabled
   toggling.value = record.id
   record.enabled = checked
   try {
     await patchSkill(record.id, { enabled: checked })
   } catch (e) {
-    record.enabled = !checked
-    message.error(e?.response?.data?.detail || '状态更新失败')
+    if (e?.response?.status === 404) {
+      skills.value = skills.value.filter((s) => s.id !== record.id)
+      message.info('该技能已不存在，已从列表移除')
+    } else {
+      record.enabled = prev
+      message.error(e?.response?.data?.detail || '状态更新失败')
+    }
   } finally {
     toggling.value = null
   }
@@ -126,7 +134,12 @@ function removeSkill(record) {
         skills.value = skills.value.filter((s) => s.id !== record.id)
         message.success('技能已删除')
       } catch (e) {
-        message.error(e?.response?.data?.detail || '删除失败')
+        // 404 视为服务端已删（如其他标签页删过）：静默就地移除，别报「删除失败」（复审 M-4）
+        if (e?.response?.status === 404) {
+          skills.value = skills.value.filter((s) => s.id !== record.id)
+        } else {
+          message.error(e?.response?.data?.detail || '删除失败')
+        }
       }
     },
   })
@@ -175,6 +188,8 @@ function removeSkill(record) {
       <template #bodyCell="{ column, record }">
         <template v-if="column.key === 'enabled'">
           <a-switch :checked="record.enabled" :loading="toggling === record.id"
+                    :disabled="toggling !== null && toggling !== record.id"
+                    checked-children="启用" un-checked-children="停用"
                     @change="(v) => toggleEnabled(record, v)" />
         </template>
         <template v-if="column.key === 'ops'">
