@@ -95,7 +95,8 @@ async def install_release(sf, *, release_row: dict, applicant_actor_id: int,
         app = await app_service.create_app_project(
             sf, name=want_name, slug=slug, scale="small",
             stack=manifest.get("stack") or "vue3-fastapi",
-            origin=f"store:{release_row['id']}", materialize=_materializer(pkg, release_row))
+            origin=f"store:{release_row['id']}", materialize=_materializer(pkg, release_row),
+            owner_user_id=applicant_actor_id)   # 安装者即归属人（Ticket 003 扩展态）
         rid = await records.begin(sf, app["id"], "install", release_row["version"])
 
         def on_log(line: str) -> None:

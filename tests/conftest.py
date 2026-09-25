@@ -20,14 +20,33 @@ async def test_engine():
     engine = make_engine(test_database_url())
     await run_migrations(engine)
     yield engine
-    # 测试间清库（全局约束），保留 schema_migration 与 app_config 种子
-    # deploy_record 显式点名：此前只靠 app_project 的 FK ON DELETE CASCADE 隐式带掉，
-    # 一旦历史表改成「应用删了历史仍留」就会静默漏表（审查 M-9）。
+    # 测试间清库（全局约束）。app_config 不在 TRUNCATE 名单里，但它的 owner_user_id FK 指向
+    # actor（Ticket 003）→ CASCADE 会带飞全表，故清完重放种子（与全部迁移应用完的终态一致）；
+    # ON CONFLICT 不写目标：兼容无主键后的 ux_app_config_owner_key。
     async with engine.begin() as conn:
         await conn.execute(text(
             "TRUNCATE message, file_change, compaction, chat_session, workspace, app_project, "
             "model_config, deploy_record, app_instance_link, release_application, app_release, actor "
             "RESTART IDENTITY CASCADE"))
+        await conn.execute(text(
+            "INSERT INTO app_config (key, value) VALUES "
+            "('llm.base_url', '\"https://api.deepseek.com/v1\"'), "
+            "('llm.api_key', '\"\"'), "
+            "('llm.model', '\"deepseek-chat\"'), "
+            "('agent.write_confirm', 'false'), "
+            "('agent.ask_timeout_seconds', '0'), "
+            "('agent.max_tool_rounds', '30'), "
+            "('agent.history_window', '40'), "
+            "('deploy.apps_root', '\"\"'), "
+            "('deploy.port_base', '8210'), "
+            "('deploy.port_max', '8399'), "
+            "('deploy.keep_versions', '5'), "
+            "('deploy.health_timeout', '240'), "
+            "('deploy.auto_stop_dev_on_exit', 'true'), "
+            "('deploy.default_nic', '\"\"'), "
+            "('store.enabled', 'true'), "
+            "('store.keep_prev', '1') "
+            "ON CONFLICT DO NOTHING"))
     await engine.dispose()
 
 @pytest.fixture

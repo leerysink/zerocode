@@ -81,14 +81,18 @@ def load_app_json(root: Path) -> dict:
 
 
 async def _insert_rows(session_factory, *, name, slug, scale, stack, root,
-                       prod_port: int, dev_port: int, origin: str | None = None) -> dict:
+                       prod_port: int, dev_port: int, origin: str | None = None,
+                       owner_user_id: int | None = None) -> dict:
     """workspace + app_project 单事务提交；端口由调用方前置分配后显式传入（裁定 R-A）。
 
     UNIQUE 冲突（并发创建的 slug/端口/目录竞态）→ 409，由上层统一回滚。
+    owner_user_id（Ticket 003 扩展态）：新建行盖当前登录用户，目录查重按同归属隔离。
     """
     async with session_factory() as s:
-        dup = (await s.execute(text("SELECT id FROM workspace WHERE root_path = :p"),
-                               {"p": str(root)})).first()
+        dup = (await s.execute(text(
+            "SELECT id FROM workspace WHERE root_path = :p "
+            "AND owner_user_id IS NOT DISTINCT FROM :o"),
+            {"p": str(root), "o": owner_user_id})).first()
         if dup:
             raise DeployError("该目录已被登记为工作区", status=409)
         dup_slug = (await s.execute(text("SELECT id FROM app_project WHERE slug = :s"),
@@ -98,15 +102,15 @@ async def _insert_rows(session_factory, *, name, slug, scale, stack, root,
         try:
             # workspace 与 app_project 同一条 UNIQUE 兜底路径：并发抢走同目录时同样映射 409（m2）
             wid = (await s.execute(text(
-                "INSERT INTO workspace (name, root_path) VALUES (:n, :p) RETURNING id"),
-                {"n": name, "p": str(root)})).scalar()
+                "INSERT INTO workspace (name, root_path, owner_user_id) VALUES (:n, :p, :o) RETURNING id"),
+                {"n": name, "p": str(root), "o": owner_user_id})).scalar()
             row = (await s.execute(text(
                 "INSERT INTO app_project (workspace_id, name, slug, scale, stack, prod_port, "
-                "dev_port, origin) VALUES (:w, :n, :s, :sc, :st, :pp, :dp, :og) "
+                "dev_port, origin, owner_user_id) VALUES (:w, :n, :s, :sc, :st, :pp, :dp, :og, :o) "
                 "RETURNING id, workspace_id, name, slug, scale, stack, prod_port, dev_port, "
                 "status_dev, status_prod, current_version, created_at, updated_at"),
                 {"w": wid, "n": name, "s": slug, "sc": scale, "st": stack,
-                 "pp": prod_port, "dp": dev_port, "og": origin})).mappings().first()
+                 "pp": prod_port, "dp": dev_port, "og": origin, "o": owner_user_id})).mappings().first()
             await s.commit()
         except IntegrityError as e:
             # 只读探测与插入之间的竞态（另一路创建占走同一目录/端口/slug）：事务已废，交给上层回滚
@@ -122,12 +126,14 @@ async def _delete_rows(session_factory, app_id: int) -> None:
 
 async def create_app_project(session_factory, *, name: str, slug: str, scale: str,
                              stack: str, root: str | None = None,
-                             origin: str | None = None, materialize=None) -> dict:
+                             origin: str | None = None, materialize=None,
+                             owner_user_id: int | None = None) -> dict:
     """原子创建一个应用工程：任一步失败即回滚（平台记录 + 供给 + 目录），抛 DeployError。
 
     `materialize(root_path, mapping)`：铺源钩子。默认走栈模板渲染；商店安装传自己的闭包
     （从包 copy 源码 + 锚点 sqlchange），从而复用本函数的端口分配、app.json、原子回滚。
     `origin`：安装来源标记（`store:<release_id>`），自建应用为 NULL。
+    `owner_user_id`：归属用户（登录后的 actor id），新建行落此列（Ticket 003 扩展态）。
     """
     name_stripped = check_name(name)
     validate_slug(slug)
@@ -152,7 +158,7 @@ async def create_app_project(session_factory, *, name: str, slug: str, scale: st
         render(root_path, mapping)   # R-C 已保证模板目录存在
         app = await _insert_rows(session_factory, name=name_stripped, slug=slug, scale=scale,
                                  stack=stack, root=root_path, prod_port=prod_port,
-                                 dev_port=dev_port, origin=origin)
+                                 dev_port=dev_port, origin=origin, owner_user_id=owner_user_id)
         app_id = app["id"]
         workspace_id = app["workspace_id"]
         # app.json：不含密码；端口来自同一次分配，与库内登记一致

@@ -74,7 +74,8 @@ async def create_app(request: Request, body: AppIn):
     try:
         return await app_service.create_app_project(
             request.app.state.session_factory, name=body.name, slug=body.slug,
-            scale=body.scale, stack=body.stack)
+            scale=body.scale, stack=body.stack,
+            owner_user_id=request.state.actor["id"])   # 扩展态落归属（Ticket 003）
     except DeployError as e:
         raise _http(e)
 

@@ -17,9 +17,10 @@ def admin_url() -> str:
 
 async def _app_config_set(session_factory, key: str, value: dict) -> None:
     async with session_factory() as s:
+        # 仲裁目标跟 ux_app_config_owner_key（Ticket 003）：owner 缺省 NULL = 平台级键
         await s.execute(text(
             "INSERT INTO app_config (key, value) VALUES (:k, CAST(:v AS JSONB)) "
-            "ON CONFLICT (key) DO UPDATE SET value = CAST(:v AS JSONB), updated_at = now()"),
+            "ON CONFLICT (owner_user_id, key) DO UPDATE SET value = CAST(:v AS JSONB), updated_at = now()"),
             {"k": key, "v": json.dumps(value, ensure_ascii=False)})
         await s.commit()
 

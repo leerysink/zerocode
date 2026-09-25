@@ -98,7 +98,7 @@ async def _set_cred(sf, slug: str, env: str = "dev") -> None:
     """登记假凭据（不建库不建角色）：应用库连接链路由 fail-soft 用例专门验「连不上也返回空」。"""
     async with sf() as s:
         await s.execute(text("INSERT INTO app_config (key, value) VALUES (:k, CAST(:v AS JSONB)) "
-                             "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, "
+                             "ON CONFLICT (owner_user_id, key) DO UPDATE SET value = EXCLUDED.value, "
                              "updated_at = now()"),
                         {"k": f"dbcred.{slug}.{env}",
                          "v": json.dumps({"db": f"{slug}_{env}", "user": f"{slug}_{env}",

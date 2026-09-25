@@ -127,7 +127,7 @@ async def make_app(sf):
                  "pp": prod_port, "dp": dev_port})).scalar()
             await s.execute(text(
                 "INSERT INTO app_config (key, value) VALUES (:k, CAST(:v AS JSONB)) "
-                "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()"),
+                "ON CONFLICT (owner_user_id, key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()"),
                 {"k": f"dbcred.{slug}.dev",
                  "v": json.dumps({"db": f"{slug}_dev", "user": f"{slug}_dev", "password": "fake-pw"})})
             await s.commit()

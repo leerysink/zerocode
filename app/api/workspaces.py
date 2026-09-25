@@ -19,16 +19,22 @@ async def create_workspace(request: Request, body: WsIn):
     root = Path(body.root_path)
     if not root.is_dir():
         raise HTTPException(400, "目录不存在")
-    # 查重-插入段：并发竞态时另一请求可能已插入同 root_path，DB UNIQUE 约束抛 IntegrityError，统一转 409
+    # 查重-插入段：并发竞态时另一请求可能已插入同 (owner, root_path)，DB 联合 UNIQUE 抛 IntegrityError，统一转 409
+    # 扩展态（Ticket 003）：查重按当前用户隔离，跨用户同目录各自登记（guard 已保证 actor 存在）
+    owner_id = request.state.actor["id"]
     try:
         async with request.app.state.session_factory() as s:
-            dup = (await s.execute(text("SELECT id FROM workspace WHERE root_path = :p"), {"p": str(root)})).first()
+            dup = (await s.execute(text(
+                "SELECT id FROM workspace WHERE root_path = :p "
+                "AND owner_user_id IS NOT DISTINCT FROM :o"),
+                {"p": str(root), "o": owner_id})).first()
             if dup:
                 raise HTTPException(409, "该目录已存在")
             name = body.name or root.name
             row = (await s.execute(text(
-                "INSERT INTO workspace (name, root_path) VALUES (:n, :p) RETURNING id, name, root_path, created_at"),
-                {"n": name, "p": str(root)})).mappings().first()
+                "INSERT INTO workspace (name, root_path, owner_user_id) "
+                "VALUES (:n, :p, :o) RETURNING id, name, root_path, created_at"),
+                {"n": name, "p": str(root), "o": owner_id})).mappings().first()
             await s.commit()
     except IntegrityError:
         # async with 退出时自动回滚未 commit 的事务，直接转 409 即可

@@ -30,14 +30,20 @@ async def list_models(request: Request):
 
 @router.post("")
 async def create_model(request: Request, body: ModelIn):
+    # 扩展态（Ticket 003）：默认位清除按当前用户隔离，跨用户默认互不干扰
+    # （DB 侧由部分唯一索引 ux_model_default_per_owner 兜底）
+    owner_id = request.state.actor["id"]
     async with request.app.state.session_factory() as s:
         if body.is_default:
-            await s.execute(text("UPDATE model_config SET is_default=FALSE WHERE is_default"))
+            await s.execute(text(
+                "UPDATE model_config SET is_default=FALSE "
+                "WHERE is_default AND owner_user_id IS NOT DISTINCT FROM :o"),
+                {"o": owner_id})
         row = (await s.execute(text(
-            "INSERT INTO model_config (name, base_url, api_key, model, is_default) "
-            "VALUES (:n, :b, :k, :m, :d) RETURNING id, name, base_url, api_key, model, is_default, created_at"),
+            "INSERT INTO model_config (name, base_url, api_key, model, is_default, owner_user_id) "
+            "VALUES (:n, :b, :k, :m, :d, :o) RETURNING id, name, base_url, api_key, model, is_default, created_at"),
             {"n": body.name, "b": body.base_url, "k": body.api_key, "m": body.model,
-             "d": body.is_default})).mappings().first()
+             "d": body.is_default, "o": owner_id})).mappings().first()
         await s.commit()
     return _row_out(row)
 
@@ -49,8 +55,12 @@ async def update_model(request: Request, model_id: int, body: ModelIn):
             raise HTTPException(404, "模型不存在")
         new_key = old[0] if body.api_key == MASK else body.api_key
         if body.is_default:
-            await s.execute(text("UPDATE model_config SET is_default=FALSE WHERE is_default AND id <> :i"),
-                            {"i": model_id})
+            # 默认位竞争只发生在同一归属用户内：按目标行的 owner 清位（扩展态，Ticket 003）
+            await s.execute(text(
+                "UPDATE model_config SET is_default=FALSE "
+                "WHERE is_default AND id <> :i "
+                "AND owner_user_id IS NOT DISTINCT FROM (SELECT owner_user_id FROM model_config WHERE id = :i)"),
+                {"i": model_id})
         await s.execute(text(
             "UPDATE model_config SET name=:n, base_url=:b, api_key=:k, model=:m, is_default=:d WHERE id=:i"),
             {"n": body.name, "b": body.base_url, "k": new_key, "m": body.model,
