@@ -132,8 +132,13 @@ def test_resolve_skill_path_fence(tmp_path):
     assert resolve_skill_path(root, "pdf/SKILL.md") is None  # 非绝对（工作区相对面管）
     assert resolve_skill_path(root, None) is None
     assert resolve_skill_path(None, str(inner)) is None  # 无读面默认关
-    assert is_skill_scripts(root / "pdf" / "scripts" / "run.py") is True
-    assert is_skill_scripts(root / "pdf" / "SKILL.md") is False
+    assert is_skill_scripts(root / "pdf" / "scripts" / "run.py", root) is True
+    assert is_skill_scripts(root / "pdf" / "SKILL.md", root) is False
+    # 复审 I-1：祖先目录名为 scripts 不误伤（只看根内相对段）
+    assert is_skill_scripts(Path("/scripts/u1/skills/pdf/SKILL.md"),
+                            Path("/scripts/u1/skills")) is False
+    assert is_skill_scripts(Path("/scripts/u1/skills/pdf/scripts/run.py"),
+                            Path("/scripts/u1/skills")) is True
 
 
 @pytest.mark.asyncio
@@ -159,8 +164,45 @@ async def test_skill_scripts_denied(tmp_path):
 async def test_skill_non_whitelist_ext_denied(tmp_path):
     skills, pdf, ws = _skills_fixture(tmp_path)
     ctx = _mk_skill_ctx(ws, skills)
-    with pytest.raises(ToolError):
+    with pytest.raises(ToolError) as e:
         await execute_tool(ctx, "read_file", {"path": str(pdf / "blob.pdf")})
+    assert "文本类" in str(e.value)  # 钉住是因后缀被拒，而非文件不存在（复审 M-4）
+
+
+@pytest.mark.asyncio
+async def test_skill_size_over_limit_denied(tmp_path):
+    # 验收2：超 MAX_READ_BYTES 拒（复审 M-3）
+    from app.agent.tools import MAX_READ_BYTES
+    skills, pdf, ws = _skills_fixture(tmp_path)
+    (pdf / "big.md").write_bytes(b"x" * (MAX_READ_BYTES + 1))
+    ctx = _mk_skill_ctx(ws, skills)
+    with pytest.raises(ToolError) as e:
+        await execute_tool(ctx, "read_file", {"path": str(pdf / "big.md")})
+    assert "200KB" in str(e.value)
+
+
+@pytest.mark.asyncio
+async def test_skill_dotdot_escape_denied(tmp_path):
+    # 验收2：根内起点 + .. 逃逸到根外仍拒（resolve 收敛后围栏拦下，复审 M-3）
+    skills, pdf, ws = _skills_fixture(tmp_path)
+    secret = tmp_path / "outside.md"
+    secret.write_text("不得读", encoding="utf-8")
+    ctx = _mk_skill_ctx(ws, skills)
+    escape = str(pdf / ".." / ".." / ".." / ".." / "outside.md")  # pdf 上跳到 users/1 再上跳到 tmp_path
+    with pytest.raises(ToolError):
+        await execute_tool(ctx, "read_file", {"path": escape})
+
+
+@pytest.mark.asyncio
+async def test_edit_not_allowed_into_skill_dir(tmp_path):
+    # 无双开口覆盖 edit_file（不只 write_file）：绝对路径抛错且母本未变（复审 M-3）
+    skills, pdf, ws = _skills_fixture(tmp_path)
+    ctx = _mk_skill_ctx(ws, skills)
+    target = pdf / "SKILL.md"
+    with pytest.raises(ToolError):
+        await execute_tool(ctx, "edit_file",
+                          {"path": str(target), "old_string": "读我全文", "new_string": "篡改"})
+    assert "读我全文" in target.read_text(encoding="utf-8")
 
 
 @pytest.mark.asyncio

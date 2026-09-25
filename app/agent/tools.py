@@ -38,16 +38,25 @@ def resolve_skill_path(skills_root: Path | None, abs_path: str | None) -> Path |
     try:
         root_r = Path(skills_root).resolve()
         full = p.resolve()
-    except (OSError, RuntimeError):
+    except (OSError, RuntimeError, ValueError):  # 死链接/reparse 点/空字节路径都归 None
         return None
     if root_r != full and root_r not in full.parents:
         return None
     return full
 
 
-def is_skill_scripts(path: Path) -> bool:
-    """技能母本 scripts/ 子树检测（故事11：脚本不在 v1 消费面）。"""
-    return "scripts" in path.parts
+def is_skill_scripts(path: Path, root: Path) -> bool:
+    """技能母本 scripts/ 子树检测（故事11：脚本不在 v1 消费面）。
+
+    只对**技能根内的相对段**判定，不看整条绝对路径（复审 I-1）——否则祖先
+    目录（如仓库 clone 进名为 scripts 的父目录、或 ZEROCODE_DATA_DIR 含 scripts 段）
+    同名会误拒整个读面。path 不在 root 内时返回 False（调用方已围栏，理论不可达）。
+    """
+    try:
+        rel_parts = path.relative_to(root).parts
+    except ValueError:
+        return False
+    return "scripts" in rel_parts
 
 
 @dataclasses.dataclass
@@ -100,7 +109,7 @@ async def execute_tool(ctx: ToolContext, name: str, args: dict) -> dict:
                 raise ws_err
             if not sk.is_file():
                 raise ToolError(f"文件不存在: {rel}")
-            if is_skill_scripts(sk):
+            if is_skill_scripts(sk, Path(ctx.skills_root).resolve()):
                 raise ToolError(f"技能 scripts/ 目录不在读取范围: {rel}")
             if sk.suffix.lower() not in SKILL_READ_EXTS:
                 raise ToolError(
