@@ -111,7 +111,8 @@ function finishInstall(data) {
           allow-clear
           @press-enter="doInstall()"
         />
-        <a-button type="primary" :loading="installing && !pendingPath" @click="doInstall()">安装</a-button>
+        <a-button type="primary" :disabled="installing" :loading="installing && !pendingPath"
+                  @click="doInstall()">安装</a-button>
       </div>
       <p class="zc-tip">技能遵循 Anthropic Agent Skills 标准；安装后归属当前账户，工作区不会出现技能文件。</p>
     </a-card>

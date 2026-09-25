@@ -26,6 +26,7 @@ class SkillError(Exception):
     """
 
     status_code: int | None = None
+    oversize: bool = False  # 体积/条数守卫抛出的标记（_fetch_tree 据此改专属文案）
 
 
 def parse_skill_md(content: str) -> tuple[str, str]:

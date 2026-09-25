@@ -296,3 +296,67 @@ async def test_slash_branch_monorepo_two_step_candidate(client):
     assert r.status_code == 201, r.text
     assert r.json()["name"] == "Skill Alpha"
     assert r.json()["subpath"] == "skills/a"
+
+
+# ---- 三轮复审锚定（N-2：F-5/F-6/M-1 行为钉死，防改文案静默失效）----
+
+
+async def test_cross_host_redirect_strips_token_header(client, monkeypatch):
+    """F-6：trees 落点 302 到外站，该跳不带 Authorization；后续同源请求 token 仍在（N-1）。"""
+    import httpx
+
+    monkeypatch.setenv("ZEROCODE_GITHUB_TOKEN", "SECRET-TOKEN")
+    seen = []
+
+    async def handler(request):
+        seen.append((request.url.host, request.url.path,
+                     request.headers.get("authorization")))
+        if request.url.host == "api.github.com" and request.url.path == "/repos/owner/repo":
+            return httpx.Response(200, json={"default_branch": "main"})
+        if request.url.path.startswith("/repos/owner/repo/git/trees/"):
+            return httpx.Response(302, headers={"location": "https://cdn.example.com/tree.json"})
+        if request.url.host == "cdn.example.com":
+            return httpx.Response(200, json={"tree": [_blob("SKILL.md")], "truncated": False})
+        if request.url.host == "raw.githubusercontent.com":
+            return httpx.Response(200, content=SKILL_B)
+        return httpx.Response(404)
+    client.app.state.skills_http_transport = httpx.MockTransport(handler)
+    r = await client.post("/api/skills/install", json={"url": "https://github.com/owner/repo"})
+    assert r.status_code == 201, r.text
+    hop = [s for s in seen if s[0] == "cdn.example.com"][0]
+    assert not hop[2]  # 跨主机落点不带凭证（空串按请求覆盖，真实 token 不外流）
+    api_calls = [s for s in seen if s[0] == "api.github.com"]
+    # N-1：按请求剔除非常驻突变，其余 api.github.com 调用仍带 token
+    assert all(h == "Bearer SECRET-TOKEN" for _, _, h in api_calls)
+
+
+async def test_trees_internal_redirect_keeps_ssrf_message(client):
+    """M-1：trees 请求 302 跳内网，必须仍报 SSRF 拒绝，不被「仓库过大」专属文案吞掉。"""
+    import httpx
+
+    async def handler(request):
+        if request.url.path.startswith("/repos/owner/repo/git/trees/"):
+            return httpx.Response(302, headers={"location": "http://127.0.0.1/x"})
+        return httpx.Response(200, json={"default_branch": "main"})
+    client.app.state.skills_http_transport = httpx.MockTransport(handler)
+    r = await client.post("/api/skills/install", json={"url": "https://github.com/owner/repo"})
+    assert r.status_code == 400
+    assert "内网" in r.text
+    assert "仓库过大" not in r.text
+
+
+async def test_trees_metadata_oversize_dedicated_message(client):
+    """F-5：trees 元数据响应超 5MB 预算→专属「仓库过大」文案，不再是误导的单文件上限。"""
+    import httpx
+
+    big = b"{" + b"z" * (5 * 1024 * 1024 + 100)
+
+    async def handler(request):
+        if request.url.path.startswith("/repos/owner/repo/git/trees/"):
+            return httpx.Response(200, content=big)
+        return httpx.Response(200, json={"default_branch": "main"})
+    client.app.state.skills_http_transport = httpx.MockTransport(handler)
+    r = await client.post("/api/skills/install", json={"url": "https://github.com/owner/repo"})
+    assert r.status_code == 400
+    assert "仓库过大" in r.text
+    assert "subpath" in r.text

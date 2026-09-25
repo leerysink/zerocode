@@ -29,6 +29,7 @@ _LINK = re.compile(r"\]\(([^)\s]+)")
 _URL_MAX = 1000   # user_skill.source_url VARCHAR(1000)
 _NAME_MAX = 200   # user_skill.name VARCHAR(200)
 _MAX_REDIRECTS = 5
+_REF_ATTEMPTS_MAX = 200  # 直链引用尝试数硬上限：链接条数不得线性放大请求数（复审 M-2）
 _REDIR_STATUSES = {301, 302, 303, 307, 308}
 
 
@@ -82,7 +83,7 @@ def _relative_refs(md: str) -> list[str]:
         if norm == "." or norm.startswith("..") or posixpath.isabs(norm):
             continue
         out.append(norm)
-    return out
+    return list(dict.fromkeys(out))  # 去重：同一目标只拉一次（复审 M-2）
 
 
 def is_skill_md_url(url: str) -> bool:
@@ -103,14 +104,24 @@ def _rawize_github_blob(url: str) -> str:
     return url
 
 
+def _oversize_error(msg: str) -> SkillError:
+    """体积/条数守卫专用：打 oversize 标记，供 _fetch_tree 按标记而非「无 status_code」
+    反推超预算（复审 M-1：SSRF/协议类拒绝不被误改文案成「仓库过大」）。"""
+    err = SkillError(msg)
+    err.oversize = True
+    return err
+
+
 async def _get_limited(client: httpx.AsyncClient, url: str, label: str, *,
                        required: bool, max_bytes: int = MAX_FILE_BYTES,
-                       _hops: int = 0) -> bytes:
+                       _hops: int = 0, _hdrs: dict | None = None) -> bytes:
     """流式下载并边下边限长；非 200 按 required 语义抛 SkillError/_RefMissing。
 
     重定向手动逐跳：Location 先过 SSRF 预检再发下一跳请求，内网落点根本不被连接。
+    跨主机落点按请求摘除 authorization（复审 N-1：不永久突变共享 client，
+    同一次安装里后续同源调用仍可带 token）。
     """
-    async with client.stream("GET", url) as resp:
+    async with client.stream("GET", url, headers=_hdrs) as resp:
         if resp.status_code in _REDIR_STATUSES:
             loc = resp.headers.get("location")
             if not loc or _hops >= _MAX_REDIRECTS:
@@ -125,10 +136,14 @@ async def _get_limited(client: httpx.AsyncClient, url: str, label: str, *,
             if tp.scheme.lower() not in ("http", "https"):
                 raise SkillError("重定向目标协议不允许")
             _reject_internal_host(tp.hostname)
+            # 按请求覆盖不突变共享 client（复审 N-1）：httpx 合并语义下只能以空串覆盖 client 默认头，
+            # 该跳不带真实 token（F-6），其余同源调用仍取 client 默认（token 完整）
+            hop_hdrs = dict(_hdrs) if _hdrs is not None else {}
             if tp.hostname != urlparse(url).hostname:  # 跨主机落点不带凭证（复审 F-6）
-                client.headers.pop("authorization", None)
+                hop_hdrs["authorization"] = ""
             return await _get_limited(client, target, label, required=required,
-                                      max_bytes=max_bytes, _hops=_hops + 1)
+                                      max_bytes=max_bytes, _hops=_hops + 1,
+                                      _hdrs=hop_hdrs)
         if resp.status_code != 200:
             if required:
                 err = SkillError(f"拉取 {label} 失败: HTTP {resp.status_code}")
@@ -137,13 +152,13 @@ async def _get_limited(client: httpx.AsyncClient, url: str, label: str, *,
             raise _RefMissing(label)
         declared = resp.headers.get("content-length", "")
         if declared.isdigit() and int(declared) > max_bytes:
-            raise SkillError(f"文件超过大小上限: {label}")
+            raise _oversize_error(f"文件超过大小上限: {label}")
         chunks: list[bytes] = []
         total = 0
         async for chunk in resp.aiter_bytes():
             total += len(chunk)
             if total > max_bytes:
-                raise SkillError(f"文件超过大小上限: {label}")
+                raise _oversize_error(f"文件超过大小上限: {label}")
             chunks.append(chunk)
         return b"".join(chunks)
 
@@ -180,7 +195,10 @@ async def fetch_skill_from_url(url: str, *, transport=None) -> dict:
             files: dict[str, bytes] = {"SKILL.md": raw}
             running = len(raw)
             base = url[: url.rfind("/") + 1]
-            for rel in _relative_refs(content):
+            refs = _relative_refs(content)
+            if len(refs) > _REF_ATTEMPTS_MAX:
+                raise _oversize_error(f"技能引用数超过上限: > {_REF_ATTEMPTS_MAX}")
+            for rel in refs:
                 try:
                     blob = await _get_limited(client, base + rel, rel, required=False)
                 except _RefMissing:
@@ -274,12 +292,14 @@ async def fetch_skill_from_github(url: str, *, subpath: str | None = None,
                     if e.get("type") == "blob" and _is_skill_md(str(e.get("path") or ""))
                     and (not scoped or posixpath.dirname(str(e.get("path") or "")) == prefix)]
             hits = [h for h in hits if h]
-            if len(hits) > 1:
-                return {"candidates": [{"path": posixpath.dirname(h)} for h in sorted(hits)]}
-            if not hits:
+            # 候选按目录去重（复审 N-3）：同目录 SKILL.md+skill.md 变体折叠为单一直装
+            dirs = sorted(set(posixpath.dirname(h) for h in hits))
+            if len(dirs) > 1:
+                return {"candidates": [{"path": d} for d in dirs]}
+            if not dirs:
                 scope = f"目录 {prefix or '（仓库根）'}" if scoped else "仓库"
                 raise SkillError(f"{scope}内未找到 SKILL.md，请确认它是符合 Agent Skills 标准的技能")
-            base_dir = posixpath.dirname(hits[0])
+            base_dir = dirs[0]
             if len(base_dir) > 500:  # user_skill.subpath VARCHAR(500)，落库的是远端推导路径（复审 F-4）
                 raise SkillError("技能路径超过 500 字符上限")
             base_pre = f"{base_dir}/" if base_dir else ""
@@ -331,13 +351,11 @@ async def _fetch_tree(client: httpx.AsyncClient, api: str, ref: str) -> dict | N
             client, f"{api}/git/trees/{quote(ref, safe='/')}?recursive=1",
             "仓库文件树", required=True, max_bytes=5 * 1024 * 1024)
     except SkillError as e:
-        code = getattr(e, "status_code", None)
-        if code == 404:  # 按语义属性判，不盯文案（复审 F-8）
+        if getattr(e, "status_code", None) == 404:  # 按语义属性判，不盯文案（复审 F-8）
             return None
-        if code is not None:
-            raise  # 403/5xx 等 HTTP 错误原样上报
-        # 无 status_code = 响应体超预算（复审 F-5：独立文案，不误报普通 HTTP 错）
-        raise SkillError("仓库过大（文件树响应超过 5MB），请用 /tree/<ref>/<subpath> 指向具体目录") from e
+        if getattr(e, "oversize", False):  # 仅体积超预算走专属文案（复审 M-1）
+            raise SkillError("仓库过大（文件树响应超过 5MB），请用 /tree/<ref>/<subpath> 指向具体目录") from e
+        raise  # 403/5xx 及 SSRF 拒绝等原样上报
     return _json_or_error(raw, "仓库文件树")
 
 
