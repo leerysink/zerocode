@@ -279,3 +279,20 @@ async def test_slash_branch_ref_fallback_retry(client):
     paths = [q.url.path for q in reqs if q.url.host == "api.github.com"]
     assert "/repos/jane/dotfiles/git/trees/feature" in paths  # 首次尝试确实发生过
     assert "/repos/jane/dotfiles/git/trees/feature/x" in paths
+
+
+async def test_slash_branch_monorepo_two_step_candidate(client):
+    """复审 F-1：含斜杠分支的 monorepo——先取候选再带 subpath 二次提交必须 201（不再被回退门控排除）。"""
+    tree = [_blob("skills/a/SKILL.md"), _blob("skills/a/references/x.md"), _blob("skills/b/SKILL.md")]
+    files = {"skills/a/SKILL.md": SKILL_A, "skills/a/references/x.md": b"ref x",
+             "skills/b/SKILL.md": SKILL_B}
+    client.app.state.skills_http_transport = _gh_transport(
+        tree, files, repo="jane/dotfiles", ref="feature/x", bad_refs=("feature",))
+    url = "https://github.com/jane/dotfiles/tree/feature/x"
+    r = await client.post("/api/skills/install", json={"url": url})
+    assert r.status_code == 200, r.text  # 回退重试后拿到全仓树→多命中候选
+    assert [c["path"] for c in r.json()["candidates"]] == ["skills/a", "skills/b"]
+    r = await client.post("/api/skills/install", json={"url": url, "subpath": "skills/a"})
+    assert r.status_code == 201, r.text
+    assert r.json()["name"] == "Skill Alpha"
+    assert r.json()["subpath"] == "skills/a"

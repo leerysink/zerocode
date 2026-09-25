@@ -20,7 +20,12 @@ SLUG_MAX_LEN = 80             # slug 上限，给 next_free_slug 的 -N 后缀�
 
 
 class SkillError(Exception):
-    """技能安装/解析领域错误；api 层统一映射为 HTTP 400。"""
+    """技能安装/解析领域错误；api 层统一映射为 HTTP 400。
+
+    可附 status_code 属性（远端 HTTP 状态），供调用方按语义分支而非文案匹配。
+    """
+
+    status_code: int | None = None
 
 
 def parse_skill_md(content: str) -> tuple[str, str]:

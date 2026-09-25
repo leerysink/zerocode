@@ -263,6 +263,29 @@ async def test_oversize_optional_ref_skipped_not_fatal(client):
     assert not (skill_dir / "big.md").exists()
 
 
+async def test_direct_channel_ref_budget_stops_early(client):
+    """复审 F-2：直链引用累积途中即拒，请求数不由远端链接条数线性放大。"""
+    import httpx
+
+    # 200 个相对引用，每个回 900KB（均在 1MB 单文件限内），合计远超 10MB
+    links = " ".join(f"[r{i}](r{i}.md)" for i in range(200)).encode()
+    md = b"---\nname: ChainRef\ndescription: d\n---\n" + links
+    seen = []
+
+    async def handler(request):
+        seen.append(request.url.path)
+        if request.url.path.upper().endswith("SKILL.MD"):
+            return httpx.Response(200, content=md)
+        return httpx.Response(200, content=b"z" * (900 * 1024))
+    client.app.state.skills_http_transport = httpx.MockTransport(handler)
+    r = await client.post("/api/skills/install", json={"url": "https://x.invalid/a/SKILL.md"})
+    assert r.status_code == 400
+    assert "总大小" in r.text
+    # 越预算即停：实际发出的请求远少于 200 个引用（约 12~13 个就触顶）
+    assert len(seen) < 20, f"requests not stopped early: {len(seen)}"
+    assert (await client.get("/api/skills")).json() == []
+
+
 async def test_db_failure_cleans_up_skill_dir(client, monkeypatch, tmp_path):
     """审查 Blocker #1 兜底半边：DB 写入非 IntegrityError 异常不得留永久孤儿母本。"""
     from sqlalchemy.exc import DBAPIError

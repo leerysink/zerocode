@@ -115,19 +115,25 @@ async def _get_limited(client: httpx.AsyncClient, url: str, label: str, *,
             loc = resp.headers.get("location")
             if not loc or _hops >= _MAX_REDIRECTS:
                 if required:
-                    raise SkillError(f"拉取 {label} 失败: HTTP {resp.status_code}"
+                    err = SkillError(f"拉取 {label} 失败: HTTP {resp.status_code}"
                                      + ("" if loc else "（重定向缺少 Location）"))
+                    err.status_code = resp.status_code
+                    raise err
                 raise _RefMissing(label)
             target = urljoin(url, loc)
             tp = urlparse(target)
             if tp.scheme.lower() not in ("http", "https"):
                 raise SkillError("重定向目标协议不允许")
             _reject_internal_host(tp.hostname)
+            if tp.hostname != urlparse(url).hostname:  # 跨主机落点不带凭证（复审 F-6）
+                client.headers.pop("authorization", None)
             return await _get_limited(client, target, label, required=required,
                                       max_bytes=max_bytes, _hops=_hops + 1)
         if resp.status_code != 200:
             if required:
-                raise SkillError(f"拉取 {label} 失败: HTTP {resp.status_code}")
+                err = SkillError(f"拉取 {label} 失败: HTTP {resp.status_code}")
+                err.status_code = resp.status_code
+                raise err
             raise _RefMissing(label)
         declared = resp.headers.get("content-length", "")
         if declared.isdigit() and int(declared) > max_bytes:
@@ -172,15 +178,24 @@ async def fetch_skill_from_url(url: str, *, transport=None) -> dict:
             if len(name) > _NAME_MAX:
                 raise SkillError(f"技能 name 超过 {_NAME_MAX} 字符上限")
             files: dict[str, bytes] = {"SKILL.md": raw}
+            running = len(raw)
             base = url[: url.rfind("/") + 1]
             for rel in _relative_refs(content):
                 try:
-                    files[rel] = await _get_limited(client, base + rel, rel, required=False)
+                    blob = await _get_limited(client, base + rel, rel, required=False)
                 except _RefMissing:
                     pass  # 尽力而为：引用文件缺失不阻塞安装
                 except (httpx.HTTPError, SkillError):
                     # 引用文件超限/其它领域错误同样降级为跳过，不凭远端内容一票否决
                     pass
+                else:
+                    # 复审 F-2：预算守卫搬进循环，缓冲/请求数不再由远端链接条数线性放大
+                    running += len(blob)
+                    if running > TOTAL_MAX_BYTES:
+                        raise SkillError(f"技能总大小超过上限: > {TOTAL_MAX_BYTES} 字节")
+                    if len(files) >= FILE_COUNT_MAX:
+                        raise SkillError(f"技能文件数超过上限: > {FILE_COUNT_MAX}")
+                    files[rel] = blob
             check_size_budget(files)  # 直链通道整包守卫（审缺 M-4：引用可无限累积）
         except httpx.HTTPError as e:
             raise SkillError(f"远端请求失败: {type(e).__name__}") from e
@@ -241,8 +256,9 @@ async def fetch_skill_from_github(url: str, *, subpath: str | None = None,
             ref = spec["ref"] or await _default_branch(client, api)
             tree = await _fetch_tree(client, api, ref)
             if tree is None:
-                # 含斜杠分支名（feature/x）的 URL 天然歧义：404 时把 subpath 并入 ref 重试一次
-                if subpath is None and spec["subpath"]:
+                # 含斜杠分支名（feature/x）的 URL 天然歧义：404 时把 subpath 并入 ref 重试一次；
+                # 与显式 subpath 参数共存——候选二次提交同样需回退（复审 F-1）
+                if spec["subpath"]:
                     ref = f"{ref}/{spec['subpath']}"
                     spec["subpath"] = None
                     tree = await _fetch_tree(client, api, ref)
@@ -264,13 +280,18 @@ async def fetch_skill_from_github(url: str, *, subpath: str | None = None,
                 scope = f"目录 {prefix or '（仓库根）'}" if scoped else "仓库"
                 raise SkillError(f"{scope}内未找到 SKILL.md，请确认它是符合 Agent Skills 标准的技能")
             base_dir = posixpath.dirname(hits[0])
+            if len(base_dir) > 500:  # user_skill.subpath VARCHAR(500)，落库的是远端推导路径（复审 F-4）
+                raise SkillError("技能路径超过 500 字符上限")
             base_pre = f"{base_dir}/" if base_dir else ""
             # base_dir=="" 时 startswith("") 恒真=整树，与「未指定 subpath 单命中装全仓」语义一致
             blobs = [e for e in entries
                      if e.get("type") == "blob" and str(e.get("path") or "").startswith(base_pre)]
             if len(blobs) > FILE_COUNT_MAX:
                 raise SkillError(f"技能文件数超过上限: {len(blobs)} > {FILE_COUNT_MAX}")
-            declared_total = sum(int(e.get("size") or 0) for e in blobs)
+            try:  # 远端 shape 异常不能外溢成 500（复审 F-3）
+                declared_total = sum(int(str(e.get("size") or 0)) for e in blobs)
+            except ValueError:
+                raise SkillError("仓库文件树元数据异常：size 非数值") from None
             if declared_total > TOTAL_MAX_BYTES:
                 raise SkillError(f"技能总大小超过上限: {declared_total} > {TOTAL_MAX_BYTES} 字节")
             raw_base = (f"https://raw.githubusercontent.com/{quote(spec['owner'])}/"
@@ -278,7 +299,9 @@ async def fetch_skill_from_github(url: str, *, subpath: str | None = None,
             files: dict[str, bytes] = {}
             running = 0
             for e in blobs:
-                path = str(e["path"])
+                path = str(e.get("path") or "")
+                if not path:
+                    continue
                 rel = path[len(base_pre):]
                 data = await _get_limited(client, raw_base + quote(path), rel, required=True)
                 running += len(data)  # 元数据可能缺失，下载中按实际字节边接边拒（审查 I-2）
@@ -306,11 +329,15 @@ async def _fetch_tree(client: httpx.AsyncClient, api: str, ref: str) -> dict | N
     try:
         raw = await _get_limited(
             client, f"{api}/git/trees/{quote(ref, safe='/')}?recursive=1",
-            "仓库文件树", required=True)
+            "仓库文件树", required=True, max_bytes=5 * 1024 * 1024)
     except SkillError as e:
-        if "HTTP 404" in str(e):
+        code = getattr(e, "status_code", None)
+        if code == 404:  # 按语义属性判，不盯文案（复审 F-8）
             return None
-        raise
+        if code is not None:
+            raise  # 403/5xx 等 HTTP 错误原样上报
+        # 无 status_code = 响应体超预算（复审 F-5：独立文案，不误报普通 HTTP 错）
+        raise SkillError("仓库过大（文件树响应超过 5MB），请用 /tree/<ref>/<subpath> 指向具体目录") from e
     return _json_or_error(raw, "仓库文件树")
 
 
