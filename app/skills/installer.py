@@ -181,6 +181,7 @@ async def fetch_skill_from_url(url: str, *, transport=None) -> dict:
                 except (httpx.HTTPError, SkillError):
                     # 引用文件超限/其它领域错误同样降级为跳过，不凭远端内容一票否决
                     pass
+            check_size_budget(files)  # 直链通道整包守卫（审缺 M-4：引用可无限累积）
         except httpx.HTTPError as e:
             raise SkillError(f"远端请求失败: {type(e).__name__}") from e
         return {"name": name, "description": desc, "files": files,
@@ -205,7 +206,7 @@ def parse_github_url(url: str) -> dict | None:
     segs = [s for s in parsed.path.split("/") if s]
     if len(segs) < 2:
         raise SkillError("GitHub URL 至少要有 owner/repo")
-    repo = segs[1][:-4] if segs[1].endswith(".git") else segs[1]
+    repo = segs[1][:-4] if segs[1].lower().endswith(".git") else segs[1]
     out = {"owner": segs[0], "repo": repo, "ref": None, "subpath": None}
     if len(segs) > 2:
         if segs[2] != "tree" or len(segs) < 4:
@@ -228,6 +229,8 @@ async def fetch_skill_from_github(url: str, *, subpath: str | None = None,
     含根目录 ""），前端带 subpath 二次提交同一 install 端点。
     """
     _validate_http_url(url)
+    if subpath is not None and len(subpath) > 500:  # user_skill.subpath VARCHAR(500)
+        raise SkillError("subpath 超过 500 字符上限")
     spec = parse_github_url(url)
     if spec is None:
         raise SkillError("不是可扫描的 GitHub 仓库 URL")
@@ -236,25 +239,35 @@ async def fetch_skill_from_github(url: str, *, subpath: str | None = None,
     try:
         try:
             ref = spec["ref"] or await _default_branch(client, api)
-            tree = json.loads(await _get_limited(
-                client, f"{api}/git/trees/{quote(ref, safe='/')}?recursive=1",
-                "仓库文件树", required=True))
-            entries = tree.get("tree") or []
+            tree = await _fetch_tree(client, api, ref)
+            if tree is None:
+                # 含斜杠分支名（feature/x）的 URL 天然歧义：404 时把 subpath 并入 ref 重试一次
+                if subpath is None and spec["subpath"]:
+                    ref = f"{ref}/{spec['subpath']}"
+                    spec["subpath"] = None
+                    tree = await _fetch_tree(client, api, ref)
+                if tree is None:
+                    raise SkillError("获取仓库文件树失败：分支或路径不存在（HTTP 404）")
+            entries = [e for e in (tree.get("tree") or []) if isinstance(e, dict)]
             if tree.get("truncated"):
                 raise SkillError("仓库文件树过大（truncated），请用 subpath 指向具体技能目录")
+            # 审查 B-1：显式 subpath（含空串「仓库根」候选）与未指定扫描全域语义不同，不再把 "" 折叠成 None
+            scoped = subpath is not None or spec["subpath"] is not None
             prefix = ((subpath if subpath is not None else spec["subpath"]) or "").strip("/")
-            hits = [e["path"] for e in entries
-                    if e.get("type") == "blob" and _is_skill_md(e["path"])
-                    and (not prefix or posixpath.dirname(e["path"]) == prefix)]
-            scope = f"目录 {prefix}/" if prefix else "仓库"
+            hits = [str(e.get("path") or "") for e in entries
+                    if e.get("type") == "blob" and _is_skill_md(str(e.get("path") or ""))
+                    and (not scoped or posixpath.dirname(str(e.get("path") or "")) == prefix)]
+            hits = [h for h in hits if h]
             if len(hits) > 1:
                 return {"candidates": [{"path": posixpath.dirname(h)} for h in sorted(hits)]}
             if not hits:
+                scope = f"目录 {prefix or '（仓库根）'}" if scoped else "仓库"
                 raise SkillError(f"{scope}内未找到 SKILL.md，请确认它是符合 Agent Skills 标准的技能")
             base_dir = posixpath.dirname(hits[0])
             base_pre = f"{base_dir}/" if base_dir else ""
+            # base_dir=="" 时 startswith("") 恒真=整树，与「未指定 subpath 单命中装全仓」语义一致
             blobs = [e for e in entries
-                     if e.get("type") == "blob" and e["path"].startswith(base_pre)]
+                     if e.get("type") == "blob" and str(e.get("path") or "").startswith(base_pre)]
             if len(blobs) > FILE_COUNT_MAX:
                 raise SkillError(f"技能文件数超过上限: {len(blobs)} > {FILE_COUNT_MAX}")
             declared_total = sum(int(e.get("size") or 0) for e in blobs)
@@ -263,12 +276,21 @@ async def fetch_skill_from_github(url: str, *, subpath: str | None = None,
             raw_base = (f"https://raw.githubusercontent.com/{quote(spec['owner'])}/"
                         f"{quote(spec['repo'])}/{quote(ref, safe='/')}/")
             files: dict[str, bytes] = {}
+            running = 0
             for e in blobs:
-                rel = e["path"][len(base_pre):]
-                files[rel] = await _get_limited(client, raw_base + quote(e["path"]),
-                                                rel, required=True)
-            check_size_budget(files)  # trees 元数据可能缺 size，按实际字节复核
-            name, desc = parse_skill_md(files["SKILL.md"].decode("utf-8", "replace"))
+                path = str(e["path"])
+                rel = path[len(base_pre):]
+                data = await _get_limited(client, raw_base + quote(path), rel, required=True)
+                running += len(data)  # 元数据可能缺失，下载中按实际字节边接边拒（审查 I-2）
+                if running > TOTAL_MAX_BYTES:
+                    raise SkillError(f"技能总大小超过上限: > {TOTAL_MAX_BYTES} 字节")
+                files[rel] = data
+            check_size_budget(files)
+            # 命中判定大小写不敏感，回取也按同一规则（审查 I-1：防 skill.md 变体 KeyError→500）
+            key = next((k for k in files if _is_skill_md(k)), None)
+            if key is None:
+                raise SkillError("技能目录内未找到 SKILL.md，无法解析 frontmatter")
+            name, desc = parse_skill_md(files[key].decode("utf-8", "replace"))
             if len(name) > _NAME_MAX:
                 raise SkillError(f"技能 name 超过 {_NAME_MAX} 字符上限")
         except httpx.HTTPError as e:
@@ -279,8 +301,31 @@ async def fetch_skill_from_github(url: str, *, subpath: str | None = None,
         await client.aclose()
 
 
+async def _fetch_tree(client: httpx.AsyncClient, api: str, ref: str) -> dict | None:
+    """拉解析后的 trees JSON；404 返 None（给含斜杠分支的回退重试作信号），其余失败直报。"""
+    try:
+        raw = await _get_limited(
+            client, f"{api}/git/trees/{quote(ref, safe='/')}?recursive=1",
+            "仓库文件树", required=True)
+    except SkillError as e:
+        if "HTTP 404" in str(e):
+            return None
+        raise
+    return _json_or_error(raw, "仓库文件树")
+
+
+def _json_or_error(raw: bytes, label: str) -> dict:
+    try:
+        data = json.loads(raw)
+    except ValueError as e:
+        raise SkillError(f"{label}响应不是合法 JSON") from e
+    if not isinstance(data, dict):
+        raise SkillError(f"{label}响应不是 JSON 对象")
+    return data
+
+
 async def _default_branch(client: httpx.AsyncClient, api: str) -> str:
-    info = json.loads(await _get_limited(client, api, "仓库信息", required=True))
+    info = _json_or_error(await _get_limited(client, api, "仓库信息", required=True), "仓库信息")
     branch = str(info.get("default_branch") or "").strip()
     if not branch:
         raise SkillError("仓库没有默认分支，请用 /tree/<ref> 形态指定分支")

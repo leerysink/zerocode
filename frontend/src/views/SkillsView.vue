@@ -20,6 +20,7 @@ const installing = ref(false)
 const url = ref('')
 const candidates = ref(null) // GitHub 仓库多命中候选（{path} 清单）
 const candidateUrl = ref('')
+const pendingPath = ref(null) // 候选清单中正在安装的那一行（避免逐行按钮 loading 串扰）
 
 const columns = [
   { title: '名称', dataIndex: 'name' },
@@ -46,6 +47,9 @@ async function doInstall() {
     message.warning('请粘贴 GitHub 仓库或 SKILL.md 链接')
     return
   }
+  // 换 URL 重新安装时清掉旧候选卡：残留候选可能带错误仓库二次提交（审查 M-3）
+  candidates.value = null
+  candidateUrl.value = ''
   installing.value = true
   try {
     const { data } = await installSkill({ url: u })
@@ -65,13 +69,21 @@ async function doInstall() {
 
 async function pickCandidate(path) {
   installing.value = true
+  pendingPath.value = path
   try {
     const { data } = await installSkill({ url: candidateUrl.value, subpath: path })
+    // 二次提交仍可能返回候选（候选目录嵌套多技能）：不守卫会假成功 toast「undefined」（审查 B-1）
+    if (data.candidates) {
+      candidates.value = data.candidates
+      message.info('该路径下仍有多个技能，请再选一次')
+      return
+    }
     finishInstall(data)
   } catch (e) {
     message.error(e?.response?.data?.detail || '安装失败')
   } finally {
     installing.value = false
+    pendingPath.value = null
   }
 }
 
@@ -107,7 +119,8 @@ function finishInstall(data) {
     <a-card v-if="candidates" class="zc-card" title="选择要安装的技能">
       <div v-for="c in candidates" :key="c.path" class="zc-cand-row">
         <span class="zc-cand-path">{{ c.path || '（仓库根目录）' }}</span>
-        <a-button size="small" type="primary" :loading="installing"
+        <a-button size="small" type="primary" :disabled="installing"
+                  :loading="pendingPath === c.path"
                   @click="pickCandidate(c.path)">安装</a-button>
       </div>
     </a-card>
