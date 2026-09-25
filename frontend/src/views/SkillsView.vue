@@ -42,6 +42,7 @@ async function load() {
 onMounted(load)
 
 async function doInstall() {
+  if (installing.value) return  // 点击与 Enter 两条入口统一短路，防在飞时二次提交（复审 Nit-2）
   const u = url.value.trim()
   if (!u) {
     message.warning('请粘贴 GitHub 仓库或 SKILL.md 链接')

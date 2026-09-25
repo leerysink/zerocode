@@ -302,7 +302,8 @@ async def test_slash_branch_monorepo_two_step_candidate(client):
 
 
 async def test_cross_host_redirect_strips_token_header(client, monkeypatch):
-    """F-6：trees 落点 302 到外站，该跳不带 Authorization；后续同源请求 token 仍在（N-1）。"""
+    """F-6：trees 落点 302 到外站，该跳 authorization 被空串覆盖（真实 token 不外流）；
+    后续同源调用不受影响（N-1：非常驻突变）。用斜杠分支回退制造摘除跳之后的同源调用。"""
     import httpx
 
     monkeypatch.setenv("ZEROCODE_GITHUB_TOKEN", "SECRET-TOKEN")
@@ -313,21 +314,25 @@ async def test_cross_host_redirect_strips_token_header(client, monkeypatch):
                      request.headers.get("authorization")))
         if request.url.host == "api.github.com" and request.url.path == "/repos/owner/repo":
             return httpx.Response(200, json={"default_branch": "main"})
-        if request.url.path.startswith("/repos/owner/repo/git/trees/"):
+        if request.url.path == "/repos/owner/repo/git/trees/feature":
             return httpx.Response(302, headers={"location": "https://cdn.example.com/tree.json"})
-        if request.url.host == "cdn.example.com":
+        if request.url.path == "/repos/owner/repo/git/trees/feature/x":
             return httpx.Response(200, json={"tree": [_blob("SKILL.md")], "truncated": False})
+        if request.url.host == "cdn.example.com":
+            return httpx.Response(404)  # 外站 404 → 回退信号，触发摘除跳之后的第二次同源 trees
         if request.url.host == "raw.githubusercontent.com":
             return httpx.Response(200, content=SKILL_B)
         return httpx.Response(404)
     client.app.state.skills_http_transport = httpx.MockTransport(handler)
-    r = await client.post("/api/skills/install", json={"url": "https://github.com/owner/repo"})
-    assert r.status_code == 201, r.text
-    hop = [s for s in seen if s[0] == "cdn.example.com"][0]
-    assert not hop[2]  # 跨主机落点不带凭证（空串按请求覆盖，真实 token 不外流）
-    api_calls = [s for s in seen if s[0] == "api.github.com"]
-    # N-1：按请求剔除非常驻突变，其余 api.github.com 调用仍带 token
-    assert all(h == "Bearer SECRET-TOKEN" for _, _, h in api_calls)
+    r = await client.post("/api/skills/install",
+                          json={"url": "https://github.com/owner/repo/tree/feature/x"})
+    assert r.status_code == 201, r.text  # trees/feature →302→cdn 404 → 回退重试 trees/feature/x → 直装
+    hops = [s for s in seen if s[0] == "cdn.example.com"]
+    assert hops and all(h == "" for _, _, h in hops)  # 钉死空串覆盖，而非头缺失
+    idx_strip = seen.index(hops[0])
+    after = [s for s in seen[idx_strip + 1:] if s[0] == "api.github.com"]
+    assert after, "摘除跳之后需再发生一次同源调用，否则钉不住非常驻突变"
+    assert all(h == "Bearer SECRET-TOKEN" for _, _, h in after)
 
 
 async def test_trees_internal_redirect_keeps_ssrf_message(client):
