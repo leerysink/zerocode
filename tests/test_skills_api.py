@@ -76,10 +76,20 @@ async def test_same_name_reinstall_gets_slug_suffix(client):
     assert Path(s2["skill_dir"], "SKILL.md").is_file()
 
 
-async def test_github_repo_url_is_placeholder(client):
-    r = await client.post("/api/skills/install", json={"url": "https://github.com/o/r"})
-    assert r.status_code == 400
-    assert "下一票" in r.text or "直链" in r.text
+async def test_github_repo_url_scans_via_github_channel(client):
+    """002 后 GitHub 仓库 URL 不再占位报错：扫到多命中返候选（详表见 github 测试文件）。"""
+    import httpx
+
+    async def handler(request):
+        if request.url.path == "/repos/owner/repo":
+            return httpx.Response(200, json={"default_branch": "main"})
+        tree = [{"path": "skills/a/SKILL.md", "type": "blob", "size": 10},
+                {"path": "skills/b/SKILL.md", "type": "blob", "size": 10}]
+        return httpx.Response(200, json={"tree": tree, "truncated": False})
+    client.app.state.skills_http_transport = httpx.MockTransport(handler)
+    r = await client.post("/api/skills/install", json={"url": "https://github.com/owner/repo"})
+    assert r.status_code == 200
+    assert [c["path"] for c in r.json()["candidates"]] == ["skills/a", "skills/b"]
 
 
 async def test_direct_url_must_point_to_skill_md(client):
@@ -149,7 +159,7 @@ async def test_oversize_file_rejected(client):
     client.app.state.skills_http_transport = httpx.MockTransport(handler)
     r = await client.post("/api/skills/install", json={"url": "https://x.invalid/a/SKILL.md"})
     assert r.status_code == 400
-    assert "1MB" in r.text
+    assert "大小上限" in r.text
     assert (await client.get("/api/skills")).json() == []
 
 
@@ -183,10 +193,13 @@ async def test_unsafe_relative_refs_skipped(client):
 
 
 async def test_redirect_to_internal_host_rejected(client):
-    """审查 I-1：公网 URL 借 302 跳内网必须被落点复查拦下。"""
+    """审查 I-1：公网 URL 借 302 跳内网必须被拦，且内网请求根本不发出（002 逐跳预检）。"""
     import httpx
 
+    seen = []
+
     async def handler(request):
+        seen.append(request.url.host)
         if request.url.host == "outer.invalid":
             return httpx.Response(302, headers={"location": "http://127.0.0.1:5433/x/SKILL.md"})
         return httpx.Response(200, content=SKILL_MD)
@@ -194,7 +207,21 @@ async def test_redirect_to_internal_host_rejected(client):
     r = await client.post("/api/skills/install", json={"url": "https://outer.invalid/a/SKILL.md"})
     assert r.status_code == 400
     assert "内网" in r.text
+    assert "127.0.0.1" not in seen  # 落点预检在请求前，不是事后拦读
     assert (await client.get("/api/skills")).json() == []
+
+
+async def test_public_redirect_chain_followed(client):
+    """公网→公网的合法重定向仍能装成（逐跳手动跟不再误伤）。"""
+    import httpx
+
+    async def handler(request):
+        if request.url.host == "short.invalid":
+            return httpx.Response(301, headers={"location": "https://long.invalid/a/SKILL.md"})
+        return httpx.Response(200, content=SKILL_MD)
+    client.app.state.skills_http_transport = httpx.MockTransport(handler)
+    r = await client.post("/api/skills/install", json={"url": "https://short.invalid/a/SKILL.md"})
+    assert r.status_code == 201, r.text
 
 
 async def test_obfuscated_ip_host_rejected(client):

@@ -1,7 +1,7 @@
 <script setup>
-// 技能管理页（Ticket 001 / ADR-0004）：本票只做「直链安装 + 列表」。
-// 启用开关与删除（PATCH/DELETE）在 003 补，GitHub 仓库安装在 002 补——届时 install 返回
-// candidates 会走候选选择。当前从设置页头部进入，回退优先浏览器历史、兜底回设置页。
+// 技能管理页（Ticket 001/002 / ADR-0004）：直链 + GitHub 仓库安装 + 列表。
+// GitHub monorepo 多命中时后端返回 candidates，这里展示可选清单、带 subpath 二次提交。
+// 启用开关与删除（PATCH/DELETE）在 003 补。回退优先浏览器历史、兜底回设置页。
 import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { message } from 'ant-design-vue'
@@ -18,6 +18,8 @@ const skills = ref([])
 const loading = ref(false)
 const installing = ref(false)
 const url = ref('')
+const candidates = ref(null) // GitHub 仓库多命中候选（{path} 清单）
+const candidateUrl = ref('')
 
 const columns = [
   { title: '名称', dataIndex: 'name' },
@@ -41,20 +43,44 @@ onMounted(load)
 async function doInstall() {
   const u = url.value.trim()
   if (!u) {
-    message.warning('请粘贴 SKILL.md 链接')
+    message.warning('请粘贴 GitHub 仓库或 SKILL.md 链接')
     return
   }
   installing.value = true
   try {
     const { data } = await installSkill({ url: u })
-    message.success(`已安装技能：${data.name}`)
-    url.value = ''
-    await load()
+    if (data.candidates) {
+      candidates.value = data.candidates
+      candidateUrl.value = u
+      message.info('检测到多个技能，请选择要安装的一个')
+      return
+    }
+    finishInstall(data)
   } catch (e) {
     message.error(e?.response?.data?.detail || '安装失败')
   } finally {
     installing.value = false
   }
+}
+
+async function pickCandidate(path) {
+  installing.value = true
+  try {
+    const { data } = await installSkill({ url: candidateUrl.value, subpath: path })
+    finishInstall(data)
+  } catch (e) {
+    message.error(e?.response?.data?.detail || '安装失败')
+  } finally {
+    installing.value = false
+  }
+}
+
+function finishInstall(data) {
+  candidates.value = null
+  candidateUrl.value = ''
+  message.success(`已安装技能：${data.name}`)
+  url.value = ''
+  load()
 }
 </script>
 
@@ -69,13 +95,21 @@ async function doInstall() {
       <div class="zc-install-row">
         <a-input
           v-model:value="url"
-          placeholder="粘贴指向 SKILL.md 的直链，如 https://raw.githubusercontent.com/owner/repo/main/skills/pdf/SKILL.md"
+          placeholder="粘贴 GitHub 仓库链接（如 https://github.com/owner/repo）或指向 SKILL.md 的直链"
           allow-clear
-          @press-enter="doInstall"
+          @press-enter="doInstall()"
         />
-        <a-button type="primary" :loading="installing" @click="doInstall">安装</a-button>
+        <a-button type="primary" :loading="installing" @click="doInstall()">安装</a-button>
       </div>
       <p class="zc-tip">技能遵循 Anthropic Agent Skills 标准；安装后归属当前账户，工作区不会出现技能文件。</p>
+    </a-card>
+
+    <a-card v-if="candidates" class="zc-card" title="选择要安装的技能">
+      <div v-for="c in candidates" :key="c.path" class="zc-cand-row">
+        <span class="zc-cand-path">{{ c.path || '（仓库根目录）' }}</span>
+        <a-button size="small" type="primary" :loading="installing"
+                  @click="pickCandidate(c.path)">安装</a-button>
+      </div>
     </a-card>
 
     <a-table
@@ -126,6 +160,17 @@ async function doInstall() {
 .zc-install-row {
   display: flex;
   gap: 8px;
+}
+.zc-cand-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 0;
+}
+.zc-cand-path {
+  font-family: ui-monospace, Consolas, Menlo, monospace;
+  font-size: 13px;
 }
 .zc-tip {
   margin: 8px 0 0;

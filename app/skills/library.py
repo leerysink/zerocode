@@ -13,7 +13,9 @@ import yaml
 
 from app.config import data_dir
 
-MAX_FILE_BYTES = 1024 * 1024  # 单文件 1MB（spec §3 故事3；目录总量/文件数守卫在 002）
+MAX_FILE_BYTES = 1024 * 1024  # 单文件 1MB（spec §3 故事3）
+TOTAL_MAX_BYTES = 10 * 1024 * 1024  # 单技能目录 10MB（spec §3 故事3，002 GitHub 通道）
+FILE_COUNT_MAX = 600                # 单技能目录文件数上限（同上）
 SLUG_MAX_LEN = 80             # slug 上限，给 next_free_slug 的 -N 后缀留空间（列宽 VARCHAR(200)）
 
 
@@ -70,6 +72,15 @@ def next_free_slug(existing: set[str], base: str) -> str:
     while f"{base}-{k}" in existing:
         k += 1
     return f"{base}-{k}"
+
+
+def check_size_budget(files: dict[str, bytes]) -> None:
+    """整包尺寸守卫：文件数/总量超限即拒（spec §3 故事3；单文件 1MB 在取回/写盘处另有拦截）。"""
+    if len(files) > FILE_COUNT_MAX:
+        raise SkillError(f"技能文件数超过上限: {len(files)} > {FILE_COUNT_MAX}")
+    total = sum(len(b) for b in files.values())
+    if total > TOTAL_MAX_BYTES:
+        raise SkillError(f"技能总大小超过上限: {total} > {TOTAL_MAX_BYTES} 字节")
 
 
 def skills_root(uid) -> Path:
