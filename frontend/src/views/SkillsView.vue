@@ -1,12 +1,12 @@
 <script setup>
-// 技能管理页（Ticket 001/002 / ADR-0004）：直链 + GitHub 仓库安装 + 列表。
+// 技能管理页（Ticket 001~003 / ADR-0004）：直链 + GitHub 仓库安装 + 列表 + 启用开关 + 删除。
 // GitHub monorepo 多命中时后端返回 candidates，这里展示可选清单、带 subpath 二次提交。
-// 启用开关与删除（PATCH/DELETE）在 003 补。回退优先浏览器历史、兜底回设置页。
+// 回退优先浏览器历史、兜底回设置页。
 import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { message } from 'ant-design-vue'
-import { ArrowLeftOutlined } from '@ant-design/icons-vue'
-import { installSkill, listSkills } from '../api'
+import { message, Modal } from 'ant-design-vue'
+import { ArrowLeftOutlined, DeleteOutlined } from '@ant-design/icons-vue'
+import { deleteSkill, installSkill, listSkills, patchSkill } from '../api'
 
 const router = useRouter()
 function goBack() {
@@ -27,6 +27,7 @@ const columns = [
   { title: '描述', dataIndex: 'description' },
   { title: '来源', dataIndex: 'source_type', width: 90 },
   { title: '状态', dataIndex: 'enabled', key: 'enabled', width: 80 },
+  { title: '操作', key: 'ops', width: 72 },
 ]
 
 async function load() {
@@ -95,6 +96,41 @@ function finishInstall(data) {
   url.value = ''
   load()
 }
+
+// 启用开关（003）：PATCH 失败回滚开关状态，不做乐观常驻
+const toggling = ref(null)
+async function toggleEnabled(record, checked) {
+  toggling.value = record.id
+  record.enabled = checked
+  try {
+    await patchSkill(record.id, { enabled: checked })
+  } catch (e) {
+    record.enabled = !checked
+    message.error(e?.response?.data?.detail || '状态更新失败')
+  } finally {
+    toggling.value = null
+  }
+}
+
+// 删除（003）：二次确认；后端先删磁盘母本再删行，前端成功后就地移除
+function removeSkill(record) {
+  Modal.confirm({
+    title: '删除技能',
+    content: `确定删除「${record.name}」吗？磁盘母本一并删除，不可恢复。`,
+    okText: '删除',
+    okType: 'danger',
+    cancelText: '取消',
+    async onOk() {
+      try {
+        await deleteSkill(record.id)
+        skills.value = skills.value.filter((s) => s.id !== record.id)
+        message.success('技能已删除')
+      } catch (e) {
+        message.error(e?.response?.data?.detail || '删除失败')
+      }
+    },
+  })
+}
 </script>
 
 <template>
@@ -138,9 +174,13 @@ function finishInstall(data) {
     >
       <template #bodyCell="{ column, record }">
         <template v-if="column.key === 'enabled'">
-          <a-tag :color="record.enabled ? 'green' : 'default'">
-            {{ record.enabled ? '已启用' : '已停用' }}
-          </a-tag>
+          <a-switch :checked="record.enabled" :loading="toggling === record.id"
+                    @change="(v) => toggleEnabled(record, v)" />
+        </template>
+        <template v-if="column.key === 'ops'">
+          <a-button size="small" danger type="text" @click="removeSkill(record)">
+            <delete-outlined /> 删除
+          </a-button>
         </template>
       </template>
       <template #emptyText>

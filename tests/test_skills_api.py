@@ -1,6 +1,7 @@
 # tests/test_skills_api.py
-"""Ticket 001 技能直链安装示踪弹：install→list 闭环、frontmatter 校验、slug 后缀、
-双账号隔离、GitHub 占位。最高接缝＝HTTP API（installer 远端用 httpx.MockTransport 注入）。
+"""Ticket 001/003 技能 HTTP 面：install→list→PATCH→DELETE 闭环、frontmatter 校验、
+slug 后缀、双账号隔离与越权 404、母本磁盘治理。最高接缝＝HTTP API（installer 远端用
+httpx.MockTransport 注入）。
 """
 import pytest
 from pathlib import Path
@@ -298,3 +299,98 @@ async def test_db_failure_cleans_up_skill_dir(client, monkeypatch, tmp_path):
         await client.post("/api/skills/install", json={"url": "https://x.invalid/a/SKILL.md"})
     # 母本目录已被清理：users/*/skills 下不留任何子目录/文件
     assert list((tmp_path / "data").glob("users/*/skills/*")) == []
+
+
+# ---- Ticket 003：启用开关与删除（PATCH/DELETE + 越权 404）----
+
+
+async def _install_one(client):
+    client.app.state.skills_http_transport = _transport()
+    r = await client.post("/api/skills/install", json={"url": "https://x.invalid/a/SKILL.md"})
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
+async def test_patch_flips_enabled(client):
+    sk = await _install_one(client)
+    assert sk["enabled"] is True
+    r = await client.patch(f"/api/skills/{sk['id']}", json={"enabled": False})
+    assert r.status_code == 200, r.text
+    assert r.json()["enabled"] is False
+    rows = (await client.get("/api/skills")).json()
+    assert [x["enabled"] for x in rows] == [False]  # 列表持久化看到停用
+    r = await client.patch(f"/api/skills/{sk['id']}", json={"enabled": True})
+    assert r.status_code == 200 and r.json()["enabled"] is True
+
+
+async def test_patch_nonexistent_404(client):
+    r = await client.patch("/api/skills/99999999", json={"enabled": False})
+    assert r.status_code == 404
+
+
+async def test_delete_removes_row_and_disk(client, tmp_path):
+    sk = await _install_one(client)
+    skill_dir = Path(sk["skill_dir"])
+    assert skill_dir.is_dir()
+    r = await client.delete(f"/api/skills/{sk['id']}")
+    assert r.status_code == 200, r.text
+    assert (await client.get("/api/skills")).json() == []
+    assert not skill_dir.exists()  # 母本同删，不留孤儿目录
+    # 再删同一 id → 404（行已不在）
+    assert (await client.delete(f"/api/skills/{sk['id']}")).status_code == 404
+
+
+async def test_cross_account_patch_and_delete_404(two_auth_clients, tmp_path):
+    alice, bob = two_auth_clients
+    sk = await _install_one(alice)
+    assert (await bob.patch(f"/api/skills/{sk['id']}", json={"enabled": False})).status_code == 404
+    assert (await bob.delete(f"/api/skills/{sk['id']}")).status_code == 404
+    # 越权尝试后 alice 的行与母本分毫未动
+    rows = (await alice.get("/api/skills")).json()
+    assert [x["id"] for x in rows] == [sk["id"]] and rows[0]["enabled"] is True
+    assert Path(sk["skill_dir"]).is_dir()
+
+
+async def test_delete_dir_failure_keeps_row(client, monkeypatch):
+    """故事8 的次序保险丝：目录删不掉则整体失败不动行，不造清单外的孤儿反例。"""
+    import app.api.skills as skills_api
+    from app.skills.library import SkillError
+
+    sk = await _install_one(client)
+
+    def _boom(uid, d):
+        raise SkillError("模拟磁盘错误")
+    monkeypatch.setattr(skills_api, "delete_skill_dir", _boom)
+    r = await client.delete(f"/api/skills/{sk['id']}")
+    assert r.status_code == 400
+    assert "磁盘" in r.text
+    rows = (await client.get("/api/skills")).json()
+    assert [x["id"] for x in rows] == [sk["id"]]  # 行未动，可重试
+
+
+async def test_delete_out_of_root_skill_dir_refused(client, tmp_path):
+    """路径围栏：残行/改库把 skill_dir 指向根外时，DELETE 拒绝且不动那目录。"""
+    sk = await _install_one(client)
+    victim = tmp_path / "data" / "users" / "other"
+    victim.mkdir(parents=True, exist_ok=True)
+    (victim / "keep.txt").write_bytes(b"do not delete")
+
+    async with client.app.state.session_factory() as s:
+        from sqlalchemy import text
+        await s.execute(text("UPDATE user_skill SET skill_dir=:d WHERE id=:i"),
+                        {"d": str(victim), "i": sk["id"]})
+        await s.commit()
+    r = await client.delete(f"/api/skills/{sk['id']}")
+    assert r.status_code == 400
+    assert "路径异常" in r.text
+    assert victim.is_dir() and (victim / "keep.txt").is_file()
+    # 围栏内但已不存在的目录：再指回自己根下的空位，删除可自愈（行仍在）
+    ghost = str(Path(sk["skill_dir"]).parent / "ghost-skill")
+    async with client.app.state.session_factory() as s:
+        from sqlalchemy import text
+        await s.execute(text("UPDATE user_skill SET skill_dir=:d WHERE id=:i"),
+                        {"d": ghost, "i": sk["id"]})
+        await s.commit()
+    r = await client.delete(f"/api/skills/{sk['id']}")
+    assert r.status_code == 200  # 不存在视为已删，残行可清理
+    assert (await client.get("/api/skills")).json() == []

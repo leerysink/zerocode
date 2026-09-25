@@ -130,3 +130,21 @@ def write_skill_dir(uid, slug: str, files: dict[str, bytes]) -> Path:
         shutil.rmtree(tmp, ignore_errors=True)
         raise
     return dest
+
+
+def delete_skill_dir(uid, skill_dir: str) -> None:
+    """删除技能母本目录（003）：限用户自己技能根内，不存在视为已删。
+
+    路径围栏：DB 行理论上只由我们写入，但残行/手工改库也不能让 DELETE
+    接口变成任意目录删除器。越界/失败抛 SkillError，调用方不得继续删行。
+    """
+    root = skills_root(uid).resolve()
+    p = Path(skill_dir).resolve()
+    if root not in p.parents or p == root:
+        raise SkillError("技能目录路径异常，已拒绝删除")
+    if not p.exists():
+        return
+    try:
+        shutil.rmtree(p)
+    except OSError as e:
+        raise SkillError("技能目录删除失败，请重试") from e

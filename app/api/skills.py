@@ -1,7 +1,7 @@
-"""技能 HTTP 端点（spec §5 / Ticket 001）：列表 + 直链安装。
+"""技能 HTTP 端点（spec §5 / Ticket 001~003）：列表 + 双通道安装 + 启用开关 + 删除。
 
 鉴权沿用全局 guard（/api/skills 非白名单即要求会话）；归属一律按 request.state.actor["id"]
-过滤，越权语义（PATCH/DELETE）在 003 兑现。启用开关/删除/PATCH 后续票补。
+过滤，PATCH/DELETE 带 owner 条件、越权返 404（不区分 403，沿用登录项目裁定）。
 """
 import shutil
 
@@ -12,8 +12,8 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
 from app.skills import installer
-from app.skills.library import (SkillError, next_free_slug, slugify,
-                                write_skill_dir)
+from app.skills.library import (SkillError, delete_skill_dir, next_free_slug,
+                                slugify, write_skill_dir)
 
 router = APIRouter(prefix="/api/skills")
 
@@ -24,6 +24,10 @@ _COLUMNS = ("id, slug, name, description, source_type, source_url, "
 class InstallIn(BaseModel):
     url: str
     subpath: str | None = None  # 仅 GitHub 仓库通道有意义（monorepo 候选二次提交）
+
+
+class PatchIn(BaseModel):
+    enabled: bool
 
 
 @router.get("")
@@ -87,3 +91,45 @@ async def install(request: Request, body: InstallIn):
         shutil.rmtree(dest, ignore_errors=True)
         raise
     return dict(row)
+
+
+@router.patch("/{skill_id}")
+async def patch_skill(request: Request, skill_id: int, body: PatchIn):
+    """启用/停用翻转（spec §3 故事7）：owner 条件更新，越权/不存在一律 404。"""
+    uid = request.state.actor["id"]
+    async with request.app.state.session_factory() as s:
+        row = (await s.execute(text(
+            "UPDATE user_skill SET enabled=:e, updated_at=NOW() "
+            "WHERE id=:i AND owner_user_id=:u "
+            f"RETURNING {_COLUMNS}"),
+            {"e": body.enabled, "i": skill_id, "u": uid})).mappings().first()
+        await s.commit()
+    if row is None:
+        raise HTTPException(404, "技能不存在")
+    return dict(row)
+
+
+@router.delete("/{skill_id}")
+async def delete_skill(request: Request, skill_id: int):
+    """删除技能（spec §3 故事8）：先删磁盘母本成功、再删 DB 行；目录删不掉则不动行。
+
+    顺序刻意反常规：行是目录的清单，先删行会造清单外的孤儿母本；残行+已删目录
+    可由再次删除自愈（delete_skill_dir 不存在视为已删）。
+    """
+    uid = request.state.actor["id"]
+    async with request.app.state.session_factory() as s:
+        row = (await s.execute(text(
+            "SELECT skill_dir FROM user_skill WHERE id=:i AND owner_user_id=:u"),
+            {"i": skill_id, "u": uid})).first()
+    if row is None:
+        raise HTTPException(404, "技能不存在")
+    try:
+        delete_skill_dir(uid, row[0])
+    except SkillError as e:
+        raise HTTPException(400, str(e))
+    async with request.app.state.session_factory() as s:
+        await s.execute(text(
+            "DELETE FROM user_skill WHERE id=:i AND owner_user_id=:u"),
+            {"i": skill_id, "u": uid})
+        await s.commit()
+    return {"ok": True}
