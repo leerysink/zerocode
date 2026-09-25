@@ -162,6 +162,23 @@ describe('DeployLogPanel', () => {
     expect(FakeWS.instances[1].closed).toBe(true)
   })
 
+  it('认证拒绝（4401）：不重连，引导去登录页（Ticket 009）', async () => {
+    const assign = vi.fn()
+    const saved = window.location
+    Object.defineProperty(window, 'location', { value: { assign }, writable: true, configurable: true })
+    try {
+      await mountPanel()
+      const sock = FakeWS.instances[0]
+      sock.onclose({ code: 4401 })
+      expect(assign).toHaveBeenCalledWith('/login')
+      // 原重连排在 500ms 后：等过那个窗口，确认没有新连接被 scheduled
+      await new Promise((r) => setTimeout(r, 1100))
+      expect(FakeWS.instances.length).toBe(1)
+    } finally {
+      Object.defineProperty(window, 'location', { value: saved, writable: true, configurable: true })
+    }
+  })
+
   it('拉取失败不白屏：错误进 note', async () => {
     devLogs.mockRejectedValue({ response: { data: { detail: '应用不存在' } } })
     const w = await mountPanel()

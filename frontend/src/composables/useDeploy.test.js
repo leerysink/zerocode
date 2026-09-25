@@ -13,7 +13,7 @@ class FakeWS {
   addEventListener(t, fn) { (this.listeners[t] ||= []).push(fn) }
   open() { this.listeners.open?.forEach(f => f()) }
   recv(obj) { this.listeners.message?.forEach(f => f({ data: JSON.stringify(obj) })) }
-  close() { this.listeners.close?.forEach(f => f()) }
+  close(code) { this.listeners.close?.forEach(f => f({ code })) }
 }
 
 beforeEach(() => { vi.useFakeTimers(); FakeWS.instances = []; globalThis.WebSocket = FakeWS })
@@ -95,6 +95,39 @@ describe('useDeploy', () => {
     FakeWS.instances.at(-1).close()
     vi.advanceTimersByTime(20000)
     expect(FakeWS.instances.length).toBe(1)      // close() 后不再重连
+  })
+
+  it('4401（未登录被服务端拒）：不再重连，引导去登录页（Ticket 009）', () => {
+    const assign = vi.fn()
+    const saved = window.location
+    Object.defineProperty(window, 'location', { value: { assign }, writable: true, configurable: true })
+    try {
+      const d = useDeploy(7)
+      d.connect()
+      FakeWS.instances.at(-1).close(4401)
+      vi.advanceTimersByTime(20000)
+      expect(FakeWS.instances.length).toBe(1)      // 认证拒绝不是网络抖动：无限重连只会刷屏
+      expect(assign).toHaveBeenCalledWith('/login')
+    } finally {
+      Object.defineProperty(window, 'location', { value: saved, writable: true, configurable: true })
+    }
+  })
+
+  it('普通断线（非 44xx）照常重连，不受认证分支影响', () => {
+    const assign = vi.fn()
+    const saved = window.location
+    Object.defineProperty(window, 'location', { value: { assign }, writable: true, configurable: true })
+    try {
+      const d = useDeploy(7)
+      d.connect()
+      FakeWS.instances.at(-1).open()
+      FakeWS.instances.at(-1).close(1006)
+      vi.advanceTimersByTime(1000)
+      expect(FakeWS.instances.length).toBe(2)
+      expect(assign).not.toHaveBeenCalled()
+    } finally {
+      Object.defineProperty(window, 'location', { value: saved, writable: true, configurable: true })
+    }
   })
 
   it('坏 JSON 与 ping 静默忽略；reset 清空 steps 与缓冲', () => {

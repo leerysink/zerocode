@@ -28,6 +28,29 @@ router = APIRouter()
 
 @router.websocket("/ws/chat/{session_id}")
 async def ws_chat(ws: WebSocket, session_id: int):
+    # WS 认证收口（Ticket 009 / spec §3 故事12）：/ws scope 不走 HTTP guard 中间件，
+    # 这里 accept 前解析 zc_actor cookie → by_token，未登录拒 4401；
+    # 会话经 workspace 归属他人拒 4404（HTTP 侧越权统一 404 的 WS 映射，不暴露存在性）。
+    # 拒绝用 accept+close 而非 accept 前 close：uvicorn 会把后者转成 HTTP 403，
+    # close code 被吞（浏览器只见 1006），前端 onclose 按 4401 跳登录就无从判断。
+    # 校验本身在 accept 前完成：被拒连接从不注册 emit 槽/不触任何业务。
+    from app.store import identity
+    actor = await identity.by_token(
+        ws.app.state.session_factory, ws.cookies.get(identity.ACTOR_COOKIE))
+    if actor is None:
+        await ws.accept()
+        await ws.close(code=4401)
+        return
+    async with ws.app.state.session_factory() as s:
+        owner = (await s.execute(_sql(
+            "SELECT w.owner_user_id FROM chat_session cs "
+            "JOIN workspace w ON w.id = cs.workspace_id WHERE cs.id=:i"),
+            {"i": session_id})).scalar()
+    if owner != actor["id"]:
+        await ws.accept()
+        await ws.close(code=4404)
+        return
+
     await ws.accept()
     app = ws.app
     hub = app.state.hub

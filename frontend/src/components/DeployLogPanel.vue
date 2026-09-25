@@ -96,9 +96,13 @@ function connect() {
       handleEvent(JSON.parse(m.data))
     } catch { /* 非 JSON 帧忽略 */ }
   }
-  ws.onclose = () => {
+  ws.onclose = (ev) => {
     live.value = false
     ws = null
+    // WS 认证收口（Ticket 009）：4401=未登录拒→登录页；4404=资源不可用；
+    // 被拒的握手不是断线，排重连只会无限循环。
+    if (ev?.code === 4401) { window.location.assign('/login'); return }
+    if (ev?.code === 4404) return
     // 面板还开着就续上：预览启动过程往往正是最需要看的时候，断一次就永远停在快照很难看。
     if (props.active && retries < 3) {
       retries += 1

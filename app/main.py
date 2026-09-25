@@ -148,7 +148,8 @@ def create_app(database_url: str | None = None) -> FastAPI:
     app.include_router(ws_router)
 
     # ---- 全局登录 guard（Ticket 002 / ADR-0003）：/api/* 除 /api/auth/* 外一律要求会话 ----
-    # /ws/* 属 WebSocket scope 不经 http 中间件，收口在 Ticket 009；静态资源（SPA）不拦。
+    # /ws/* 属 WebSocket scope 不经 http 中间件，已在 Ticket 009 收口（ws/deploy_ws 端点内
+    # 自行 by_token 鉴权，未登录拒 close 4401）；静态资源（SPA）不拦。
     # actor 挂 request.state.actor 供业务层取用；by_token 命中即续期（store 侧既有同款语义）。
     from fastapi.responses import JSONResponse
 

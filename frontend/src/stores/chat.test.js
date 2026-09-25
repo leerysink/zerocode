@@ -1,6 +1,13 @@
 // applyEvent 纯函数测试：传入普通对象即可（不依赖 pinia/WS）
-import { describe, it, expect } from 'vitest'
-import { applyEvent } from './chat'
+// @vitest-environment happy-dom   （Ticket 009 的 WS 接线用例需要 window/location 与 pinia）
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { createPinia, setActivePinia } from 'pinia'
+import { applyEvent, useChatStore } from './chat'
+
+vi.mock('../api', async (importOriginal) => ({
+  ...(await importOriginal()),
+  wsUrl: (p) => 'ws://t' + p,
+}))
 
 function mk() {
   return { messages: [], streamingContent: '', streamingThinking: '', todoList: [], compacting: false, pendingAsk: null }
@@ -54,5 +61,63 @@ describe('applyEvent 新事件', () => {
   it('session_title 找不到对应条目时安全忽略（未加载的分组/已删会话）', () => {
     const s = { ...mk(), currentSessionId: 99, currentWorkspaceId: 2, sessionsByWs: {} }
     expect(() => applyEvent(s, { type: 'session_title', title: 'x' })).not.toThrow()
+  })
+})
+
+// Ticket 009：WS 认证收口的前端侧——close code 4401（未登录）跳登录页、4404（会话不可用）
+// 不再重连；两者都不能落进既有指数退避重连循环（对认证拒绝无限重连只会刷屏）。
+describe('WS onclose 认证分支（Ticket 009）', () => {
+  class PropWS {
+    static instances = []
+    constructor(url) { this.url = url; this.readyState = 1; PropWS.instances.push(this) }
+    send() {}
+    close() {}
+  }
+  let savedLocation
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    PropWS.instances = []
+    globalThis.WebSocket = PropWS
+    vi.useFakeTimers()
+    savedLocation = window.location
+  })
+  afterEach(() => { vi.useRealTimers(); Object.defineProperty(window, 'location', { value: savedLocation, writable: true, configurable: true }) })
+
+  function stubLocation() {
+    const assign = vi.fn()
+    Object.defineProperty(window, 'location', { value: { assign }, writable: true, configurable: true })
+    return assign
+  }
+
+  it('4401：跳登录页且不再重连', () => {
+    const assign = stubLocation()
+    const store = useChatStore()
+    store.connect(5)
+    expect(PropWS.instances.length).toBe(1)
+    PropWS.instances.at(-1).onclose({ code: 4401 })
+    vi.advanceTimersByTime(60000)
+    expect(PropWS.instances.length).toBe(1)
+    expect(assign).toHaveBeenCalledWith('/login')
+  })
+
+  it('4404：会话不可用（被删/越权），停止重连也不跳登录', () => {
+    const assign = stubLocation()
+    const store = useChatStore()
+    store.connect(5)
+    PropWS.instances.at(-1).onclose({ code: 4404 })
+    vi.advanceTimersByTime(60000)
+    expect(PropWS.instances.length).toBe(1)
+    expect(assign).not.toHaveBeenCalled()
+    expect(store.wsStatus).toBe('disconnected')
+  })
+
+  it('普通断线（无 44xx）仍按退避重连（既有行为不回退）', () => {
+    const assign = stubLocation()
+    const store = useChatStore()
+    store.connect(5)
+    PropWS.instances.at(-1).onclose({ code: 1006 })
+    vi.advanceTimersByTime(60000)
+    expect(PropWS.instances.length).toBeGreaterThan(1)
+    expect(assign).not.toHaveBeenCalled()
   })
 })

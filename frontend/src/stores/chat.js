@@ -199,8 +199,12 @@ export const useChatStore = defineStore('chat', {
         this._retry = 0 // 连接成功后退避归零
       }
       ws.onmessage = (e) => applyEvent(this, JSON.parse(e.data))
-      ws.onclose = () => {
+      ws.onclose = (ev) => {
         this.wsStatus = 'disconnected'
+        // WS 认证收口（Ticket 009）：4401=未登录拒→登录页；4404=会话不可用（被删/越权）。
+        // 都不是网络抖动，落进退避重连会无限重复被拒的握手。
+        if (ev?.code === 4401) { window.location.assign('/login'); return }
+        if (ev?.code === 4404) return
         // 断线指数退避重连：1s→2s→4s→…上限 15s
         const delay = Math.min(1000 * 2 ** (this._retry || 0), 15000)
         this._retry = (this._retry || 0) + 1

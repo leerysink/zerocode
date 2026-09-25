@@ -76,9 +76,13 @@ export function useDeploy(appId) {
       }
       fire(ev)
     })
-    ws.addEventListener('close', () => {
+    ws.addEventListener('close', (ev) => {
       ws = null
       connected.value = false
+      // WS 认证收口（Ticket 009）：4401=未登录拒→登录页；4404=资源不可用→安静停下。
+      // 两者都不是网络抖动，落进退避重连只会无限重复被拒的握手。
+      if (ev?.code === 4401) { window.location.assign('/login'); return }
+      if (ev?.code === 4404) return
       if (!closedByUs) {
         timer = setTimeout(connect, backoff)
         backoff = Math.min(backoff * 2, 15000)

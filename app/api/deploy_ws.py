@@ -19,6 +19,15 @@ _KEEPALIVE = 30.0      # 秒：无事件时的保活探测间隔（测试里改�
 
 @router.websocket("/ws/deploy/{app_id}")
 async def deploy_ws(ws: WebSocket, app_id: int):
+    # WS 认证收口（Ticket 009）：未登录拒 4401。拒绝用 accept+close：accept 前 close
+    # 会被 uvicorn 转成 HTTP 403，close code 到不了浏览器 onclose。订阅注册在鉴权之后。
+    from app.store import identity
+    actor = await identity.by_token(
+        ws.app.state.session_factory, ws.cookies.get(identity.ACTOR_COOKIE))
+    if actor is None:
+        await ws.accept()
+        await ws.close(code=4401)
+        return
     await ws.accept()
     hub = ws.app.state.deploy_hub
     q = hub.subscribe(app_id)

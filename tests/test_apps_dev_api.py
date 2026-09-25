@@ -374,6 +374,7 @@ async def test_sqlchange_apply_reports_docker_failure(client, dev_app, monkeypat
 async def test_ws_deploy_hello(client, dev_app):
     """连接即回一条 hello（前端据此确认订阅成功、开始拉状态）。"""
     with TestClient(client.app) as tc:
+        tc.cookies.set("zc_actor", client.cookies.get("zc_actor"))  # WS 认证（Ticket 009）：裸连拒 4401
         with tc.websocket_connect(f"/ws/deploy/{dev_app}") as ws:
             msg = ws.receive_json()
             assert msg["type"] == "hello" and msg["app_id"] == dev_app
@@ -402,6 +403,7 @@ async def test_ws_deploy_keepalive_ping_keeps_stream_open(client, dev_app, monke
 
     monkeypatch.setattr(ws_api, "_KEEPALIVE", 0.05)
     with TestClient(client.app) as tc:
+        tc.cookies.set("zc_actor", client.cookies.get("zc_actor"))  # WS 认证（Ticket 009）
         with tc.websocket_connect(f"/ws/deploy/{dev_app}") as ws:
             assert ws.receive_json()["type"] == "hello"
             assert [ws.receive_json()["type"] for _ in range(3)] == ["ping", "ping", "ping"]
@@ -410,6 +412,7 @@ async def test_ws_deploy_keepalive_ping_keeps_stream_open(client, dev_app, monke
 async def test_ws_deploy_unsubscribes_on_disconnect(client, dev_app):
     """断连必须退订：每次预览页开合都留一个僵尸队列的话，hub 会被越堆越大的槽吃满。"""
     with TestClient(client.app) as tc:
+        tc.cookies.set("zc_actor", client.cookies.get("zc_actor"))  # WS 认证（Ticket 009）
         hub = tc.app.state.deploy_hub
         with tc.websocket_connect(f"/ws/deploy/{dev_app}") as ws:
             assert ws.receive_json()["type"] == "hello"
