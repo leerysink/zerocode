@@ -410,3 +410,82 @@ async def test_delete_out_of_root_skill_dir_refused(client, tmp_path):
     r = await client.delete(f"/api/skills/{sk['id']}")
     assert r.status_code == 200  # 不存在视为已删，残行可清理
     assert (await client.get("/api/skills")).json() == []
+
+
+# ---- Ticket 006：跨票全链路冒烟（API 安装 → agent 注入 → 受控读面 → 停用即隐 → 删除清盘）----
+
+class _Rec2:
+    def __init__(self):
+        self.ev = []
+
+    async def __call__(self, e):
+        self.ev.append(e)
+
+
+async def _e2e_cfg():
+    return {"agent.write_confirm": False, "agent.ask_timeout_seconds": 0,
+            "agent.max_tool_rounds": 30, "agent.history_window": 40}
+
+
+async def _run_agent_build_system(sf, sid, first_turn_done):
+    """走真实 AgentRunner.run 路径取回本轮 system 文本（fake-llm，不打网络）。"""
+    from app.agent.llm import ScriptedLLM
+    from app.agent.loop import AgentRunner
+    done = [{"type": "content_delta", "content": "好"},
+            {"type": "done", "message": {"role": "assistant", "content": first_turn_done, "tool_calls": None}}]
+    llm = ScriptedLLM([done])
+    runner = AgentRunner(sf, llm, _e2e_cfg, _Rec2(),
+                         lambda *a, **k: None, lambda *a, **k: True)
+    await runner.run(sid, "帮我处理 PDF", __import__("asyncio").Event())
+    return llm.received[0][0]["content"]
+
+
+async def test_full_chain_install_inject_read_disable_delete(client, tmp_path):
+    """把 001/002(install)、003(enabled/delete)、004(prompt 注入)、005(受控读) 串成一条真实路径：
+    同一条已安装技能的绝对母本路径，既被注入 system，又能经 read_file 受控读面读回。"""
+    from sqlalchemy import text
+    from app.agent.tools import ToolContext, execute_tool
+
+    # 1) 安装（直链通道，MockTransport）
+    client.app.state.skills_http_transport = _transport()
+    r = await client.post("/api/skills/install", json={"url": "https://x.invalid/pdf/SKILL.md"})
+    assert r.status_code == 201, r.text
+    sk = r.json()
+    skill_dir = Path(sk["skill_dir"])
+    assert skill_dir.is_dir()
+
+    # 取安装者 owner uid（技能行归属）+ 用同一 session_factory 建 owner 的工作区与会话
+    sf = client.app.state.session_factory
+    async with sf() as s:
+        uid = (await s.execute(text(
+            "SELECT owner_user_id FROM user_skill WHERE id=:i"), {"i": sk["id"]})).scalar()
+        ws_root = tmp_path / "ws"
+        ws_root.mkdir(exist_ok=True)
+        ws = (await s.execute(text(
+            "INSERT INTO workspace (name, root_path, owner_user_id) VALUES ('e2e', :p, :u) RETURNING id"),
+            {"p": str(ws_root), "u": uid})).scalar()
+        sid = (await s.execute(text(
+            "INSERT INTO chat_session (workspace_id) VALUES (:w) RETURNING id"), {"w": ws})).scalar()
+        await s.commit()
+
+    # 2) Agent 构建 messages：已启用技能名与绝对路径都出现在 <available_skills>
+    sys = await _run_agent_build_system(sf, sid, "好了")
+    assert "<available_skills>" in sys and sk["name"] in sys and str(skill_dir) in sys
+
+    # 3) 受控读面：Agent 拿注入的绝对路径 read_file 读 SKILL.md 全文（与 system 里那行路径一致）
+    ctx = ToolContext(root=ws_root, session_id=sid, session_factory=sf, send=_Rec2(),
+                      skills_root=skill_dir.parent)
+    res = await execute_tool(ctx, "read_file", {"path": str(skill_dir / "SKILL.md")})
+    assert "PDF" in res["content"]
+
+    # 4) 停用→再构建 messages：技能从块中消失（故事10 enabled 驱动）
+    rp = await client.patch(f"/api/skills/{sk['id']}", json={"enabled": False})
+    assert rp.status_code == 200
+    sys2 = await _run_agent_build_system(sf, sid, "再看")
+    assert "<available_skills>" not in sys2
+
+    # 5) 删除→行与盘同清（故事8 先删盘后删行）
+    rd = await client.delete(f"/api/skills/{sk['id']}")
+    assert rd.status_code == 200
+    assert not skill_dir.exists()
+    assert (await client.get("/api/skills")).json() == []
