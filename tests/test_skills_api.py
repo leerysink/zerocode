@@ -3,6 +3,9 @@
 slug 后缀、双账号隔离与越权 404、母本磁盘治理。最高接缝＝HTTP API（installer 远端用
 httpx.MockTransport 注入）。
 """
+import asyncio
+import json
+
 import pytest
 from pathlib import Path
 
@@ -427,22 +430,35 @@ async def _e2e_cfg():
             "agent.max_tool_rounds": 30, "agent.history_window": 40}
 
 
-async def _run_agent_build_system(sf, sid, first_turn_done):
-    """走真实 AgentRunner.run 路径取回本轮 system 文本（fake-llm，不打网络）。"""
+def _e2e_turn(content, tool_calls=None):
+    return [{"type": "done", "message": {"role": "assistant", "content": content,
+                                         "tool_calls": tool_calls}}]
+
+
+def _e2e_tool_call(id_, name, **args):
+    return {"id": id_, "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}}
+
+
+async def _e2e_run(sf, sid, turns):
+    """走真实 AgentRunner.run 路径（fake-llm，不打网络）：返回 (status, 事件流, llm)。
+
+    ask 替身与 test_agent_loop 同形（asyncio.sleep(0)）：防未来脚本发 ask_user 轮次时
+    await None 的 TypeError 被 run() 吞成没人看的 error 事件（复审 M-2）。
+    """
     from app.agent.llm import ScriptedLLM
     from app.agent.loop import AgentRunner
-    done = [{"type": "content_delta", "content": "好"},
-            {"type": "done", "message": {"role": "assistant", "content": first_turn_done, "tool_calls": None}}]
-    llm = ScriptedLLM([done])
-    runner = AgentRunner(sf, llm, _e2e_cfg, _Rec2(),
-                         lambda *a, **k: None, lambda *a, **k: True)
-    await runner.run(sid, "帮我处理 PDF", __import__("asyncio").Event())
-    return llm.received[0][0]["content"]
+    rec = _Rec2()
+    llm = ScriptedLLM(turns)
+    runner = AgentRunner(sf, llm, _e2e_cfg, rec,
+                         lambda *a, **k: asyncio.sleep(0, None), lambda *a, **k: True)
+    status = await runner.run(sid, "帮我处理 PDF", asyncio.Event())
+    return status, rec.ev, llm
 
 
 async def test_full_chain_install_inject_read_disable_delete(client, tmp_path):
     """把 001/002(install)、003(enabled/delete)、004(prompt 注入)、005(受控读) 串成一条真实路径：
-    同一条已安装技能的绝对母本路径，既被注入 system，又能经 read_file 受控读面读回。"""
+    脚本轮次发 read_file 工具调用，路径取自注入到 system 里的那一行 —— 从注入到读取
+    全程经 AgentRunner 生产接线（含 _skills_root_of 拼 ToolContext，复审 I-1）。"""
     from sqlalchemy import text
     from app.agent.tools import ToolContext, execute_tool
 
@@ -468,23 +484,39 @@ async def test_full_chain_install_inject_read_disable_delete(client, tmp_path):
             "INSERT INTO chat_session (workspace_id) VALUES (:w) RETURNING id"), {"w": ws})).scalar()
         await s.commit()
 
-    # 2) Agent 构建 messages：已启用技能名与绝对路径都出现在 <available_skills>
-    sys = await _run_agent_build_system(sf, sid, "好了")
+    # 2) 真 AgentRunner.run：已启用技能名与绝对路径都出现在 <available_skills>
+    tc = _e2e_tool_call("call_1", "read_file", path=str(skill_dir / "SKILL.md"))
+    turns = [[{"type": "content_delta", "content": "读一下"},
+              {"type": "done", "message": {"role": "assistant", "content": None, "tool_calls": [tc]}}],
+             _e2e_turn("读完")]
+    status, evs, llm = await _e2e_run(sf, sid, turns)
+    # run() 吞异常换状态码：状态不裁决则注入/读面段的失败会静默通过（复审 M-1）
+    assert status == "idle", evs
+    assert not [e for e in evs if e["type"] == "error"]
+    sys = llm.received[0][0]["content"]
     assert "<available_skills>" in sys and sk["name"] in sys and str(skill_dir) in sys
 
-    # 3) 受控读面：Agent 拿注入的绝对路径 read_file 读 SKILL.md 全文（与 system 里那行路径一致）
-    ctx = ToolContext(root=ws_root, session_id=sid, session_factory=sf, send=_Rec2(),
-                      skills_root=skill_dir.parent)
-    res = await execute_tool(ctx, "read_file", {"path": str(skill_dir / "SKILL.md")})
-    assert "PDF" in res["content"]
+    # 3) 受控读面经生产接线生效：loop 里 _skills_root_of 拼出的 ToolContext 读到全文
+    tr = [e for e in evs if e["type"] == "tool_result" and e["name"] == "read_file"]
+    assert len(tr) == 1, evs
+    assert "PDF" in tr[0]["result"]["content"]
+    assert tr[0]["result"]["size"] == (skill_dir / "SKILL.md").stat().st_size  # 读回的是全文
 
-    # 4) 停用→再构建 messages：技能从块中消失（故事10 enabled 驱动）
+    # 4) 故事12：工作区树永不可见技能母本（读面只在 workspace 外，不并入工作区）
+    ld = await execute_tool(ToolContext(root=ws_root, session_id=sid, session_factory=sf,
+                                        send=_Rec2()), "list_dir", {"path": "."})
+    names = {e["name"] for e in ld["entries"]}
+    assert sk["slug"] not in names and "data" not in names
+
+    # 5) 停用→再构建 messages：技能从块中消失（故事10 enabled 驱动）
     rp = await client.patch(f"/api/skills/{sk['id']}", json={"enabled": False})
     assert rp.status_code == 200
-    sys2 = await _run_agent_build_system(sf, sid, "再看")
-    assert "<available_skills>" not in sys2
+    status2, evs2, llm2 = await _e2e_run(sf, sid, [_e2e_turn("再看")])
+    assert status2 == "idle", evs2
+    sys2 = llm2.received[0][0]["content"]
+    assert "<available_skills>" not in sys2 and sk["name"] not in sys2
 
-    # 5) 删除→行与盘同清（故事8 先删盘后删行）
+    # 6) 删除→行与盘同清（故事8 先删盘后删行）
     rd = await client.delete(f"/api/skills/{sk['id']}")
     assert rd.status_code == 200
     assert not skill_dir.exists()
