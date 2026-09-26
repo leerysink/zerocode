@@ -5,6 +5,7 @@ httpx.MockTransport 注入）。
 """
 import asyncio
 import json
+import re
 
 import pytest
 from pathlib import Path
@@ -457,7 +458,7 @@ async def _e2e_run(sf, sid, turns):
 
 async def test_full_chain_install_inject_read_disable_delete(client, tmp_path):
     """把 001/002(install)、003(enabled/delete)、004(prompt 注入)、005(受控读) 串成一条真实路径：
-    脚本轮次发 read_file 工具调用，路径取自注入到 system 里的那一行 —— 从注入到读取
+    读取路径从注入到 system 的文本里正则抽出 —— 从注入到读取
     全程经 AgentRunner 生产接线（含 _skills_root_of 拼 ToolContext，复审 I-1）。"""
     from sqlalchemy import text
     from app.agent.tools import ToolContext, execute_tool
@@ -485,36 +486,44 @@ async def test_full_chain_install_inject_read_disable_delete(client, tmp_path):
         await s.commit()
 
     # 2) 真 AgentRunner.run：已启用技能名与绝对路径都出现在 <available_skills>
-    tc = _e2e_tool_call("call_1", "read_file", path=str(skill_dir / "SKILL.md"))
-    turns = [[{"type": "content_delta", "content": "读一下"},
-              {"type": "done", "message": {"role": "assistant", "content": None, "tool_calls": [tc]}}],
-             _e2e_turn("读完")]
-    status, evs, llm = await _e2e_run(sf, sid, turns)
+    status, evs, llm = await _e2e_run(sf, sid, [_e2e_turn("好了")])
     # run() 吞异常换状态码：状态不裁决则注入/读面段的失败会静默通过（复审 M-1）
     assert status == "idle", evs
     assert not [e for e in evs if e["type"] == "error"]
-    sys = llm.received[0][0]["content"]
-    assert "<available_skills>" in sys and sk["name"] in sys and str(skill_dir) in sys
+    sys_text = llm.received[0][0]["content"]
+    assert "<available_skills>" in sys_text and sk["name"] in sys_text and str(skill_dir) in sys_text
 
-    # 3) 受控读面经生产接线生效：loop 里 _skills_root_of 拼出的 ToolContext 读到全文
-    tr = [e for e in evs if e["type"] == "tool_result" and e["name"] == "read_file"]
-    assert len(tr) == 1, evs
-    assert "PDF" in tr[0]["result"]["content"]
-    assert tr[0]["result"]["size"] == (skill_dir / "SKILL.md").stat().st_size  # 读回的是全文
+    # 3) 受控读面经生产接线生效：读取路径从注入文本里抽取（真数据流绑定，复审 Minor-4），
+    #    脚本轮次发 read_file tool_call，由 loop 内 _skills_root_of 拼的 ToolContext 执行
+    m = re.search(r"(?m)^- name: .*\| path: (.+)$", sys_text)
+    assert m, sys_text
+    tc = _e2e_tool_call("call_1", "read_file", path=str(Path(m.group(1)) / "SKILL.md"))
+    turns = [[{"type": "content_delta", "content": "读一下"},
+              {"type": "done", "message": {"role": "assistant", "content": None, "tool_calls": [tc]}}],
+             _e2e_turn("读完")]
+    status2, evs2, _ = await _e2e_run(sf, sid, turns)
+    assert status2 == "idle", evs2
+    tr = [e for e in evs2 if e["type"] == "tool_result" and e["name"] == "read_file"]
+    assert len(tr) == 1, evs2
+    # _dispatch 把 ToolError 吞成 ok:False：先裁决返回形状再取键，失败时直接透出 error 文本
+    assert tr[0]["result"].get("ok") is not False, tr[0]["result"]
+    body = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
+    assert tr[0]["result"]["content"] == body  # 全文一致性自证（size 断言无区分能力，复审 Minor-1）
 
-    # 4) 故事12：工作区树永不可见技能母本（读面只在 workspace 外，不并入工作区）
+    # 4) 故事12：工作区树永不可见技能母本（结构性守卫，非生产接线断言，复审 Minor-2）
     ld = await execute_tool(ToolContext(root=ws_root, session_id=sid, session_factory=sf,
                                         send=_Rec2()), "list_dir", {"path": "."})
     names = {e["name"] for e in ld["entries"]}
     assert sk["slug"] not in names and "data" not in names
+    assert ws_root.resolve() not in skill_dir.resolve().parents  # 落盘位置与workspace无包含关系
 
     # 5) 停用→再构建 messages：技能从块中消失（故事10 enabled 驱动）
     rp = await client.patch(f"/api/skills/{sk['id']}", json={"enabled": False})
     assert rp.status_code == 200
-    status2, evs2, llm2 = await _e2e_run(sf, sid, [_e2e_turn("再看")])
-    assert status2 == "idle", evs2
-    sys2 = llm2.received[0][0]["content"]
-    assert "<available_skills>" not in sys2 and sk["name"] not in sys2
+    status3, evs3, llm3 = await _e2e_run(sf, sid, [_e2e_turn("再看")])
+    assert status3 == "idle", evs3
+    sys2_text = llm3.received[0][0]["content"]
+    assert "<available_skills>" not in sys2_text and sk["name"] not in sys2_text
 
     # 6) 删除→行与盘同清（故事8 先删盘后删行）
     rd = await client.delete(f"/api/skills/{sk['id']}")
