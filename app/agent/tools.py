@@ -5,6 +5,8 @@ from sqlalchemy import text
 
 MAX_READ_BYTES = 200 * 1024
 BINARY_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".pdf", ".zip", ".gz", ".exe", ".dll", ".so", ".bin", ".db", ".sqlite", ".mp3", ".mp4"}
+# 技能母本受控读面文本白名单（故事11）：references/assets 常见形态，非此列表一律拒
+SKILL_READ_EXTS = {".md", ".txt", ".json", ".csv", ".yaml", ".yml"}
 
 class ToolError(Exception):
     pass
@@ -21,12 +23,49 @@ def resolve_in_workspace(root: Path, rel: str | None) -> Path:
         raise ToolError(f"路径越界: {rel}")
     return full
 
+
+def resolve_skill_path(skills_root: Path | None, abs_path: str | None) -> Path | None:
+    """技能目录受控读面（spec §5 / 故事11）：把 <available_skills> 给出的**绝对路径**
+    收敛到当前用户技能根内。命中返回 Path；非绝对/根缺失/越出技能根/resolve 失败（死链接、
+    reparse 点）一律返回 None，由调用方回落到既有工作区越界报错——绝不开第二读面（§4 双保险）。
+    仅 read_file 使用；写类工具不调用本函数（母本对 Agent 只读）。
+    """
+    if not skills_root or not abs_path:
+        return None
+    p = Path(abs_path)
+    if not p.is_absolute():
+        return None
+    try:
+        root_r = Path(skills_root).resolve()
+        full = p.resolve()
+    except (OSError, RuntimeError, ValueError):  # 死链接/reparse 点/空字节路径都归 None
+        return None
+    if root_r != full and root_r not in full.parents:
+        return None
+    return full
+
+
+def is_skill_scripts(path: Path, root: Path) -> bool:
+    """技能母本 scripts/ 子树检测（故事11：脚本不在 v1 消费面）。
+
+    只对**技能根内的相对段**判定，不看整条绝对路径（复审 I-1）——否则祖先
+    目录（如仓库 clone 进名为 scripts 的父目录、或 ZEROCODE_DATA_DIR 含 scripts 段）
+    同名会误拒整个读面。path 不在 root 内时返回 False（调用方已围栏，理论不可达）。
+    """
+    try:
+        rel_parts = path.relative_to(root).parts
+    except ValueError:
+        return False
+    return "scripts" in rel_parts
+
+
 @dataclasses.dataclass
 class ToolContext:
     root: Path
     session_id: int
     session_factory: Any
     send: Callable[[dict], Awaitable[None]]
+    skills_root: Path | None = None  # 该用户技能母本根（受控读面）；None = 无技能读面，存量调用不受影响
 
 def _unified_diff(path: str, before: str, after: str) -> str:
     return "".join(difflib.unified_diff(
@@ -60,7 +99,25 @@ async def execute_tool(ctx: ToolContext, name: str, args: dict) -> dict:
 
     if name == "read_file":
         rel = args.get("path")
-        f = resolve_in_workspace(ctx.root, rel)
+        try:
+            f = resolve_in_workspace(ctx.root, rel)
+        except ToolError as ws_err:
+            # 工作区解析失败：回落技能目录受控读面（<available_skills> 给的是绝对路径）；
+            # 仍不在技能根内则维持原越界/绝对路径报错，不开第二读面（spec §4 双保险）
+            sk = resolve_skill_path(ctx.skills_root, rel)
+            if sk is None:
+                raise ws_err
+            if not sk.is_file():
+                raise ToolError(f"文件不存在: {rel}")
+            if is_skill_scripts(sk, Path(ctx.skills_root).resolve()):
+                raise ToolError(f"技能 scripts/ 目录不在读取范围: {rel}")
+            if sk.suffix.lower() not in SKILL_READ_EXTS:
+                raise ToolError(
+                    f"技能目录仅可读文本类文件（{'/'.join(sorted(SKILL_READ_EXTS))}）: {rel}")
+            size = sk.stat().st_size
+            if size > MAX_READ_BYTES:
+                raise ToolError(f"文件超过 200KB（{size} 字节）: {rel}")
+            return {"path": rel, "content": sk.read_text(encoding="utf-8", errors="replace"), "size": size}
         # M-3（终审 M43）：deploy/** 含凭据明文，AI 读面同样收口（口令不得进模型上下文/对话历史外发 LLM）；
         # 调用顺序与 write/edit 一致：先 resolve 拒越界，后 guard。app.json 读放行（契约要求 AI 看清单）。
         from app.deploy.guard import is_secret_read

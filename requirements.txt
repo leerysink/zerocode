@@ -9,3 +9,4 @@ asgi-lifespan>=0.1.0
 pytest
 pytest-asyncio
 httpx
+pyyaml>=6.0
