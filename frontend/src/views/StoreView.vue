@@ -11,6 +11,9 @@ const tab = ref('store')
 const releases = ref([])
 const mine = ref([])
 const review = ref([])
+// 审批权收口创始人（平台管理员）：非创始人不展示审批收件箱；
+// 收件箱读接口对非创始人返回空列表、决策接口 403 兜底（后端 applications.py）。
+const isFounder = ref(false)
 const applyOpen = ref(false)
 const applyTarget = ref(null)
 const applyName = ref('')
@@ -24,7 +27,8 @@ async function load () {
 
 onMounted(async () => {
   try {
-    await api.authMe()   // 登录门禁：401 走下方 catch 引导去登录页；昵称回显已上全局顶栏（AccountBar）
+    const res = await api.authMe()   // 登录门禁 + 创始人角色（昵称回显已上全局顶栏 AccountBar）
+    isFounder.value = !!res.data?.is_founder
     await load()
   } catch (e) {
     // 非 auth 接口的 401 由 axios 拦截器统一跳转；authMe 在豁免名单里，这里自己引导
@@ -40,7 +44,7 @@ async function submitApply () {
   if (!name) { message.warning('给应用起个名字'); return }
   await api.storeApply(applyTarget.value.id, name)
   applyOpen.value = false
-  message.success('已提交申请，等发布者审批')
+  message.success('已提交申请，等管理员审批')
   await load()
 }
 
@@ -104,8 +108,8 @@ function gotoApps () { window.location.href = '/apps' }
                      { title: '状态', dataIndex: 'status' }, { title: '说明', dataIndex: 'reason' }]" />
       </a-tab-pane>
 
-      <a-tab-pane key="review">
-        <template #tab><span data-test="tab-review">待我审批</span></template>
+      <a-tab-pane v-if="isFounder" key="review">
+        <template #tab><span data-test="tab-review">待审批</span></template>
         <a-empty v-if="!review.length" description="没有待审批的申请" />
         <div v-for="row in review" :key="row.id" class="zc-review-row">
           <div><b>{{ row.want_name }}</b> · 来自 {{ row.title }} {{ row.version }}</div>

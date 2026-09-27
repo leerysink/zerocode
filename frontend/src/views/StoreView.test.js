@@ -1,5 +1,5 @@
 // @vitest-environment happy-dom
-// Task 12 + Ticket 008：商店页三视图（列表/我的申请/待审批）与登录态身份的接线契约。
+// Task 12 + Ticket 008：商店页三视图与登录态身份接线；审批收件箱只对创始人（平台管理员）可见。
 // 真 Antd 插件挂载（与 AppsView 的桩件模式不同：商店页无 WS/进度流，交互全在 tabs/modal 上）。
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { flushPromises, mount } from '@vue/test-utils'
@@ -75,7 +75,22 @@ describe('StoreView', () => {
     }
   })
 
+  it('非创始人看不到审批收件箱（审批权收口创始人）', async () => {
+    api.authMe.mockResolvedValue({ data: { id: 1, nickname: '普通用户', is_founder: false } })
+    const w = mountView()
+    await flushPromises()
+    expect(w.find('[data-test="tab-review"]').exists()).toBe(false)
+  })
+
+  it('创始人看到审批收件箱并可决策', async () => {
+    api.authMe.mockResolvedValue({ data: { id: 1, nickname: '管理员', is_founder: true } })
+    const w = mountView()
+    await flushPromises()
+    expect(w.find('[data-test="tab-review"]').exists()).toBe(true)
+  })
+
   it('审批：驳回必须填原因才可调接口', async () => {
+    api.authMe.mockResolvedValue({ data: { id: 1, nickname: '管理员', is_founder: true } })
     const w = mountView()
     await flushPromises()
     await w.find('[data-test="tab-review"]').trigger('click')

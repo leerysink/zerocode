@@ -30,6 +30,40 @@ async def test_商店身份即登录用户没有第二套actor(client):
     assert actor["id"] == me["id"] and actor["nickname"] == me["nickname"]
 
 
+async def test_审批权在HTTP层收口到创始人(two_auth_clients, test_engine):
+    """端点接线的靶心：is_founder 只能来自会话 actor——
+    bob（非创始人，即便是版本发布者）决策 403、收件箱空；alice（创始人，局外人）可批。
+    直连 sf 写库的用例显式请求 test_engine（同 test_isolation_config_models:73 先例），
+    保证清库 finalizer 的拆序正确，不泄漏状态给下一个用例。"""
+    alice, bob = two_auth_clients   # alice 首注册即创始人
+    sf = alice.app.state.session_factory
+    async with sf() as s:
+        bob_id = (await s.execute(text("SELECT id FROM actor WHERE nickname = 'bob'"))).scalar()
+        rid = (await s.execute(text(
+            "INSERT INTO app_release (app_id, slug, version, title, stack, anchor, "
+            "fingerprint, status, created_by) VALUES (0, 'gating', 'b1', '门禁', "
+            "'vue3-fastapi', '[]'::jsonb, 'fp-g1', 'published', :a) RETURNING id"),
+            {"a": bob_id})).scalar()
+        await s.commit()
+    a = await bob.post("/api/store/applications",
+                       json={"release_id": int(rid), "want_name": "bob的实例"})
+    assert a.status_code == 201, a.text
+    aid = a.json()["id"]
+    # 发布者本人也无权决策（权限翻转）
+    r = await bob.post(f"/api/store/applications/{aid}/reject",
+                       json={"approve": False, "reason": "越权尝试"})
+    assert r.status_code == 403
+    # bob 的审批收件箱为空（不再按版本归属分发）
+    assert (await bob.get("/api/store/applications?box=review")).json() == []
+    # alice 看得到全部 pending 并可代批
+    rows = (await alice.get("/api/store/applications?box=review")).json()
+    assert [x["id"] for x in rows] == [aid]
+    r2 = await alice.post(f"/api/store/applications/{aid}/reject",
+                          json={"approve": False, "reason": "名字不合适"})
+    assert r2.status_code == 200 and r2.json()["status"] == "rejected"
+    assert (await alice.get("/api/store/applications?box=review")).json() == []
+
+
 async def test_releases_list_only_published(client):
     """未上架时是空列表而不是 404；withdrawn 不出现。"""
     r = await client.get("/api/store/releases")

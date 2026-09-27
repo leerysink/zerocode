@@ -139,7 +139,8 @@ async def apply(request: Request, body: ApplyIn, actor: dict = Actor):
 async def list_applications(request: Request, box: str = "mine", actor: dict = Actor):
     sf = request.app.state.session_factory
     try:
-        return await apps_svc.list_box(sf, box=box, actor_id=actor["id"])
+        return await apps_svc.list_box(sf, box=box, actor_id=actor["id"],
+                                       is_founder=bool(actor.get("is_founder")))
     except DeployError as e:
         raise _http(e)
 
@@ -154,6 +155,7 @@ async def approve(request: Request, aid: int, body: DecideIn, actor: dict = Acto
     hub = request.app.state.deploy_hub
     try:
         a = await apps_svc.decide(sf, app_id=aid, approver_id=actor["id"],
+                                  approver_is_founder=bool(actor.get("is_founder")),
                                   approve=body.approve, reason=body.reason)
         if not body.approve:
             return a
@@ -170,6 +172,7 @@ async def reject(request: Request, aid: int, body: DecideIn, actor: dict = Actor
     sf = request.app.state.session_factory
     try:
         return await apps_svc.decide(sf, app_id=aid, approver_id=actor["id"],
+                                     approver_is_founder=bool(actor.get("is_founder")),
                                      approve=False, reason=body.reason)
     except DeployError as e:
         raise _http(e)
