@@ -6,7 +6,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from app.db import make_session_factory
-from app.deploy import provision, sqlrun
+from app.deploy import provision
 from app.deploy.errors import DeployError
 from app.services import db_admin_service as svc
 
@@ -287,3 +287,102 @@ async def test_sql_select_timeout_enforced(db_app, monkeypatch):
             "SELECT status, error FROM db_operation_log WHERE app_id=:a AND status='error' "
             "ORDER BY id DESC LIMIT 1"), {"a": aid})).mappings().first()
     assert row and row["error"]
+
+
+# ---------- Ticket 005: 后端边界用例补齐 ----------
+
+async def _seed_widgets(client, slug, pairs):
+    """往 provision 好的 dev 库 widgets 表插行（独立连接，与端点无关）。"""
+    eng = await _dev_eng(client, slug)
+    try:
+        async with eng.begin() as conn:
+            for i, n in pairs:
+                await conn.exec_driver_sql(f"INSERT INTO widgets(id,name) VALUES ({i},'{n}')")
+    finally:
+        await eng.dispose()
+
+
+async def _dev_eng(client, slug):
+    sf = client.app.state.session_factory
+    cred = await provision.read_cred(sf, slug, "dev")
+    return create_async_engine(svc.target_engine_url(_FakeReq(client.app), cred))
+
+
+async def test_sql_update_and_delete_report_affected_rows(db_app):
+    """边界：UPDATE/DELETE 返回真实影响行数（且真落库）。"""
+    client, aid, slug, _ = db_app
+    await _seed_widgets(client, slug, [(1, "a"), (2, "b"), (3, "c")])
+    r = await client.post(f"/api/apps/{aid}/db/dev/sql",
+                          json={"sql": "UPDATE widgets SET name='x' WHERE id < 3"})
+    assert r.status_code == 200, r.text
+    assert r.json()["kind"] == "affected" and r.json()["affected"] == 2
+    r2 = await client.post(f"/api/apps/{aid}/db/dev/sql",
+                           json={"sql": "DELETE FROM widgets WHERE id < 3"})
+    assert r2.json()["affected"] == 2
+    eng = await _dev_eng(client, slug)
+    try:
+        async with eng.connect() as conn:
+            left = (await conn.exec_driver_sql("SELECT count(*) FROM widgets")).scalar()
+    finally:
+        await eng.dispose()
+    assert left == 1  # 仅 id=3 存活，证实 DELETE 已提交
+
+
+async def test_sql_ddl_persists_and_affected_non_negative(db_app):
+    """边界：DDL 执行后对象确实变更；rowcount=-1 被钳为非负 0。"""
+    client, aid, slug, _ = db_app
+    r = await client.post(f"/api/apps/{aid}/db/dev/sql",
+                          json={"sql": "CREATE TABLE probe_ddl (x int)"})
+    assert r.status_code == 200, r.text
+    assert r.json()["kind"] == "affected" and r.json()["affected"] >= 0
+    eng = await _dev_eng(client, slug)
+    try:
+        async with eng.connect() as conn:
+            exists = (await conn.exec_driver_sql(
+                "SELECT 1 FROM information_schema.tables WHERE table_name='probe_ddl'")).first()
+    finally:
+        await eng.dispose()
+    assert exists is not None
+
+
+async def test_data_endpoint_injection_table_name_not_500(db_app):
+    """边界：恶意表名（含引号/分号/空格）作为绑定参数查不到→非500，不改变语句、不注入。"""
+    client, aid, slug, _ = db_app
+    await _seed_widgets(client, slug, [(1, "a")])
+    evil = 'widgets"; DROP TABLE widgets; --'
+    r = await client.get(f"/api/apps/{aid}/db/dev/tables/{evil}/data")
+    assert r.status_code in (404, 400)
+    # 关键：widgets 表仍在（注入未执行 DROP）
+    eng = await _dev_eng(client, slug)
+    try:
+        async with eng.connect() as conn:
+            still = (await conn.exec_driver_sql(
+                "SELECT 1 FROM information_schema.tables WHERE table_name='widgets'")).first()
+    finally:
+        await eng.dispose()
+    assert still is not None
+
+
+async def test_data_endpoint_readable_without_pk(db_app):
+    """边界：无主键表的 data 端仍可浏览（禁编辑不影响读取）。"""
+    client, aid, slug, _ = db_app
+    eng = await _dev_eng(client, slug)
+    async with eng.begin() as conn:
+        await conn.exec_driver_sql("CREATE TABLE nopk (a int, b text)")
+        await conn.exec_driver_sql("INSERT INTO nopk VALUES (1,'x'),(2,'y')")
+    await eng.dispose()
+    r = await client.get(f"/api/apps/{aid}/db/dev/tables/nopk/data")
+    assert r.status_code == 200, r.text
+    assert len(r.json()["rows"]) == 2
+    rs = await client.get(f"/api/apps/{aid}/db/dev/tables/nopk/schema")
+    assert rs.json()["primary_key"] == []  # 无主键→前端禁编辑的依据
+
+
+async def test_audit_foreign_app_404(two_auth_clients):
+    """边界：非归属账号查他人 app 审计→404（不暴露存在性）。"""
+    c_alice, c_bob = two_auth_clients
+    sf = c_alice.app.state.session_factory
+    uid_a = (await c_alice.get("/api/auth/me")).json()["id"]
+    aid = await _make_app_row(sf, uid_a, "auditforeign", 8531, 8532)
+    r = await c_bob.get(f"/api/apps/{aid}/db/audit")
+    assert r.status_code == 404
