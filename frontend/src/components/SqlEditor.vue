@@ -32,21 +32,22 @@ const classHighlightStyle = HighlightStyle.define([
   { tag: t.typeName, class: 'cm-type' },
 ])
 
-// 对齐操作台的灰边卡片 + 主色 #5b7a9d；token 颜色靠上面 classHighlightStyle 打的类名落到这里（US-01）。
+// 编辑器只管自己的“内”（token 配色 / 光标 / 选中）；外框、高度、等宽字体由 db-admin.less 的
+// .zc-sql-editor-host 统一给（避免两处各画一重 1px 边框、也避免 min-height 和实际高度错位）。
 const consoleTheme = EditorView.theme({
-  '&': { backgroundColor: '#fff', border: '1px solid #e5e7eb', borderRadius: '6px', fontSize: '13px' },
-  '&.cm-focused': { outline: 'none', borderColor: '#5b7a9d' },
-  '.cm-content': { fontFamily: 'ui-monospace, SFMono-Regular, Consolas, monospace', caretColor: '#5b7a9d', padding: '8px 0' },
-  '.cm-cursor, .cm-dropCursor': { borderLeftColor: '#5b7a9d' },
+  '&': { backgroundColor: '#fff', fontSize: '13px' },
+  '&.cm-focused': { outline: 'none' },
+  '.cm-content': { caretColor: '#4a6d94', padding: '8px 0' },
+  '.cm-cursor, .cm-dropCursor': { borderLeftColor: '#4a6d94' },
   '.cm-selectionBackground, &.cm-focused .cm-selectionBackground, .cm-content ::selection': { backgroundColor: '#dce6f0' },
   '.cm-activeLine': { backgroundColor: '#f4f8fb' },
-  '.cm-gutters': { backgroundColor: '#f7f9fb', color: '#9aa5b1', border: 'none', borderRight: '1px solid #e5e7eb' },
+  '.cm-gutters': { backgroundColor: '#f7f9fb', color: '#8d98a6', border: 'none', borderRight: '1px solid #dfe5ec' },
   '.cm-keyword': { color: '#2f6fa7', fontWeight: '600' },
-  '.cm-def, .cm-variableName, .cm-type': { color: '#3f5061' },
-  '.cm-string, .cm-string2': { color: '#3f7d4e' },
+  '.cm-def, .cm-variableName, .cm-type': { color: '#374555' },
+  '.cm-string, .cm-string2': { color: '#2e7d4f' },
   '.cm-number, .cm-atom': { color: '#a15c00' },
-  '.cm-comment': { color: '#8a94a0', fontStyle: 'italic' },
-  '.cm-operator, .cm-punctuation': { color: '#6b7280' },
+  '.cm-comment': { color: '#7f8b98', fontStyle: 'italic' },
+  '.cm-operator, .cm-punctuation': { color: '#5c6875' },
 }, { dark: false })
 
 const host = ref(null)
@@ -98,8 +99,3 @@ defineExpose({
 <template>
   <div ref="host" class="zc-sql-editor-host" />
 </template>
-
-<style scoped>
-.zc-sql-editor-host { min-height: 160px; }
-.zc-sql-editor-host :deep(.cm-editor) { max-height: 42vh; }
-</style>

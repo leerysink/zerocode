@@ -7,6 +7,7 @@
 // prod 确认词（007）都在后续票里长出来。
 import { computed, ref, watch } from 'vue'
 import { message, Modal } from 'ant-design-vue'
+import { PlayCircleOutlined } from '@ant-design/icons-vue'
 import { dbSqlBatch } from '../api'
 import SqlEditor from './SqlEditor.vue'
 import { splitSqlStatements } from '../utils/sqlSplit'
@@ -75,50 +76,38 @@ defineExpose({ text, results, busy, sentCount, summary, run, submit })
   <div class="zc-sql">
     <SqlEditor v-model="text" :tables="tables" class="zc-sql-input" />
     <div class="zc-sql-tools">
-      <a-button class="zc-sql-run" type="primary" :disabled="busy" @click="run">执行</a-button>
+      <a-button class="zc-sql-run" type="primary" :disabled="busy" @click="run"><play-circle-outlined />执行</a-button>
       <span class="zc-sql-hint">多条以分号分隔，按序逐条执行</span>
       <span class="zc-sql-env">当前环境：{{ env }}</span>
     </div>
-    <div v-for="(r, i) in results" :key="i" class="zc-sql-block"
-         :class="{ 'zc-sql-block--error': r.status === 'error', 'zc-sql-block--skipped': r.status === 'skipped' }">
-      <div class="zc-sql-block-head">
-        <span class="zc-sql-block-no">第 {{ (r.index ?? i) + 1 }}/{{ sentCount }} 条</span>
-        <span class="zc-sql-block-op">{{ r.op }}</span>
-        <span v-if="r.duration_ms != null" class="zc-sql-block-cost">{{ r.duration_ms }}ms</span>
-        <span v-if="r.status === 'skipped'" class="zc-sql-block-state">未执行</span>
-      </div>
-      <pre class="zc-sql-block-text">{{ r.sql }}</pre>
-      <!-- 失败条：PG 原文不加工不做行号定位，用 pre 留住换行；不编造结果体 -->
-      <pre v-if="r.status === 'error'" class="zc-sql-error-text">{{ r.error }}</pre>
-      <template v-else-if="r.kind === 'rows'">
-        <a-table size="small" :dataSource="r.rows"
-                 :columns="r.columns.map(c => ({ title: c, dataIndex: c }))" :pagination="false" />
-        <div v-if="r.truncated" class="zc-sql-truncated">
-          结果过大，仅显示前 {{ r.rows.length }} 行；请用 LIMIT / WHERE 收窄。
+    <!-- 结果区做成固定高度的面板：汇总条粘底常驻，不再随长表格滑到看不见 -->
+    <div class="zc-sql-results">
+      <div class="zc-sql-results-head">执行结果</div>
+      <div class="zc-sql-results-body">
+        <div v-if="!results.length" class="zc-sql-empty">{{ busy ? '执行中…' : '尚未执行' }}</div>
+        <div v-for="(r, i) in results" :key="i" class="zc-sql-block"
+             :class="{ 'zc-sql-block--error': r.status === 'error', 'zc-sql-block--skipped': r.status === 'skipped' }">
+          <div class="zc-sql-block-head">
+            <span class="zc-sql-block-no">第 {{ (r.index ?? i) + 1 }}/{{ sentCount }} 条</span>
+            <span class="zc-sql-block-op">{{ r.op }}</span>
+            <span v-if="r.duration_ms != null" class="zc-sql-block-cost">{{ r.duration_ms }}ms</span>
+            <span v-if="r.status === 'skipped'" class="zc-sql-block-state">未执行</span>
+            <span v-else-if="r.status === 'error'" class="zc-sql-block-state zc-sql-block-state--error">失败</span>
+          </div>
+          <pre class="zc-sql-block-text">{{ r.sql }}</pre>
+          <!-- 失败条：PG 原文不加工不做行号定位，用 pre 留住换行；不编造结果体 -->
+          <pre v-if="r.status === 'error'" class="zc-sql-error-text">{{ r.error }}</pre>
+          <template v-else-if="r.kind === 'rows'">
+            <a-table size="small" :dataSource="r.rows"
+                     :columns="r.columns.map(c => ({ title: c, dataIndex: c }))" :pagination="false" />
+            <div v-if="r.truncated" class="zc-sql-truncated">
+              结果过大，仅显示前 {{ r.rows.length }} 行；请用 LIMIT / WHERE 收窄。
+            </div>
+          </template>
+          <div v-else-if="r.kind === 'affected'" class="zc-sql-affected">影响 {{ r.affected }} 行</div>
         </div>
-      </template>
-      <div v-else-if="r.kind === 'affected'" class="zc-sql-affected">影响 {{ r.affected }} 行</div>
+      </div>
+      <div v-if="summary" class="zc-sql-summary">{{ summary }}</div>
     </div>
-    <div v-if="summary" class="zc-sql-summary">{{ summary }}</div>
   </div>
 </template>
-
-<style scoped>
-.zc-sql-tools { display: flex; align-items: center; gap: 12px; margin: 8px 0 12px; }
-.zc-sql-hint, .zc-sql-env { color: #6b7280; font-size: 12px; }
-.zc-sql-block { border: 1px solid #e5e7eb; border-radius: 6px; padding: 8px 10px; margin-bottom: 10px; }
-.zc-sql-block--error { border-color: #e7bcbc; background: #fdf6f6; }
-.zc-sql-block--skipped { border-color: #e8ebef; background: #f7f8fa; }
-.zc-sql-block-head { display: flex; gap: 8px; align-items: center; font-size: 12px; color: #6b7280; }
-.zc-sql-block-op { padding: 0 6px; border-radius: 4px; background: #eef3f8; color: #2f6fa7; }
-.zc-sql-block-state { padding: 0 6px; border-radius: 4px; background: #eceff3; color: #7b8794; }
-.zc-sql-block-text { margin: 6px 0 8px; font-family: ui-monospace, Consolas, monospace;
-                     font-size: 12px; color: #3f5061; white-space: pre-wrap; }
-.zc-sql-error-text { margin: 0; padding: 6px 8px; border-radius: 4px; background: #fbeeee;
-                     color: #b96a6a; font-family: ui-monospace, Consolas, monospace;
-                     font-size: 12px; white-space: pre-wrap; word-break: break-all; }
-.zc-sql-affected { margin-top: 8px; color: #3f7d4e; font-size: 13px; }
-.zc-sql-truncated { margin-top: 8px; color: #b45309; font-size: 12px; }
-.zc-sql-summary { margin-top: 4px; padding: 6px 10px; border-radius: 4px; background: #eef3f8;
-                  color: #3f5061; font-size: 12px; }
-</style>

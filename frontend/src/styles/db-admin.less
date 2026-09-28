@@ -1,0 +1,827 @@
+/**
+ * DB 操作台 Navicat 化样式（设计依据：浏览器实测 getComputedStyle 清单）。
+ *
+ * 作用域硬约束：所有规则都挂在 .zc-db / .zc-db-drawer 之下（抽屉是 portal 到 body，
+ * 靠 a-drawer 的 root-class-name 拿到自己的根），因此不改其它页面、不动 App.vue 的
+ * colorPrimary，删掉 main.js 里这一行 import 即可整体回滚。
+ *
+ * 深色模式预留：颜色一律走 --zc-db-* 变量，将来补一套变量值即可，不重写规则。
+ */
+
+// ---- 变量层：浅色实值；命名带 db 前缀避免与全局 theme.less 抢名字 ----
+// .zc-db-dd 也列进来：下拉面板 portal 到 body，拿不到 .zc-db 上的变量就得回退成默认色。
+.zc-db,
+.zc-db-drawer,
+.zc-db-dd {
+  --zc-db-accent: #4a6d94;          // 主色加深：白字对比度 5.4:1（原 #5b7a9d 只有 4.45:1）
+  --zc-db-accent-hover: #3d5c80;
+  --zc-db-accent-soft: #eaf1f8;     // 选中底
+  --zc-db-accent-line: #c9d9ea;
+  --zc-db-page: #eef2f6;            // 外壳底色（比内容深一档，面板才浮得出来）
+  --zc-db-panel: #fff;
+  --zc-db-chrome: #f2f5f9;          // 工具栏 / 列头 / 面板标题
+  --zc-db-zebra: #f8fafc;
+  --zc-db-border: #dfe5ec;
+  --zc-db-border-strong: #cdd6e0;
+  --zc-db-text: #2f3a47;
+  --zc-db-text-sub: #64748b;        // 原 #8a97a5 落在浅底只有 2.9:1
+  --zc-db-ok: #2e7d4f;
+  --zc-db-ok-bg: #eff6f1;
+  --zc-db-warn: #a86b12;
+  --zc-db-warn-bg: #fdf6e8;
+  --zc-db-err: #c0392b;
+  --zc-db-err-bg: #fdf2f2;
+  --zc-db-muted: #a2adba;           // skipped / 占位
+  --zc-db-radius: 4px;              // 全站统一 4px（原来 6px 与 4px 混用）
+  --zc-db-row-h: 26px;
+  --zc-db-font-sans: -apple-system, 'Segoe UI', 'Microsoft YaHei', Roboto, Helvetica, Arial, sans-serif;
+  --zc-db-font-mono: ui-monospace, 'Cascadia Mono', Consolas, 'Liberation Mono', Menlo, monospace;
+}
+
+// ---- antd 部件主色覆写：把仍吃全局 colorPrimary(#5b7a9d) 的部件拉回 --zc-db-accent ----
+// 浏览器实测残留 5 处旧主色全在分页器（选中项 border、其 <a> 的 color/outline）。
+// 写成 mixin 只在 .zc-db / .zc-db-drawer 内调用：不碰 App.vue 的 colorPrimary，其它页面零影响。
+.zc-db-accent-antd() {
+  // 分页器：方角小尺寸，选中项只描边不填实色（antd 默认填主色，太重）
+  .ant-pagination {
+    margin: 8px 0 0;
+    font-size: 12px;
+
+    .ant-pagination-item,
+    .ant-pagination-item-link,
+    .ant-select-selector {
+      border-radius: var(--zc-db-radius);
+    }
+    .ant-pagination-item:hover,
+    .ant-pagination-item-link:hover {
+      border-color: var(--zc-db-accent);
+    }
+    .ant-pagination-item:hover a,
+    .ant-pagination-item-link:hover {
+      color: var(--zc-db-accent);
+    }
+    .ant-pagination-item-active {
+      background: var(--zc-db-panel);
+      border-color: var(--zc-db-accent);
+    }
+    .ant-pagination-item-active a {
+      color: var(--zc-db-accent);
+      font-weight: 600;
+    }
+    // focus ring 换色而不是删掉，键盘可达性要留着
+    .ant-pagination-item:focus,
+    .ant-pagination-item:focus-visible,
+    .ant-pagination-item-link:focus,
+    .ant-pagination-item-link:focus-visible {
+      outline-color: var(--zc-db-accent);
+    }
+    .ant-pagination-options-quick-jumper input:hover,
+    .ant-pagination-options-quick-jumper input:focus {
+      border-color: var(--zc-db-accent);
+      box-shadow: none;
+    }
+  }
+
+  // 输入类控件：hover / focus 统一主色深一档，光晕降透明度
+  .ant-input:hover,
+  .ant-input-affix-wrapper:hover,
+  .ant-select:not(.ant-select-disabled):hover .ant-select-selector {
+    border-color: var(--zc-db-accent-line);
+  }
+  .ant-input:focus,
+  .ant-input-focused,
+  .ant-input-affix-wrapper:focus,
+  .ant-input-affix-wrapper-focused {
+    border-color: var(--zc-db-accent);
+    box-shadow: 0 0 0 2px rgba(74, 109, 148, .12);
+  }
+  .ant-select-focused:not(.ant-select-disabled) .ant-select-selector {
+    border-color: var(--zc-db-accent) !important;
+    box-shadow: 0 0 0 2px rgba(74, 109, 148, .12) !important;
+  }
+  // 链接型按钮与排序器激活态也不留旧主色
+  .ant-btn-link,
+  .ant-typography a {
+    color: var(--zc-db-accent);
+  }
+  .ant-btn-link:hover {
+    color: var(--zc-db-accent-hover);
+  }
+  .ant-table-column-sorter-up.active,
+  .ant-table-column-sorter-down.active {
+    color: var(--zc-db-accent);
+  }
+}
+
+// ---- 外壳：贴边的 dock 布局，不再是一个飘着的 16px 内边距卡片 ----
+.zc-db {
+  box-sizing: border-box;
+  // 壳层账户栏占 40px（App.vue/AccountBar）；原来写 100vh 导致永久滚动条
+  height: calc(100vh - 40px);
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  background: var(--zc-db-page);
+  color: var(--zc-db-text);
+  font-family: var(--zc-db-font-sans);
+  font-size: 13px;
+
+  // ---- 工具栏 ----
+  .zc-db-head {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    height: 44px;
+    padding: 0 12px;
+    background: var(--zc-db-chrome);
+    border-bottom: 1px solid var(--zc-db-border-strong);
+  }
+  .zc-db-head h2 {
+    margin: 0;
+    font-size: 14px;
+    font-weight: 600;
+    letter-spacing: .2px;
+    color: var(--zc-db-text);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .zc-db-head-right {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: 0 0 auto;
+  }
+  // 工具栏按钮统一成细边框扁平款：主色只留给「执行」这类真正的主操作
+  .zc-db-head-right .ant-btn,
+  .zc-db-edit-save {
+    height: 28px;
+    padding: 0 12px;
+    font-size: 12px;
+    border-radius: var(--zc-db-radius);
+  }
+  .zc-db-env .ant-segmented-item {
+    min-height: 26px;
+    font-size: 12px;
+  }
+  .zc-db-env .ant-segmented-item-selected {
+    color: var(--zc-db-accent);
+    font-weight: 600;
+  }
+  // prod 环境把工具栏染成警示色，比一条 alert 更早被看到
+  &.is-prod .zc-db-head {
+    background: var(--zc-db-warn-bg);
+    border-bottom-color: #e8d4ae;
+    // 顶部 3px 实心警示条：用 inset 阴影画，不占高度、不影响 flex 布局
+    box-shadow: inset 0 3px 0 var(--zc-db-warn);
+  }
+
+  .zc-db-prod-warn {
+    flex: 0 0 auto;
+    margin: 0;
+    padding: 6px 12px;
+    font-size: 12px;
+    border: 0;
+    border-bottom: 1px solid #e8d4ae;
+    border-radius: 0;
+    background: var(--zc-db-warn-bg);
+    color: var(--zc-db-warn);
+  }
+
+  // ---- 主体：左对象树 + 右内容，中间一条分隔而不是 12px 空隙 ----
+  .zc-db-body {
+    flex: 1 1 auto;
+    display: flex;
+    min-height: 0;
+    padding: 8px;
+    gap: 8px;
+  }
+  .zc-db-left {
+    display: flex;
+    flex-direction: column;
+    width: 232px;
+    flex: 0 0 232px;
+    overflow: hidden;
+    background: var(--zc-db-panel);
+    border: 1px solid var(--zc-db-border);
+    border-radius: var(--zc-db-radius);
+  }
+  .zc-db-left-head {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    height: 28px;
+    padding: 0 10px;
+    background: var(--zc-db-chrome);
+    border-bottom: 1px solid var(--zc-db-border);
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--zc-db-text-sub);
+  }
+  .zc-db-left-count {
+    font-weight: 400;
+    font-size: 11px;
+    color: var(--zc-db-muted);
+  }
+  .zc-db-tree {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: auto;
+    padding: 4px 6px;
+    font-size: 13px;
+    background: transparent;
+  }
+  .zc-db-tree .ant-tree-node-content-wrapper {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-height: 24px;
+    padding: 0 6px;
+    border-radius: var(--zc-db-radius);
+    color: var(--zc-db-text);
+  }
+  .zc-db-tree .ant-tree-node-content-wrapper:hover {
+    background: var(--zc-db-accent-soft);
+  }
+  .zc-db-tree .ant-tree-node-content-wrapper.ant-tree-node-selected {
+    background: var(--zc-db-accent-soft);
+    color: var(--zc-db-accent);
+    font-weight: 600;
+  }
+  .zc-db-tree .ant-tree-iconEle {
+    width: 16px;
+    color: var(--zc-db-accent);
+  }
+  .zc-db-left-empty {
+    padding: 12px 10px;
+    font-size: 12px;
+    color: var(--zc-db-muted);
+  }
+
+  .zc-db-right {
+    flex: 1 1 auto;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    background: var(--zc-db-panel);
+    border: 1px solid var(--zc-db-border);
+    border-radius: var(--zc-db-radius);
+  }
+  .zc-db-right > .ant-tabs,
+  .zc-db-right .ant-tabs {
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+  }
+  .zc-db-right .ant-tabs-nav {
+    flex: 0 0 auto;
+    margin: 0;
+    padding: 0 8px;
+    background: var(--zc-db-chrome);
+    border-bottom: 1px solid var(--zc-db-border);
+  }
+  .zc-db-right .ant-tabs-tab {
+    padding: 7px 12px;
+    font-size: 12px;
+    color: var(--zc-db-text-sub);
+  }
+  .zc-db-right .ant-tabs-tab.ant-tabs-tab-active .ant-tabs-tab-btn {
+    color: var(--zc-db-accent);
+    font-weight: 600;
+  }
+  .zc-db-right .ant-tabs-ink-bar {
+    height: 2px;
+    background: var(--zc-db-accent);
+  }
+  .zc-db-right .ant-tabs-content-holder {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: auto;
+  }
+  .zc-db-right .ant-tabs-content,
+  .zc-db-right .ant-tabs-tabpane {
+    height: 100%;
+  }
+  .zc-db-tab-body {
+    padding: 8px 10px;
+  }
+  .zc-db-placeholder {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+    min-height: 120px;
+    color: var(--zc-db-muted);
+    font-size: 12px;
+  }
+  // 查询页签必须自己有高度，否则 SqlConsole 的 height:100% 拿不到父高、结果面板塌成一条
+  .zc-db-tab-console {
+    height: 100%;
+    min-height: 0;
+    padding: 8px 10px;
+  }
+  // 结构页签的主键行：弱化的附属信息，不跟表格抢视觉
+  .zc-db-pk {
+    margin-top: 8px;
+    padding: 4px 8px;
+    background: var(--zc-db-chrome);
+    border: 1px solid var(--zc-db-border);
+    border-radius: var(--zc-db-radius);
+    color: var(--zc-db-text-sub);
+    font-size: 12px;
+  }
+
+  // ---- 高密度数据网格（在 antd a-table 上定制，不引新依赖）----
+  .ant-table {
+    font-family: var(--zc-db-font-sans);
+    font-size: 12px;
+    color: var(--zc-db-text);
+  }
+  .ant-table-thead > tr > th {
+    padding: 5px 8px;
+    height: var(--zc-db-row-h);
+    background: var(--zc-db-chrome);
+    border-bottom: 1px solid var(--zc-db-border-strong);
+    border-right: 1px solid var(--zc-db-border);
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--zc-db-text-sub);
+    white-space: nowrap;
+  }
+  .ant-table-thead > tr > th:last-child {
+    border-right: 0;
+  }
+  .ant-table-tbody > tr > td {
+    padding: 2px 8px;
+    height: var(--zc-db-row-h);
+    border-bottom: 1px solid var(--zc-db-border);
+    border-right: 1px solid var(--zc-db-border);
+    white-space: nowrap;
+  }
+  .ant-table-tbody > tr > td:last-child {
+    border-right: 0;
+  }
+  // 斑马纹 + 悬停：Navicat 网格靠这两样做行追踪
+  .ant-table-tbody > tr:nth-child(even) > td {
+    background: var(--zc-db-zebra);
+  }
+  .ant-table-tbody > tr:hover > td,
+  .ant-table-tbody > tr.ant-table-row-hover > td {
+    background: var(--zc-db-accent-soft);
+  }
+  .ant-table-tbody .zc-db-col-no {
+    background: var(--zc-db-chrome);
+    color: var(--zc-db-muted);
+    font-family: var(--zc-db-font-mono);
+    text-align: right;
+    user-select: none;
+  }
+  .ant-table-cell .ant-table-column-sorter,
+  .ant-table-column-sorter-up,
+  .ant-table-column-sorter-down {
+    color: var(--zc-db-muted);
+    font-size: 10px;
+  }
+  .ant-table-placeholder:hover > td {
+    background: var(--zc-db-panel) !important;
+  }
+  // antd 部件主色覆写（分页器 / 输入框 / 链接 / 排序器）
+  .zc-db-accent-antd();
+
+  // ---- 行内编辑面板：贴着网格下方的条目编辑器 ----
+  .zc-db-edit-disabled {
+    margin-bottom: 8px;
+    padding: 6px 10px;
+    border: 1px solid #e8d4ae;
+    border-left: 3px solid var(--zc-db-warn);
+    border-radius: var(--zc-db-radius);
+    background: var(--zc-db-warn-bg);
+    color: var(--zc-db-warn);
+    font-size: 12px;
+  }
+  .zc-db-edit-panel {
+    margin-top: 10px;
+    padding: 8px 10px;
+    background: var(--zc-db-chrome);
+    border: 1px solid var(--zc-db-border);
+    border-radius: var(--zc-db-radius);
+  }
+  .zc-db-edit-title {
+    margin-bottom: 6px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--zc-db-text-sub);
+  }
+  .zc-db-edit-fields {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 12px;
+  }
+  .zc-db-edit-field {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .zc-db-edit-field label {
+    min-width: 92px;
+    font-size: 12px;
+    color: var(--zc-db-text-sub);
+    text-align: right;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+  .zc-db-edit-field .ant-input {
+    height: 26px;
+    font-size: 12px;
+    border-radius: var(--zc-db-radius);
+  }
+  .zc-db-edit-save {
+    margin-top: 8px;
+    background: var(--zc-db-accent);
+    border-color: var(--zc-db-accent);
+    color: #fff;
+    font-weight: 600;
+  }
+  .zc-db-edit-save:hover {
+    background: var(--zc-db-accent-hover);
+    border-color: var(--zc-db-accent-hover);
+  }
+
+  // ---- 底部状态栏：环境 / 表数 / 当前表 / 行数页码 ----
+  .zc-db-status {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    height: 24px;
+    padding: 0 12px;
+    background: var(--zc-db-chrome);
+    border-top: 1px solid var(--zc-db-border-strong);
+    font-size: 11px;
+    color: var(--zc-db-text-sub);
+    white-space: nowrap;
+    overflow: hidden;
+  }
+  .zc-db-status-env {
+    padding: 0 8px;
+    border-radius: 10px;
+    background: var(--zc-db-accent-soft);
+    color: var(--zc-db-accent);
+    font-weight: 600;
+  }
+  &.is-prod .zc-db-status-env {
+    background: var(--zc-db-warn-bg);
+    color: var(--zc-db-warn);
+  }
+  .zc-db-status-sep {
+    color: var(--zc-db-border-strong);
+  }
+}
+
+// ---- 查询控制台：上编辑器 / 中工具条 / 下结果面板 ----
+.zc-db .zc-sql {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  font-family: var(--zc-db-font-sans);
+
+  .zc-sql-editor-host {
+    flex: 0 0 auto;
+    height: clamp(150px, 26vh, 260px);
+    background: var(--zc-db-panel);
+    border: 1px solid var(--zc-db-border-strong);
+    border-radius: var(--zc-db-radius);
+    overflow: hidden;
+  }
+  // 原来只有 min-height:160px 而 .cm-editor 实测 36px：编辑器与边框盒错位、下方死白
+  .zc-sql-editor-host .cm-editor {
+    height: 100%;
+    font-size: 13px;
+  }
+  .zc-sql-editor-host .cm-scroller {
+    font-family: var(--zc-db-font-mono);
+  }
+
+  .zc-sql-tools {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin: 8px 0;
+    padding: 6px 8px;
+    background: var(--zc-db-chrome);
+    border: 1px solid var(--zc-db-border);
+    border-radius: var(--zc-db-radius);
+  }
+  .zc-sql-run.ant-btn-primary {
+    height: 28px;
+    padding: 0 14px;
+    background: var(--zc-db-accent);
+    border-color: var(--zc-db-accent);
+    font-size: 12px;
+    font-weight: 600;
+    border-radius: var(--zc-db-radius);
+  }
+  .zc-sql-run.ant-btn-primary:hover {
+    background: var(--zc-db-accent-hover);
+    border-color: var(--zc-db-accent-hover);
+  }
+  .zc-sql-hint {
+    color: var(--zc-db-text-sub);
+    font-size: 12px;
+  }
+  .zc-sql-env {
+    margin-left: auto;
+    padding: 1px 8px;
+    border-radius: 10px;
+    background: var(--zc-db-accent-soft);
+    color: var(--zc-db-accent);
+    font-size: 11px;
+    font-weight: 600;
+  }
+
+  .zc-sql-results {
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    background: var(--zc-db-panel);
+    border: 1px solid var(--zc-db-border);
+    border-radius: var(--zc-db-radius);
+  }
+  .zc-sql-results-head {
+    flex: 0 0 auto;
+    height: 26px;
+    padding: 0 10px;
+    display: flex;
+    align-items: center;
+    background: var(--zc-db-chrome);
+    border-bottom: 1px solid var(--zc-db-border);
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--zc-db-text-sub);
+  }
+  .zc-sql-results-body {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: auto;
+    padding: 8px 10px;
+  }
+  // 空态：没执行时给一句人话，不留一片死白，也不编造「共 0 条」
+  .zc-sql-empty {
+    padding: 24px 0;
+    text-align: center;
+    color: var(--zc-db-muted);
+    font-size: 12px;
+  }
+  .zc-sql-block {
+    margin-bottom: 8px;
+    padding: 6px 8px;
+    background: var(--zc-db-panel);
+    border: 1px solid var(--zc-db-border);
+    border-left: 3px solid var(--zc-db-ok);
+    border-radius: var(--zc-db-radius);
+  }
+  // 三态靠左侧色条 + 底色区分，不再只靠肉眼难辨的边框色差
+  .zc-sql-block--error {
+    background: var(--zc-db-err-bg);
+    border-color: #efc7c4;
+    border-left-color: var(--zc-db-err);
+  }
+  .zc-sql-block--skipped {
+    background: #f6f8fa;
+    border-color: var(--zc-db-border);
+    border-left-color: var(--zc-db-muted);
+  }
+  .zc-sql-block-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 11px;
+    color: var(--zc-db-text-sub);
+  }
+  .zc-sql-block-no {
+    font-family: var(--zc-db-font-mono);
+    font-weight: 600;
+    color: var(--zc-db-text);
+  }
+  .zc-sql-block-op,
+  .zc-sql-block-state {
+    padding: 0 6px;
+    border-radius: 2px;
+    font-size: 11px;
+  }
+  .zc-sql-block-op {
+    background: var(--zc-db-accent-soft);
+    color: var(--zc-db-accent);
+  }
+  .zc-sql-block-state {
+    background: #e9edf2;
+    color: var(--zc-db-muted);
+  }
+  .zc-sql-block-state--error {
+    background: #f8dcd9;
+    color: var(--zc-db-err);
+    font-weight: 600;
+  }
+  .zc-sql-block-cost {
+    margin-left: auto;
+    font-family: var(--zc-db-font-mono);
+    color: var(--zc-db-muted);
+  }
+  .zc-sql-block-text {
+    margin: 6px 0 6px;
+    font-family: var(--zc-db-font-mono);
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--zc-db-text);
+    white-space: pre-wrap;
+  }
+  .zc-sql-error-text {
+    margin: 0;
+    padding: 6px 8px;
+    background: #fbe6e3;
+    border-left: 3px solid var(--zc-db-err);
+    border-radius: 2px;
+    color: #922b21;               // 原 #b96a6a 只有 3.48:1
+    font-family: var(--zc-db-font-mono);
+    font-size: 12px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+  .zc-sql-affected {
+    margin-top: 6px;
+    color: var(--zc-db-ok);
+    font-size: 12px;
+    font-weight: 600;
+  }
+  .zc-sql-truncated {
+    margin-top: 6px;
+    padding: 3px 8px;
+    background: var(--zc-db-warn-bg);
+    border-left: 3px solid var(--zc-db-warn);
+    border-radius: 2px;
+    color: var(--zc-db-warn);
+    font-size: 11px;
+  }
+  // 汇总条：粘底常驻，滚动结果时也能看到「成功几条、失败在哪条」
+  .zc-sql-summary {
+    flex: 0 0 auto;
+    margin: 0;
+    padding: 5px 10px;
+    background: var(--zc-db-chrome);
+    border-top: 1px solid var(--zc-db-border);
+    color: var(--zc-db-text);
+    font-size: 12px;
+    font-weight: 600;
+  }
+}
+
+// ---- 审计抽屉（portal 在 body，用 root-class-name 当根）----
+.zc-db-drawer {
+  font-family: var(--zc-db-font-sans);
+
+  .ant-drawer-header {
+    padding: 10px 14px;
+    background: var(--zc-db-chrome);
+    border-bottom: 1px solid var(--zc-db-border-strong);
+  }
+  .ant-drawer-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--zc-db-text);
+  }
+  .ant-drawer-body {
+    padding: 0;
+    background: var(--zc-db-page);
+  }
+  .zc-db-audit-drawer {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    min-width: 0;
+    color: var(--zc-db-text);
+  }
+  .zc-db-audit-filter {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    background: var(--zc-db-panel);
+    border-bottom: 1px solid var(--zc-db-border);
+  }
+  .zc-db-audit-filter-label {
+    font-size: 12px;
+    color: var(--zc-db-text-sub);
+  }
+  .zc-db-audit-filter .ant-select {
+    width: 132px;
+    font-size: 12px;
+  }
+  .zc-db-audit-filter .ant-select-selection-item,
+  .zc-db-audit-filter .ant-select-selector {
+    font-size: 12px;
+  }
+  .zc-db-audit-body {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: auto;
+    padding: 8px 10px;
+    background: var(--zc-db-panel);
+  }
+  .ant-table {
+    font-size: 12px;
+    color: var(--zc-db-text);
+  }
+  .ant-table-thead > tr > th {
+    padding: 5px 8px;
+    height: var(--zc-db-row-h);
+    background: var(--zc-db-chrome);
+    border-bottom: 1px solid var(--zc-db-border-strong);
+    border-right: 1px solid var(--zc-db-border);
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--zc-db-text-sub);
+    white-space: nowrap;
+  }
+  .ant-table-tbody > tr > td {
+    padding: 2px 8px;
+    height: var(--zc-db-row-h);
+    border-bottom: 1px solid var(--zc-db-border);
+    border-right: 1px solid var(--zc-db-border);
+    font-size: 12px;
+  }
+  .ant-table-tbody > tr:nth-child(even) > td {
+    background: var(--zc-db-zebra);
+  }
+  .ant-table-tbody > tr:hover > td {
+    background: var(--zc-db-accent-soft);
+  }
+  .zc-db-audit-time,
+  .zc-db-audit-num {
+    font-family: var(--zc-db-font-mono);
+    white-space: nowrap;
+  }
+  .zc-db-audit-sql {
+    font-family: var(--zc-db-font-mono);
+    font-size: 11px;
+    color: var(--zc-db-text);
+  }
+  .zc-db-audit-error {
+    font-family: var(--zc-db-font-mono);
+    font-size: 11px;
+    color: var(--zc-db-err);
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+  .zc-db-audit-null {
+    color: var(--zc-db-muted);
+  }
+  .ant-drawer-close {
+    color: var(--zc-db-text-sub);
+  }
+
+  // 抽屉里的 a-select / 输入框焦点态同样不留旧主色
+  .zc-db-accent-antd();
+}
+
+// ---- 下拉面板：a-select 的候选列表 portal 在 body，靠 popup-class-name 拿自己的根 ----
+// 选择器同时列一份 `.zc-db-dd.ant-select-dropdown`：antd cssinjs 用 `:where(hash)` 前缀不计权重，
+// 单类根与它特异性打平，胜负只能赌 style 注入顺序（生产构建无保证）；多一级类做层叠保险，
+// 保留裸 `.zc-db-dd` 那份是防哪天 antd 换了 dropdown 根类名导致整块样式落空。
+.zc-db-dd,
+.zc-db-dd.ant-select-dropdown {
+  font-family: var(--zc-db-font-sans);
+  font-size: 12px;
+
+  .ant-select-item {
+    min-height: 26px;
+    padding: 3px 8px;
+  }
+  .ant-select-item-option-active:not(.ant-select-item-option-disabled) {
+    background: var(--zc-db-accent-soft);
+  }
+  // 选中项：antd 默认用全局主色派生的浅底 + 主色字，这里统一换成 db 主色
+  .ant-select-item-option-selected:not(.ant-select-item-option-disabled) {
+    background: var(--zc-db-accent-soft);
+    color: var(--zc-db-accent);
+    font-weight: 600;
+    // 右侧 ✓ 图标是独立节点，自己吃 color，父级的换色传不下去，得单独拉回来
+    // （单选模式下 antd 会把该节点渲染成空占位，规则备用于多选/自定义场景）
+    .ant-select-item-option-state {
+      color: var(--zc-db-accent);
+    }
+  }
+  .ant-select-item-empty {
+    color: var(--zc-db-muted);
+  }
+}

@@ -1,9 +1,10 @@
 <script setup>
 // 应用 DB 操作台（设计 2026-09-28）。骨架：顶栏 + dev/prod 切换 + prod 警示 + 左表树 + 结构页。
 // 数据网格在 Task 10 填充，SQL 控制台/审计抽屉在 Task 11 填充。
-import { onMounted, ref, watch } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { message, Modal } from 'ant-design-vue'
+import { HistoryOutlined, ReloadOutlined, SaveOutlined, TableOutlined } from '@ant-design/icons-vue'
 import { dbTables, dbTableSchema, dbTableData, dbSqlExec, dbAudit } from '../api'
 import SqlConsole from '../components/SqlConsole.vue'
 
@@ -23,6 +24,20 @@ const size = ref(50)
 const sortCol = ref(null)
 const sortDir = ref('asc')
 const editRow = ref(null) // 当前编辑行（默认首行；点行切换）
+
+// 行号列：Navicat 式的第一列，跨页连续计数；纯展示，不带 sorter、不参与编辑。
+const gridColumns = computed(() => [
+  {
+    title: '#', key: '__row_no', width: 56, align: 'right', className: 'zc-db-col-no',
+    customRender: ({ index }) => (page.value - 1) * size.value + index + 1,
+  },
+  ...dataCols.value.map((c) => ({ title: c, dataIndex: c, sorter: true })),
+])
+
+// 状态栏右半句：未选表时说明白，不用「共 0 行」糊人。
+const selectionText = computed(() => (selected.value
+  ? `${selected.value} · 共 ${total.value} 行 · 第 ${page.value} 页`
+  : '未选择表'))
 
 async function loadTables() {
   try {
@@ -107,112 +122,147 @@ async function fetchAudit() {
   try { auditItems.value = (await dbAudit(appId, params)).data.items }
   catch (e) { message.error(e?.response?.data?.detail || '审计加载失败') }
 }
-function onAuditFilter() { fetchAudit() }
+// 过滤器由原生 select 换成 a-select：v-model 写回与 change 的先后顺序不该依赖组件实现，
+// 直接 watch 两个 ref 重拉，边界（切回"全部"）也自然覆盖。
+watch([auditEnv, auditOp], fetchAudit)
+const auditEnvOptions = [
+  { value: '', label: '全部环境' }, { value: 'dev', label: 'dev' }, { value: 'prod', label: 'prod' },
+]
+const auditOpOptions = ['', 'select', 'insert', 'update', 'delete', 'ddl', 'other']
+  .map((v) => ({ value: v, label: v || '全部类型' }))
+// 列宽定死 + 横向滚动：原来 937px 内容塞进 625px 容器，列被挤扁且必须横滚却看不见滚轮提示
+const auditColumns = [
+  { title: '时间', dataIndex: 'ts', width: 150 },
+  { title: '环境', dataIndex: 'env', width: 72 },
+  { title: '类型', dataIndex: 'op_type', width: 88 },
+  { title: '状态', dataIndex: 'status', width: 84 },
+  { title: '耗时ms', dataIndex: 'duration_ms', width: 84, align: 'right', className: 'zc-db-audit-num' },
+  { title: '目标表', dataIndex: 'target_table', width: 130 },
+  { title: 'SQL', dataIndex: 'sql_text', width: 320 },
+  { title: '错误', dataIndex: 'error', width: 220 },
+]
+
+/** 审计时间列：后端给的是带微秒+时区的 ISO，压到秒。 */
+function formatTs(ts) {
+  if (ts === null || ts === undefined || ts === '') return '-'
+  const m = String(ts).match(/^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})/)
+  return m ? `${m[1]} ${m[2]}` : String(ts) // 非 ISO 形状原样返回，不编造时间
+}
+
+/** 空值占位：0 / false 是合法值不能被吞成 '-'，只有 null / undefined / 空串算空。 */
+function cellText(v) {
+  return v === null || v === undefined || v === '' ? '-' : String(v)
+}
 async function refresh() {
   await loadTables()
   if (selected.value) { await selectTable(selected.value); await loadData() }
 }
 
 onMounted(loadTables)
-defineExpose({ selected, schema, selectTable, loadData, saveEdits, canEdit, openAudit, refresh, fetchAudit, auditEnv, auditOp })
+defineExpose({ selected, schema, selectTable, loadData, saveEdits, canEdit, openAudit, refresh, fetchAudit,
+  auditEnv, auditOp, selectionText, formatTs, cellText })
 </script>
 
 <template>
-  <div class="zc-db">
+  <div class="zc-db" :class="{ 'is-prod': env === 'prod' }">
     <div class="zc-db-head">
       <h2>DB 操作 · 应用 {{ appId }}</h2>
       <div class="zc-db-head-right">
         <a-segmented v-model:value="env" class="zc-db-env" :options="[{ value: 'dev' }, { value: 'prod' }]" />
-        <a-button class="zc-db-refresh" @click="refresh">刷新</a-button>
-        <a-button class="zc-db-audit-btn" @click="openAudit">操作历史</a-button>
+        <a-button class="zc-db-refresh" @click="refresh"><reload-outlined />刷新</a-button>
+        <a-button class="zc-db-audit-btn" @click="openAudit"><history-outlined />操作历史</a-button>
       </div>
     </div>
     <a-alert v-if="env === 'prod'" class="zc-db-prod-warn" type="warning" show-icon
              message="直改 prod 会绕过发布迁移轨，请确认你知道自己在做什么" />
     <div class="zc-db-body">
       <div class="zc-db-left">
-        <a-tree class="zc-db-tree" :tree-data="tables.map(t => ({ key: t.name, title: t.name }))"
-                @select="(k) => k[0] && selectTable(k[0])" />
+        <div class="zc-db-left-head">
+          <span>表</span>
+          <span class="zc-db-left-count">{{ tables.length }}</span>
+        </div>
+        <a-tree v-if="tables.length" class="zc-db-tree" show-icon
+                :tree-data="tables.map(t => ({ key: t.name, title: t.name }))"
+                @select="(k) => k[0] && selectTable(k[0])">
+          <template #icon><table-outlined /></template>
+        </a-tree>
+        <div v-else class="zc-db-left-empty">该库暂无表</div>
       </div>
       <div class="zc-db-right">
         <a-tabs>
           <a-tab-pane key="data" tab="数据">
-            <span v-if="!selected">选择左侧表以查看数据</span>
-            <div v-else>
+            <div v-if="!selected" class="zc-db-placeholder">选择左侧表以查看数据</div>
+            <div v-else class="zc-db-tab-body">
               <div v-if="!canEdit()" class="zc-db-edit-disabled">
                 该表无主键，行内编辑已禁用（仍可浏览，改数据请用查询控制台）
               </div>
               <a-table size="small" :dataSource="rows" :rowKey="(r, i) => i"
-                       :columns="dataCols.map(c => ({ title: c, dataIndex: c, sorter: true }))"
-                       :pagination="{ total, current: page, pageSize: size, onChange: onPageChange }"
+                       :columns="gridColumns"
+                       :pagination="{ total, current: page, pageSize: size, showSizeChanger: false, onChange: onPageChange }"
+                       :scroll="{ x: 'max-content' }"
                        :custom-row="(r) => ({ onClick: () => pickRow(r) })"
                        @change="(_p, _f, s, extra) => extra && extra.action === 'sort' && onSort(s.columnKey || s.field)" />
               <div v-if="canEdit() && editRow" class="zc-db-edit-panel">
                 <div class="zc-db-edit-title">编辑行（主键：{{ schema.primary_key.join(', ') }}）</div>
-                <div v-for="c in dataCols" :key="c" class="zc-db-edit-field">
-                  <label>{{ c }}</label>
-                  <a-input :value="editRow[c]" :disabled="isPk(c)"
-                           @change="(e) => editRow[c] = e.target.value" />
+                <div class="zc-db-edit-fields">
+                  <div v-for="c in dataCols" :key="c" class="zc-db-edit-field">
+                    <label>{{ c }}</label>
+                    <a-input :value="editRow[c]" :disabled="isPk(c)"
+                             @change="(e) => editRow[c] = e.target.value" />
+                  </div>
                 </div>
-                <button class="zc-db-edit-save" @click="saveEdits">保存</button>
+                <button class="zc-db-edit-save" @click="saveEdits"><save-outlined />保存</button>
               </div>
             </div>
           </a-tab-pane>
           <a-tab-pane key="schema" tab="结构">
-            <a-table v-if="schema" size="small" rowKey="name" :dataSource="schema.columns"
-                     :columns="[{ title: '列', dataIndex: 'name' }, { title: '类型', dataIndex: 'type' },
-                               { title: '默认值', dataIndex: 'default' }]" />
-            <div v-if="schema && schema.primary_key.length" class="zc-db-pk">主键：{{ schema.primary_key.join(', ') }}</div>
+            <div v-if="!schema" class="zc-db-placeholder">选择左侧表以查看结构</div>
+            <div v-else class="zc-db-tab-body">
+              <a-table size="small" rowKey="name" :dataSource="schema.columns" :pagination="false"
+                       :scroll="{ x: 'max-content' }"
+                       :columns="[{ title: '列', dataIndex: 'name', width: 180 }, { title: '类型', dataIndex: 'type', width: 200 },
+                                 { title: '默认值', dataIndex: 'default' }]" />
+              <div v-if="schema.primary_key.length" class="zc-db-pk">主键：{{ schema.primary_key.join(', ') }}</div>
+            </div>
           </a-tab-pane>
           <a-tab-pane key="query" tab="查询">
-            <SqlConsole :app-id="appId" :env="env" :tables="tables" />
+            <div class="zc-db-tab-console">
+              <SqlConsole :app-id="appId" :env="env" :tables="tables" />
+            </div>
           </a-tab-pane>
         </a-tabs>
       </div>
     </div>
-    <a-drawer v-model:open="auditing" title="操作历史" width="640">
+    <a-drawer v-model:open="auditing" title="操作历史" width="900" root-class-name="zc-db-drawer">
       <div class="zc-db-audit-drawer">
         <div class="zc-db-audit-filter">
-          <select v-model="auditEnv" class="zc-db-audit-env" @change="onAuditFilter">
-            <option value="">全部环境</option>
-            <option value="dev">dev</option>
-            <option value="prod">prod</option>
-          </select>
-          <select v-model="auditOp" class="zc-db-audit-op" @change="onAuditFilter">
-            <option value="">全部类型</option>
-            <option value="select">select</option>
-            <option value="insert">insert</option>
-            <option value="update">update</option>
-            <option value="delete">delete</option>
-            <option value="ddl">ddl</option>
-            <option value="other">other</option>
-          </select>
+          <span class="zc-db-audit-filter-label">环境</span>
+          <a-select v-model:value="auditEnv" class="zc-db-audit-env" :options="auditEnvOptions"
+                    popup-class-name="zc-db-dd" />
+          <span class="zc-db-audit-filter-label">类型</span>
+          <a-select v-model:value="auditOp" class="zc-db-audit-op" :options="auditOpOptions"
+                    popup-class-name="zc-db-dd" />
         </div>
-        <a-table size="small" rowKey="id" :dataSource="auditItems"
-                 :columns="[{ title: '时间', dataIndex: 'ts' }, { title: '环境', dataIndex: 'env' },
-                            { title: '类型', dataIndex: 'op_type' }, { title: '状态', dataIndex: 'status' },
-                            { title: '耗时ms', dataIndex: 'duration_ms' }, { title: '目标表', dataIndex: 'target_table' },
-                            { title: 'SQL', dataIndex: 'sql_text' }, { title: '错误', dataIndex: 'error' }]" />
+        <div class="zc-db-audit-body">
+          <a-table size="small" rowKey="id" :dataSource="auditItems" :columns="auditColumns"
+                   :pagination="false" :scroll="{ x: 'max-content' }">
+            <template #bodyCell="{ column, record, text }">
+              <span v-if="column.dataIndex === 'ts'" class="zc-db-audit-time">{{ formatTs(record.ts) }}</span>
+              <a-tag v-else-if="column.dataIndex === 'status'" class="zc-db-audit-status"
+                     :color="record.status === 'success' ? 'success' : 'error'">{{ record.status === 'success' ? '成功' : '失败' }}</a-tag>
+              <span v-else-if="column.dataIndex === 'sql_text'" class="zc-db-audit-sql">{{ cellText(record.sql_text) }}</span>
+              <span v-else-if="column.dataIndex === 'error'" class="zc-db-audit-error">{{ cellText(record.error) }}</span>
+              <span v-else :class="{ 'zc-db-audit-null': cellText(text) === '-' }">{{ cellText(text) }}</span>
+            </template>
+          </a-table>
+        </div>
       </div>
     </a-drawer>
+    <div class="zc-db-status">
+      <span class="zc-db-status-env">{{ env }}</span>
+      <span>表 {{ tables.length }} 张</span>
+      <span class="zc-db-status-sep">|</span>
+      <span>{{ selectionText }}</span>
+    </div>
   </div>
 </template>
-
-<style scoped>
-.zc-db { padding: 16px 20px; height: 100vh; display: flex; flex-direction: column; box-sizing: border-box; }
-.zc-db-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
-.zc-db-head h2 { font-size: 18px; margin: 0; }
-.zc-db-head-right { display: flex; align-items: center; gap: 12px; }
-.zc-db-audit-filter { display: flex; gap: 8px; margin-bottom: 12px; }
-.zc-db-audit-filter select { padding: 4px 8px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 13px; }
-.zc-db-body { flex: 1; display: flex; gap: 12px; min-height: 0; }
-.zc-db-left { width: 240px; overflow: auto; border: 1px solid #e5e7eb; border-radius: 6px; padding: 8px; }
-.zc-db-right { flex: 1; overflow: auto; }
-.zc-db-pk { margin-top: 8px; color: #6b7280; font-size: 12px; }
-.zc-db-edit-panel { margin-top: 12px; padding: 12px; border: 1px solid #e5e7eb; border-radius: 6px; }
-.zc-db-edit-title { font-size: 13px; color: #6b7280; margin-bottom: 8px; }
-.zc-db-edit-field { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
-.zc-db-edit-field label { width: 120px; font-size: 13px; }
-.zc-db-edit-save { margin-top: 8px; padding: 4px 14px; border: 1px solid #5b7a9d; border-radius: 4px;
-                   background: #5b7a9d; color: #fff; cursor: pointer; }
-</style>

@@ -302,3 +302,49 @@ describe('SqlConsole 遇错即停与失败可见（Ticket 003）', () => {
     expect(w.find('.zc-sql-summary').exists()).toBe(false)
   })
 })
+
+describe('SqlConsole 结果面板与空态（样式轮）', () => {
+  it('边界：未执行时空态占位，不画汇总也不假装「共 0 条」', async () => {
+    const w = mountConsole()
+    await flushPromises()
+    expect(w.find('.zc-sql-empty').text()).toBe('尚未执行')
+    expect(w.find('.zc-sql-results-head').text()).toContain('执行结果')
+    expect(w.find('.zc-sql-summary').exists()).toBe(false)
+  })
+
+  it('边界：拿到结果后空态消失，不与结果块并存', async () => {
+    const w = await runWith('SELECT 1; SELECT 2')
+    expect(w.find('.zc-sql-empty').exists()).toBe(false)
+    expect(w.findAll('.zc-sql-block')).toHaveLength(2)
+  })
+
+  it('边界：整体请求失败后回到空态，不残留半截结果', async () => {
+    mocks.api.dbSqlBatch.mockRejectedValue({ response: { data: { detail: '目标库不可达' } } })
+    const w = await runWith('SELECT 1')
+    expect(w.find('.zc-sql-empty').text()).toBe('尚未执行')
+    expect(w.find('.zc-sql-summary').exists()).toBe(false)
+  })
+
+  it('块头状态：失败标「失败」、未执行标「未执行」、成功条不挂重复状态', async () => {
+    mocks.api.dbSqlBatch.mockResolvedValue({ data: { results: [
+      affectedResult(0, "INSERT INTO widgets VALUES (1,'a')", 1),
+      errorResult(1, 'SELECT * FROM nope', 'relation "nope" does not exist'),
+      skippedResult(2, 'SELECT 3 AS n'),
+    ] } })
+    const w = await runWith("INSERT INTO widgets VALUES (1,'a'); SELECT * FROM nope; SELECT 3 AS n")
+    const chips = w.findAll('.zc-sql-block-state')
+    expect(chips).toHaveLength(2)
+    expect(chips[0].classes()).toContain('zc-sql-block-state--error')
+    expect(chips[0].text()).toBe('失败')
+    expect(chips[1].text()).toBe('未执行')
+    expect(w.findAll('.zc-sql-block')[0].find('.zc-sql-block-state').exists()).toBe(false)
+  })
+
+  it('边界：耗时 null 不渲染成「nullms」', async () => {
+    mocks.api.dbSqlBatch.mockResolvedValue({ data: { results: [
+      { ...rowsResult(0, 'SELECT 1', [{ n: 1 }]), duration_ms: null },
+    ] } })
+    const w = await runWith('SELECT 1')
+    expect(w.findAll('.zc-sql-block')[0].find('.zc-sql-block-cost').exists()).toBe(false)
+  })
+})
