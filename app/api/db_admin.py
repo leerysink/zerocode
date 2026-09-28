@@ -29,6 +29,17 @@ async def _load_app(request: Request, app_id: int) -> dict:
         raise HTTPException(e.status, str(e))
 
 
+@router.get("/{app_id}/db/audit")
+async def db_audit(request: Request, app_id: int, env: str | None = None,
+                   op: str | None = None, limit: int = 100):
+    await _load_app(request, app_id)
+    if env is not None:
+        svc.validate_env(env)
+    items = await svc.list_audit(request.app.state.session_factory, app_id,
+                                 env=env, op=op, limit=limit)
+    return {"items": items}
+
+
 @router.get("/{app_id}/db/{env}/tables")
 async def db_tables(request: Request, app_id: int, env: str):
     app = await _load_app(request, app_id)

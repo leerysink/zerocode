@@ -206,3 +206,14 @@ async def test_sql_error_writes_error_audit(db_app):
             "SELECT status, error FROM db_operation_log WHERE app_id=:a AND status='error' "
             "ORDER BY id DESC LIMIT 1"), {"a": aid})).mappings().first()
     assert row and row["error"]
+
+
+# ---------- Task 6: 审计查询端点 ----------
+
+async def test_audit_endpoint_returns_recent_ops(db_app):
+    client, aid, *_ = db_app
+    await client.post(f"/api/apps/{aid}/db/dev/sql", json={"sql": "SELECT 1 AS n"})
+    r = await client.get(f"/api/apps/{aid}/db/audit?limit=10")
+    assert r.status_code == 200, r.text
+    items = r.json()["items"]
+    assert any(it["op_type"] == "select" and it["status"] == "success" for it in items)

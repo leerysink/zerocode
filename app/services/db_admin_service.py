@@ -173,3 +173,20 @@ async def execute_sql(request, slug: str, env: str, sql: str) -> dict:
             return {"kind": "affected", "affected": int(result.rowcount or 0)}
     finally:
         await eng.dispose()
+
+
+async def list_audit(sf, app_id: int, *, env: str | None = None, op: str | None = None,
+                     limit: int = 100) -> list[dict]:
+    """读平台库 db_operation_log（归属校验在 API 层 _load_app 已做）。env/op 可选过滤，limit 上限 500。"""
+    limit = min(max(int(limit), 1), 500)
+    clauses, params = ["app_id = :a"], {"a": app_id, "lim": limit}
+    if env:
+        clauses.append("env = :e"); params["e"] = env
+    if op:
+        clauses.append("op_type = :o"); params["o"] = op
+    async with sf() as s:
+        rows = (await s.execute(text(
+            "SELECT id, env, op_type, sql_text, target_table, status, affected, error, "
+            "duration_ms, ts FROM db_operation_log WHERE " + " AND ".join(clauses) +
+            " ORDER BY ts DESC LIMIT :lim"), params)).mappings().all()
+    return [{**dict(r), "ts": r["ts"].isoformat()} for r in rows]
