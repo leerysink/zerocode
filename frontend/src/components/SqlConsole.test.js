@@ -26,6 +26,10 @@ const rowsResult = (index, sql, rows, extra = {}) => ({
 const affectedResult = (index, sql, affected) => ({
   index, op: 'insert', sql, status: 'ok', duration_ms: 5, kind: 'affected', affected,
 })
+const errorResult = (index, sql, error) => ({
+  index, op: 'select', sql, status: 'error', duration_ms: 2, error,
+})
+const skippedResult = (index, sql) => ({ index, op: 'select', sql, status: 'skipped' })
 
 // SqlEditor 桩：textarea 双向绑定 + 暴露 getSelectionText（本票恒空，006 才消费选区）
 const EDITOR_STUB = {
@@ -194,5 +198,107 @@ describe('SqlConsole 边界', () => {
     done({ data: { results: [rowsResult(0, 'SELECT 1', [{ n: 1 }])] } })
     await flushPromises()
     expect(w.find('.zc-sql-run').attributes('disabled')).toBeUndefined()
+  })
+})
+
+describe('SqlConsole 遇错即停与失败可见（Ticket 003）', () => {
+  const threeStates = () => mocks.api.dbSqlBatch.mockResolvedValue({ data: { results: [
+    affectedResult(0, 'INSERT INTO widgets VALUES (21,\'keep\')', 1),
+    errorResult(1, 'SELECT * FROM no_such_table', 'relation "no_such_table" does not exist'),
+    skippedResult(2, 'SELECT 3 AS n'),
+  ] } })
+
+  it('第 2 条失败：失败块带 error 修饰类且显示 PG 原文，其后块带 skipped 类与「未执行」', async () => {
+    threeStates()
+    const w = await runWith("INSERT INTO widgets VALUES (21,'keep'); SELECT * FROM no_such_table; SELECT 3 AS n")
+    const blocks = w.findAll('.zc-sql-block')
+    expect(blocks).toHaveLength(3)
+    expect(blocks[0].classes()).not.toContain('zc-sql-block--error')
+    expect(blocks[1].classes()).toContain('zc-sql-block--error')
+    expect(blocks[1].text()).toContain('relation "no_such_table" does not exist')
+    expect(blocks[2].classes()).toContain('zc-sql-block--skipped')
+    expect(blocks[2].text()).toContain('未执行')
+  })
+
+  it('汇总条：共 N 条、成功 X、失败于第 i 条、剩余 M 条未执行', async () => {
+    threeStates()
+    const w = await runWith("INSERT INTO widgets VALUES (21,'keep'); SELECT * FROM no_such_table; SELECT 3 AS n")
+    expect(w.find('.zc-sql-summary').text())
+      .toBe('共 3 条，成功 1，失败于第 2 条，剩余 1 条未执行')
+  })
+
+  it('边界：全部成功时汇总不出现失败与未执行子句', async () => {
+    const w = await runWith('SELECT 1; SELECT 2')
+    expect(w.find('.zc-sql-summary').text()).toBe('共 2 条，成功 2')
+  })
+
+  it('边界：第 1 条即错 → 成功 0、剩余全部未执行', async () => {
+    mocks.api.dbSqlBatch.mockResolvedValue({ data: { results: [
+      errorResult(0, 'SELECT * FROM no_such_table', 'relation "no_such_table" does not exist'),
+      skippedResult(1, 'SELECT 1 AS a'), skippedResult(2, 'SELECT 2 AS b'),
+    ] } })
+    const w = await runWith('SELECT * FROM no_such_table; SELECT 1 AS a; SELECT 2 AS b')
+    expect(w.find('.zc-sql-summary').text())
+      .toBe('共 3 条，成功 0，失败于第 1 条，剩余 2 条未执行')
+    expect(w.findAll('.zc-sql-block--skipped')).toHaveLength(2)
+  })
+
+  it('边界：最后一条失败（后面无未执行）→ 汇总不带「剩余」子句', async () => {
+    mocks.api.dbSqlBatch.mockResolvedValue({ data: { results: [
+      rowsResult(0, 'SELECT 1', [{ n: 1 }]),
+      errorResult(1, 'SELECT * FROM nope', 'relation "nope" does not exist'),
+    ] } })
+    const w = await runWith('SELECT 1; SELECT * FROM nope')
+    expect(w.find('.zc-sql-summary').text()).toBe('共 2 条，成功 1，失败于第 2 条')
+  })
+
+  it('边界：未执行块不编造结果体（不画表格、不写影响行数）', async () => {
+    threeStates()
+    const w = await runWith("INSERT INTO widgets VALUES (21,'keep'); SELECT * FROM no_such_table; SELECT 3 AS n")
+    const skipped = w.findAll('.zc-sql-block')[2]
+    expect(skipped.find('.zc-sql-table').exists()).toBe(false)
+    expect(skipped.text()).not.toContain('影响')
+    expect(skipped.text()).not.toContain('成功')
+  })
+
+  it('边界：失败块不画表格，只把原文经 <pre> 保留换行', async () => {
+    mocks.api.dbSqlBatch.mockResolvedValue({ data: { results: [
+      errorResult(0, 'SELECT * FROM a\nJOIN b', 'relation "a" does not exist\nLINE 2: JOIN b'),
+    ] } })
+    const w = await runWith('SELECT * FROM a\nJOIN b')
+    const err = w.find('.zc-sql-error-text')
+    expect(err.exists()).toBe(true)
+    expect(err.element.tagName.toLowerCase()).toBe('pre')
+    expect(err.text()).toContain('LINE 2: JOIN b')
+    expect(w.find('.zc-sql-table').exists()).toBe(false)
+  })
+
+  it('边界：服务端丢弃了纯注释段时 index 仍按原数组，块头分母是发出去的条数', async () => {
+    mocks.api.dbSqlBatch.mockResolvedValue({ data: { results: [rowsResult(2, 'SELECT 3 AS n', [{ n: 3 }])] } })
+    const w = await runWith('-- 只是注释\n; SELECT 1\n; SELECT 3 AS n')
+    expect(w.findAll('.zc-sql-block')).toHaveLength(1)
+    expect(w.findAll('.zc-sql-block')[0].text()).toContain('第 3/3 条')
+  })
+
+  it('边界：重新执行后旧的 error/skipped 块与汇总不残留', async () => {
+    threeStates()
+    const w = await runWith("INSERT INTO widgets VALUES (21,'keep'); SELECT * FROM no_such_table; SELECT 3 AS n")
+    expect(w.findAll('.zc-sql-block--error')).toHaveLength(1)
+    mocks.api.dbSqlBatch.mockResolvedValue({ data: { results: [rowsResult(0, 'SELECT 1', [{ n: 1 }])] } })
+    await w.find('.zc-sql-editor').setValue('SELECT 1')
+    await w.find('.zc-sql-run').trigger('click')
+    await flushPromises()
+    expect(w.findAll('.zc-sql-block')).toHaveLength(1)
+    expect(w.findAll('.zc-sql-block--error')).toHaveLength(0)
+    expect(w.find('.zc-sql-summary').text()).toBe('共 1 条，成功 1')
+  })
+
+  it('边界：503（整体拒绝）走 message.error，不画任何结果块也不画汇总', async () => {
+    mocks.api.dbSqlBatch.mockRejectedValue({
+      response: { data: { detail: '数据库连接失败，请检查 zerocode-pg16：' } } })
+    const w = await runWith('SELECT 1; SELECT 2')
+    expect(mocks.antd.message.error).toHaveBeenCalledWith('数据库连接失败，请检查 zerocode-pg16：')
+    expect(w.findAll('.zc-sql-block')).toHaveLength(0)
+    expect(w.find('.zc-sql-summary').exists()).toBe(false)
   })
 })

@@ -3,6 +3,7 @@
 审计写入用平台 session；连接类端点需真实 provision 的 dev 库（docker+PG 可用才跑）。"""
 import pytest
 from sqlalchemy import text
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from app.db import make_session_factory
@@ -534,3 +535,204 @@ async def test_sql_select_comment_variants_still_capped(db_app, monkeypatch):
         body = r.json()
         assert body["kind"] == "rows", sql
         assert len(body["rows"]) == 2 and body["truncated"] is True, sql
+
+
+# ---------- db-sql-console Ticket 003: 遇错即停与失败可见 ----------
+# 状态码分界（钉死）：connect() 之前/之外的异常走 HTTPException（400/404/409/503），
+# connect() 之内逐条执行的异常走 result 项、整体 200——否则拿不到前 i-1 条的结果。
+# 单条 /sql 对所有异常一律 500 的旧行为**故意保持不变**（见 test_sql_select_timeout_enforced）。
+
+
+def test_has_executable_content_blank_and_comment_only():
+    """纯函数：去掉空白与注释后还剩什么才算可执行——空串/纯空白/纯注释为 False。"""
+    assert svc.has_executable_content("SELECT 1") is True
+    assert svc.has_executable_content("-- x\nSELECT 1") is True   # 注释后还有真语句
+    assert svc.has_executable_content("SELECT '--'") is True      # 串里的 -- 不误判为空
+    assert svc.has_executable_content("") is False
+    assert svc.has_executable_content("   \n\t ") is False
+    assert svc.has_executable_content("-- 只是注释") is False
+    assert svc.has_executable_content("/* 块注释\n   多行 */") is False
+
+
+async def test_sql_batch_second_fails_stops_and_keeps_earlier_commit(db_app):
+    """第 2 条报错：第 1 条**已提交落库**（独立连接回查）、第 2 条带 PG 原文、第 3 条 skipped、整体 200。"""
+    client, aid, slug, _ = db_app
+    r = await client.post(f"/api/apps/{aid}/db/dev/sql/batch", json={"statements": [
+        "INSERT INTO widgets(id,name) VALUES (21,'keep')",
+        "SELECT * FROM no_such_table",
+        "SELECT 3 AS n",
+    ]})
+    assert r.status_code == 200, r.text
+    results = r.json()["results"]
+    assert [it["status"] for it in results] == ["ok", "error", "skipped"]
+    assert [it["index"] for it in results] == [0, 1, 2]   # index 显式带回，前端不靠数组下标猜
+    assert "no_such_table" in results[1]["error"]         # 错误原文不加工
+    assert "kind" not in results[2] and "rows" not in results[2]  # skipped 不编造结果体
+    eng = await _dev_eng(client, slug)
+    try:
+        async with eng.connect() as conn:
+            kept = (await conn.exec_driver_sql("SELECT name FROM widgets WHERE id=21")).scalar()
+    finally:
+        await eng.dispose()
+    assert kept == "keep"  # 遇错即停**不回滚**已成功的第 1 条（ADR 0007）
+
+
+async def test_sql_batch_first_fails_skips_everything_after(db_app):
+    """边界：第 1 条即错 → 成功 0、其余全 skipped，且后面的 INSERT 确实没跑。"""
+    client, aid, slug, _ = db_app
+    r = await client.post(f"/api/apps/{aid}/db/dev/sql/batch", json={"statements": [
+        "SELECT * FROM no_such_table",
+        "INSERT INTO widgets(id,name) VALUES (31,'never')",
+        "SELECT 1 AS n",
+    ]})
+    assert r.status_code == 200, r.text
+    results = r.json()["results"]
+    assert [it["status"] for it in results] == ["error", "skipped", "skipped"]
+    assert [it["index"] for it in results] == [0, 1, 2]
+    eng = await _dev_eng(client, slug)
+    try:
+        async with eng.connect() as conn:
+            got = (await conn.exec_driver_sql("SELECT count(*) FROM widgets WHERE id=31")).scalar()
+    finally:
+        await eng.dispose()
+    assert got == 0  # 证实 break 生效：skipped 不是"执行了但没显示"
+
+
+async def test_sql_batch_audits_executed_only_not_skipped(db_app):
+    """边界：审计条数 == 实际执行条数；error 条目 status='error' 且留错误原文；skipped 不留痕（US-14）。"""
+    client, aid, *_ = db_app
+    sf = client.app.state.session_factory
+    before = await _audit_count(sf, aid)
+    r = await client.post(f"/api/apps/{aid}/db/dev/sql/batch", json={"statements": [
+        "INSERT INTO widgets(id,name) VALUES (41,'a')",
+        "SELECT * FROM no_such_table",
+        "SELECT 9 AS n",
+    ]})
+    assert r.status_code == 200, r.text
+    assert await _audit_count(sf, aid) - before == 2
+    async with sf() as s:
+        rows = (await s.execute(text(
+            "SELECT sql_text, status, error FROM db_operation_log WHERE app_id=:a "
+            "ORDER BY id DESC LIMIT 3"), {"a": aid})).mappings().all()
+    by_sql = {row["sql_text"]: row for row in rows}
+    assert by_sql["INSERT INTO widgets(id,name) VALUES (41,'a')"]["status"] == "success"
+    assert by_sql["SELECT * FROM no_such_table"]["status"] == "error"
+    assert by_sql["SELECT * FROM no_such_table"]["error"]
+    assert "SELECT 9 AS n" not in by_sql
+
+
+def counting_engine(calls):
+    """包一层 create_async_engine 记录被调次数：短路类用例据此断言「压根没建引擎」。"""
+    real = svc.create_async_engine
+
+    def spy(url, *a, **kw):
+        calls.append(url)
+        return real(url, *a, **kw)
+
+    return spy
+
+
+async def test_sql_batch_empty_statements_400(db_app, monkeypatch):
+    """边界：空数组 → 400 且文案为「没有可执行的语句」，压根不建引擎。"""
+    client, aid, *_ = db_app
+    calls = []
+    monkeypatch.setattr(svc, "create_async_engine", counting_engine(calls))
+    r = await client.post(f"/api/apps/{aid}/db/dev/sql/batch", json={"statements": []})
+    assert r.status_code == 400, r.text
+    assert "没有可执行的语句" in r.json()["detail"]
+    assert calls == []
+
+
+async def test_sql_batch_all_blank_or_comment_400(db_app, monkeypatch):
+    """边界：全是空白/行注释/块注释 → 400，不把注释当语句送 PG。"""
+    client, aid, *_ = db_app
+    calls = []
+    monkeypatch.setattr(svc, "create_async_engine", counting_engine(calls))
+    r = await client.post(f"/api/apps/{aid}/db/dev/sql/batch",
+                          json={"statements": ["   ", "-- x", "/* y */\n", "\t"]})
+    assert r.status_code == 400, r.text
+    assert "没有可执行的语句" in r.json()["detail"]
+    assert calls == []
+
+
+async def test_sql_batch_blank_statement_among_real_ones_is_not_executed(db_app):
+    """边界：夹在真语句之间的空白/纯注释段不送 PG（否则会因它报错而误停整批），且不占结果位；index 仍按原数组。"""
+    client, aid, *_ = db_app
+    r = await client.post(f"/api/apps/{aid}/db/dev/sql/batch",
+                          json={"statements": ["   ", "-- 只是注释", "SELECT 1 AS n"]})
+    assert r.status_code == 200, r.text
+    results = r.json()["results"]
+    assert [it["index"] for it in results] == [2]      # 只有真语句出现在结果里
+    assert [it["status"] for it in results] == ["ok"]
+
+
+async def test_sql_batch_missing_credentials_409(client):
+    """边界：app 存在但未供给该 env（凭据缺失）→ 409，不是 500。"""
+    sf = client.app.state.session_factory
+    uid = (await client.get("/api/auth/me")).json()["id"]
+    aid = await _make_app_row(sf, uid, "batchnocred", 8551, 8552)
+    r = await client.post(f"/api/apps/{aid}/db/dev/sql/batch", json={"statements": ["SELECT 1"]})
+    assert r.status_code == 409, r.text
+
+
+async def test_sql_batch_connect_failure_503(db_app, monkeypatch):
+    """边界：建连阶段就失败（库不可达）→ 503，与表列表/数据端点同口径；实际执行 0 条故不写审计。"""
+    client, aid, *_ = db_app
+    sf = client.app.state.session_factory
+    before = await _audit_count(sf, aid)
+    real = svc.create_async_engine
+
+    def unreachable(url, *a, **kw):
+        # 必须 hide_password=False：str(URL) 会把密码涂成 ***，失败原因会偷换成「密码错」而不是「库不存在」。
+        return real(make_url(url).set(database="zc_no_such_db").render_as_string(hide_password=False),
+                    *a, **kw)
+
+    monkeypatch.setattr(svc, "create_async_engine", unreachable)
+    r = await client.post(f"/api/apps/{aid}/db/dev/sql/batch",
+                          json={"statements": ["SELECT 1", "SELECT 2"]})
+    assert r.status_code == 503, r.text
+    assert "数据库连接失败" in r.json()["detail"]
+    assert await _audit_count(sf, aid) == before
+
+
+async def test_sql_batch_row_cap_applies_per_statement(db_app, monkeypatch):
+    """边界：批量内每条 SELECT 各自受 SELECT_ROW_CAP 截断，truncated 逐条独立（US-16）。"""
+    monkeypatch.setattr(svc, "SELECT_ROW_CAP", 5)
+    client, aid, *_ = db_app
+    r = await client.post(f"/api/apps/{aid}/db/dev/sql/batch", json={"statements": [
+        "SELECT generate_series(1,20) AS n",
+        "SELECT generate_series(1,3) AS m",
+    ]})
+    assert r.status_code == 200, r.text
+    results = r.json()["results"]
+    assert [it["status"] for it in results] == ["ok", "ok"]
+    assert len(results[0]["rows"]) == 5 and results[0]["truncated"] is True
+    assert len(results[1]["rows"]) == 3 and results[1]["truncated"] is False
+
+
+async def test_sql_batch_dollar_quoted_function_body_not_resplit(db_app):
+    """边界：含 `$$ ... ; ... $$` 的整条建函数原文送达——服务端不二次拆分，否则函数体在第一个分号处被切断。"""
+    client, aid, *_ = db_app
+    r = await client.post(f"/api/apps/{aid}/db/dev/sql/batch", json={"statements": [
+        "CREATE FUNCTION zc_probe_add(a int, b int) RETURNS int AS $$ BEGIN RETURN a + b; END; $$ "
+        "LANGUAGE plpgsql",
+        "SELECT zc_probe_add(2,3) AS s",
+    ]})
+    assert r.status_code == 200, r.text
+    results = r.json()["results"]
+    assert [it["status"] for it in results] == ["ok", "ok"]
+    assert [it["op"] for it in results] == ["ddl", "select"]
+    assert results[1]["rows"] == [{"s": 5}]
+
+
+async def test_sql_batch_insert_returning_reports_rows(db_app):
+    """边界：INSERT ... RETURNING 归 kind='rows'（有返回列），不是 affected；写入本身已提交。"""
+    client, aid, *_ = db_app
+    r = await client.post(f"/api/apps/{aid}/db/dev/sql/batch", json={"statements": [
+        "INSERT INTO widgets(id,name) VALUES (51,'r') RETURNING id,name",
+    ]})
+    assert r.status_code == 200, r.text
+    it = r.json()["results"][0]
+    assert it["kind"] == "rows"
+    assert it["columns"] == ["id", "name"]
+    assert it["rows"] == [{"id": 51, "name": "r"}]

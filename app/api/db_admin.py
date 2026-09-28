@@ -151,8 +151,12 @@ async def db_sql_exec(request: Request, app_id: int, env: str, body: SqlIn):
 async def db_sql_batch(request: Request, app_id: int, env: str, body: SqlBatchIn):
     """批量执行：一个框里的多条语句在同一连接内按序跑，**逐条**写审计（一次批量 ≠ 一条留痕）。
 
-    语句顺序即执行顺序，响应 results[i] 与请求 statements[i] 一一对应（index 显式带回，
-    前端结果块不靠数组下标猜）。"""
+    语句顺序即执行顺序；results[i].index 显式带回原数组下标（空白/纯注释段不进结果集），
+    前端结果块不靠数组长度猜。
+
+    状态码分界：connect() 之前/之外的失败走 HTTP（400 非法 env / 400 无可执行语句 /
+    404 非归属 / 409 凭据缺失 / 503 建连失败）；connect() 之内逐条执行的失败走结果项、
+    整体 200——否则拿不到前 i-1 条的结果。单条 /sql 一律 500 的旧行为故意保持不变。"""
     app = await _load_app(request, app_id)
     actor_id = request.state.actor["id"]
     sf = request.app.state.session_factory
@@ -160,14 +164,24 @@ async def db_sql_batch(request: Request, app_id: int, env: str, body: SqlBatchIn
         svc.validate_env(env)
     except DeployError as e:
         raise HTTPException(e.status, str(e))
+    # 全空白/纯注释（含空数组）在建连前就拒：不把注释当语句送 PG，也不留痕。
+    if not any(svc.has_executable_content(s) for s in body.statements):
+        raise HTTPException(400, "没有可执行的语句")
     try:
         results = await svc.execute_batch(request, app["slug"], env, body.statements)
     except DeployError as e:
         raise HTTPException(e.status, str(e))
+    except Exception as e:
+        # 建连阶段就失败：实际执行了 0 条，没有逐条结果可展示，因此也不写审计。
+        raise HTTPException(503, f"数据库连接失败，请检查 zerocode-pg16：{e}")
     for it in results:
-        affected = it["affected"] if it["kind"] == "affected" else len(it["rows"])
-        await svc.log_operation(sf, app_id=app_id, actor_user_id=actor_id, env=env,
-                                op_type=it["op"], sql_text=it["sql"], target_table=None,
-                                status="success", affected=affected,
-                                duration_ms=it["duration_ms"])
+        if it["status"] == "skipped":
+            continue  # 没执行的事不留痕：记 success 或 error 都是凭空捏造一条执行记录
+        ok = it["status"] == "ok"
+        await svc.log_operation(
+            sf, app_id=app_id, actor_user_id=actor_id, env=env,
+            op_type=it["op"], sql_text=it["sql"], target_table=None,
+            status="success" if ok else "error",
+            affected=(it["affected"] if it["kind"] == "affected" else len(it["rows"])) if ok else None,
+            error=None if ok else it["error"], duration_ms=it["duration_ms"])
     return {"results": results}

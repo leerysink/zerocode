@@ -15,6 +15,9 @@ from app.deploy.errors import DeployError
 
 ENV_WHITELIST = ("dev", "prod")
 _DDL_KEYWORDS = {"create", "alter", "drop", "truncate", "comment"}
+# 粗剥注释用：只判「还剩不剩内容」，不理解字符串字面量（完整的状态机在 sqlSplit，Ticket 004）。
+_LINE_COMMENT_RE = re.compile(r"--[^\n]*")
+_BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.S)
 
 
 def validate_env(env: str) -> None:
@@ -40,6 +43,13 @@ def classify_op(sql: str) -> str:
             return "other"
         return "select"
     return "other"
+
+
+def has_executable_content(sql: str) -> bool:
+    """去掉空白与注释后还剩内容，才算一条真要送给数据库的语句。"""
+    if not sql:
+        return False
+    return bool(_BLOCK_COMMENT_RE.sub(" ", _LINE_COMMENT_RE.sub(" ", sql)).strip())
 
 
 def target_engine_url(request, cred: dict) -> str:
@@ -226,21 +236,42 @@ async def execute_batch(request, slug: str, env: str, statements: list[str]) -> 
     """同一引擎/同一连接内**按序**执行多条 SQL，逐条返回结果（不记审计）。
 
     只建一次连接：N 条语句重连 N 次既慢又会让"已成功的语句"落在不同会话里。
-    每条结果 = execute_one 的返回 + {index, op, sql, status, duration_ms}；
     审计留到 API 层逐条写（保持 service 只管执行、API 只管归属/留痕/状态码的分工）。
-    本票只走全部成功的路径：语句级异常与"遇错即停"在 Ticket 003 补。"""
+
+    遇错即停：某条抛异常 → 该条 {status:'error', error:str(e)}，其后所有可执行条
+    {status:'skipped'} 并立即 break。**不回滚**已成功的条目——每条在 execute_one 内已各自提交，
+    整体回滚反而会把用户已经看到的成功结果抹掉（ADR 0007）。
+
+    异常原样上抛（不缀号、不做行号定位），错误原文是用户唯一能拿去改 SQL 的东西。
+
+    两条不进结果集的语句：
+    - 空白/纯注释段不送 PG：PG 对空语句报错会让一个杂散空段误停整批；也不占结果位。
+    - index 始终是**原数组下标**，前端据此显示"第 N 条"，不靠数组长度猜。
+    所以统一口径：结果集只含可执行语句。建连阶段的异常仍上抛给 API 换 503——
+    那时一条都没执行，没有可展示的逐条结果。"""
     cred = await _cred_or_409(request, slug, env)
     eng = create_async_engine(target_engine_url(request, cred))
     results = []
     try:
         async with eng.connect() as conn:
             for index, sql in enumerate(statements):
+                if not has_executable_content(sql):
+                    continue
                 t0 = time.monotonic()
-                outcome = await execute_one(conn, sql)
-                results.append({"index": index, "op": classify_op(sql), "sql": sql,
-                                "status": "ok",
-                                "duration_ms": int((time.monotonic() - t0) * 1000),
-                                **outcome})
+                item = {"index": index, "op": classify_op(sql), "sql": sql}
+                try:
+                    outcome = await execute_one(conn, sql)
+                except Exception as e:
+                    item.update(status="error", error=str(e),
+                                duration_ms=int((time.monotonic() - t0) * 1000))
+                    results.append(item)
+                    for j in range(index + 1, len(statements)):
+                        if has_executable_content(statements[j]):
+                            results.append({"index": j, "op": classify_op(statements[j]),
+                                            "sql": statements[j], "status": "skipped"})
+                    break
+                item.update(status="ok", duration_ms=int((time.monotonic() - t0) * 1000), **outcome)
+                results.append(item)
     finally:
         await eng.dispose()
     return results
