@@ -29,6 +29,9 @@ const STUBS = {
       h('tr', { key: i }, Object.values(r).map((v) => h('td', String(v))))))) } },
   'a-alert': { props: ['message'], render() { return h('div', { class: 'zc-db-prod-warn' }, this.message) } },
   'a-button': { render() { return h('button', { class: 'zc-db-btn' }, this.$slots.default?.()) } },
+  'a-input': { props: ['value', 'disabled'], emits: ['change', 'update:value'], render() {
+    return h('input', { class: 'zc-db-input', value: this.value ?? '', disabled: !!this.disabled,
+      onInput: (e) => this.$emit('change', { target: { value: e.target.value } }) }) } },
   'a-drawer': { props: ['open'], render() { return this.open ? h('div', this.$slots.default?.()) : null } },
 }
 
@@ -53,4 +56,30 @@ it('切到 prod 重新拉表并显示警示条', async () => {
   await flushPromises()
   expect(mocks.api.dbTables).toHaveBeenCalledWith('1', 'prod')
   expect(w.find('.zc-db-prod-warn').exists()).toBe(true)
+})
+
+// ---------- Task 10: 数据 tab 行内编辑二次确认 + 无主键禁编辑 ----------
+it('选中有主键表拉数据，编辑保存走二次确认后执行 SQL', async () => {
+  mocks.api.dbSqlExec.mockResolvedValue({ data: { kind: 'affected', affected: 1 } })
+  mocks.antd.Modal.confirm = vi.fn(({ onOk }) => onOk())
+  const w = mount(DbAdminView, { global: { stubs: STUBS } })
+  await flushPromises()
+  await w.find('.zc-tree-node').trigger('click')
+  await flushPromises()
+  expect(mocks.api.dbTableData).toHaveBeenCalledWith('1', 'dev', 'widgets', expect.anything())
+  const save = w.find('.zc-db-edit-save')
+  expect(save.exists()).toBe(true)
+  await save.trigger('click')
+  await flushPromises()
+  expect(mocks.antd.Modal.confirm).toHaveBeenCalled()
+  expect(mocks.api.dbSqlExec).toHaveBeenCalledWith('1', 'dev', expect.stringContaining('UPDATE'))
+})
+
+it('无主键表禁用行内编辑', async () => {
+  mocks.api.dbTableSchema.mockResolvedValueOnce({ data: { columns: [{ name: 'id', type: 'integer', nullable: false, default: null }], primary_key: [], indexes: [] } })
+  const w = mount(DbAdminView, { global: { stubs: STUBS } })
+  await flushPromises()
+  await w.find('.zc-tree-node').trigger('click')
+  await flushPromises()
+  expect(w.find('.zc-db-edit-disabled').exists()).toBe(true)
 })

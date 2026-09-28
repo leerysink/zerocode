@@ -3,8 +3,8 @@
 // 数据网格在 Task 10 填充，SQL 控制台/审计抽屉在 Task 11 填充。
 import { onMounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
-import { message } from 'ant-design-vue'
-import { dbTables, dbTableSchema } from '../api'
+import { message, Modal } from 'ant-design-vue'
+import { dbTables, dbTableSchema, dbTableData, dbSqlExec } from '../api'
 
 const route = useRoute()
 const appId = route.params.id
@@ -12,6 +12,16 @@ const env = ref('dev')
 const tables = ref([])
 const selected = ref(null)
 const schema = ref(null)
+
+// ---- 数据网格 + 行内编辑（Task 10）----
+const rows = ref([])
+const dataCols = ref([])
+const total = ref(0)
+const page = ref(1)
+const size = ref(50)
+const sortCol = ref(null)
+const sortDir = ref('asc')
+const editRow = ref(null) // 当前编辑行（默认首行；点行切换）
 
 async function loadTables() {
   try {
@@ -30,8 +40,50 @@ async function selectTable(name) {
   }
 }
 watch(env, () => { selected.value = null; schema.value = null; loadTables() })
+
+async function loadData() {
+  if (!selected.value) return
+  try {
+    const { data } = await dbTableData(appId, env.value, selected.value,
+      { page: page.value, size: size.value, sort: sortCol.value || undefined, dir: sortDir.value })
+    rows.value = data.rows; dataCols.value = data.columns; total.value = data.total
+    editRow.value = rows.value.length ? { ...rows.value[0] } : null
+  } catch (e) { message.error(e?.response?.data?.detail || '数据加载失败') }
+}
+function onPageChange(p) { page.value = p; loadData() }
+function onSort(col) {
+  if (sortCol.value === col) sortDir.value = sortDir.value === 'asc' ? 'desc' : 'asc'
+  else { sortCol.value = col; sortDir.value = 'asc' }
+  page.value = 1; loadData()
+}
+function pickRow(row) { editRow.value = { ...row } }
+const canEdit = () => (schema.value?.primary_key || []).length > 0
+const isPk = (c) => (schema.value?.primary_key || []).includes(c)
+const q = (s) => `"${String(s).replace(/"/g, '""')}"`
+const lit = (v) => (v === null || v === undefined) ? 'NULL'
+  : typeof v === 'number' ? String(v) : `'${String(v).replace(/'/g, "''")}'`
+function buildUpdate(row) {
+  const pk = schema.value.primary_key
+  const setCols = dataCols.value.filter((c) => !pk.includes(c))
+  const set = setCols.map((c) => `${q(c)} = ${lit(row[c])}`).join(', ')
+  const where = pk.map((c) => `${q(c)} = ${lit(row[c])}`).join(' AND ')
+  return `UPDATE ${q(selected.value)} SET ${set} WHERE ${where}`
+}
+function saveEdits() {
+  if (!editRow.value) return
+  const sql = buildUpdate(editRow.value)
+  Modal.confirm({
+    title: '确认执行写操作', content: sql, okText: '执行', okType: 'danger',
+    onOk: async () => {
+      try { await dbSqlExec(appId, env.value, sql); message.success('已保存'); await loadData() }
+      catch (e) { message.error(e?.response?.data?.detail || '执行失败') }
+    },
+  })
+}
+watch(selected, () => { page.value = 1; editRow.value = null; loadData() })
+
 onMounted(loadTables)
-defineExpose({ selected, schema, selectTable })
+defineExpose({ selected, schema, selectTable, loadData, saveEdits, canEdit })
 </script>
 
 <template>
@@ -51,7 +103,24 @@ defineExpose({ selected, schema, selectTable })
         <a-tabs>
           <a-tab-pane key="data" tab="数据">
             <span v-if="!selected">选择左侧表以查看数据</span>
-            <!-- Task 10 填充数据网格 -->
+            <div v-else-if="!canEdit()" class="zc-db-edit-disabled">
+              该表无主键，行内编辑已禁用（请用查询控制台）
+            </div>
+            <div v-else>
+              <a-table size="small" :dataSource="rows" rowKey="__rk"
+                       :columns="dataCols.map(c => ({ title: c, dataIndex: c, sorter: true }))"
+                       :pagination="{ total, current: page, pageSize: size, onChange: onPageChange }"
+                       @change="(_p, _f, s) => s && onSort(s.columnKey || s.field)" />
+              <div v-if="editRow" class="zc-db-edit-panel">
+                <div class="zc-db-edit-title">编辑行（主键：{{ schema.primary_key.join(', ') }}）</div>
+                <div v-for="c in dataCols" :key="c" class="zc-db-edit-field">
+                  <label>{{ c }}</label>
+                  <a-input :value="editRow[c]" :disabled="isPk(c)"
+                           @change="(e) => editRow[c] = e.target.value" />
+                </div>
+                <button class="zc-db-edit-save" @click="saveEdits">保存</button>
+              </div>
+            </div>
           </a-tab-pane>
           <a-tab-pane key="schema" tab="结构">
             <a-table v-if="schema" size="small" rowKey="name" :dataSource="schema.columns"
@@ -74,4 +143,10 @@ defineExpose({ selected, schema, selectTable })
 .zc-db-left { width: 240px; overflow: auto; border: 1px solid #e5e7eb; border-radius: 6px; padding: 8px; }
 .zc-db-right { flex: 1; overflow: auto; }
 .zc-db-pk { margin-top: 8px; color: #6b7280; font-size: 12px; }
+.zc-db-edit-panel { margin-top: 12px; padding: 12px; border: 1px solid #e5e7eb; border-radius: 6px; }
+.zc-db-edit-title { font-size: 13px; color: #6b7280; margin-bottom: 8px; }
+.zc-db-edit-field { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.zc-db-edit-field label { width: 120px; font-size: 13px; }
+.zc-db-edit-save { margin-top: 8px; padding: 4px 14px; border: 1px solid #5b7a9d; border-radius: 4px;
+                   background: #5b7a9d; color: #fff; cursor: pointer; }
 </style>
