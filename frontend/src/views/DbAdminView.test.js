@@ -144,3 +144,30 @@ it('打开审计抽屉拉操作历史', async () => {
   expect(mocks.api.dbAudit).toHaveBeenCalledWith('1', expect.anything())
   expect(w.find('.zc-db-audit-drawer').exists()).toBe(true)
 })
+
+// ---------- Ticket 004: 审计过滤 + 顶栏刷新 ----------
+it('审计抽屉按环境过滤重拉', async () => {
+  mocks.api.dbAudit.mockResolvedValue({ data: { items: [] } })
+  const w = mount(DbAdminView, { global: { stubs: STUBS } })
+  await flushPromises()
+  await w.find('.zc-db-audit-btn').trigger('click')
+  await flushPromises()
+  const envSel = w.find('.zc-db-audit-env')
+  expect(envSel.exists()).toBe(true)
+  await envSel.setValue('prod')
+  await envSel.trigger('change')
+  await flushPromises()
+  expect(mocks.api.dbAudit).toHaveBeenLastCalledWith('1', expect.objectContaining({ env: 'prod' }))
+})
+
+it('顶栏刷新重拉当前表数据', async () => {
+  const w = mount(DbAdminView, { global: { stubs: STUBS } })
+  await flushPromises()
+  await w.find('.zc-tree-node').trigger('click')
+  await flushPromises()
+  expect(w.find('.zc-db-refresh').exists()).toBe(true)
+  mocks.api.dbTableData.mockClear()
+  await w.find('.zc-db-refresh').trigger('click')
+  await flushPromises()
+  expect(mocks.api.dbTableData).toHaveBeenCalledWith('1', 'dev', 'widgets', expect.anything())
+})

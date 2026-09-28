@@ -94,6 +94,8 @@ const sqlText = ref('')
 const sqlResult = ref(null)
 const auditing = ref(false)
 const auditItems = ref([])
+const auditEnv = ref('') // '' = 全部环境
+const auditOp = ref('') // '' = 全部操作类型
 
 function isSelect(s) {
   // 仅纯读 SELECT 免确认；SELECT...INTO（建表）与含函数式写的写法归为写，走二次确认。
@@ -113,12 +115,23 @@ function runSql() {
 }
 async function openAudit() {
   auditing.value = true
-  try { auditItems.value = (await dbAudit(appId, { limit: 100 })).data.items }
+  await fetchAudit()
+}
+async function fetchAudit() {
+  const params = { limit: 100 }
+  if (auditEnv.value) params.env = auditEnv.value
+  if (auditOp.value) params.op = auditOp.value
+  try { auditItems.value = (await dbAudit(appId, params)).data.items }
   catch (e) { message.error(e?.response?.data?.detail || '审计加载失败') }
+}
+function onAuditFilter() { fetchAudit() }
+async function refresh() {
+  await loadTables()
+  if (selected.value) { await selectTable(selected.value); await loadData() }
 }
 
 onMounted(loadTables)
-defineExpose({ selected, schema, selectTable, loadData, saveEdits, canEdit, runSql, openAudit })
+defineExpose({ selected, schema, selectTable, loadData, saveEdits, canEdit, runSql, openAudit, refresh, fetchAudit, auditEnv, auditOp })
 </script>
 
 <template>
@@ -127,6 +140,7 @@ defineExpose({ selected, schema, selectTable, loadData, saveEdits, canEdit, runS
       <h2>DB 操作 · 应用 {{ appId }}</h2>
       <div class="zc-db-head-right">
         <a-segmented v-model:value="env" class="zc-db-env" :options="[{ value: 'dev' }, { value: 'prod' }]" />
+        <a-button class="zc-db-refresh" @click="refresh">刷新</a-button>
         <a-button class="zc-db-audit-btn" @click="openAudit">操作历史</a-button>
       </div>
     </div>
@@ -185,10 +199,27 @@ defineExpose({ selected, schema, selectTable, loadData, saveEdits, canEdit, runS
     </div>
     <a-drawer v-model:open="auditing" title="操作历史" width="640">
       <div class="zc-db-audit-drawer">
+        <div class="zc-db-audit-filter">
+          <select v-model="auditEnv" class="zc-db-audit-env" @change="onAuditFilter">
+            <option value="">全部环境</option>
+            <option value="dev">dev</option>
+            <option value="prod">prod</option>
+          </select>
+          <select v-model="auditOp" class="zc-db-audit-op" @change="onAuditFilter">
+            <option value="">全部类型</option>
+            <option value="select">select</option>
+            <option value="insert">insert</option>
+            <option value="update">update</option>
+            <option value="delete">delete</option>
+            <option value="ddl">ddl</option>
+            <option value="other">other</option>
+          </select>
+        </div>
         <a-table size="small" rowKey="id" :dataSource="auditItems"
                  :columns="[{ title: '时间', dataIndex: 'ts' }, { title: '环境', dataIndex: 'env' },
                             { title: '类型', dataIndex: 'op_type' }, { title: '状态', dataIndex: 'status' },
-                            { title: 'SQL', dataIndex: 'sql_text' }]" />
+                            { title: '耗时ms', dataIndex: 'duration_ms' }, { title: '目标表', dataIndex: 'target_table' },
+                            { title: 'SQL', dataIndex: 'sql_text' }, { title: '错误', dataIndex: 'error' }]" />
       </div>
     </a-drawer>
   </div>
@@ -203,6 +234,8 @@ defineExpose({ selected, schema, selectTable, loadData, saveEdits, canEdit, runS
 .zc-db-sql-run { margin-bottom: 12px; }
 .zc-db-sql-affected { margin-top: 12px; color: #3f7d4e; font-size: 13px; }
 .zc-db-sql-truncated { margin-top: 8px; color: #b45309; font-size: 12px; }
+.zc-db-audit-filter { display: flex; gap: 8px; margin-bottom: 12px; }
+.zc-db-audit-filter select { padding: 4px 8px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 13px; }
 .zc-db-body { flex: 1; display: flex; gap: 12px; min-height: 0; }
 .zc-db-left { width: 240px; overflow: auto; border: 1px solid #e5e7eb; border-radius: 6px; padding: 8px; }
 .zc-db-right { flex: 1; overflow: auto; }
