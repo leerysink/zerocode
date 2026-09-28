@@ -42,7 +42,7 @@ beforeEach(() => {
   vi.clearAllMocks()
   mocks.api.dbTables.mockResolvedValue({ data: { tables: [{ name: 'widgets', type: 'BASE TABLE' }] } })
   mocks.api.dbTableSchema.mockResolvedValue({ data: { columns: [{ name: 'id', type: 'integer', nullable: false, default: null }], primary_key: ['id'], indexes: [] } })
-  mocks.api.dbTableData.mockResolvedValue({ data: { columns: ['id'], rows: [{ id: 1 }], total: 1, truncated: false } })
+  mocks.api.dbTableData.mockResolvedValue({ data: { columns: ['id', 'name'], rows: [{ id: 1, name: 'a' }], total: 1, truncated: false } })
 })
 
 it('挂载拉表并渲染树节点', async () => {
@@ -78,13 +78,17 @@ it('选中有主键表拉数据，编辑保存走二次确认后执行 SQL', asy
   expect(mocks.api.dbSqlExec).toHaveBeenCalledWith('1', 'dev', expect.stringContaining('UPDATE'))
 })
 
-it('无主键表禁用行内编辑', async () => {
+it('无主键表禁用行内编辑但仍可浏览数据', async () => {
   mocks.api.dbTableSchema.mockResolvedValueOnce({ data: { columns: [{ name: 'id', type: 'integer', nullable: false, default: null }], primary_key: [], indexes: [] } })
   const w = mount(DbAdminView, { global: { stubs: STUBS } })
   await flushPromises()
   await w.find('.zc-tree-node').trigger('click')
   await flushPromises()
   expect(w.find('.zc-db-edit-disabled').exists()).toBe(true)
+  expect(w.find('.zc-db-edit-save').exists()).toBe(false)
+  // 无主键不影响拉数据/渲染网格（视图可浏览）
+  expect(mocks.api.dbTableData).toHaveBeenCalledWith('1', 'dev', 'widgets', expect.anything())
+  expect(w.find('.zc-db-table').exists()).toBe(true)
 })
 
 // ---------- Task 11: SQL 控制台 + 审计抽屉 ----------

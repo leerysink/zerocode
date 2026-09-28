@@ -39,7 +39,12 @@ async function selectTable(name) {
     schema.value = null
   }
 }
-watch(env, () => { selected.value = null; schema.value = null; loadTables() })
+watch(env, () => {
+  selected.value = null; schema.value = null
+  rows.value = []; dataCols.value = []; total.value = 0; editRow.value = null
+  sqlResult.value = null; sqlText.value = ''
+  loadTables()
+})
 
 async function loadData() {
   if (!selected.value) return
@@ -65,6 +70,7 @@ const lit = (v) => (v === null || v === undefined) ? 'NULL'
 function buildUpdate(row) {
   const pk = schema.value.primary_key
   const setCols = dataCols.value.filter((c) => !pk.includes(c))
+  if (!setCols.length) return null // 全列即主键：无可编辑列，不生成坏 SQL
   const set = setCols.map((c) => `${q(c)} = ${lit(row[c])}`).join(', ')
   const where = pk.map((c) => `${q(c)} = ${lit(row[c])}`).join(' AND ')
   return `UPDATE ${q(selected.value)} SET ${set} WHERE ${where}`
@@ -72,6 +78,7 @@ function buildUpdate(row) {
 function saveEdits() {
   if (!editRow.value) return
   const sql = buildUpdate(editRow.value)
+  if (!sql) { message.warning('该表所有列均为主键，无可编辑列（请用查询控制台）'); return }
   Modal.confirm({
     title: '确认执行写操作', content: sql, okText: '执行', okType: 'danger',
     onOk: async () => {
@@ -88,7 +95,11 @@ const sqlResult = ref(null)
 const auditing = ref(false)
 const auditItems = ref([])
 
-function isSelect(s) { return /^\s*select\b/i.test(s) }
+function isSelect(s) {
+  // 仅纯读 SELECT 免确认；SELECT...INTO（建表）与含函数式写的写法归为写，走二次确认。
+  return /^\s*select\b/i.test(s) && !/\binto\b/i.test(s)
+    && !/\b(setval|nextval|currval|pg_sleep|pg_terminate_backend|pg_drop_replication_slot|call|perform)\b/i.test(s)
+}
 async function runRaw(s) {
   try { sqlResult.value = (await dbSqlExec(appId, env.value, s)).data }
   catch (e) { message.error(e?.response?.data?.detail || '执行失败') }
@@ -130,15 +141,16 @@ defineExpose({ selected, schema, selectTable, loadData, saveEdits, canEdit, runS
         <a-tabs>
           <a-tab-pane key="data" tab="数据">
             <span v-if="!selected">选择左侧表以查看数据</span>
-            <div v-else-if="!canEdit()" class="zc-db-edit-disabled">
-              该表无主键，行内编辑已禁用（请用查询控制台）
-            </div>
             <div v-else>
-              <a-table size="small" :dataSource="rows" rowKey="__rk"
+              <div v-if="!canEdit()" class="zc-db-edit-disabled">
+                该表无主键，行内编辑已禁用（仍可浏览，改数据请用查询控制台）
+              </div>
+              <a-table size="small" :dataSource="rows" :rowKey="(r, i) => i"
                        :columns="dataCols.map(c => ({ title: c, dataIndex: c, sorter: true }))"
                        :pagination="{ total, current: page, pageSize: size, onChange: onPageChange }"
-                       @change="(_p, _f, s) => s && onSort(s.columnKey || s.field)" />
-              <div v-if="editRow" class="zc-db-edit-panel">
+                       :custom-row="(r) => ({ onClick: () => pickRow(r) })"
+                       @change="(_p, _f, s, extra) => extra && extra.action === 'sort' && onSort(s.columnKey || s.field)" />
+              <div v-if="canEdit() && editRow" class="zc-db-edit-panel">
                 <div class="zc-db-edit-title">编辑行（主键：{{ schema.primary_key.join(', ') }}）</div>
                 <div v-for="c in dataCols" :key="c" class="zc-db-edit-field">
                   <label>{{ c }}</label>
