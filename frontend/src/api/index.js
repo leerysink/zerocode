@@ -97,6 +97,8 @@ export const deleteRecord = (id, rid) => http.delete(`/apps/${id}/records/${rid}
 export const appUrls = (id) => http.get(`/apps/${id}/urls`)
 // 应用资源监控（Ticket 001）：当前实时值（本期 workspace_size + prod_status）。
 export const appMetricsCurrent = (id) => http.get(`/apps/${id}/metrics/current`)
+// 历史曲线（Ticket 002）：window 取 1h/24h/7d/30d，返回各 kind 时序。
+export const appMetricsHistory = (id, window) => http.get(`/apps/${id}/metrics/history`, { params: { window } })
 export const systemNics = () => http.get('/system/nics')
 
 // ---- 应用商店 M3-a（上架 / 申请审批）----
