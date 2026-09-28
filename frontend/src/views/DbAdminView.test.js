@@ -32,6 +32,9 @@ const STUBS = {
   'a-input': { props: ['value', 'disabled'], emits: ['change', 'update:value'], render() {
     return h('input', { class: 'zc-db-input', value: this.value ?? '', disabled: !!this.disabled,
       onInput: (e) => this.$emit('change', { target: { value: e.target.value } }) }) } },
+  'a-textarea': { props: ['value'], emits: ['update:value'], render() {
+    return h('textarea', { class: 'zc-db-sql-input-el', value: this.value ?? '',
+      onInput: (e) => this.$emit('update:value', e.target.value) }) } },
   'a-drawer': { props: ['open'], render() { return this.open ? h('div', this.$slots.default?.()) : null } },
 }
 
@@ -82,4 +85,38 @@ it('无主键表禁用行内编辑', async () => {
   await w.find('.zc-tree-node').trigger('click')
   await flushPromises()
   expect(w.find('.zc-db-edit-disabled').exists()).toBe(true)
+})
+
+// ---------- Task 11: SQL 控制台 + 审计抽屉 ----------
+it('SELECT 直接执行并渲染结果', async () => {
+  mocks.api.dbSqlExec.mockResolvedValue({ data: { kind: 'rows', columns: ['n'], rows: [{ n: 1 }], truncated: false } })
+  const w = mount(DbAdminView, { global: { stubs: STUBS } })
+  await flushPromises()
+  await w.find('.zc-db-sql-input').setValue('SELECT 1 AS n')
+  mocks.antd.Modal.confirm = vi.fn()
+  await w.find('.zc-db-sql-run').trigger('click')
+  await flushPromises()
+  expect(mocks.antd.Modal.confirm).not.toHaveBeenCalled()
+  expect(mocks.api.dbSqlExec).toHaveBeenCalledWith('1', 'dev', 'SELECT 1 AS n')
+})
+
+it('非 SELECT 执行前二次确认', async () => {
+  mocks.api.dbSqlExec.mockResolvedValue({ data: { kind: 'affected', affected: 1 } })
+  mocks.antd.Modal.confirm = vi.fn(({ onOk }) => onOk())
+  const w = mount(DbAdminView, { global: { stubs: STUBS } })
+  await flushPromises()
+  await w.find('.zc-db-sql-input').setValue('UPDATE widgets SET name=1')
+  await w.find('.zc-db-sql-run').trigger('click')
+  await flushPromises()
+  expect(mocks.antd.Modal.confirm).toHaveBeenCalled()
+})
+
+it('打开审计抽屉拉操作历史', async () => {
+  mocks.api.dbAudit.mockResolvedValue({ data: { items: [{ id: 1, op_type: 'select', status: 'success', env: 'dev' }] } })
+  const w = mount(DbAdminView, { global: { stubs: STUBS } })
+  await flushPromises()
+  await w.find('.zc-db-audit-btn').trigger('click')
+  await flushPromises()
+  expect(mocks.api.dbAudit).toHaveBeenCalledWith('1', expect.anything())
+  expect(w.find('.zc-db-audit-drawer').exists()).toBe(true)
 })
