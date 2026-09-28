@@ -173,7 +173,10 @@ defineExpose({ selected, schema, selectTable, loadData, saveEdits, canEdit, runS
             <a-button class="zc-db-sql-run" type="primary" @click="runSql">执行</a-button>
             <a-table v-if="sqlResult && sqlResult.kind === 'rows'" size="small" :dataSource="sqlResult.rows"
                      :columns="sqlResult.columns.map(c => ({ title: c, dataIndex: c }))" />
-            <div v-else-if="sqlResult && sqlResult.kind === 'affected'" class="zc-db-sql-affected">
+            <div v-if="sqlResult && sqlResult.kind === 'rows' && sqlResult.truncated" class="zc-db-sql-truncated">
+              结果过大，仅显示前 {{ sqlResult.rows.length }} 行；请用 LIMIT / WHERE 收窄。
+            </div>
+            <div v-if="sqlResult && sqlResult.kind === 'affected'" class="zc-db-sql-affected">
               影响 {{ sqlResult.affected }} 行
             </div>
           </a-tab-pane>
@@ -199,6 +202,7 @@ defineExpose({ selected, schema, selectTable, loadData, saveEdits, canEdit, runS
 .zc-db-sql-input { margin-bottom: 8px; font-family: monospace; }
 .zc-db-sql-run { margin-bottom: 12px; }
 .zc-db-sql-affected { margin-top: 12px; color: #3f7d4e; font-size: 13px; }
+.zc-db-sql-truncated { margin-top: 8px; color: #b45309; font-size: 12px; }
 .zc-db-body { flex: 1; display: flex; gap: 12px; min-height: 0; }
 .zc-db-left { width: 240px; overflow: auto; border: 1px solid #e5e7eb; border-radius: 6px; padding: 8px; }
 .zc-db-right { flex: 1; overflow: auto; }

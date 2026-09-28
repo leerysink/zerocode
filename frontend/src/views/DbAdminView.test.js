@@ -104,6 +104,26 @@ it('SELECT 直接执行并渲染结果', async () => {
   expect(mocks.api.dbSqlExec).toHaveBeenCalledWith('1', 'dev', 'SELECT 1 AS n')
 })
 
+it('SELECT 命中行上限时展示截断提示', async () => {
+  mocks.api.dbSqlExec.mockResolvedValue({ data: { kind: 'rows', columns: ['n'], rows: [{ n: 1 }], truncated: true } })
+  const w = mount(DbAdminView, { global: { stubs: STUBS } })
+  await flushPromises()
+  await w.find('.zc-db-sql-input').setValue('SELECT generate_series(1,9999) AS n')
+  await w.find('.zc-db-sql-run').trigger('click')
+  await flushPromises()
+  expect(w.find('.zc-db-sql-truncated').exists()).toBe(true)
+})
+
+it('SELECT 未达上限时不显示截断提示', async () => {
+  mocks.api.dbSqlExec.mockResolvedValue({ data: { kind: 'rows', columns: ['n'], rows: [{ n: 1 }], truncated: false } })
+  const w = mount(DbAdminView, { global: { stubs: STUBS } })
+  await flushPromises()
+  await w.find('.zc-db-sql-input').setValue('SELECT 1 AS n')
+  await w.find('.zc-db-sql-run').trigger('click')
+  await flushPromises()
+  expect(w.find('.zc-db-sql-truncated').exists()).toBe(false)
+})
+
 it('非 SELECT 执行前二次确认', async () => {
   mocks.api.dbSqlExec.mockResolvedValue({ data: { kind: 'affected', affected: 1 } })
   mocks.antd.Modal.confirm = vi.fn(({ onOk }) => onOk())
