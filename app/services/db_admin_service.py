@@ -75,3 +75,40 @@ async def list_tables(request, slug: str, env: str) -> list[dict]:
         return [dict(r) for r in rows]
     finally:
         await eng.dispose()
+
+
+async def table_schema(request, slug: str, env: str, table: str) -> dict:
+    """读列/主键/索引。table 作绑定参数查 information_schema；不存在 → DeployError(404)。"""
+    cred = await _cred_or_409(request, slug, env)
+    eng = create_async_engine(target_engine_url(request, cred))
+    try:
+        async with eng.connect() as conn:
+            exists = (await conn.execute(text(
+                "SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name=:t"),
+                {"t": table})).first()
+            if not exists:
+                raise DeployError(f"表不存在: {table}", status=404)
+            cols = (await conn.execute(text(
+                "SELECT column_name AS name, data_type AS type, is_nullable AS nullable, "
+                "column_default AS default FROM information_schema.columns "
+                "WHERE table_schema='public' AND table_name=:t ORDER BY ordinal_position"),
+                {"t": table})).mappings().all()
+            pk = (await conn.execute(text(
+                "SELECT kcu.column_name AS c FROM information_schema.table_constraints tc "
+                "JOIN information_schema.key_column_usage kcu "
+                "  ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema "
+                "WHERE tc.constraint_type='PRIMARY KEY' AND tc.table_schema='public' AND tc.table_name=:t "
+                "ORDER BY kcu.ordinal_position"), {"t": table})).scalars().all()
+            idx = (await conn.execute(text(
+                "SELECT indexname AS name, indexdef AS definition FROM pg_indexes "
+                "WHERE schemaname='public' AND tablename=:t ORDER BY indexname"),
+                {"t": table})).mappings().all()
+        return {
+            "columns": [{"name": c["name"], "type": c["type"],
+                         "nullable": c["nullable"] == "YES", "default": c["default"]}
+                        for c in cols],
+            "primary_key": list(pk),
+            "indexes": [dict(i) for i in idx],
+        }
+    finally:
+        await eng.dispose()

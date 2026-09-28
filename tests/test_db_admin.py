@@ -126,3 +126,21 @@ async def test_tables_foreign_app_404(two_auth_clients):
     aid = await _make_app_row(sf, uid_a, "foreignx", 8513, 8514)
     r = await c_bob.get(f"/api/apps/{aid}/db/dev/tables")
     assert r.status_code == 404
+
+
+# ---------- Task 3: 表结构端点 ----------
+
+async def test_schema_endpoint_returns_columns_and_pk(db_app):
+    client, aid, slug, uid = db_app
+    r = await client.get(f"/api/apps/{aid}/db/dev/tables/widgets/schema")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    colnames = [c["name"] for c in body["columns"]]
+    assert "id" in colnames and "name" in colnames
+    assert body["primary_key"] == ["id"]
+
+
+async def test_schema_unknown_table_404(db_app):
+    client, aid, *_ = db_app
+    r = await client.get(f"/api/apps/{aid}/db/dev/tables/nope_nope/schema")
+    assert r.status_code == 404

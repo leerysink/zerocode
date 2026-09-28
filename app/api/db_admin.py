@@ -39,3 +39,20 @@ async def db_tables(request: Request, app_id: int, env: str):
         return {"tables": tables}
     except DeployError as e:
         raise HTTPException(e.status, str(e))
+
+
+@router.get("/{app_id}/db/{env}/tables/{table}/schema")
+async def db_table_schema(request: Request, app_id: int, env: str, table: str):
+    app = await _load_app(request, app_id)
+    try:
+        svc.validate_env(env)
+        t0 = time.monotonic()
+        schema = await svc.table_schema(request, app["slug"], env, table)
+        await svc.log_operation(
+            request.app.state.session_factory, app_id=app_id,
+            actor_user_id=request.state.actor["id"], env=env, op_type="struct_view",
+            sql_text="GET schema", target_table=table, status="success",
+            duration_ms=int((time.monotonic() - t0) * 1000))
+        return schema
+    except DeployError as e:
+        raise HTTPException(e.status, str(e))
