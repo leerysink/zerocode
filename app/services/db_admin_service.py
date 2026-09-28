@@ -76,6 +76,7 @@ async def list_tables(request, slug: str, env: str) -> list[dict]:
     eng = create_async_engine(target_engine_url(request, cred))
     try:
         async with eng.connect() as conn:
+            await conn.exec_driver_sql(f"SET statement_timeout = '{STATEMENT_TIMEOUT}'")
             rows = (await conn.execute(text(
                 "SELECT table_name AS name, table_type AS type FROM information_schema.tables "
                 "WHERE table_schema = 'public' ORDER BY table_name"))).mappings().all()
@@ -90,6 +91,7 @@ async def table_schema(request, slug: str, env: str, table: str) -> dict:
     eng = create_async_engine(target_engine_url(request, cred))
     try:
         async with eng.connect() as conn:
+            await conn.exec_driver_sql(f"SET statement_timeout = '{STATEMENT_TIMEOUT}'")
             exists = (await conn.execute(text(
                 "SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name=:t"),
                 {"t": table})).first()
@@ -145,6 +147,7 @@ async def table_data(request, slug: str, env: str, table: str, *, page: int = 1,
     eng = create_async_engine(target_engine_url(request, cred))
     try:
         async with eng.connect() as conn:
+            await conn.exec_driver_sql(f"SET statement_timeout = '{STATEMENT_TIMEOUT}'")
             total = (await conn.execute(text(f"SELECT count(*) FROM {tbl}"))).scalar()
             offset = (page - 1) * size
             rows = (await conn.execute(text(
@@ -158,11 +161,14 @@ async def table_data(request, slug: str, env: str, table: str, *, page: int = 1,
 
 
 SELECT_ROW_CAP = 5000
+STATEMENT_TIMEOUT = "15s"
 
 
 async def execute_sql(request, slug: str, env: str, sql: str) -> dict:
     """直连执行一条 SQL。有返回列 → rows（截断 SELECT_ROW_CAP）；否则 → affected。
-    SELECT 类加语句超时护栏；写/DDL 不加（用户承担）。
+    SELECT 类：外层包 `SELECT * FROM (<sql>) LIMIT cap+1` 在库侧即截断（不把整表 fetchall 进内存、防 OOM），
+    并加 statement_timeout 护栏；写/DDL 不加超时（用户承担）。
+    子查询包裹要求内层是合法 SELECT 源（重复输出列名等极端情形可能报错，属管控台可接受限制）。
     关键：SQLAlchemy 2.0 默认「commit as you go」，写完必须显式 conn.commit()，否则
     连接关闭即回滚——写/DDL 不落库却返回成功、审计误记 success。异常原样上抛给 API 层记审计。"""
     cred = await _cred_or_409(request, slug, env)
@@ -171,11 +177,15 @@ async def execute_sql(request, slug: str, env: str, sql: str) -> dict:
     try:
         async with eng.connect() as conn:
             if op == "select":
-                await conn.exec_driver_sql("SET statement_timeout = '15s'")
-            result = await conn.exec_driver_sql(sql)
+                await conn.exec_driver_sql(f"SET statement_timeout = '{STATEMENT_TIMEOUT}'")
+                inner = sql.strip().rstrip(";")
+                capped = f"SELECT * FROM ({inner}) AS _zc_cap LIMIT {SELECT_ROW_CAP + 1}"
+                result = await conn.exec_driver_sql(capped)
+            else:
+                result = await conn.exec_driver_sql(sql)
             if result.returns_rows:
                 cols = list(result.keys())
-                fetched = result.fetchall()
+                fetched = result.fetchall()  # select 至多 cap+1 行；写/RETURNING 一般小量
                 truncated = len(fetched) > SELECT_ROW_CAP
                 rows = [dict(zip(cols, r)) for r in fetched[:SELECT_ROW_CAP]]
                 await conn.commit()  # SELECT 提交无害；带副作用的 SELECT（如 INTO）需此提交才落库

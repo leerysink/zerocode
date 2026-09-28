@@ -247,3 +247,43 @@ async def test_audit_endpoint_returns_recent_ops(db_app):
     assert r.status_code == 200, r.text
     items = r.json()["items"]
     assert any(it["op_type"] == "select" and it["status"] == "success" for it in items)
+
+
+# ---------- Ticket 001: 结果集护栏（行上限截断 + 语句超时）----------
+
+async def test_sql_select_row_cap_truncates(db_app, monkeypatch):
+    """边界：命中 SELECT_ROW_CAP 时库侧即截断，返回恰为上限行且 truncated=true。"""
+    monkeypatch.setattr(svc, "SELECT_ROW_CAP", 5)
+    client, aid, *_ = db_app
+    r = await client.post(f"/api/apps/{aid}/db/dev/sql",
+                          json={"sql": "SELECT generate_series(1,20) AS n"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["kind"] == "rows"
+    assert len(body["rows"]) == 5
+    assert body["truncated"] is True
+
+
+async def test_sql_select_under_cap_not_truncated(db_app, monkeypatch):
+    """边界：行数未达上限时 truncated=false，不丢行。"""
+    monkeypatch.setattr(svc, "SELECT_ROW_CAP", 5)
+    client, aid, *_ = db_app
+    r = await client.post(f"/api/apps/{aid}/db/dev/sql",
+                          json={"sql": "SELECT generate_series(1,3) AS n"})
+    body = r.json()
+    assert len(body["rows"]) == 3
+    assert body["truncated"] is False
+
+
+async def test_sql_select_timeout_enforced(db_app, monkeypatch):
+    """边界：超长 SELECT 被 statement_timeout 中断 → /sql 返回 500 且写 error 审计。"""
+    monkeypatch.setattr(svc, "STATEMENT_TIMEOUT", "1s")
+    client, aid, *_ = db_app
+    r = await client.post(f"/api/apps/{aid}/db/dev/sql", json={"sql": "SELECT pg_sleep(5)"})
+    assert r.status_code == 500
+    sf = client.app.state.session_factory
+    async with sf() as s:
+        row = (await s.execute(text(
+            "SELECT status, error FROM db_operation_log WHERE app_id=:a AND status='error' "
+            "ORDER BY id DESC LIMIT 1"), {"a": aid})).mappings().first()
+    assert row and row["error"]
