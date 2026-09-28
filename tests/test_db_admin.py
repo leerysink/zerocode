@@ -386,3 +386,151 @@ async def test_audit_foreign_app_404(two_auth_clients):
     aid = await _make_app_row(sf, uid_a, "auditforeign", 8531, 8532)
     r = await c_bob.get(f"/api/apps/{aid}/db/audit")
     assert r.status_code == 404
+
+
+# ---------- db-sql-console Ticket 002: 批量端点（示踪弹） ----------
+
+async def _audit_count(sf, aid):
+    async with sf() as s:
+        return (await s.execute(text(
+            "SELECT count(*) FROM db_operation_log WHERE app_id=:a"), {"a": aid})).scalar()
+
+
+async def test_sql_batch_two_selects_returns_two_results(db_app):
+    """示踪弹主流程：一个框两条 SELECT → 两个结果块，顺序与输入一致。"""
+    client, aid, *_ = db_app
+    r = await client.post(f"/api/apps/{aid}/db/dev/sql/batch",
+                          json={"statements": ["SELECT 1 AS n", "SELECT 2 AS n"]})
+    assert r.status_code == 200, r.text
+    results = r.json()["results"]
+    assert len(results) == 2
+    assert [it["index"] for it in results] == [0, 1]
+    assert [it["status"] for it in results] == ["ok", "ok"]
+    assert [it["op"] for it in results] == ["select", "select"]
+    assert results[0]["rows"] == [{"n": 1}] and results[1]["rows"] == [{"n": 2}]
+    assert all(isinstance(it["duration_ms"], int) for it in results)
+
+
+async def test_sql_batch_mixed_writes_and_select_in_order(db_app):
+    """边界：写-写-读混合段按序生效，affected/rows 两种形态共存（US-08）。"""
+    client, aid, slug, _ = db_app
+    await _seed_widgets(client, slug, [(1, "a")])
+    r = await client.post(f"/api/apps/{aid}/db/dev/sql/batch", json={"statements": [
+        "INSERT INTO widgets(id,name) VALUES (11,'k1')",
+        "INSERT INTO widgets(id,name) VALUES (12,'k2')",
+        "SELECT id FROM widgets ORDER BY id",
+    ]})
+    assert r.status_code == 200, r.text
+    results = r.json()["results"]
+    assert [it["kind"] for it in results] == ["affected", "affected", "rows"]
+    assert [it["affected"] for it in results[:2]] == [1, 1]
+    assert [row["id"] for row in results[2]["rows"]] == [1, 11, 12]  # 前面的写已提交可见
+
+
+async def test_sql_batch_uses_one_engine(db_app, monkeypatch):
+    """边界：N 条批量只建一次引擎/一条连接（防每条语句重连，US-09 的代价来源）。"""
+    client, aid, *_ = db_app
+    calls = []
+    real = svc.create_async_engine
+
+    def counting(url, *a, **kw):
+        calls.append(url)
+        return real(url, *a, **kw)
+
+    monkeypatch.setattr(svc, "create_async_engine", counting)
+    r = await client.post(f"/api/apps/{aid}/db/dev/sql/batch",
+                          json={"statements": ["SELECT 1", "SELECT 2", "SELECT 3"]})
+    assert r.status_code == 200, r.text
+    assert len(calls) == 1
+
+
+async def test_sql_batch_writes_one_audit_per_statement(db_app):
+    """边界：一次 N 条批量 → 审计新增 N 条（逐条留痕，不是整段一条，US-14）。"""
+    client, aid, *_ = db_app
+    sf = client.app.state.session_factory
+    before = await _audit_count(sf, aid)
+    r = await client.post(f"/api/apps/{aid}/db/dev/sql/batch",
+                          json={"statements": ["SELECT 1", "SELECT 2"]})
+    assert r.status_code == 200, r.text
+    assert await _audit_count(sf, aid) - before == 2
+    async with sf() as s:
+        rows = (await s.execute(text(
+            "SELECT op_type, status, sql_text FROM db_operation_log WHERE app_id=:a "
+            "ORDER BY id DESC LIMIT 2"), {"a": aid})).mappings().all()
+    assert {row["sql_text"] for row in rows} == {"SELECT 1", "SELECT 2"}
+    assert all(row["status"] == "success" and row["op_type"] == "select" for row in rows)
+
+
+async def test_sql_batch_foreign_app_404(two_auth_clients):
+    """边界：非归属账号调批量端点→404（与单条 /sql 同一归属过滤）。"""
+    c_alice, c_bob = two_auth_clients
+    sf = c_alice.app.state.session_factory
+    uid_a = (await c_alice.get("/api/auth/me")).json()["id"]
+    aid = await _make_app_row(sf, uid_a, "batchforeign", 8541, 8542)
+    r = await c_bob.post(f"/api/apps/{aid}/db/dev/sql/batch", json={"statements": ["SELECT 1"]})
+    assert r.status_code == 404
+
+
+async def test_sql_batch_illegal_env_400(db_app):
+    """边界：批量端点非法 env → 400（不建连）。"""
+    client, aid, *_ = db_app
+    r = await client.post(f"/api/apps/{aid}/db/qa/sql/batch", json={"statements": ["SELECT 1"]})
+    assert r.status_code == 400
+
+
+# ---------- db-sql-console Ticket 002 边界: 行数护栏包裹 vs 行尾注释 ----------
+# 复现的 bug：SELECT 被包成 `SELECT * FROM (<sql>) AS _zc_cap LIMIT n` 时，
+# 若 <sql> 以 `--` 行注释收尾，右括号与 LIMIT 会被注释吃掉 → syntax error at end of input。
+# 浏览器实测（Ticket 002 手工冒烟）踩中，单条与批量两条路径同源（都走 execute_one）。
+
+async def test_sql_select_trailing_line_comment_survives_row_cap(db_app):
+    """边界：单条 SELECT 以行注释收尾 → 包裹换行终止注释，仍正常返回 rows（不再 500）。"""
+    client, aid, *_ = db_app
+    r = await client.post(f"/api/apps/{aid}/db/dev/sql", json={"sql": "SELECT 1 AS n -- x"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["kind"] == "rows"
+    assert body["rows"] == [{"n": 1}]
+    assert body["truncated"] is False
+
+
+async def test_sql_batch_select_trailing_line_comment_keeps_later_statements(db_app):
+    """边界：批量首条带行尾注释不吞掉后续语句——两条都要 ok（回归即整批 500）。"""
+    client, aid, *_ = db_app
+    r = await client.post(f"/api/apps/{aid}/db/dev/sql/batch", json={"statements": [
+        "SELECT 1 AS n -- x",
+        "SELECT 2 AS m",
+    ]})
+    assert r.status_code == 200, r.text
+    results = r.json()["results"]
+    assert [it["status"] for it in results] == ["ok", "ok"]
+    assert results[0]["rows"] == [{"n": 1}] and results[1]["rows"] == [{"m": 2}]
+
+
+async def test_sql_multiline_select_with_line_comments_on_every_line(db_app):
+    """边界：多行 SELECT 每行都带行尾注释（最贴近真实手写脚本），列名与取值不丢。"""
+    client, aid, slug, _ = db_app
+    await _seed_widgets(client, slug, [(1, "a"), (2, "b")])
+    sql = "SELECT id,   -- 主键\n       name  -- 名称\nFROM widgets  -- 全表\n"
+    r = await client.post(f"/api/apps/{aid}/db/dev/sql", json={"sql": sql})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["kind"] == "rows"
+    assert body["columns"] == ["id", "name"]
+    assert [row["id"] for row in body["rows"]] == [1, 2]
+
+
+async def test_sql_select_comment_variants_still_capped(db_app, monkeypatch):
+    """边界：行注释带分号收尾 / 块注释收尾 / 中文全角注释，三种写法都不破语法且截断仍生效。"""
+    monkeypatch.setattr(svc, "SELECT_ROW_CAP", 2)
+    client, aid, *_ = db_app
+    for sql in (
+        "SELECT generate_series(1,10) AS n -- x;",        # 注释后有分号
+        "SELECT generate_series(1,10) AS n /* x */",      # 块注释收尾（原本就合法）
+        "SELECT generate_series(1,10) AS n -- 注释（全角）",
+    ):
+        r = await client.post(f"/api/apps/{aid}/db/dev/sql", json={"sql": sql})
+        assert r.status_code == 200, f"{sql!r} → {r.status_code} {r.text}"
+        body = r.json()
+        assert body["kind"] == "rows", sql
+        assert len(body["rows"]) == 2 and body["truncated"] is True, sql

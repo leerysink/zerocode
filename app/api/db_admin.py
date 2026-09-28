@@ -19,6 +19,10 @@ class SqlIn(BaseModel):
     sql: str
 
 
+class SqlBatchIn(BaseModel):
+    statements: list[str]
+
+
 async def _load_app(request: Request, app_id: int) -> dict:
     actor = request.state.actor
     owner = None if actor.get("is_founder") else actor["id"]
@@ -141,3 +145,29 @@ async def db_sql_exec(request: Request, app_id: int, env: str, body: SqlIn):
                             status="success", affected=affected,
                             duration_ms=int((time.monotonic() - t0) * 1000))
     return result
+
+
+@router.post("/{app_id}/db/{env}/sql/batch")
+async def db_sql_batch(request: Request, app_id: int, env: str, body: SqlBatchIn):
+    """批量执行：一个框里的多条语句在同一连接内按序跑，**逐条**写审计（一次批量 ≠ 一条留痕）。
+
+    语句顺序即执行顺序，响应 results[i] 与请求 statements[i] 一一对应（index 显式带回，
+    前端结果块不靠数组下标猜）。"""
+    app = await _load_app(request, app_id)
+    actor_id = request.state.actor["id"]
+    sf = request.app.state.session_factory
+    try:
+        svc.validate_env(env)
+    except DeployError as e:
+        raise HTTPException(e.status, str(e))
+    try:
+        results = await svc.execute_batch(request, app["slug"], env, body.statements)
+    except DeployError as e:
+        raise HTTPException(e.status, str(e))
+    for it in results:
+        affected = it["affected"] if it["kind"] == "affected" else len(it["rows"])
+        await svc.log_operation(sf, app_id=app_id, actor_user_id=actor_id, env=env,
+                                op_type=it["op"], sql_text=it["sql"], target_table=None,
+                                status="success", affected=affected,
+                                duration_ms=it["duration_ms"])
+    return {"results": results}

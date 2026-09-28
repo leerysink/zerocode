@@ -6,6 +6,7 @@
 app.state.engine.url 才是当前进程真实连接的实例/端口。安全：标识符 quote_ident 转义 + 值参数绑定。
 """
 import re
+import time
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -175,37 +176,74 @@ SELECT_ROW_CAP = 5000
 STATEMENT_TIMEOUT = "15s"
 
 
-async def execute_sql(request, slug: str, env: str, sql: str) -> dict:
-    """直连执行一条 SQL。有返回列 → rows（截断 SELECT_ROW_CAP）；否则 → affected。
+async def execute_one(conn, sql: str) -> dict:
+    """在**已打开的连接**上执行一条 SQL 并返回结果字典（不建连、不 dispose、不记审计）。
+
+    有返回列 → rows（截断 SELECT_ROW_CAP）；否则 → affected。
     SELECT 类：外层包 `SELECT * FROM (<sql>) LIMIT cap+1` 在库侧即截断（不把整表 fetchall 进内存、防 OOM），
     并加 statement_timeout 护栏；写/DDL 不加超时（用户承担）。
     子查询包裹要求内层是合法 SELECT 源（重复输出列名等极端情形可能报错，属管控台可接受限制）。
+    包裹时内层前后各补一个换行：否则以 `--` 行注释收尾的 SELECT 会把右括号和 LIMIT 一起注释掉。
     关键：SQLAlchemy 2.0 默认「commit as you go」，写完必须显式 conn.commit()，否则
-    连接关闭即回滚——写/DDL 不落库却返回成功、审计误记 success。异常原样上抛给 API 层记审计。"""
+    连接关闭即回滚——写/DDL 不落库却返回成功、审计误记 success。异常原样上抛给调用方。
+
+    单条 execute_sql 与批量 execute_batch **共用本函数**：护栏（超时/行数上限/提交时机）只此一份，
+    两条路径不各写一套，避免行为漂移。"""
+    op = classify_op(sql)
+    if op == "select":
+        await conn.exec_driver_sql(f"SET statement_timeout = '{STATEMENT_TIMEOUT}'")
+        inner = sql.strip().rstrip(";")
+        # 换行不可省：内层以 `--` 收尾时，同一行上的 `) AS _zc_cap LIMIT n` 会被注释吃掉。
+        capped = f"SELECT * FROM (\n{inner}\n) AS _zc_cap LIMIT {SELECT_ROW_CAP + 1}"
+        result = await conn.exec_driver_sql(capped)
+    else:
+        result = await conn.exec_driver_sql(sql)
+    if result.returns_rows:
+        cols = list(result.keys())
+        fetched = result.fetchall()  # select 至多 cap+1 行；写/RETURNING 一般小量
+        truncated = len(fetched) > SELECT_ROW_CAP
+        rows = [dict(zip(cols, r)) for r in fetched[:SELECT_ROW_CAP]]
+        await conn.commit()  # SELECT 提交无害；带副作用的 SELECT（如 INTO）需此提交才落库
+        return {"kind": "rows", "columns": cols, "rows": rows, "truncated": truncated}
+    affected = int(result.rowcount or 0)
+    await conn.commit()  # 写/DDL 必须显式提交
+    return {"kind": "affected", "affected": max(affected, 0)}
+
+
+async def execute_sql(request, slug: str, env: str, sql: str) -> dict:
+    """直连执行一条 SQL：建连/销毁与结果体分开，结果体一律走 execute_one（护栏单一来源）。
+    异常原样上抛给 API 层记审计。"""
     cred = await _cred_or_409(request, slug, env)
     eng = create_async_engine(target_engine_url(request, cred))
-    op = classify_op(sql)
     try:
         async with eng.connect() as conn:
-            if op == "select":
-                await conn.exec_driver_sql(f"SET statement_timeout = '{STATEMENT_TIMEOUT}'")
-                inner = sql.strip().rstrip(";")
-                capped = f"SELECT * FROM ({inner}) AS _zc_cap LIMIT {SELECT_ROW_CAP + 1}"
-                result = await conn.exec_driver_sql(capped)
-            else:
-                result = await conn.exec_driver_sql(sql)
-            if result.returns_rows:
-                cols = list(result.keys())
-                fetched = result.fetchall()  # select 至多 cap+1 行；写/RETURNING 一般小量
-                truncated = len(fetched) > SELECT_ROW_CAP
-                rows = [dict(zip(cols, r)) for r in fetched[:SELECT_ROW_CAP]]
-                await conn.commit()  # SELECT 提交无害；带副作用的 SELECT（如 INTO）需此提交才落库
-                return {"kind": "rows", "columns": cols, "rows": rows, "truncated": truncated}
-            affected = int(result.rowcount or 0)
-            await conn.commit()  # 写/DDL 必须显式提交
-            return {"kind": "affected", "affected": max(affected, 0)}
+            return await execute_one(conn, sql)
     finally:
         await eng.dispose()
+
+
+async def execute_batch(request, slug: str, env: str, statements: list[str]) -> list[dict]:
+    """同一引擎/同一连接内**按序**执行多条 SQL，逐条返回结果（不记审计）。
+
+    只建一次连接：N 条语句重连 N 次既慢又会让"已成功的语句"落在不同会话里。
+    每条结果 = execute_one 的返回 + {index, op, sql, status, duration_ms}；
+    审计留到 API 层逐条写（保持 service 只管执行、API 只管归属/留痕/状态码的分工）。
+    本票只走全部成功的路径：语句级异常与"遇错即停"在 Ticket 003 补。"""
+    cred = await _cred_or_409(request, slug, env)
+    eng = create_async_engine(target_engine_url(request, cred))
+    results = []
+    try:
+        async with eng.connect() as conn:
+            for index, sql in enumerate(statements):
+                t0 = time.monotonic()
+                outcome = await execute_one(conn, sql)
+                results.append({"index": index, "op": classify_op(sql), "sql": sql,
+                                "status": "ok",
+                                "duration_ms": int((time.monotonic() - t0) * 1000),
+                                **outcome})
+    finally:
+        await eng.dispose()
+    return results
 
 
 async def list_audit(sf, app_id: int, *, env: str | None = None, op: str | None = None,

@@ -134,4 +134,7 @@ export const dbTableSchema = (id, env, table) =>
 export const dbTableData = (id, env, table, params = {}) =>
   http.get(`/apps/${id}/db/${env}/tables/${encodeURIComponent(table)}/data`, { params })
 export const dbSqlExec = (id, env, sql) => http.post(`/apps/${id}/db/${env}/sql`, { sql })
+// 批量执行（Ticket 002）：同一连接内按序逐条跑，服务端逐条留痕，返回 results 与入参一一对应
+export const dbSqlBatch = (id, env, statements) =>
+  http.post(`/apps/${id}/db/${env}/sql/batch`, { statements })
 export const dbAudit = (id, params = {}) => http.get(`/apps/${id}/db/audit`, { params })

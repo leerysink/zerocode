@@ -5,6 +5,7 @@ import { onMounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { message, Modal } from 'ant-design-vue'
 import { dbTables, dbTableSchema, dbTableData, dbSqlExec, dbAudit } from '../api'
+import SqlConsole from '../components/SqlConsole.vue'
 
 const route = useRoute()
 const appId = route.params.id
@@ -42,7 +43,6 @@ async function selectTable(name) {
 watch(env, () => {
   selected.value = null; schema.value = null
   rows.value = []; dataCols.value = []; total.value = 0; editRow.value = null
-  sqlResult.value = null; sqlText.value = ''
   loadTables()
 })
 
@@ -89,30 +89,13 @@ function saveEdits() {
 }
 watch(selected, () => { page.value = 1; editRow.value = null; loadData() })
 
-// ---- SQL 控制台 + 审计抽屉（Task 11）----
-const sqlText = ref('')
-const sqlResult = ref(null)
+// ---- 查询控制台 + 审计抽屉 ----
+// SQL 编辑器与批量执行已下沉到 SqlConsole（Ticket 002），本视图只负责供 appId/env/tables。
 const auditing = ref(false)
 const auditItems = ref([])
 const auditEnv = ref('') // '' = 全部环境
 const auditOp = ref('') // '' = 全部操作类型
 
-function isSelect(s) {
-  // 仅纯读 SELECT 免确认；SELECT...INTO（建表）与含函数式写的写法归为写，走二次确认。
-  return /^\s*select\b/i.test(s) && !/\binto\b/i.test(s)
-    && !/\b(setval|nextval|currval|pg_sleep|pg_terminate_backend|pg_drop_replication_slot|call|perform)\b/i.test(s)
-}
-async function runRaw(s) {
-  try { sqlResult.value = (await dbSqlExec(appId, env.value, s)).data }
-  catch (e) { message.error(e?.response?.data?.detail || '执行失败') }
-}
-function runSql() {
-  const s = sqlText.value.trim()
-  if (!s) return
-  if (isSelect(s)) return runRaw(s)
-  Modal.confirm({ title: '确认执行写操作', content: s, okText: '执行', okType: 'danger',
-    onOk: () => runRaw(s) })
-}
 async function openAudit() {
   auditing.value = true
   await fetchAudit()
@@ -131,7 +114,7 @@ async function refresh() {
 }
 
 onMounted(loadTables)
-defineExpose({ selected, schema, selectTable, loadData, saveEdits, canEdit, runSql, openAudit, refresh, fetchAudit, auditEnv, auditOp })
+defineExpose({ selected, schema, selectTable, loadData, saveEdits, canEdit, openAudit, refresh, fetchAudit, auditEnv, auditOp })
 </script>
 
 <template>
@@ -182,17 +165,7 @@ defineExpose({ selected, schema, selectTable, loadData, saveEdits, canEdit, runS
             <div v-if="schema && schema.primary_key.length" class="zc-db-pk">主键：{{ schema.primary_key.join(', ') }}</div>
           </a-tab-pane>
           <a-tab-pane key="query" tab="查询">
-            <a-textarea v-model:value="sqlText" class="zc-db-sql-input" :rows="4"
-                        placeholder="输入 SQL，SELECT 直接执行，写/DDL 二次确认" />
-            <a-button class="zc-db-sql-run" type="primary" @click="runSql">执行</a-button>
-            <a-table v-if="sqlResult && sqlResult.kind === 'rows'" size="small" :dataSource="sqlResult.rows"
-                     :columns="sqlResult.columns.map(c => ({ title: c, dataIndex: c }))" />
-            <div v-if="sqlResult && sqlResult.kind === 'rows' && sqlResult.truncated" class="zc-db-sql-truncated">
-              结果过大，仅显示前 {{ sqlResult.rows.length }} 行；请用 LIMIT / WHERE 收窄。
-            </div>
-            <div v-if="sqlResult && sqlResult.kind === 'affected'" class="zc-db-sql-affected">
-              影响 {{ sqlResult.affected }} 行
-            </div>
+            <SqlConsole :app-id="appId" :env="env" :tables="tables" />
           </a-tab-pane>
         </a-tabs>
       </div>
@@ -230,10 +203,6 @@ defineExpose({ selected, schema, selectTable, loadData, saveEdits, canEdit, runS
 .zc-db-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
 .zc-db-head h2 { font-size: 18px; margin: 0; }
 .zc-db-head-right { display: flex; align-items: center; gap: 12px; }
-.zc-db-sql-input { margin-bottom: 8px; font-family: monospace; }
-.zc-db-sql-run { margin-bottom: 12px; }
-.zc-db-sql-affected { margin-top: 12px; color: #3f7d4e; font-size: 13px; }
-.zc-db-sql-truncated { margin-top: 8px; color: #b45309; font-size: 12px; }
 .zc-db-audit-filter { display: flex; gap: 8px; margin-bottom: 12px; }
 .zc-db-audit-filter select { padding: 4px 8px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 13px; }
 .zc-db-body { flex: 1; display: flex; gap: 12px; min-height: 0; }

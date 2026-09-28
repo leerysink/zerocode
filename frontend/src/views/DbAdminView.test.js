@@ -4,7 +4,7 @@ import { h } from 'vue'
 import { flushPromises, mount } from '@vue/test-utils'
 
 const mocks = vi.hoisted(() => ({
-  api: { dbTables: vi.fn(), dbTableSchema: vi.fn(), dbTableData: vi.fn(), dbSqlExec: vi.fn(), dbAudit: vi.fn() },
+  api: { dbTables: vi.fn(), dbTableSchema: vi.fn(), dbTableData: vi.fn(), dbSqlExec: vi.fn(), dbSqlBatch: vi.fn(), dbAudit: vi.fn() },
   antd: { message: { success: vi.fn(), error: vi.fn(), info: vi.fn(), warning: vi.fn() },
     Modal: { confirm: vi.fn(({ onOk }) => onOk && onOk()) } },
   route: { params: { id: '1' } },
@@ -14,6 +14,7 @@ vi.mock('ant-design-vue', () => ({ ...mocks.antd, default: { message: mocks.antd
 vi.mock('vue-router', () => ({ useRoute: () => mocks.route }))
 
 import DbAdminView from './DbAdminView.vue'
+import SqlConsole from '../components/SqlConsole.vue'
 
 const STUBS = {
   'a-segmented': { props: ['value', 'options'], emits: ['update:value'], render() {
@@ -32,9 +33,8 @@ const STUBS = {
   'a-input': { props: ['value', 'disabled'], emits: ['change', 'update:value'], render() {
     return h('input', { class: 'zc-db-input', value: this.value ?? '', disabled: !!this.disabled,
       onInput: (e) => this.$emit('change', { target: { value: e.target.value } }) }) } },
-  'a-textarea': { props: ['value'], emits: ['update:value'], render() {
-    return h('textarea', { class: 'zc-db-sql-input-el', value: this.value ?? '',
-      onInput: (e) => this.$emit('update:value', e.target.value) }) } },
+  // SqlConsole 自带编辑器（CodeMirror 在 happy-dom 起不来），本视图只测"接线"：挂载 + 传参。
+  SqlEditor: { template: '<textarea />' },
   'a-drawer': { props: ['open'], render() { return this.open ? h('div', this.$slots.default?.()) : null } },
 }
 
@@ -91,48 +91,23 @@ it('无主键表禁用行内编辑但仍可浏览数据', async () => {
   expect(w.find('.zc-db-table').exists()).toBe(true)
 })
 
-// ---------- Task 11: SQL 控制台 + 审计抽屉 ----------
-it('SELECT 直接执行并渲染结果', async () => {
-  mocks.api.dbSqlExec.mockResolvedValue({ data: { kind: 'rows', columns: ['n'], rows: [{ n: 1 }], truncated: false } })
+// ---------- Ticket 002: 查询控制台接线（SQL 执行用例已迁往 SqlConsole.test.js）----------
+it('查询页签挂 SqlConsole 并把 appId/env/tables 透传', async () => {
   const w = mount(DbAdminView, { global: { stubs: STUBS } })
   await flushPromises()
-  await w.find('.zc-db-sql-input').setValue('SELECT 1 AS n')
-  mocks.antd.Modal.confirm = vi.fn()
-  await w.find('.zc-db-sql-run').trigger('click')
-  await flushPromises()
-  expect(mocks.antd.Modal.confirm).not.toHaveBeenCalled()
-  expect(mocks.api.dbSqlExec).toHaveBeenCalledWith('1', 'dev', 'SELECT 1 AS n')
+  const console_ = w.findComponent(SqlConsole)
+  expect(console_.exists()).toBe(true)
+  expect(console_.props('appId')).toBe('1')
+  expect(console_.props('env')).toBe('dev')
+  expect(console_.props('tables')).toEqual([{ name: 'widgets', type: 'BASE TABLE' }])
 })
 
-it('SELECT 命中行上限时展示截断提示', async () => {
-  mocks.api.dbSqlExec.mockResolvedValue({ data: { kind: 'rows', columns: ['n'], rows: [{ n: 1 }], truncated: true } })
+it('边界：切到 prod 后 SqlConsole 收到的是 prod', async () => {
   const w = mount(DbAdminView, { global: { stubs: STUBS } })
   await flushPromises()
-  await w.find('.zc-db-sql-input').setValue('SELECT generate_series(1,9999) AS n')
-  await w.find('.zc-db-sql-run').trigger('click')
+  await w.findAll('.zc-db-env button')[1].trigger('click')
   await flushPromises()
-  expect(w.find('.zc-db-sql-truncated').exists()).toBe(true)
-})
-
-it('SELECT 未达上限时不显示截断提示', async () => {
-  mocks.api.dbSqlExec.mockResolvedValue({ data: { kind: 'rows', columns: ['n'], rows: [{ n: 1 }], truncated: false } })
-  const w = mount(DbAdminView, { global: { stubs: STUBS } })
-  await flushPromises()
-  await w.find('.zc-db-sql-input').setValue('SELECT 1 AS n')
-  await w.find('.zc-db-sql-run').trigger('click')
-  await flushPromises()
-  expect(w.find('.zc-db-sql-truncated').exists()).toBe(false)
-})
-
-it('非 SELECT 执行前二次确认', async () => {
-  mocks.api.dbSqlExec.mockResolvedValue({ data: { kind: 'affected', affected: 1 } })
-  mocks.antd.Modal.confirm = vi.fn(({ onOk }) => onOk())
-  const w = mount(DbAdminView, { global: { stubs: STUBS } })
-  await flushPromises()
-  await w.find('.zc-db-sql-input').setValue('UPDATE widgets SET name=1')
-  await w.find('.zc-db-sql-run').trigger('click')
-  await flushPromises()
-  expect(mocks.antd.Modal.confirm).toHaveBeenCalled()
+  expect(w.findComponent(SqlConsole).props('env')).toBe('prod')
 })
 
 it('打开审计抽屉拉操作历史', async () => {
