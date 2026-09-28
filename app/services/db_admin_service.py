@@ -112,3 +112,39 @@ async def table_schema(request, slug: str, env: str, table: str) -> dict:
         }
     finally:
         await eng.dispose()
+
+
+MAX_PAGE_SIZE = 500
+
+
+async def table_data(request, slug: str, env: str, table: str, *, page: int = 1,
+                     size: int = 50, sort: str | None = None, dirn: str = "asc") -> dict:
+    """分页取数。排序列必须是该表实际列（白名单），方向 asc|desc，其余 400；标识符 quote_ident 转义。"""
+    cred = await _cred_or_409(request, slug, env)
+    schema = await table_schema(request, slug, env, table)  # 顺带做表存在性 404
+    valid_cols = {c["name"] for c in schema["columns"]}
+    if dirn not in ("asc", "desc"):
+        raise DeployError(f"非法排序方向: {dirn}", status=400)
+    if not (1 <= size <= MAX_PAGE_SIZE):
+        raise DeployError(f"size 需在 1..{MAX_PAGE_SIZE}", status=400)
+    if page < 1:
+        raise DeployError("page 需 >= 1", status=400)
+    order_sql = ""
+    if sort:
+        if sort not in valid_cols:
+            raise DeployError(f"非法排序列: {sort}", status=400)
+        order_sql = f" ORDER BY {quote_ident(sort)} {dirn.upper()}"
+    tbl = quote_ident(table)
+    eng = create_async_engine(target_engine_url(request, cred))
+    try:
+        async with eng.connect() as conn:
+            total = (await conn.execute(text(f"SELECT count(*) FROM {tbl}"))).scalar()
+            offset = (page - 1) * size
+            rows = (await conn.execute(text(
+                f"SELECT * FROM {tbl}{order_sql} LIMIT :lim OFFSET :off"),
+                {"lim": size, "off": offset})).mappings().all()
+        cols = [c["name"] for c in schema["columns"]]
+        return {"columns": cols, "rows": [dict(r) for r in rows],
+                "total": int(total), "truncated": total > offset + len(rows)}
+    finally:
+        await eng.dispose()

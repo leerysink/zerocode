@@ -144,3 +144,29 @@ async def test_schema_unknown_table_404(db_app):
     client, aid, *_ = db_app
     r = await client.get(f"/api/apps/{aid}/db/dev/tables/nope_nope/schema")
     assert r.status_code == 404
+
+
+# ---------- Task 4: 分页数据端点 ----------
+
+async def test_data_endpoint_pages_and_totals(db_app):
+    client, aid, slug, uid = db_app
+    sf = client.app.state.session_factory
+    cred = await provision.read_cred(sf, slug, "dev")
+    eng = create_async_engine(svc.target_engine_url(_FakeReq(client.app), cred))
+    async with eng.begin() as conn:
+        await conn.exec_driver_sql("INSERT INTO widgets(id,name) VALUES (1,'a'),(2,'b'),(3,'c')")
+    await eng.dispose()
+    r = await client.get(f"/api/apps/{aid}/db/dev/tables/widgets/data?page=1&size=2")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["total"] == 3
+    assert len(body["rows"]) == 2
+    assert set(body["columns"]) >= {"id", "name"}
+
+
+async def test_data_endpoint_sort_whitelist(db_app):
+    client, aid, *_ = db_app
+    r = await client.get(f"/api/apps/{aid}/db/dev/tables/widgets/data?sort=name&dir=desc")
+    assert r.status_code == 200, r.text
+    r2 = await client.get(f"/api/apps/{aid}/db/dev/tables/widgets/data?sort=name;--&dir=desc")
+    assert r2.status_code == 400  # 非法排序列被白名单挡下
