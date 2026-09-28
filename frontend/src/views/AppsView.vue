@@ -5,7 +5,8 @@
 import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { message, Modal } from 'ant-design-vue'
 import {
-  AppstoreOutlined, CloudServerOutlined, CloudUploadOutlined, CopyOutlined, DeleteOutlined, EditOutlined,
+  AppstoreOutlined, CloudServerOutlined, CloudUploadOutlined, CopyOutlined, DashboardOutlined,
+  DeleteOutlined, EditOutlined,
   ExperimentOutlined,
   EyeOutlined, FolderOpenOutlined, HistoryOutlined, MenuOutlined, PlayCircleOutlined,
   PoweroffOutlined, ProfileOutlined, RedoOutlined, ReloadOutlined, RocketOutlined, ShopOutlined,
@@ -15,6 +16,7 @@ import {
   openFolder, prodStart, prodStop, releaseToStore, renameApp, validateAppSlug,
 } from '../api'
 import PublishHistory from '../components/PublishHistory.vue'
+import MetricsDrawer from '../components/MetricsDrawer.vue'
 import PublishModal from '../components/PublishModal.vue'
 import { SMALL_STACKS, slugFromName, validateForm } from '../utils/appForm'
 import DeployLogPanel from '../components/DeployLogPanel.vue'
@@ -31,6 +33,7 @@ const preview = reactive({ open: false, app: null, url: '', status: '', nonce: 0
 const logs = reactive({ open: false, app: null })
 const pub = reactive({ open: false, app: null, mode: 'publish', version: null, autoStart: false, seq: 0 })
 const hist = reactive({ open: false, app: null })
+const mon = reactive({ open: false, app: null })
 const rel = reactive({ open: false, app: null, title: '', summary: '' })
 const urlsCache = reactive({})
 const rename = reactive({ open: false, app: null, name: '' })
@@ -269,6 +272,11 @@ function openHistory(a) {
   hist.app = a
   hist.open = true
 }
+// 资源监控抽屉（Ticket 001）：本期只读当前磁盘占用，CPU/内存/历史曲线由后续票扩。
+function openMetrics(a) {
+  mon.app = a
+  mon.open = true
+}
 // 历史页确认回滚 → 关掉抽屉、开进度弹层（autoStart 单点触发 rollbackApp）
 function startRollback(version) {
   const app = hist.app
@@ -353,6 +361,7 @@ async function doRelease() {
                 <div class="zc-app-menu-item zc-menu-preview" @click.stop="openPreview(a)"><eye-outlined /> 预览</div>
                 <div class="zc-app-menu-item zc-menu-reset" @click.stop="resetDev(a)"><redo-outlined /> 重建 dev</div>
                 <div class="zc-app-menu-item zc-menu-history" @click.stop="openHistory(a)"><history-outlined /> 发布历史</div>
+                <div class="zc-app-menu-item zc-menu-metrics" @click.stop="openMetrics(a)"><dashboard-outlined /> 资源监控</div>
                 <div v-if="canReleaseToStore(a)" class="zc-app-menu-item zc-menu-release" @click.stop="openRelease(a)"><shop-outlined /> 发布到商店</div>
                 <div class="zc-app-menu-item zc-menu-rename" @click.stop="openRename(a)"><edit-outlined /> 重命名</div>
                 <div class="zc-app-menu-item zc-menu-folder" @click.stop="openAppFolder(a)"><folder-open-outlined /> 打开工程目录</div>
@@ -487,6 +496,10 @@ async function doRelease() {
 
     <a-drawer v-model:open="hist.open" :title="`发布历史 · ${hist.app?.name || ''}`" width="760px">
       <PublishHistory v-if="hist.open && hist.app" :app="hist.app" @rollback="startRollback" />
+    </a-drawer>
+
+    <a-drawer v-model:open="mon.open" :title="`资源监控 · ${mon.app?.name || ''}`" width="520px" destroy-on-close>
+      <MetricsDrawer v-if="mon.open && mon.app" :key="mon.app.id" :app="mon.app" />
     </a-drawer>
 
     <a-modal v-model:open="rel.open" title="发布到商店" ok-text="上架" destroy-on-close @ok="doRelease">

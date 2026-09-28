@@ -13,6 +13,7 @@ const mocks = vi.hoisted(() => ({
     appUrls: vi.fn(), publishApp: vi.fn(), rollbackApp: vi.fn(),
     appRecords: vi.fn(), deleteRecord: vi.fn(), systemNics: vi.fn(), putConfig: vi.fn(),
     releaseToStore: vi.fn(), renameApp: vi.fn(), deleteApp: vi.fn(), openFolder: vi.fn(),
+    appMetricsCurrent: vi.fn(),
     wsUrl: vi.fn(() => 'ws://test'),
   },
   antd: { message: { success: vi.fn(), error: vi.fn(), info: vi.fn(), warning: vi.fn() },
@@ -68,6 +69,8 @@ const STUBS = {
   WorkspaceExplorer: { name: 'WorkspaceExplorer', render() { return h('div', { class: 'stub-explorer' }) } },
   PublishModal: { name: 'PublishModal', render() { return h('div', { class: 'stub-pub-modal' }) } },
   PublishHistory: { name: 'PublishHistory', render() { return h('div', { class: 'stub-pub-history' }) } },
+  MetricsDrawer: { name: 'MetricsDrawer', props: ['app'],
+    render() { return h('div', { class: 'stub-metrics-drawer' }, String(this.app?.id ?? '')) } },
 }
 
 async function mountView() {
@@ -150,6 +153,17 @@ describe('AppsView 发布接线', () => {
     const opts = mocks.antd.Modal.confirm.mock.calls[0][0]
     await opts.onOk()
     expect(mocks.api.devReset).toHaveBeenCalledWith(1)
+  })
+
+  it('☰ 菜单「资源监控」：点击打开监控抽屉（MetricsDrawer 挂载并收到当前应用）', async () => {
+    const wrapper = await mountView()
+    expect(wrapper.find('.stub-metrics-drawer').exists()).toBe(false)
+    const item = wrapper.findAll('.stub-card')[0].find('.zc-menu-metrics')
+    expect(item.exists()).toBe(true)
+    await item.trigger('click')
+    const drawer = wrapper.find('.stub-metrics-drawer')
+    expect(drawer.exists()).toBe(true)
+    expect(drawer.text()).toBe('1')   // 传进去的是第一张卡片的应用 id
   })
 })
 

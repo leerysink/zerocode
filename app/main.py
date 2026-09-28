@@ -104,10 +104,17 @@ def create_app(database_url: str | None = None) -> FastAPI:
         await run_migrations(engine)
         await _deploy_startup(app)
         watchdog = asyncio.create_task(_watchdog(engine, app.state.hub))
+        # 应用资源监控·磁盘低频采集循环（Ticket 001，规格 docs/specs/2026-09-28-app-metrics.md）。
+        # 先睡后采（同 _watchdog），故启动与测试期内都不触发；单拍异常在循环内吞掉，带不崩平台。
+        from app.deploy import metrics as deploy_metrics
+        metrics_disk = asyncio.create_task(deploy_metrics.disk_loop(app))
         yield
         watchdog.cancel()
         with suppress(asyncio.CancelledError):
             await watchdog  # 等取消落地，避免事件循环关闭时报 pending task 警告
+        metrics_disk.cancel()
+        with suppress(asyncio.CancelledError):
+            await metrics_disk
         # 优雅退出：停掉仍在跑的 dev 栈（prod 不受影响，FR3-04）；同样不得因 Docker 侧异常而卡住关闭
         try:
             from app.deploy import engine as deploy_engine
@@ -137,6 +144,9 @@ def create_app(database_url: str | None = None) -> FastAPI:
     # 预览日志：GET /api/apps/{id}/dev/logs（页面「查看日志」的历史来源，与 apps_api 同前缀）
     from app.api import dev_logs
     app.include_router(dev_logs.router)
+    # 应用资源监控：GET /api/apps/{id}/metrics/current（Ticket 001，与 apps_api 同前缀、独立模块）
+    from app.api import metrics as metrics_api
+    app.include_router(metrics_api.router)
     # 部署发布套件（Task 12）：/ws/deploy/{app_id} 部署事件流（须在静态托管之前，路由不被 SPA 吞掉）
     from app.api import deploy_ws
     app.include_router(deploy_ws.router)
