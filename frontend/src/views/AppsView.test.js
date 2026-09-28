@@ -247,6 +247,15 @@ describe('AppsView 卡片折叠菜单', () => {
       expect(text).toContain(label)
   })
 
+  it('☰ 菜单含 DB 操作入口且 href 指向 /apps/:id/db（新标签打开）', async () => {
+    const wrapper = await mountView()
+    const dbLink = wrapper.findAll('.stub-card')[0].find('.zc-menu-db')
+    expect(dbLink.exists()).toBe(true)
+    expect(dbLink.attributes('href')).toBe('/apps/1/db')
+    expect(dbLink.attributes('target')).toBe('_blank')
+    expect(dbLink.text()).toContain('DB 操作')
+  })
+
   it('菜单点「删除应用」→ 弹确认框，确认后调 deleteApp', async () => {
     mocks.api.deleteApp.mockResolvedValue({ data: { kept: { root_path: 'apps/aaa' } } })
     mocks.api.listApps.mockResolvedValue({ data: APPS })

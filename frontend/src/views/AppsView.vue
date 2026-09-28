@@ -6,7 +6,7 @@ import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { message, Modal } from 'ant-design-vue'
 import {
   AppstoreOutlined, CloudServerOutlined, CloudUploadOutlined, CopyOutlined, DashboardOutlined,
-  DeleteOutlined, EditOutlined,
+  DatabaseOutlined, DeleteOutlined, EditOutlined,
   ExperimentOutlined,
   EyeOutlined, FolderOpenOutlined, HistoryOutlined, MenuOutlined, PlayCircleOutlined,
   PoweroffOutlined, ProfileOutlined, RedoOutlined, ReloadOutlined, RocketOutlined, ShopOutlined,
@@ -367,6 +367,9 @@ async function doRelease() {
                 <div class="zc-app-menu-item zc-menu-folder" @click.stop="openAppFolder(a)"><folder-open-outlined /> 打开工程目录</div>
                 <div class="zc-app-menu-item zc-menu-copy" @click.stop="copyPreviewUrl(a)"><copy-outlined /> 复制预览地址</div>
                 <div class="zc-app-menu-item zc-menu-logs" @click.stop="openLogs(a)"><profile-outlined /> 查看日志</div>
+                <a class="zc-app-menu-item zc-menu-db" :href="`/apps/${a.id}/db`" target="_blank" @click.stop>
+                  <database-outlined /> DB 操作
+                </a>
                 <div class="zc-app-menu-item zc-app-menu-danger zc-menu-del" @click.stop="openDelete(a)">
                   <delete-outlined /> 删除应用
                 </div>
@@ -582,6 +585,7 @@ async function doRelease() {
 .zc-app-menu-item:hover { background: rgba(91, 122, 157, 0.08); }
 .zc-app-menu-danger { color: #b96a6a; }
 .zc-app-menu-danger:hover { background: #fdf3f2; }
+.zc-menu-db { text-decoration: none; }
 .zc-modal-warn { margin: 0 0 6px; color: var(--zc-text); font-size: 13px; }
 /* 资源监控弹框标题：应用名 + 右侧一枚按状态着色的小徽标 */
 .zc-metrics-title { display: inline-flex; align-items: center; gap: 8px; }
