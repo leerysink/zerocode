@@ -16,7 +16,7 @@ import {
   openFolder, prodStart, prodStop, releaseToStore, renameApp, validateAppSlug,
 } from '../api'
 import PublishHistory from '../components/PublishHistory.vue'
-import MetricsDrawer from '../components/MetricsDrawer.vue'
+import MetricsModal from '../components/MetricsModal.vue'
 import PublishModal from '../components/PublishModal.vue'
 import { SMALL_STACKS, slugFromName, validateForm } from '../utils/appForm'
 import DeployLogPanel from '../components/DeployLogPanel.vue'
@@ -272,7 +272,7 @@ function openHistory(a) {
   hist.app = a
   hist.open = true
 }
-// 资源监控抽屉（Ticket 001）：本期只读当前磁盘占用，CPU/内存/历史曲线由后续票扩。
+// 资源监控弹框（重设计）：居中 a-modal 承载 MetricsModal（分组 2×2 卡片 + 精致曲线）。
 function openMetrics(a) {
   mon.app = a
   mon.open = true
@@ -498,9 +498,15 @@ async function doRelease() {
       <PublishHistory v-if="hist.open && hist.app" :app="hist.app" @rollback="startRollback" />
     </a-drawer>
 
-    <a-drawer v-model:open="mon.open" :title="`资源监控 · ${mon.app?.name || ''}`" width="520px" destroy-on-close>
-      <MetricsDrawer v-if="mon.open && mon.app" :key="mon.app.id" :app="mon.app" />
-    </a-drawer>
+    <a-modal v-model:open="mon.open" :width="920" :centered="true" :footer="null" destroy-on-close>
+      <template #title>
+        <span class="zc-metrics-title">
+          资源监控 · {{ mon.app?.name || '' }}
+          <a-tag :color="statusColor(mon.app?.status_prod)" class="zc-metrics-badge">{{ statusText(mon.app?.status_prod) }}</a-tag>
+        </span>
+      </template>
+      <MetricsModal v-if="mon.open && mon.app" :key="mon.app.id" :app="mon.app" />
+    </a-modal>
 
     <a-modal v-model:open="rel.open" title="发布到商店" ok-text="上架" destroy-on-close @ok="doRelease">
       <a-input v-model:value="rel.title" placeholder="商店展示名称" />
@@ -577,4 +583,7 @@ async function doRelease() {
 .zc-app-menu-danger { color: #b96a6a; }
 .zc-app-menu-danger:hover { background: #fdf3f2; }
 .zc-modal-warn { margin: 0 0 6px; color: var(--zc-text); font-size: 13px; }
+/* 资源监控弹框标题：应用名 + 右侧一枚按状态着色的小徽标 */
+.zc-metrics-title { display: inline-flex; align-items: center; gap: 8px; }
+.zc-metrics-badge { margin: 0; }
 </style>

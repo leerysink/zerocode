@@ -52,7 +52,8 @@ const STUBS = {
   'a-space': slot('a-space'),
   'a-button': slot('a-button'),
   'a-tag': slot('a-tag'),
-  'a-modal': slot('a-modal'),
+  'a-modal': { name: 'a-modal', props: ['open', 'width', 'title', 'centered', 'footer'],
+    render() { return h('div', { class: 'stub-a-modal' }, [this.$slots.title?.(), this.$slots.default?.()]) } },
   'a-drawer': { name: 'a-drawer', props: ['open'], render() {
     return this.open ? h('div', { class: 'stub-drawer' }, this.$slots.default?.()) : null } },
   'a-spin': slot('a-spin'),
@@ -69,8 +70,8 @@ const STUBS = {
   WorkspaceExplorer: { name: 'WorkspaceExplorer', render() { return h('div', { class: 'stub-explorer' }) } },
   PublishModal: { name: 'PublishModal', render() { return h('div', { class: 'stub-pub-modal' }) } },
   PublishHistory: { name: 'PublishHistory', render() { return h('div', { class: 'stub-pub-history' }) } },
-  MetricsDrawer: { name: 'MetricsDrawer', props: ['app'],
-    render() { return h('div', { class: 'stub-metrics-drawer' }, String(this.app?.id ?? '')) } },
+  MetricsModal: { name: 'MetricsModal', props: ['app'],
+    render() { return h('div', { class: 'stub-metrics-modal' }, String(this.app?.id ?? '')) } },
 }
 
 async function mountView() {
@@ -155,15 +156,19 @@ describe('AppsView 发布接线', () => {
     expect(mocks.api.devReset).toHaveBeenCalledWith(1)
   })
 
-  it('☰ 菜单「资源监控」：点击打开监控抽屉（MetricsDrawer 挂载并收到当前应用）', async () => {
+  it('☰ 菜单「资源监控」：点击打开监控弹框（MetricsModal 挂载并收到当前应用）', async () => {
     const wrapper = await mountView()
-    expect(wrapper.find('.stub-metrics-drawer').exists()).toBe(false)
+    expect(wrapper.find('.stub-metrics-modal').exists()).toBe(false)
     const item = wrapper.findAll('.stub-card')[0].find('.zc-menu-metrics')
     expect(item.exists()).toBe(true)
     await item.trigger('click')
-    const drawer = wrapper.find('.stub-metrics-drawer')
-    expect(drawer.exists()).toBe(true)
-    expect(drawer.text()).toBe('1')   // 传进去的是第一张卡片的应用 id
+    const modal = wrapper.find('.stub-metrics-modal')
+    expect(modal.exists()).toBe(true)
+    expect(modal.text()).toBe('1')   // 传进去的是第一张卡片的应用 id
+    // 标题区按 status_prod 着色的状态徽标（卡片[0] prod=running）
+    const title = wrapper.find('.zc-metrics-title')
+    expect(title.text()).toContain('甲')
+    expect(title.text()).toContain('运行中')
   })
 })
 
