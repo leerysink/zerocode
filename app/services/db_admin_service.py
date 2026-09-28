@@ -85,6 +85,33 @@ async def list_tables(request, slug: str, env: str) -> list[dict]:
         await eng.dispose()
 
 
+async def _table_columns_pk(conn, table: str) -> dict | None:
+    """在给定 conn 上读该 public 表的列/主键（绑定参数查 information_schema）；表不存在返回 None。
+    供 table_schema 与 table_data 复用，避免 table_data 为做存在性校验另起一个引擎。"""
+    exists = (await conn.execute(text(
+        "SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name=:t"),
+        {"t": table})).first()
+    if not exists:
+        return None
+    cols = (await conn.execute(text(
+        "SELECT column_name AS name, data_type AS type, is_nullable AS nullable, "
+        "column_default AS default FROM information_schema.columns "
+        "WHERE table_schema='public' AND table_name=:t ORDER BY ordinal_position"),
+        {"t": table})).mappings().all()
+    pk = (await conn.execute(text(
+        "SELECT kcu.column_name AS c FROM information_schema.table_constraints tc "
+        "JOIN information_schema.key_column_usage kcu "
+        "  ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema "
+        "WHERE tc.constraint_type='PRIMARY KEY' AND tc.table_schema='public' AND tc.table_name=:t "
+        "ORDER BY kcu.ordinal_position"), {"t": table})).scalars().all()
+    return {
+        "columns": [{"name": c["name"], "type": c["type"],
+                     "nullable": c["nullable"] == "YES", "default": c["default"]}
+                    for c in cols],
+        "primary_key": list(pk),
+    }
+
+
 async def table_schema(request, slug: str, env: str, table: str) -> dict:
     """读列/主键/索引。table 作绑定参数查 information_schema；不存在 → DeployError(404)。"""
     cred = await _cred_or_409(request, slug, env)
@@ -92,33 +119,14 @@ async def table_schema(request, slug: str, env: str, table: str) -> dict:
     try:
         async with eng.connect() as conn:
             await conn.exec_driver_sql(f"SET statement_timeout = '{STATEMENT_TIMEOUT}'")
-            exists = (await conn.execute(text(
-                "SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name=:t"),
-                {"t": table})).first()
-            if not exists:
+            base = await _table_columns_pk(conn, table)
+            if base is None:
                 raise DeployError(f"表不存在: {table}", status=404)
-            cols = (await conn.execute(text(
-                "SELECT column_name AS name, data_type AS type, is_nullable AS nullable, "
-                "column_default AS default FROM information_schema.columns "
-                "WHERE table_schema='public' AND table_name=:t ORDER BY ordinal_position"),
-                {"t": table})).mappings().all()
-            pk = (await conn.execute(text(
-                "SELECT kcu.column_name AS c FROM information_schema.table_constraints tc "
-                "JOIN information_schema.key_column_usage kcu "
-                "  ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema "
-                "WHERE tc.constraint_type='PRIMARY KEY' AND tc.table_schema='public' AND tc.table_name=:t "
-                "ORDER BY kcu.ordinal_position"), {"t": table})).scalars().all()
             idx = (await conn.execute(text(
                 "SELECT indexname AS name, indexdef AS definition FROM pg_indexes "
                 "WHERE schemaname='public' AND tablename=:t ORDER BY indexname"),
                 {"t": table})).mappings().all()
-        return {
-            "columns": [{"name": c["name"], "type": c["type"],
-                         "nullable": c["nullable"] == "YES", "default": c["default"]}
-                        for c in cols],
-            "primary_key": list(pk),
-            "indexes": [dict(i) for i in idx],
-        }
+        return {**base, "indexes": [dict(i) for i in idx]}
     finally:
         await eng.dispose()
 
@@ -128,32 +136,35 @@ MAX_PAGE_SIZE = 500
 
 async def table_data(request, slug: str, env: str, table: str, *, page: int = 1,
                      size: int = 50, sort: str | None = None, dirn: str = "asc") -> dict:
-    """分页取数。排序列必须是该表实际列（白名单），方向 asc|desc，其余 400；标识符 quote_ident 转义。"""
+    """分页取数。单请求一个引擎/一条连接内完成存在性校验 + 排序列白名单 + 取数。
+    排序列必须是该表实际列（白名单），方向 asc|desc，其余 400；标识符 quote_ident 转义。"""
     cred = await _cred_or_409(request, slug, env)
-    schema = await table_schema(request, slug, env, table)  # 顺带做表存在性 404
-    valid_cols = {c["name"] for c in schema["columns"]}
     if dirn not in ("asc", "desc"):
         raise DeployError(f"非法排序方向: {dirn}", status=400)
     if not (1 <= size <= MAX_PAGE_SIZE):
         raise DeployError(f"size 需在 1..{MAX_PAGE_SIZE}", status=400)
     if page < 1:
         raise DeployError("page 需 >= 1", status=400)
-    order_sql = ""
-    if sort:
-        if sort not in valid_cols:
-            raise DeployError(f"非法排序列: {sort}", status=400)
-        order_sql = f" ORDER BY {quote_ident(sort)} {dirn.upper()}"
-    tbl = quote_ident(table)
     eng = create_async_engine(target_engine_url(request, cred))
     try:
         async with eng.connect() as conn:
             await conn.exec_driver_sql(f"SET statement_timeout = '{STATEMENT_TIMEOUT}'")
+            base = await _table_columns_pk(conn, table)  # 顺带做表存在性 404
+            if base is None:
+                raise DeployError(f"表不存在: {table}", status=404)
+            valid_cols = {c["name"] for c in base["columns"]}
+            order_sql = ""
+            if sort:
+                if sort not in valid_cols:
+                    raise DeployError(f"非法排序列: {sort}", status=400)
+                order_sql = f" ORDER BY {quote_ident(sort)} {dirn.upper()}"
+            tbl = quote_ident(table)
             total = (await conn.execute(text(f"SELECT count(*) FROM {tbl}"))).scalar()
             offset = (page - 1) * size
             rows = (await conn.execute(text(
                 f"SELECT * FROM {tbl}{order_sql} LIMIT :lim OFFSET :off"),
                 {"lim": size, "off": offset})).mappings().all()
-        cols = [c["name"] for c in schema["columns"]]
+        cols = [c["name"] for c in base["columns"]]
         return {"columns": cols, "rows": [dict(r) for r in rows],
                 "total": int(total), "truncated": total > offset + len(rows)}
     finally:
