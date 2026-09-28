@@ -170,3 +170,39 @@ async def test_data_endpoint_sort_whitelist(db_app):
     assert r.status_code == 200, r.text
     r2 = await client.get(f"/api/apps/{aid}/db/dev/tables/widgets/data?sort=name;--&dir=desc")
     assert r2.status_code == 400  # 非法排序列被白名单挡下
+
+
+# ---------- Task 5: 任意 SQL 执行端点 ----------
+
+async def test_sql_select_returns_rows(db_app):
+    client, aid, *_ = db_app
+    r = await client.post(f"/api/apps/{aid}/db/dev/sql", json={"sql": "SELECT 1 AS n"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["kind"] == "rows" and body["rows"][0]["n"] == 1
+
+
+async def test_sql_write_and_audit_success(db_app):
+    client, aid, *_ = db_app
+    r = await client.post(f"/api/apps/{aid}/db/dev/sql",
+                          json={"sql": "INSERT INTO widgets(id,name) VALUES (99,'z')"})
+    assert r.status_code == 200, r.text
+    assert r.json()["kind"] == "affected" and r.json()["affected"] == 1
+    sf = client.app.state.session_factory
+    async with sf() as s:
+        row = (await s.execute(text(
+            "SELECT status FROM db_operation_log WHERE app_id=:a AND op_type='insert' "
+            "ORDER BY id DESC LIMIT 1"), {"a": aid})).mappings().first()
+    assert row and row["status"] == "success"
+
+
+async def test_sql_error_writes_error_audit(db_app):
+    client, aid, *_ = db_app
+    r = await client.post(f"/api/apps/{aid}/db/dev/sql", json={"sql": "SELECT * FROM not_a_table"})
+    assert r.status_code == 500
+    sf = client.app.state.session_factory
+    async with sf() as s:
+        row = (await s.execute(text(
+            "SELECT status, error FROM db_operation_log WHERE app_id=:a AND status='error' "
+            "ORDER BY id DESC LIMIT 1"), {"a": aid})).mappings().first()
+    assert row and row["error"]

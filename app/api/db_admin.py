@@ -7,11 +7,16 @@
 import time
 
 from fastapi import APIRouter, HTTPException, Request
+from pydantic import BaseModel
 
 from app.deploy.errors import DeployError
 from app.services import app_service, db_admin_service as svc
 
 router = APIRouter(prefix="/api/apps")
+
+
+class SqlIn(BaseModel):
+    sql: str
 
 
 async def _load_app(request: Request, app_id: int) -> dict:
@@ -75,3 +80,29 @@ async def db_table_data(request: Request, app_id: int, env: str, table: str,
         return data
     except DeployError as e:
         raise HTTPException(e.status, str(e))
+
+
+@router.post("/{app_id}/db/{env}/sql")
+async def db_sql_exec(request: Request, app_id: int, env: str, body: SqlIn):
+    app = await _load_app(request, app_id)
+    svc.validate_env(env)
+    actor_id = request.state.actor["id"]
+    sf = request.app.state.session_factory
+    op = svc.classify_op(body.sql)
+    t0 = time.monotonic()
+    try:
+        result = await svc.execute_sql(request, app["slug"], env, body.sql)
+    except DeployError as e:
+        raise HTTPException(e.status, str(e))
+    except Exception as e:  # PG 报错原文回传 + 失败留痕
+        await svc.log_operation(sf, app_id=app_id, actor_user_id=actor_id, env=env,
+                                op_type=op, sql_text=body.sql, target_table=None,
+                                status="error", error=str(e),
+                                duration_ms=int((time.monotonic() - t0) * 1000))
+        raise HTTPException(500, str(e))
+    affected = result["affected"] if result["kind"] == "affected" else len(result["rows"])
+    await svc.log_operation(sf, app_id=app_id, actor_user_id=actor_id, env=env,
+                            op_type=op, sql_text=body.sql, target_table=None,
+                            status="success", affected=affected,
+                            duration_ms=int((time.monotonic() - t0) * 1000))
+    return result

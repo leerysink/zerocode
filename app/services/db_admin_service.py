@@ -148,3 +148,28 @@ async def table_data(request, slug: str, env: str, table: str, *, page: int = 1,
                 "total": int(total), "truncated": total > offset + len(rows)}
     finally:
         await eng.dispose()
+
+
+SELECT_ROW_CAP = 5000
+
+
+async def execute_sql(request, slug: str, env: str, sql: str) -> dict:
+    """直连执行一条 SQL。有返回列 → rows（截断 SELECT_ROW_CAP）；否则 → affected。
+    SELECT 类加语句超时护栏；写/DDL 不加（用户承担）。异常原样上抛给 API 层记审计。"""
+    cred = await _cred_or_409(request, slug, env)
+    eng = create_async_engine(target_engine_url(request, cred))
+    op = classify_op(sql)
+    try:
+        async with eng.connect() as conn:
+            if op == "select":
+                await conn.exec_driver_sql("SET statement_timeout = '15s'")
+            result = await conn.exec_driver_sql(sql)
+            if result.returns_rows:
+                cols = list(result.keys())
+                fetched = result.fetchall()
+                truncated = len(fetched) > SELECT_ROW_CAP
+                rows = [dict(zip(cols, r)) for r in fetched[:SELECT_ROW_CAP]]
+                return {"kind": "rows", "columns": cols, "rows": rows, "truncated": truncated}
+            return {"kind": "affected", "affected": int(result.rowcount or 0)}
+    finally:
+        await eng.dispose()
