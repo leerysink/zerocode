@@ -30,6 +30,11 @@ const routes = [
     component: () => import('../views/AppsView.vue'),
   },
   {
+    path: '/apps/:id/db',
+    name: 'app-db',
+    component: () => import('../views/DbAdminView.vue'),
+  },
+  {
     path: '/store',
     name: 'store',
     component: () => import('../views/StoreView.vue'),

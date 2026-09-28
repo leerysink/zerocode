@@ -126,3 +126,12 @@ export const listSkills = () => http.get('/skills')
 export const installSkill = (data) => http.post('/skills/install', data) // {url, subpath?}；多命中返 {candidates}
 export const patchSkill = (id, data) => http.patch(`/skills/${id}`, data) // {enabled}
 export const deleteSkill = (id) => http.delete(`/skills/${id}`)
+
+// ---- 应用 DB 操作台（设计 2026-09-28）----
+export const dbTables = (id, env) => http.get(`/apps/${id}/db/${env}/tables`)
+export const dbTableSchema = (id, env, table) =>
+  http.get(`/apps/${id}/db/${env}/tables/${encodeURIComponent(table)}/schema`)
+export const dbTableData = (id, env, table, params = {}) =>
+  http.get(`/apps/${id}/db/${env}/tables/${encodeURIComponent(table)}/data`, { params })
+export const dbSqlExec = (id, env, sql) => http.post(`/apps/${id}/db/${env}/sql`, { sql })
+export const dbAudit = (id, params = {}) => http.get(`/apps/${id}/db/audit`, { params })
