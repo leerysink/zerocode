@@ -5,6 +5,8 @@
 不能用 app_config.database_url()——测试里它读环境变量返回默认库，而非 create_app 注入的测试 URL；
 app.state.engine.url 才是当前进程真实连接的实例/端口。安全：标识符 quote_ident 转义 + 值参数绑定。
 """
+import re
+
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
@@ -29,8 +31,13 @@ def classify_op(sql: str) -> str:
     head = stripped.split(None, 1)[0] if stripped.strip() else ""
     if head in _DDL_KEYWORDS:
         return "ddl"
-    if head in ("select", "insert", "update", "delete"):
+    if head in ("insert", "update", "delete"):
         return head
+    if head == "select":
+        # SELECT ... INTO 会建表写入；含函数调用式写（setval/pg_sleep 等）不当纯读处理。
+        if re.search(r"\binto\b", stripped):
+            return "other"
+        return "select"
     return "other"
 
 
@@ -155,7 +162,9 @@ SELECT_ROW_CAP = 5000
 
 async def execute_sql(request, slug: str, env: str, sql: str) -> dict:
     """直连执行一条 SQL。有返回列 → rows（截断 SELECT_ROW_CAP）；否则 → affected。
-    SELECT 类加语句超时护栏；写/DDL 不加（用户承担）。异常原样上抛给 API 层记审计。"""
+    SELECT 类加语句超时护栏；写/DDL 不加（用户承担）。
+    关键：SQLAlchemy 2.0 默认「commit as you go」，写完必须显式 conn.commit()，否则
+    连接关闭即回滚——写/DDL 不落库却返回成功、审计误记 success。异常原样上抛给 API 层记审计。"""
     cred = await _cred_or_409(request, slug, env)
     eng = create_async_engine(target_engine_url(request, cred))
     op = classify_op(sql)
@@ -169,8 +178,11 @@ async def execute_sql(request, slug: str, env: str, sql: str) -> dict:
                 fetched = result.fetchall()
                 truncated = len(fetched) > SELECT_ROW_CAP
                 rows = [dict(zip(cols, r)) for r in fetched[:SELECT_ROW_CAP]]
+                await conn.commit()  # SELECT 提交无害；带副作用的 SELECT（如 INTO）需此提交才落库
                 return {"kind": "rows", "columns": cols, "rows": rows, "truncated": truncated}
-            return {"kind": "affected", "affected": int(result.rowcount or 0)}
+            affected = int(result.rowcount or 0)
+            await conn.commit()  # 写/DDL 必须显式提交
+            return {"kind": "affected", "affected": max(affected, 0)}
     finally:
         await eng.dispose()
 

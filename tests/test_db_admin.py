@@ -196,6 +196,36 @@ async def test_sql_write_and_audit_success(db_app):
     assert row and row["status"] == "success"
 
 
+async def test_sql_write_actually_persists(db_app):
+    """回归：写必须真落库（防 execute_sql 漏 commit 静默回滚）。写后用独立连接直查 count。"""
+    client, aid, slug, uid = db_app
+    r = await client.post(f"/api/apps/{aid}/db/dev/sql",
+                          json={"sql": "INSERT INTO widgets(id,name) VALUES (123,'persist')"})
+    assert r.status_code == 200, r.text
+    sf = client.app.state.session_factory
+    cred = await provision.read_cred(sf, slug, "dev")
+    eng = create_async_engine(svc.target_engine_url(_FakeReq(client.app), cred))
+    try:
+        async with eng.connect() as conn:
+            n = (await conn.exec_driver_sql(
+                "SELECT count(*) FROM widgets WHERE id=123")).scalar()
+    finally:
+        await eng.dispose()
+    assert n == 1
+
+
+async def test_sql_illegal_env_400(db_app):
+    client, aid, *_ = db_app
+    r = await client.post(f"/api/apps/{aid}/db/qa/sql", json={"sql": "SELECT 1"})
+    assert r.status_code == 400
+
+
+async def test_audit_illegal_env_400(db_app):
+    client, aid, *_ = db_app
+    r = await client.get(f"/api/apps/{aid}/db/audit?env=qa")
+    assert r.status_code == 400
+
+
 async def test_sql_error_writes_error_audit(db_app):
     client, aid, *_ = db_app
     r = await client.post(f"/api/apps/{aid}/db/dev/sql", json={"sql": "SELECT * FROM not_a_table"})

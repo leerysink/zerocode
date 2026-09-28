@@ -33,72 +33,96 @@ async def _load_app(request: Request, app_id: int) -> dict:
 async def db_audit(request: Request, app_id: int, env: str | None = None,
                    op: str | None = None, limit: int = 100):
     await _load_app(request, app_id)
-    if env is not None:
-        svc.validate_env(env)
-    items = await svc.list_audit(request.app.state.session_factory, app_id,
-                                 env=env, op=op, limit=limit)
+    try:
+        if env is not None:
+            svc.validate_env(env)
+        items = await svc.list_audit(request.app.state.session_factory, app_id,
+                                     env=env, op=op, limit=limit)
+    except DeployError as e:
+        raise HTTPException(e.status, str(e))
     return {"items": items}
 
 
 @router.get("/{app_id}/db/{env}/tables")
 async def db_tables(request: Request, app_id: int, env: str):
     app = await _load_app(request, app_id)
+    actor_id = request.state.actor["id"]
+    sf = request.app.state.session_factory
     try:
         svc.validate_env(env)
         t0 = time.monotonic()
         tables = await svc.list_tables(request, app["slug"], env)
         await svc.log_operation(
-            request.app.state.session_factory, app_id=app_id,
-            actor_user_id=request.state.actor["id"], env=env, op_type="struct_view",
+            sf, app_id=app_id, actor_user_id=actor_id, env=env, op_type="struct_view",
             sql_text="GET tables", target_table=None, status="success",
             affected=len(tables), duration_ms=int((time.monotonic() - t0) * 1000))
         return {"tables": tables}
     except DeployError as e:
         raise HTTPException(e.status, str(e))
+    except Exception as e:  # 连接/权限/PG 未起 → 先留 error 审计再 503
+        await svc.log_operation(sf, app_id=app_id, actor_user_id=actor_id, env=env,
+                                op_type="struct_view", sql_text="GET tables",
+                                target_table=None, status="error", error=str(e))
+        raise HTTPException(503, f"数据库连接失败，请检查 zerocode-pg16：{e}")
 
 
 @router.get("/{app_id}/db/{env}/tables/{table}/schema")
 async def db_table_schema(request: Request, app_id: int, env: str, table: str):
     app = await _load_app(request, app_id)
+    actor_id = request.state.actor["id"]
+    sf = request.app.state.session_factory
     try:
         svc.validate_env(env)
         t0 = time.monotonic()
         schema = await svc.table_schema(request, app["slug"], env, table)
         await svc.log_operation(
-            request.app.state.session_factory, app_id=app_id,
-            actor_user_id=request.state.actor["id"], env=env, op_type="struct_view",
+            sf, app_id=app_id, actor_user_id=actor_id, env=env, op_type="struct_view",
             sql_text="GET schema", target_table=table, status="success",
             duration_ms=int((time.monotonic() - t0) * 1000))
         return schema
     except DeployError as e:
         raise HTTPException(e.status, str(e))
+    except Exception as e:
+        await svc.log_operation(sf, app_id=app_id, actor_user_id=actor_id, env=env,
+                                op_type="struct_view", sql_text="GET schema",
+                                target_table=table, status="error", error=str(e))
+        raise HTTPException(503, f"数据库连接失败，请检查 zerocode-pg16：{e}")
 
 
 @router.get("/{app_id}/db/{env}/tables/{table}/data")
 async def db_table_data(request: Request, app_id: int, env: str, table: str,
                         page: int = 1, size: int = 50, sort: str | None = None, dir: str = "asc"):
     app = await _load_app(request, app_id)
+    actor_id = request.state.actor["id"]
+    sf = request.app.state.session_factory
     try:
         svc.validate_env(env)
         t0 = time.monotonic()
         data = await svc.table_data(request, app["slug"], env, table,
                                     page=page, size=size, sort=sort, dirn=dir)
         await svc.log_operation(
-            request.app.state.session_factory, app_id=app_id,
-            actor_user_id=request.state.actor["id"], env=env, op_type="struct_view",
+            sf, app_id=app_id, actor_user_id=actor_id, env=env, op_type="struct_view",
             sql_text="GET data", target_table=table, status="success",
             affected=len(data["rows"]), duration_ms=int((time.monotonic() - t0) * 1000))
         return data
     except DeployError as e:
         raise HTTPException(e.status, str(e))
+    except Exception as e:
+        await svc.log_operation(sf, app_id=app_id, actor_user_id=actor_id, env=env,
+                                op_type="struct_view", sql_text="GET data",
+                                target_table=table, status="error", error=str(e))
+        raise HTTPException(503, f"数据库连接失败，请检查 zerocode-pg16：{e}")
 
 
 @router.post("/{app_id}/db/{env}/sql")
 async def db_sql_exec(request: Request, app_id: int, env: str, body: SqlIn):
     app = await _load_app(request, app_id)
-    svc.validate_env(env)
     actor_id = request.state.actor["id"]
     sf = request.app.state.session_factory
+    try:
+        svc.validate_env(env)
+    except DeployError as e:
+        raise HTTPException(e.status, str(e))
     op = svc.classify_op(body.sql)
     t0 = time.monotonic()
     try:
