@@ -37,7 +37,7 @@ def classify_op(sql: str) -> str:
 def target_engine_url(request, cred: dict) -> str:
     """以当前平台引擎 URL 为底座，仅替换 database/user/password 为应用凭据（host/port 沿用同实例）。"""
     base = request.app.state.engine.url
-    return (base.set(database=cred["db"], user=cred["user"], password=cred["password"])
+    return (base.set(database=cred["db"], username=cred["user"], password=cred["password"])
             .render_as_string(hide_password=False))
 
 
@@ -53,3 +53,25 @@ async def log_operation(sf, *, app_id: int, actor_user_id, env: str, op_type: st
             {"a": app_id, "u": actor_user_id, "e": env, "o": op_type, "q": sql_text,
              "t": target_table, "st": status, "af": affected, "er": error, "d": duration_ms})
         await s.commit()
+
+
+async def _cred_or_409(request, slug: str, env: str) -> dict:
+    from app.deploy.provision import read_cred
+    cred = await read_cred(request.app.state.session_factory, slug, env)
+    if not cred:
+        raise DeployError(f"库 {slug}_{env} 凭据缺失（未供给或已删除）", status=409)
+    return cred
+
+
+async def list_tables(request, slug: str, env: str) -> list[dict]:
+    """列 public schema 下基表与视图（information_schema 参数化，无注入面）。"""
+    cred = await _cred_or_409(request, slug, env)
+    eng = create_async_engine(target_engine_url(request, cred))
+    try:
+        async with eng.connect() as conn:
+            rows = (await conn.execute(text(
+                "SELECT table_name AS name, table_type AS type FROM information_schema.tables "
+                "WHERE table_schema = 'public' ORDER BY table_name"))).mappings().all()
+        return [dict(r) for r in rows]
+    finally:
+        await eng.dispose()

@@ -152,6 +152,9 @@ def create_app(database_url: str | None = None) -> FastAPI:
     # 应用资源监控：GET /api/apps/{id}/metrics/current（Ticket 001，与 apps_api 同前缀、独立模块）
     from app.api import metrics as metrics_api
     app.include_router(metrics_api.router)
+    # 应用 DB 操作台：/api/apps/{id}/db/*（与 apps/metrics 同前缀、独立模块，设计 2026-09-28）
+    from app.api import db_admin as db_admin_api
+    app.include_router(db_admin_api.router)
     # 部署发布套件（Task 12）：/ws/deploy/{app_id} 部署事件流（须在静态托管之前，路由不被 SPA 吞掉）
     from app.api import deploy_ws
     app.include_router(deploy_ws.router)
