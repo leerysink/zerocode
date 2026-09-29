@@ -224,7 +224,7 @@ defineExpose({ selected, schema, selectTable, loadData, saveEdits, canEdit, open
                   </template>
                 </template>
               </a-table>
-              <a-modal v-model:open="editOpen" :title="`编辑行 · ${selected}`"
+              <a-modal v-model:open="editOpen" :title="`编辑行 · ${selected}`" :width="760"
                        wrap-class-name="zc-db-edit-modal" :mask-closable="false">
                 <div v-if="editRow" class="zc-db-edit-fields">
                   <div v-for="c in dataCols" :key="c" class="zc-db-edit-field">

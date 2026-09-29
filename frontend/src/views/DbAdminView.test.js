@@ -313,6 +313,14 @@ describe('Ticket 010 数据网格行末编辑列与弹框', () => {
     expect(w.find('[wrap-class-name="zc-db-edit-modal"] .zc-db-edit-save').exists()).toBe(true)
   })
 
+  // 两列栅格至少需要 280×2 + 列间距 16 + body 左右 padding 28 ≈ 604px，
+  // a-modal 默认 520px 永远只解出一条轨道，13 列的宽表会排成一长条（浏览器实测踩过）。
+  it('边界：弹框显式给宽，不给就装不下两列栅格', async () => {
+    const w = mountGrid()
+    await openEditModal(w)
+    expect(Number(w.find('.zc-db-modal').attributes('width'))).toBeGreaterThanOrEqual(604)
+  })
+
   it('边界：编辑途中换环境（dev→prod）弹框立即关闭，不留上一环境的草稿', async () => {
     const w = mountGrid()
     await openEditModal(w)
@@ -578,10 +586,26 @@ describe('DB 操作台样式单源 db-admin.less', () => {
     expect(lessSource).toMatch(/--zc-db-accent:\s*#4a6d94/)
   })
 
-  it('边界：portal 到 body 的三个作用域锚点类名都还在文件里', () => {
-    for (const anchor of ['.zc-db', '.zc-db-drawer', '.zc-db-dd']) {
+  it('边界：portal 到 body 的四个作用域锚点类名都还在文件里', () => {
+    for (const anchor of ['.zc-db', '.zc-db-drawer', '.zc-db-dd', '.zc-db-edit-modal']) {
       expect(lessSource).toContain(anchor)
     }
+  })
+
+  // 样式轮容易留死 CSS：入口搬走了但旧规则还在，不报错也不会被看到，只能源码闸拦。
+  it('边界：旧的底部编辑面板样式已清，行末按钮样式已补', () => {
+    expect(lessCode).not.toContain('.zc-db-edit-panel')
+    expect(lessCode).not.toContain('.zc-db-edit-title')
+    expect(lessCode).toMatch(/\.zc-db-row-edit\s*\{/)
+    expect(lessCode).toMatch(/\.zc-db-row-edit:disabled\s*\{/)
+  })
+
+  // 固定列与表头底色分不开的话，横向滚动时最右列表头会比同行浅一格（实测踩过）。
+  it('边界：固定列表头跟普通表头同底色，弹框有窄窗口兜底', () => {
+    const headFix = lessCode.match(/\.ant-table-thead[^{]*th\.ant-table-cell-fix-right\s*\{([^}]*)\}/)?.[1] ?? ''
+    expect(headFix).toContain('--zc-db-chrome')
+    expect(headFix).not.toContain('--zc-db-panel')
+    expect(lessCode).toMatch(/\.ant-modal\s*\{[^}]*max-width:\s*calc\(100vw/)
   })
 
   // antd cssinjs 用 :where(hash) 前缀不计权重，单类根与它特异性打平，胜负只能赌注入顺序。

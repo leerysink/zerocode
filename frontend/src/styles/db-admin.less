@@ -9,10 +9,12 @@
  */
 
 // ---- 变量层：浅色实值；命名带 db 前缀避免与全局 theme.less 抢名字 ----
-// .zc-db-dd 也列进来：下拉面板 portal 到 body，拿不到 .zc-db 上的变量就得回退成默认色。
+// .zc-db-dd / .zc-db-edit-modal 也列进来：下拉面板与行编辑弹框都 portal 到 body，
+// 拿不到 .zc-db 上的变量就得回退成默认色。
 .zc-db,
 .zc-db-drawer,
-.zc-db-dd {
+.zc-db-dd,
+.zc-db-edit-modal {
   --zc-db-accent: #4a6d94;          // 主色加深：白字对比度 5.4:1（原 #5b7a9d 只有 4.45:1）
   --zc-db-accent-hover: #3d5c80;
   --zc-db-accent-soft: #eaf1f8;     // 选中底
@@ -155,8 +157,8 @@
     flex: 0 0 auto;
   }
   // 工具栏按钮统一成细边框扁平款：主色只留给「执行」这类真正的主操作
-  .zc-db-head-right .ant-btn,
-  .zc-db-edit-save {
+  // （行编辑弹框的按钮不在这——它 portal 到 body，样式在 .zc-db-edit-modal 块里）
+  .zc-db-head-right .ant-btn {
     height: 28px;
     padding: 0 12px;
     font-size: 12px;
@@ -381,6 +383,57 @@
     text-align: right;
     user-select: none;
   }
+  // 行末固定列：横向滚动时它压在数据之上，底色的必须不透明，还要跟着斑马纹/悬停换色，
+  // 否则滚起来看就是一列透明的空洞。
+  .ant-table-tbody > tr > .ant-table-cell-fix-right {
+    background: var(--zc-db-panel);
+  }
+  // 表头的固定列单独一条：浏览器实测漏了它时固定列表头是白底，比同行表头浅一格。
+  .ant-table-thead > tr > th.ant-table-cell-fix-right {
+    background: var(--zc-db-chrome);
+  }
+  .ant-table-tbody > tr:nth-child(even) > .ant-table-cell-fix-right {
+    background: var(--zc-db-zebra);
+  }
+  .ant-table-tbody > tr:hover > .ant-table-cell-fix-right {
+    background: var(--zc-db-accent-soft);
+  }
+  // 行末编辑按钮：矮版描边，不吃行高；disabled 的按钮不吃 hover，
+  // 所以悬停提示挂在包裹的 .zc-db-row-edit-wrap 上（title 在那儿）。
+  .zc-db-row-edit-wrap {
+    display: inline-flex;
+  }
+  .zc-db-row-edit {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    height: 20px;
+    padding: 0 8px;
+    font-family: inherit;
+    font-size: 11px;
+    color: var(--zc-db-accent);
+    background: transparent;
+    border: 1px solid var(--zc-db-accent-line);
+    border-radius: var(--zc-db-radius);
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .zc-db-row-edit:hover {
+    color: #fff;
+    background: var(--zc-db-accent);
+    border-color: var(--zc-db-accent);
+  }
+  .zc-db-row-edit:disabled {
+    color: var(--zc-db-muted);
+    background: var(--zc-db-chrome);
+    border-color: var(--zc-db-border);
+    cursor: not-allowed;
+  }
+  .zc-db-row-edit:disabled:hover {
+    color: var(--zc-db-muted);
+    background: var(--zc-db-chrome);
+    border-color: var(--zc-db-border);
+  }
   .ant-table-cell .ant-table-column-sorter,
   .ant-table-column-sorter-up,
   .ant-table-column-sorter-down {
@@ -393,7 +446,7 @@
   // antd 部件主色覆写（分页器 / 输入框 / 链接 / 排序器）
   .zc-db-accent-antd();
 
-  // ---- 行内编辑面板：贴着网格下方的条目编辑器 ----
+  // ---- 无主键告警条（编辑入口已搬到行末固定列，弹框样式见 .zc-db-edit-modal）----
   .zc-db-edit-disabled {
     margin-bottom: 8px;
     padding: 6px 10px;
@@ -403,54 +456,6 @@
     background: var(--zc-db-warn-bg);
     color: var(--zc-db-warn);
     font-size: 12px;
-  }
-  .zc-db-edit-panel {
-    margin-top: 10px;
-    padding: 8px 10px;
-    background: var(--zc-db-chrome);
-    border: 1px solid var(--zc-db-border);
-    border-radius: var(--zc-db-radius);
-  }
-  .zc-db-edit-title {
-    margin-bottom: 6px;
-    font-size: 12px;
-    font-weight: 600;
-    color: var(--zc-db-text-sub);
-  }
-  .zc-db-edit-fields {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px 12px;
-  }
-  .zc-db-edit-field {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-  }
-  .zc-db-edit-field label {
-    min-width: 92px;
-    font-size: 12px;
-    color: var(--zc-db-text-sub);
-    text-align: right;
-    overflow: hidden;
-    white-space: nowrap;
-    text-overflow: ellipsis;
-  }
-  .zc-db-edit-field .ant-input {
-    height: 26px;
-    font-size: 12px;
-    border-radius: var(--zc-db-radius);
-  }
-  .zc-db-edit-save {
-    margin-top: 8px;
-    background: var(--zc-db-accent);
-    border-color: var(--zc-db-accent);
-    color: #fff;
-    font-weight: 600;
-  }
-  .zc-db-edit-save:hover {
-    background: var(--zc-db-accent-hover);
-    border-color: var(--zc-db-accent-hover);
   }
 
   // ---- 底部状态栏：环境 / 表数 / 当前表 / 行数页码 ----
@@ -1000,6 +1005,121 @@
 
   // 抽屉里的 a-select / 输入框焦点态同样不留旧主色
   .zc-db-accent-antd();
+}
+
+// ---- 行编辑弹框（Ticket 010）：a-modal 的 wrap portal 到 body，靠 wrap-class-name 拿自己的根 ----
+// rootClassName 被 antd cssinjs 的 hashId 占用了，只有 wrapClassName 能当 scoped 锚点；
+// 与下拉面板同一口径再列一份 `.zc-db-edit-modal.ant-modal-wrap` 做层叠保险。
+.zc-db-edit-modal,
+.zc-db-edit-modal.ant-modal-wrap {
+  font-family: var(--zc-db-font-sans);
+
+  .ant-modal {
+    top: 64px;
+    padding-bottom: 0;
+    // 窄窗口下 760px 会顶出视口，靠这条兜底（antd 只在 <=575px 的媒体查询里给 max-width）
+    max-width: calc(100vw - 32px);
+  }
+  .ant-modal-content {
+    border: 1px solid var(--zc-db-border-strong);
+    border-radius: var(--zc-db-radius);
+    box-shadow: 0 12px 32px rgba(31, 45, 61, .18);
+  }
+  .ant-modal-header {
+    padding: 10px 14px;
+    background: var(--zc-db-chrome);
+    border-bottom: 1px solid var(--zc-db-border-strong);
+    border-radius: var(--zc-db-radius) var(--zc-db-radius) 0 0;
+  }
+  .ant-modal-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--zc-db-text);
+  }
+  .ant-modal-close {
+    top: 8px;
+    inset-inline-end: 10px;
+    color: var(--zc-db-text-sub);
+  }
+  .ant-modal-body {
+    padding: 12px 14px;
+  }
+  .ant-modal-footer {
+    padding: 10px 14px;
+    border-top: 1px solid var(--zc-db-border);
+    text-align: right;
+  }
+
+  // 表单栅格：一行两列自适应，宽表不至于排成一长条；列多了内部滚动，不撑破弹框。
+  // 下限 280px 与弹框宽度是绑死的：两列需要 280×2 + gap16 + body 左右 padding28 = 604px，
+  // 所以 a-modal 必须显式给到 760，走默认 520px 时永远只解出一条轨道（实测排成一长条）。
+  .zc-db-edit-fields {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 8px 16px;
+    max-height: 52vh;
+    overflow: auto;
+  }
+  .zc-db-edit-field {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .zc-db-edit-field label {
+    flex: 0 0 92px;
+    font-size: 12px;
+    font-family: var(--zc-db-font-mono);
+    color: var(--zc-db-text-sub);
+    text-align: right;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+  .zc-db-edit-field .ant-input {
+    flex: 1 1 auto;
+    height: 28px;
+    font-size: 12px;
+    border-radius: var(--zc-db-radius);
+  }
+  // 主键只读展示：用底色描出“不可改”，但值要看得清
+  .zc-db-edit-field .ant-input[disabled] {
+    background: var(--zc-db-chrome);
+    color: var(--zc-db-text);
+    cursor: default;
+  }
+
+  .zc-db-edit-cancel,
+  .zc-db-edit-save {
+    height: 28px;
+    margin-inline-start: 8px;
+    padding: 0 12px;
+    font-family: inherit;
+    font-size: 12px;
+    border-radius: var(--zc-db-radius);
+    cursor: pointer;
+  }
+  .zc-db-edit-cancel {
+    color: var(--zc-db-text-sub);
+    background: var(--zc-db-panel);
+    border: 1px solid var(--zc-db-border-strong);
+  }
+  .zc-db-edit-cancel:hover {
+    color: var(--zc-db-accent);
+    border-color: var(--zc-db-accent);
+  }
+  .zc-db-edit-save {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    color: #fff;
+    background: var(--zc-db-accent);
+    border: 1px solid var(--zc-db-accent);
+    font-weight: 600;
+  }
+  .zc-db-edit-save:hover {
+    background: var(--zc-db-accent-hover);
+    border-color: var(--zc-db-accent-hover);
+  }
 }
 
 // ---- 下拉面板：a-select 的候选列表 portal 在 body，靠 popup-class-name 拿自己的根 ----
