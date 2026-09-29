@@ -4,7 +4,7 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { message, Modal } from 'ant-design-vue'
-import { HistoryOutlined, ReloadOutlined, SaveOutlined, TableOutlined } from '@ant-design/icons-vue'
+import { EditOutlined, HistoryOutlined, ReloadOutlined, SaveOutlined, TableOutlined } from '@ant-design/icons-vue'
 import { dbTables, dbTableSchema, dbTableData, dbSqlExec, dbAudit } from '../api'
 import SqlConsole from '../components/SqlConsole.vue'
 
@@ -23,15 +23,18 @@ const page = ref(1)
 const size = ref(50)
 const sortCol = ref(null)
 const sortDir = ref('asc')
-const editRow = ref(null) // 当前编辑行（默认首行；点行切换）
+const editRow = ref(null) // 弹框里的草稿副本（点行末编辑才填；关闭不重置，下次 openEdit 整份覆盖）
+const editOpen = ref(false)
 
 // 行号列：Navicat 式的第一列，跨页连续计数；纯展示，不带 sorter、不参与编辑。
+// 行末「操作」列固定右侧：表一宽就横向滚动，编辑入口必须跟着行走而不是钉在页面底部。
 const gridColumns = computed(() => [
   {
     title: '#', key: '__row_no', width: 56, align: 'right', className: 'zc-db-col-no',
     customRender: ({ index }) => (page.value - 1) * size.value + index + 1,
   },
   ...dataCols.value.map((c) => ({ title: c, dataIndex: c, sorter: true })),
+  { title: '操作', key: '__actions', width: 88, fixed: 'right', align: 'center' },
 ])
 
 // 状态栏右半句：未选表时说明白，不用「共 0 行」糊人。
@@ -58,6 +61,8 @@ async function selectTable(name) {
 watch(env, () => {
   selected.value = null; schema.value = null
   rows.value = []; dataCols.value = []; total.value = 0; editRow.value = null
+  // 弹框开着时切环境，下表已经不属于这个库了，不给它留残影
+  editOpen.value = false
   loadTables()
 })
 
@@ -67,7 +72,7 @@ async function loadData() {
     const { data } = await dbTableData(appId, env.value, selected.value,
       { page: page.value, size: size.value, sort: sortCol.value || undefined, dir: sortDir.value })
     rows.value = data.rows; dataCols.value = data.columns; total.value = data.total
-    editRow.value = rows.value.length ? { ...rows.value[0] } : null
+    // 不再把首行塞进 editRow：没有显式点编辑就不该有一个看不见的“当前编辑行”
   } catch (e) { message.error(e?.response?.data?.detail || '数据加载失败') }
 }
 function onPageChange(p) { page.value = p; loadData() }
@@ -76,7 +81,11 @@ function onSort(col) {
   else { sortCol.value = col; sortDir.value = 'asc' }
   page.value = 1; loadData()
 }
-function pickRow(row) { editRow.value = { ...row } }
+function openEdit(row) {
+  if (!canEdit()) return // 无主键表按钮已禁用，这里防绕过禁用态直接调用
+  editRow.value = { ...row } // 编辑副本：改到一半取消，表格里的原值不应被动过
+  editOpen.value = true
+}
 const canEdit = () => (schema.value?.primary_key || []).length > 0
 const isPk = (c) => (schema.value?.primary_key || []).includes(c)
 const q = (s) => `"${String(s).replace(/"/g, '""')}"`
@@ -97,12 +106,12 @@ function saveEdits() {
   Modal.confirm({
     title: '确认执行写操作', content: sql, okText: '执行', okType: 'danger',
     onOk: async () => {
-      try { await dbSqlExec(appId, env.value, sql); message.success('已保存'); await loadData() }
+      try { await dbSqlExec(appId, env.value, sql); message.success('已保存'); editOpen.value = false; await loadData() }
       catch (e) { message.error(e?.response?.data?.detail || '执行失败') }
     },
   })
 }
-watch(selected, () => { page.value = 1; editRow.value = null; loadData() })
+watch(selected, () => { page.value = 1; editRow.value = null; editOpen.value = false; loadData() })
 
 // ---- 查询控制台 + 审计抽屉 ----
 // SQL 编辑器与批量执行已下沉到 SqlConsole（Ticket 002），本视图只负责供 appId/env/tables。
@@ -160,7 +169,7 @@ async function refresh() {
 
 onMounted(loadTables)
 defineExpose({ selected, schema, selectTable, loadData, saveEdits, canEdit, openAudit, refresh, fetchAudit,
-  auditEnv, auditOp, selectionText, formatTs, cellText })
+  auditEnv, auditOp, selectionText, formatTs, cellText, editRow, editOpen, openEdit })
 </script>
 
 <template>
@@ -200,19 +209,35 @@ defineExpose({ selected, schema, selectTable, loadData, saveEdits, canEdit, open
                        :columns="gridColumns"
                        :pagination="{ total, current: page, pageSize: size, showSizeChanger: false, onChange: onPageChange }"
                        :scroll="{ x: 'max-content' }"
-                       :custom-row="(r) => ({ onClick: () => pickRow(r) })"
-                       @change="(_p, _f, s, extra) => extra && extra.action === 'sort' && onSort(s.columnKey || s.field)" />
-              <div v-if="canEdit() && editRow" class="zc-db-edit-panel">
-                <div class="zc-db-edit-title">编辑行（主键：{{ schema.primary_key.join(', ') }}）</div>
-                <div class="zc-db-edit-fields">
+                       @change="(_p, _f, s, extra) => extra && extra.action === 'sort' && onSort(s.columnKey || s.field)">
+                <!-- antd v4 先跑 column.customRender，再用 customRenderSlot 包一层 #bodyCell：
+                     插槽返回的全是注释（v-if 未命中）时会回落到 customRender / 原值，
+                     所以这里只处理 __actions，不必也不该把行号列与数据列接过来。 -->
+                <template #bodyCell="{ column, record }">
+                  <template v-if="column.key === '__actions'">
+                    <span class="zc-db-row-edit-wrap"
+                          :title="canEdit() ? '编辑该行' : '该表无主键，无法按行定位，编辑已禁用'">
+                      <button class="zc-db-row-edit" :disabled="!canEdit()" @click.stop="openEdit(record)">
+                        <edit-outlined />编辑
+                      </button>
+                    </span>
+                  </template>
+                </template>
+              </a-table>
+              <a-modal v-model:open="editOpen" :title="`编辑行 · ${selected}`"
+                       wrap-class-name="zc-db-edit-modal" :mask-closable="false">
+                <div v-if="editRow" class="zc-db-edit-fields">
                   <div v-for="c in dataCols" :key="c" class="zc-db-edit-field">
                     <label>{{ c }}</label>
                     <a-input :value="editRow[c]" :disabled="isPk(c)"
                              @change="(e) => editRow[c] = e.target.value" />
                   </div>
                 </div>
-                <button class="zc-db-edit-save" @click="saveEdits"><save-outlined />保存</button>
-              </div>
+                <template #footer>
+                  <button class="zc-db-edit-cancel" @click="editOpen = false">取消</button>
+                  <button class="zc-db-edit-save" @click="saveEdits"><save-outlined />保存</button>
+                </template>
+              </a-modal>
             </div>
           </a-tab-pane>
           <a-tab-pane key="schema" tab="结构">

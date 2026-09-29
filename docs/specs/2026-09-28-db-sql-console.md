@@ -51,6 +51,7 @@ DB 操作台的查询控制台现在是一个 4 行 `a-textarea`（[DbAdminView.
 - **US-19** 作为 owner，localStorage 写入超出浏览器配额时，我得到黄条"本地存储已满，本次不再自动保存"，编辑器里的文本不被清空或截断。
 - **US-20** 作为 owner，应用尚未供给数据库（凭据缺失）时执行，得到与现有一致的 409 提示，不返回半成品结果。
 - **US-21** 作为 owner，一个框里跑 5 条语句时结果区是 5 个结果页签而不是 5 块纵向堆叠，我点第 3 个只看第 3 条；只跑 1 条时看不到页签栏；刷新后结果区仍为空（结果与结果页签的停留位都不进 localStorage）。
+- **US-22**（Ticket 010）作为 owner，「数据」页签的表格最右侧有一列固定的「操作」列，每行一个「编辑」按钮；点它弹出一个编辑框（主键列只读展示、其余列可改），改完点保存仍是原来那一次确认 + 单条 `UPDATE`。表格下方的常驻编辑面板不再有，点行本身不再有任何副作用；表无主键时按钮禁用并说明原因。
 
 ## 4. 已定决策
 
@@ -178,7 +179,7 @@ class SqlBatchIn(BaseModel):
 - 后端 `sql/batch`（pytest）：单条 SELECT、单条写、多条全成功、**第 2 条失败→第 1 条已持久化（独立连接回查 count）+ 第 3 条 skipped**、全失败（第 1 条就错）、空数组 400、全空白/纯注释数组 400、非法 env 400、非归属 404、凭据缺失 409、建连失败 503（不可达库名/故坏凭据）、`SELECT_ROW_CAP=5` 下批量内仍截断且 `truncated=true`、审计条数=实际执行条数且 skipped 无记录、含 `$$` 的单条建函数成功（验证前端整条送去的原文没被服务端二次拆分破坏）、`INSERT ... RETURNING` 归为 rows。
 - 前端 `SqlConsole`：挂载恢复 localStorage 页签、切换页签结果区跟着切、env 变化重载另一套页签、关闭非空页签需确认、prod 确认词未输够"执行"禁用、纯读段不弹框、执行调用 `dbSqlBatch` 且参数为拆分后的数组、有选区时用选区文本（通过注入 `SqlEditor` 桩的 `getSelectionText()`）。
 - 前端 `SqlConsole` 结果页签（Ticket 009）：两条→两个页签且**只有激活块在 DOM**、点第二个切换内容、单条不渲染页签栏、0 结果与执行中仍走空态、有失败时默认落失败页且页签带 `--error`、重执行后结果变少不越界空白、服务端丢弃纯注释段导致的稀疏 index 仍写「第 3/3 条」、切脚本页签不串结果页签激活位、点结果页签**不触发**任何 localStorage 写、结果页签无关闭按钮。
-- 旧测试处理：`DbAdminView.test.js` 里打 `.zc-db-sql-input` 的用例迁移到 `SqlConsole.test.js`，其余（数据网格行内编辑、审计抽屉）保持不动。
+- 旧测试处理：`DbAdminView.test.js` 里打 `.zc-db-sql-input` 的用例迁移到 `SqlConsole.test.js`，审计抽屉用例保持不动；数据网格行内编辑的用例（Ticket 010）按新入口重写——**只重写"怎么打开编辑"，保存链路的断言（`Modal.confirm` 一次 + `dbSqlExec` 单条 `UPDATE`）原样保留**。
 
 **"完成"的标志**：`npm test`（vitest）全绿 + `pytest` 全绿 + `npm run build` 通过且**重新产出 dist**（前端功能缺失常因 dist 未重建）+ 手工冒烟：进 DB 操作台看到高亮 → 格式化生效 → 开两个页签 → 跑 `SELECT 1; SELECT 2;` 出两个结果页签（点第二个只看第 2 条）→ 中间塞一条错语句看 skipped 与"前面已生效"、自动停在失败页签 → prod 下确认词拦住 → 刷新后页签还在、结果为空。
 
@@ -194,7 +195,7 @@ class SqlBatchIn(BaseModel):
 - **不做页签拖拽排序、页签颜色标记、多应用同时打开**。
 - **不做结果页签的关闭/重命名/持久化**（Ticket 009）：结果页签只是同一批结果的水平导航，不是可关闭的工作现场，不设数量上限、靠横向滚动。
 - **不做列值补全与 SQL Lint**。
-- **不动「数据」页签行内编辑与审计抽屉**。
+- **不改「数据」页签行内编辑的保存语义与审计抽屉**（Ticket 010 只搬入口：底部常驻面板 → 行末固定列 + 弹框；`buildUpdate`、单次确认、单条 `/sql` 端点、成功后重拉全部不变），也不在这一列新增行/删除行。
 - **不改网关/发布/迁移轨**：本功能与 `sqlchange/` 目录无关，不改任何发布链路。
 
 ## 8. 补充说明
@@ -206,4 +207,4 @@ class SqlBatchIn(BaseModel):
 - **`riskFlags` 的 `no_where` 判据是正则** `\bwhere\b`，会漏判 `UPDATE t SET a=(SELECT ...)` 之类，属已接受的保守误报/漏报（宁可标红也不给假安全）。
 - **CodeMirror 与 antd 弹框的 z-index/焦点冲突**：`Ctrl+Enter` 需在 `EditorView.domEventHandlers` 里拦，不能只挂 window keydown，否则焦点在编辑器外时行为不一致。
 - **Windows 冒烟前置**：需 `zerocode-pg16` 容器与应用 dev/prod 库凭据已供给，否则批量端点返回 409（属预期，不是新 bug）。
-- **下游**：本 spec 已拆为 9 张示踪弹工单，见 [.scratch/db-sql-console/tickets/](../../.scratch/db-sql-console/tickets)：001 预重构 `execute_one` → 002 示踪弹（两条 SELECT 端到端）→ 003 遇错即停与失败可见 / 004 拆分状态机 / 005 页签与本地保存（三票可并行）→ 006 格式化与选区执行 → 007 确认弹框与 prod 确认词 → 008 补全 + dist 重建 + 手工冒烟 → 009 结果页签一条一页（Blocked by 005）。
+- **下游**：本 spec 已拆为 10 张示踪弹工单，见 [.scratch/db-sql-console/tickets/](../../.scratch/db-sql-console/tickets)：001 预重构 `execute_one` → 002 示踪弹（两条 SELECT 端到端）→ 003 遇错即停与失败可见 / 004 拆分状态机 / 005 页签与本地保存（三票可并行）→ 006 格式化与选区执行 → 007 确认弹框与 prod 确认词 → 008 补全 + dist 重建 + 手工冒烟 → 009 结果页签一条一页（Blocked by 005）→ 010 数据网格行末编辑列与弹框（独立，只动 `DbAdminView.vue`）。

@@ -2,7 +2,7 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest'
 import { existsSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
-import { h } from 'vue'
+import { Comment, h } from 'vue'
 import { flushPromises, mount } from '@vue/test-utils'
 
 const mocks = vi.hoisted(() => ({
@@ -46,10 +46,23 @@ const STUBS = {
       this.$emit('change', e.target.value)
     } }, (this.options || []).map((o) => h('option', { value: o.value }, o.label))) } },
   'a-tag': { props: ['color'], render() { return h('span', { class: 'zc-db-tag' }, this.$slots.default?.()) } },
+  // a-modal 桩：没开就不渲染内容（否则“未操作就有弹框”这类残留测不出来）；
+  // wrap-class-name 不声明为 prop，靠 fallthrough 落到根节点上，与抽屉 root-class-name 同一口径。
+  'a-modal': { props: ['open', 'title'], emits: ['update:open'], render() {
+    if (!this.open) return null
+    return h('div', { class: 'zc-db-modal' }, [
+      h('div', { class: 'zc-db-modal-title' }, this.title),
+      h('div', { class: 'zc-db-modal-body' }, this.$slots.default?.()),
+      h('div', { class: 'zc-db-modal-footer' }, this.$slots.footer?.()),
+    ])
+  } },
 }
 
 beforeEach(() => {
   vi.clearAllMocks()
+  // 默认让确认框直接执行 onOk（等价于用户点「执行」）；测「取消」的用例自行覆盖。
+  // 不重建的话，上一个用例改成 vi.fn() 会泄漏给后面的用例。
+  mocks.antd.Modal.confirm = vi.fn(({ onOk }) => onOk && onOk())
   mocks.api.dbTables.mockResolvedValue({ data: { tables: [{ name: 'widgets', type: 'BASE TABLE' }] } })
   mocks.api.dbTableSchema.mockResolvedValue({ data: { columns: [{ name: 'id', type: 'integer', nullable: false, default: null }], primary_key: ['id'], indexes: [] } })
   mocks.api.dbTableData.mockResolvedValue({ data: { columns: ['id', 'name'], rows: [{ id: 1, name: 'a' }], total: 1, truncated: false } })
@@ -71,34 +84,266 @@ it('切到 prod 重新拉表并显示警示条', async () => {
   expect(w.find('.zc-db-prod-warn').exists()).toBe(true)
 })
 
-// ---------- Task 10: 数据 tab 行内编辑二次确认 + 无主键禁编辑 ----------
-it('选中有主键表拉数据，编辑保存走二次确认后执行 SQL', async () => {
-  mocks.api.dbSqlExec.mockResolvedValue({ data: { kind: 'affected', affected: 1 } })
-  mocks.antd.Modal.confirm = vi.fn(({ onOk }) => onOk())
-  const w = mount(DbAdminView, { global: { stubs: STUBS } })
+// ---------- Ticket 010: 数据网格行末固定列「编辑」+ 弹框（入口从底部搬到行末）----------
+
+/**
+ * 数据网格桩：忠实还原 antd v4 的单元格优先级——先调 #bodyCell，插槽返回全是注释
+ * （v-if 未命中）时**回落**到 customRender / 原值，见 ant-design-vue/es/_util/vnode.js
+ * 的 customRenderSlot + ensureValidVNode。
+ * 默认 a-table 桩只看 dataSource、走不到插槽；已有的 bodyCellTable 桩走插槽但没有回落，
+ * 拿它测会把「行号列被插槽清空」这类误实现测成通过，所以单开一个。
+ */
+const gridTable = {
+  props: ['columns', 'dataSource'],
+  render() {
+    const cellContent = (column, record, text, index) => {
+      const slotted = this.$slots.bodyCell
+        ? this.$slots.bodyCell({ column, record, text, index })
+        : null
+      const valid = Array.isArray(slotted) ? slotted.some((child) => child && child.type !== Comment) : !!slotted
+      if (valid) return slotted
+      return column.customRender ? column.customRender({ text, record, index, column }) : String(text ?? '')
+    }
+    return h('table', { class: 'zc-db-grid' }, h('tbody', (this.dataSource || []).map((record, ri) =>
+      h('tr', { key: ri }, (this.columns || []).map((c) =>
+        h('td', { key: c.dataIndex ?? c.key }, cellContent(c, record, record[c.dataIndex], ri)))))))
+  },
+}
+
+const mountGrid = (extraStubs = {}) => mount(DbAdminView, {
+  global: { stubs: { ...STUBS, 'a-table': gridTable, ...extraStubs } },
+})
+
+/** 选默认表 → 点第 rowIndex 行的行末编辑按钮。 */
+async function openEditModal(w, rowIndex = 0) {
   await flushPromises()
   await w.find('.zc-tree-node').trigger('click')
   await flushPromises()
+  await dataGrid(w).findAll('.zc-db-row-edit')[rowIndex].trigger('click')
+  await flushPromises()
+  return w
+}
+
+/**
+ * 数据网格在所有 .zc-db-grid 里排最前（数据页签先于结构/查询页签渲染）。
+ * 不拿容器限定就会把结构页的表头一并数进来（样式轮就踩过这个坑：格子数从 4 变 7）。
+ */
+const dataGrid = (w) => w.findAll('.zc-db-grid')[0]
+
+it('选中有主键表拉数据，点行末编辑开弹框，保存走二次确认后执行 SQL', async () => {
+  mocks.api.dbSqlExec.mockResolvedValue({ data: { kind: 'affected', affected: 1 } })
+  const w = mountGrid()
+  await openEditModal(w)
   expect(mocks.api.dbTableData).toHaveBeenCalledWith('1', 'dev', 'widgets', expect.anything())
+  expect(w.find('.zc-db-modal').exists()).toBe(true)
   const save = w.find('.zc-db-edit-save')
   expect(save.exists()).toBe(true)
   await save.trigger('click')
   await flushPromises()
-  expect(mocks.antd.Modal.confirm).toHaveBeenCalled()
+  expect(mocks.antd.Modal.confirm).toHaveBeenCalledWith(expect.objectContaining({
+    content: expect.stringContaining('UPDATE'),
+  }))
   expect(mocks.api.dbSqlExec).toHaveBeenCalledWith('1', 'dev', expect.stringContaining('UPDATE'))
+  // 保存成功 → 弹框自己关掉，并重拉数据
+  expect(w.find('.zc-db-modal').exists()).toBe(false)
+  expect(mocks.api.dbTableData).toHaveBeenCalledTimes(2)
 })
 
 it('无主键表禁用行内编辑但仍可浏览数据', async () => {
   mocks.api.dbTableSchema.mockResolvedValueOnce({ data: { columns: [{ name: 'id', type: 'integer', nullable: false, default: null }], primary_key: [], indexes: [] } })
-  const w = mount(DbAdminView, { global: { stubs: STUBS } })
+  const w = mountGrid()
   await flushPromises()
   await w.find('.zc-tree-node').trigger('click')
   await flushPromises()
   expect(w.find('.zc-db-edit-disabled').exists()).toBe(true)
+  // 编辑列照常渲染（不整列消失，避免有无主键时列宽跳动），但按钮禁用
+  const btns = dataGrid(w).findAll('.zc-db-row-edit')
+  expect(btns).toHaveLength(1)
+  expect(btns[0].attributes('disabled')).toBeDefined()
   expect(w.find('.zc-db-edit-save').exists()).toBe(false)
   // 无主键不影响拉数据/渲染网格（视图可浏览）
   expect(mocks.api.dbTableData).toHaveBeenCalledWith('1', 'dev', 'widgets', expect.anything())
-  expect(w.find('.zc-db-table').exists()).toBe(true)
+  expect(w.find('.zc-db-grid').exists()).toBe(true)
+  // 格子顺序：行号 / id / name / 操作；数据格仍正常渲染（插槽只抢了操作列）
+  expect(dataGrid(w).findAll('tbody tr td')[2].text()).toBe('a')
+})
+
+describe('Ticket 010 数据网格行末编辑列与弹框', () => {
+  it('边界：操作列声明 fixed right，且插槽没抢走行号列与数据列', async () => {
+    let gridCols = null
+    const capTable = {
+      props: ['columns', 'dataSource'],
+      render() {
+        if (this.columns?.[0]?.key === '__row_no') gridCols = this.columns
+        return gridTable.render.call(this)
+      },
+    }
+    const w = mountGrid({ 'a-table': capTable })
+    await flushPromises()
+    await w.find('.zc-tree-node').trigger('click')
+    await flushPromises()
+    const actions = gridCols[gridCols.length - 1]
+    expect(actions.key).toBe('__actions')
+    expect(actions.fixed).toBe('right')
+    expect(typeof actions.width).toBe('number')
+    // #bodyCell 里只写 __actions 分支，其他列靠 antd 的回落语义继续渲染
+    const cells = dataGrid(w).findAll('tbody tr:first-child td')
+    expect(cells).toHaveLength(4)
+    expect(cells[0].text()).toBe('1') // 行号列 customRender
+    expect(cells[1].text()).toBe('1') // id
+    expect(cells[2].text()).toBe('a') // name
+    expect(cells[3].find('.zc-db-row-edit').exists()).toBe(true)
+  })
+
+  it('点第 2 行的编辑，弹框里是第 2 行的数据且标题带表名', async () => {
+    mocks.api.dbTableData.mockResolvedValue({ data: { columns: ['id', 'name'], rows: [{ id: 1, name: 'a' }, { id: 2, name: 'b' }], total: 2, truncated: false } })
+    const w = mountGrid()
+    await openEditModal(w, 1)
+    expect(w.find('.zc-db-modal-title').text()).toContain('widgets')
+    const inputs = w.findAll('.zc-db-modal .zc-db-edit-field input')
+    expect(inputs[0].element.value).toBe('2')
+    expect(inputs[1].element.value).toBe('b')
+  })
+
+  it('边界：弹框里主键列 disabled 只读展示，其余列可编辑', async () => {
+    const w = mountGrid()
+    await openEditModal(w)
+    const labels = w.findAll('.zc-db-modal .zc-db-edit-field label').map((l) => l.text())
+    expect(labels).toEqual(['id', 'name'])
+    const inputs = w.findAll('.zc-db-modal .zc-db-edit-field input')
+    expect(inputs[0].attributes('disabled')).toBeDefined()
+    expect(inputs[1].attributes('disabled')).toBeUndefined()
+  })
+
+  it('边界：进页面/翻页/刷新都不自动弹编辑框（原「首行默认进编辑态」已删）', async () => {
+    mocks.api.dbTableData.mockResolvedValue({ data: { columns: ['id', 'name'], rows: [{ id: 1, name: 'a' }], total: 120, truncated: false } })
+    let goPage2 = null
+    const pagTable = {
+      props: ['columns', 'dataSource', 'pagination'],
+      render() {
+        const p = this.pagination
+        if (p && typeof p.onChange === 'function') goPage2 = () => p.onChange(2, p.pageSize)
+        return gridTable.render.call(this)
+      },
+    }
+    const w = mountGrid({ 'a-table': pagTable })
+    await flushPromises()
+    await w.find('.zc-tree-node').trigger('click')
+    await flushPromises()
+    expect(w.find('.zc-db-modal').exists()).toBe(false)
+    expect(w.vm.editOpen).toBe(false)
+    expect(w.vm.editRow).toBe(null)
+    goPage2()
+    await flushPromises()
+    await w.find('.zc-db-refresh').trigger('click')
+    await flushPromises()
+    expect(w.find('.zc-db-modal').exists()).toBe(false)
+    expect(w.vm.editOpen).toBe(false)
+  })
+
+  it('边界：编辑的是副本，取消后表格里的原值未被改写也不打后端', async () => {
+    const w = mountGrid()
+    await openEditModal(w)
+    await w.findAll('.zc-db-modal .zc-db-edit-field input')[1].setValue('changed')
+    await flushPromises()
+    expect(dataGrid(w).findAll('tbody tr')[0].findAll('td')[2].text()).toBe('a')
+    await w.find('.zc-db-edit-cancel').trigger('click')
+    await flushPromises()
+    expect(w.find('.zc-db-modal').exists()).toBe(false)
+    expect(mocks.api.dbSqlExec).not.toHaveBeenCalled()
+    // 重新打开是服务端原值，上一轮的脏草稿不残留
+    await dataGrid(w).findAll('.zc-db-row-edit')[0].trigger('click')
+    await flushPromises()
+    expect(w.findAll('.zc-db-modal .zc-db-edit-field input')[1].element.value).toBe('a')
+  })
+
+  it('边界：二次确认框被取消 → 不打后端、弹框还开着、改动不丢', async () => {
+    mocks.antd.Modal.confirm = vi.fn() // 不执行 onOk 等价于用户点「取消」
+    const w = mountGrid()
+    await openEditModal(w)
+    await w.findAll('.zc-db-modal .zc-db-edit-field input')[1].setValue('keep me')
+    await w.find('.zc-db-edit-save').trigger('click')
+    await flushPromises()
+    expect(mocks.api.dbSqlExec).not.toHaveBeenCalled()
+    expect(w.find('.zc-db-modal').exists()).toBe(true)
+    expect(w.findAll('.zc-db-modal .zc-db-edit-field input')[1].element.value).toBe('keep me')
+  })
+
+  it('边界：全列都是主键时保存只给 warning，不打后端也不关弹框', async () => {
+    mocks.api.dbTableData.mockResolvedValue({ data: { columns: ['id'], rows: [{ id: 1 }], total: 1, truncated: false } })
+    const w = mountGrid()
+    await openEditModal(w)
+    await w.find('.zc-db-edit-save').trigger('click')
+    await flushPromises()
+    expect(mocks.antd.message.warning).toHaveBeenCalledWith(expect.stringContaining('无可编辑列'))
+    expect(mocks.antd.Modal.confirm).not.toHaveBeenCalled()
+    expect(mocks.api.dbSqlExec).not.toHaveBeenCalled()
+    expect(w.find('.zc-db-modal').exists()).toBe(true)
+  })
+
+  it('边界：无主键时禁用提示挂在包裹 span 上（disabled 的 button 不吃 hover）', async () => {
+    mocks.api.dbTableSchema.mockResolvedValueOnce({ data: { columns: [{ name: 'id', type: 'integer', nullable: false, default: null }], primary_key: [], indexes: [] } })
+    const w = mountGrid()
+    await flushPromises()
+    await w.find('.zc-tree-node').trigger('click')
+    await flushPromises()
+    const wrap = dataGrid(w).find('.zc-db-row-edit-wrap')
+    expect(wrap.exists()).toBe(true)
+    expect(wrap.attributes('title')).toContain('无主键')
+    expect(w.find('.zc-db-row-edit').attributes('disabled')).toBeDefined()
+  })
+
+  it('边界：openEdit 在无主键表上直接 return，绕过禁用态调用也弹不出来', async () => {
+    mocks.api.dbTableSchema.mockResolvedValueOnce({ data: { columns: [{ name: 'id', type: 'integer', nullable: false, default: null }], primary_key: [], indexes: [] } })
+    const w = mountGrid()
+    await flushPromises()
+    await w.find('.zc-tree-node').trigger('click')
+    await flushPromises()
+    w.vm.openEdit({ id: 1, name: 'a' })
+    await flushPromises()
+    expect(w.vm.editOpen).toBe(false)
+    expect(w.vm.editRow).toBe(null)
+    expect(w.find('.zc-db-modal').exists()).toBe(false)
+  })
+
+  it('边界：弹框带 wrap-class-name 样式锚点，漏了就等于 portal 出去没样式', async () => {
+    const w = mountGrid()
+    await openEditModal(w)
+    expect(w.find('[wrap-class-name="zc-db-edit-modal"]').exists()).toBe(true)
+    expect(w.find('[wrap-class-name="zc-db-edit-modal"] .zc-db-edit-save').exists()).toBe(true)
+  })
+
+  it('边界：编辑途中换环境（dev→prod）弹框立即关闭，不留上一环境的草稿', async () => {
+    const w = mountGrid()
+    await openEditModal(w)
+    await w.findAll('.zc-db-modal .zc-db-edit-field input')[1].setValue('draft')
+    await w.findAll('.zc-db-env button')[1].trigger('click')
+    await flushPromises()
+    expect(w.vm.editOpen).toBe(false)
+    expect(w.find('.zc-db-modal').exists()).toBe(false)
+  })
+
+  it('边界：行点击入口已删除（custom-row 不再传给表格，点行没有副作用）', async () => {
+    let seenAttrs = null
+    const attrTable = {
+      props: ['columns', 'dataSource'],
+      render() {
+        seenAttrs = { ...this.$attrs }
+        return gridTable.render.call(this)
+      },
+    }
+    const w = mountGrid({ 'a-table': attrTable })
+    await flushPromises()
+    await w.find('.zc-tree-node').trigger('click')
+    await flushPromises()
+    expect(seenAttrs['custom-row']).toBeUndefined()
+    expect(seenAttrs.customRow).toBeUndefined()
+    await dataGrid(w).findAll('tbody tr td')[0].trigger('click')
+    await flushPromises()
+    expect(w.vm.editOpen).toBe(false)
+    expect(w.vm.editRow).toBe(null)
+    expect(w.find('.zc-db-modal').exists()).toBe(false)
+  })
 })
 
 // ---------- Ticket 002: 查询控制台接线（SQL 执行用例已迁往 SqlConsole.test.js）----------
