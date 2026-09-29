@@ -5,9 +5,9 @@
 // CodeMirror 6 依赖真实测量与布局，happy-dom 里起不来，故本票把 SqlEditor 桩成
 // textarea：控制台的逻辑（切段、确认口径、调用批量端点、渲染）全部在桩外可测。
 // 语句级失败与 skipped 归 003、假分号归 004、多页签归 005、选区优先与格式化归 006。
-import { describe, expect, it, vi, beforeEach } from 'vitest'
+import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
 import { h } from 'vue'
-import { flushPromises, mount } from '@vue/test-utils'
+import { enableAutoUnmount, flushPromises, mount } from '@vue/test-utils'
 
 const mocks = vi.hoisted(() => ({
   api: { dbSqlBatch: vi.fn() },
@@ -18,6 +18,7 @@ vi.mock('../api', () => mocks.api)
 vi.mock('ant-design-vue', () => ({ ...mocks.antd, default: { message: mocks.antd.message, Modal: mocks.antd.Modal } }))
 
 import SqlConsole from './SqlConsole.vue'
+import { MAX_TABS, TABS_VERSION, tabsKey } from '../utils/sqlTabsStore'
 
 const rowsResult = (index, sql, rows, extra = {}) => ({
   index, op: 'select', sql, status: 'ok', duration_ms: 3,
@@ -58,6 +59,26 @@ function mountConsole(props = {}) {
   })
 }
 
+// 页签落盘走 globalThis.localStorage（Ticket 005）。这里换成假 Map：一是 happy-dom 的
+// localStorage 会在用例之间串味（上一个用例写的页签被下一个用例读回来），
+// 二是能直接断言“落下去的那串 JSON 到底是什么”。
+function createStorage(initial = {}) {
+  const map = new Map(Object.entries(initial))
+  return {
+    map,
+    getItem: (k) => (map.has(k) ? map.get(k) : null),
+    setItem: (k, v) => { map.set(k, String(v)) },
+    removeItem: (k) => { map.delete(k) },
+  }
+}
+
+let storage
+// 预置一套页签（不预置时 store 返回默认单页签）
+function seed(tabs, active = 0, key = tabsKey('1', 'dev')) {
+  storage.map.set(key, JSON.stringify({ version: TABS_VERSION, active, tabs }))
+}
+const saved = (key = tabsKey('1', 'dev')) => (storage.map.has(key) ? JSON.parse(storage.map.get(key)) : null)
+
 async function runWith(text, props = {}) {
   const w = mountConsole(props)
   await flushPromises()
@@ -69,11 +90,21 @@ async function runWith(text, props = {}) {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  storage = createStorage()
+  vi.stubGlobal('localStorage', storage)
   mocks.antd.Modal.confirm = vi.fn(({ onOk }) => onOk && onOk())
   mocks.api.dbSqlBatch.mockResolvedValue({ data: { results: [
     rowsResult(0, 'SELECT 1', [{ n: 1 }]), rowsResult(1, 'SELECT 2', [{ n: 2 }]),
   ] } })
 })
+
+afterEach(() => { vi.unstubAllGlobals() })
+
+// 每条用例结束就把组件掉回去：控制台里挂着一个 400ms 的防抖写入 timer，
+// 上一用例的实例若不卸载，它会在下一用例跑到点，把脚本写进**当前用例**的假存储里，
+// 让“本不该落盘”的断言假红。
+// （卸载时的 persist 写的是旧用例那个 map，下一个用例拿到的是全新 Map）
+enableAutoUnmount(afterEach)
 
 describe('SqlConsole 批量执行（主流程）', () => {
   it('两条 SELECT 拆成数组送批量端点，并渲染两个结果块', async () => {
@@ -391,5 +422,351 @@ describe('SqlConsole 结果面板与空态（样式轮）', () => {
     ] } })
     const w = await runWith('SELECT 1')
     expect(w.findAll('.zc-sql-block')[0].find('.zc-sql-block-cost').exists()).toBe(false)
+  })
+})
+
+describe('SqlConsole 多页签与本地保存（Ticket 005）', () => {
+  it('无存档时只有一个默认页签 query_1，结果头跟着页签名走', async () => {
+    const w = mountConsole()
+    await flushPromises()
+    expect(w.findAll('.zc-sql-tab')).toHaveLength(1)
+    expect(w.find('.zc-sql-tab-name').text()).toBe('query_1')
+    expect(w.find('.zc-sql-results-head').text()).toContain('query_1')
+  })
+
+  it('挂载时从 localStorage 恢复：页签名称、顺序、激活位与当前页文本原样回来', async () => {
+    seed([
+      { id: 'query_1', name: 'query_1', sql: 'SELECT 1' },
+      { id: 'query_2', name: 'query_2', sql: 'SELECT 2' },
+      { id: 'report', name: '月度对账', sql: '  select 4  ' },
+    ], 2)
+    const w = mountConsole()
+    await flushPromises()
+    expect(w.findAll('.zc-sql-tab-name').map((n) => n.text())).toEqual(['query_1', 'query_2', '月度对账'])
+    expect(w.findAll('.zc-sql-tab')[2].classes()).toContain('zc-sql-tab--active')
+    expect(w.find('.zc-sql-editor').element.value).toBe('  select 4  ')
+  })
+
+  it('点「+」新建：新页签追加末尾并接管激活，文本框换成空白页', async () => {
+    const w = mountConsole()
+    await flushPromises()
+    await w.find('.zc-sql-editor').setValue('SELECT 1')
+    await w.find('.zc-sql-tab-add').trigger('click')
+    expect(w.findAll('.zc-sql-tab')).toHaveLength(2)
+    expect(w.findAll('.zc-sql-tab')[1].classes()).toContain('zc-sql-tab--active')
+    expect(w.find('.zc-sql-editor').element.value).toBe('')
+    // 结构性动作不等防抖：旧页的打字进度当场落盘
+    expect(saved()).toEqual({ version: TABS_VERSION, active: 1,
+      tabs: [{ id: 'query_1', name: 'query_1', sql: 'SELECT 1' }, { id: 'query_2', name: 'query_2', sql: '' }] })
+  })
+
+  it('切换页签：文本与结果各归各页，切回来还在', async () => {
+    const w = await runWith('SELECT 1; SELECT 2')
+    await w.find('.zc-sql-tab-add').trigger('click')
+    expect(w.findAll('.zc-sql-block')).toHaveLength(0)
+    expect(w.find('.zc-sql-editor').element.value).toBe('')
+    await w.findAll('.zc-sql-tab')[0].trigger('click')
+    expect(w.findAll('.zc-sql-block')).toHaveLength(2)
+    expect(w.find('.zc-sql-editor').element.value).toBe('SELECT 1; SELECT 2')
+    expect(w.find('.zc-sql-summary').exists()).toBe(true)
+  })
+
+  it('边界：打字未到防抖点就卸载 → unmount 兜底 flush，重挂不丢脚本', async () => {
+    const w = mountConsole()
+    await flushPromises()
+    await w.find('.zc-sql-editor').setValue('SELECT 半小时前写的脚本')
+    expect(saved()).toBeNull() // 防抖窗口内确实还没写
+    w.unmount()
+    expect(saved().tabs[0].sql).toBe('SELECT 半小时前写的脚本')
+    const again = mountConsole()
+    await flushPromises()
+    expect(again.find('.zc-sql-editor').element.value).toBe('SELECT 半小时前写的脚本')
+  })
+
+  it('边界：结果只存内存，落盘与重挂后结果区为空（US-05）', async () => {
+    const w = await runWith('SELECT 1; SELECT 2')
+    expect(w.findAll('.zc-sql-block')).toHaveLength(2)
+    w.unmount()
+    expect(saved().tabs[0]).not.toHaveProperty('results')
+    expect(saved().tabs[0]).not.toHaveProperty('sentCount')
+    const again = mountConsole()
+    await flushPromises()
+    expect(again.findAll('.zc-sql-block')).toHaveLength(0)
+    expect(again.find('.zc-sql-empty').text()).toBe('尚未执行')
+    expect(again.find('.zc-sql-summary').exists()).toBe(false)
+  })
+
+  it('双击原地重命名：只改标题不改 id，落盘的是新标题', async () => {
+    const w = mountConsole()
+    await flushPromises()
+    await w.find('.zc-sql-editor').setValue('SELECT 1')
+    await w.findAll('.zc-sql-tab')[0].trigger('dblclick')
+    const input = w.find('.zc-sql-tab-input')
+    expect(input.exists()).toBe(true)
+    expect(input.attributes('aria-label')).toBe('重命名页签')
+    await input.setValue('月度对账')
+    await input.trigger('keyup', { key: 'Enter' })
+    expect(w.find('.zc-sql-tab-input').exists()).toBe(false)
+    expect(w.find('.zc-sql-tab-name').text()).toBe('月度对账')
+    expect(saved().tabs[0]).toEqual({ id: 'query_1', name: '月度对账', sql: 'SELECT 1' })
+  })
+
+  it('关闭非空页签弹一次确认，确认后该页签连同它的结果一起消失', async () => {
+    const w = await runWith('SELECT 1; SELECT 2')
+    await w.find('.zc-sql-tab-add').trigger('click')
+    await w.findAll('.zc-sql-tab')[0].find('.zc-sql-tab-close').trigger('click')
+    expect(mocks.antd.Modal.confirm).toHaveBeenCalledTimes(1)
+    expect(w.findAll('.zc-sql-tab')).toHaveLength(1)
+    expect(w.find('.zc-sql-tab-name').text()).toBe('query_2')
+    expect(w.findAll('.zc-sql-block')).toHaveLength(0)
+    expect(saved().tabs.map((t) => t.id)).toEqual(['query_2'])
+  })
+
+  it('边界：结果回来时人已切走，in-flight 结果仍落回发起那一页', async () => {
+    let settle
+    mocks.api.dbSqlBatch.mockImplementation(() => new Promise((r) => { settle = r }))
+    const w = mountConsole()
+    await flushPromises()
+    await w.find('.zc-sql-editor').setValue('SELECT 1; SELECT 2')
+    await w.find('.zc-sql-run').trigger('click')
+    expect(mocks.api.dbSqlBatch).toHaveBeenCalledTimes(1)
+    await w.find('.zc-sql-tab-add').trigger('click')
+    settle({ data: { results: [rowsResult(0, 'SELECT 1', [{ n: 1 }]), rowsResult(1, 'SELECT 2', [{ n: 2 }])] } })
+    await flushPromises()
+    expect(w.findAll('.zc-sql-block')).toHaveLength(0) // 当前页（新建的空页）没拿到别人的结果
+    await w.findAll('.zc-sql-tab')[0].trigger('click')
+    expect(w.findAll('.zc-sql-block')).toHaveLength(2)
+  })
+})
+
+describe('SqlConsole 边界：页签上限与关闭兜底', () => {
+  const twelve = () => Array.from({ length: MAX_TABS }, (_, i) => ({
+    id: `query_${i + 1}`, name: `query_${i + 1}`, sql: `SELECT ${i + 1}` }))
+
+  it('边界：第 13 个被拒并提示上限，已有页签一个不少', async () => {
+    seed(twelve())
+    const w = mountConsole()
+    await flushPromises()
+    expect(w.findAll('.zc-sql-tab')).toHaveLength(MAX_TABS)
+    await w.find('.zc-sql-tab-add').trigger('click')
+    expect(w.findAll('.zc-sql-tab')).toHaveLength(MAX_TABS)
+    expect(mocks.antd.message.warning).toHaveBeenCalledWith(`最多 ${MAX_TABS} 个页签，请先关闭一些`)
+    expect(mocks.antd.Modal.confirm).not.toHaveBeenCalled()
+  })
+
+  it('边界：历史存档超过上限也不丢脚本，只在新增时拦', async () => {
+    seed(Array.from({ length: MAX_TABS + 2 }, (_, i) => ({
+      id: `query_${i + 1}`, name: `query_${i + 1}`, sql: `SELECT ${i + 1}` })))
+    const w = mountConsole()
+    await flushPromises()
+    expect(w.findAll('.zc-sql-tab')).toHaveLength(MAX_TABS + 2)
+    expect(w.findAll('.zc-sql-tab-name')[MAX_TABS + 1].text()).toBe(`query_${MAX_TABS + 2}`)
+  })
+
+  it('边界：关掉唯一那个非空页签后自动补空白页，不出现 0 页签死状态', async () => {
+    const w = await runWith('SELECT 1')
+    await w.find('.zc-sql-tab-close').trigger('click')
+    expect(mocks.antd.Modal.confirm).toHaveBeenCalledTimes(1)
+    expect(w.findAll('.zc-sql-tab')).toHaveLength(1)
+    expect(w.find('.zc-sql-tab-name').text()).toBe('query_1')
+    expect(w.find('.zc-sql-editor').element.value).toBe('')
+    expect(w.find('.zc-sql-empty').text()).toBe('尚未执行')
+    expect(saved().tabs).toEqual([{ id: 'query_1', name: 'query_1', sql: '' }])
+  })
+
+  it('边界：空页签点 × 不弹确认直接关（为“关个空页”再问一次是自找麻烦）', async () => {
+    const w = mountConsole()
+    await flushPromises()
+    await w.find('.zc-sql-tab-add').trigger('click')
+    mocks.antd.Modal.confirm.mockClear()
+    await w.findAll('.zc-sql-tab')[1].find('.zc-sql-tab-close').trigger('click')
+    expect(mocks.antd.Modal.confirm).not.toHaveBeenCalled()
+    expect(w.findAll('.zc-sql-tab')).toHaveLength(1)
+  })
+
+  it('边界：确认框被取消时不关页签、不丢脚本', async () => {
+    mocks.antd.Modal.confirm = vi.fn() // 用户点了取消： onOk 不被调
+    const w = await runWith('SELECT 1')
+    await w.find('.zc-sql-tab-close').trigger('click')
+    expect(mocks.antd.Modal.confirm).toHaveBeenCalledTimes(1)
+    expect(w.findAll('.zc-sql-tab')).toHaveLength(1)
+    expect(w.find('.zc-sql-editor').element.value).toBe('SELECT 1')
+    expect(w.findAll('.zc-sql-block')).toHaveLength(2)
+  })
+
+  it('边界：等待期间关掉发起页，补上来的同名空白页不继承别人的结果', async () => {
+    let settle
+    mocks.api.dbSqlBatch.mockImplementation(() => new Promise((r) => { settle = r }))
+    const w = mountConsole()
+    await flushPromises()
+    await w.find('.zc-sql-editor').setValue('SELECT 1; SELECT 2')
+    await w.find('.zc-sql-run').trigger('click')
+    await w.find('.zc-sql-tab-close').trigger('click') // 唯一非空页，confirm 桩直接 onOk
+    expect(w.find('.zc-sql-tab-name').text()).toBe('query_1') // 补上来的新页与发起页同名
+    settle({ data: { results: [rowsResult(0, 'SELECT 1', [{ n: 1 }]), rowsResult(1, 'SELECT 2', [{ n: 2 }])] } })
+    await flushPromises()
+    expect(w.findAll('.zc-sql-block')).toHaveLength(0)
+    expect(w.find('.zc-sql-empty').text()).toBe('尚未执行')
+  })
+
+  it('边界：重命名交空白名 → 保留原标题，不允许页签变成无名', async () => {
+    const w = mountConsole()
+    await flushPromises()
+    await w.findAll('.zc-sql-tab')[0].trigger('dblclick')
+    await w.find('.zc-sql-tab-input').setValue('   ')
+    await w.find('.zc-sql-tab-input').trigger('blur')
+    expect(w.find('.zc-sql-tab-name').text()).toBe('query_1')
+    expect(w.find('.zc-sql-tab-input').exists()).toBe(false)
+  })
+
+  it('边界：Esc 取消重命名，既不落盘也不改标题', async () => {
+    const w = mountConsole()
+    await flushPromises()
+    await w.findAll('.zc-sql-tab')[0].trigger('dblclick')
+    await w.find('.zc-sql-tab-input').setValue('改了但没提交')
+    await w.find('.zc-sql-tab-input').trigger('keyup', { key: 'Escape' })
+    expect(w.find('.zc-sql-tab-name').text()).toBe('query_1')
+    expect(saved()).toBeNull()
+  })
+})
+
+describe('SqlConsole 边界：切环境即切整套页签', () => {
+  it('边界：切到 prod 前 dev 那套先落盘，prod 读到的是自己的默认单页签', async () => {
+    seed([{ id: 'query_1', name: 'query_1', sql: 'SELECT dev' }, { id: 'query_2', name: 'query_2', sql: 'SELECT dev2' }], 1)
+    const w = mountConsole()
+    await flushPromises()
+    await w.setProps({ env: 'prod' })
+    await flushPromises()
+    expect(saved(tabsKey('1', 'dev'))).toEqual({ version: TABS_VERSION, active: 1,
+      tabs: [{ id: 'query_1', name: 'query_1', sql: 'SELECT dev' }, { id: 'query_2', name: 'query_2', sql: 'SELECT dev2' }] })
+    expect(w.findAll('.zc-sql-tab')).toHaveLength(1)
+    expect(w.find('.zc-sql-editor').element.value).toBe('')
+  })
+
+  it('边界：切走再切回，dev 的页签与打字进度原样回来', async () => {
+    const w = mountConsole()
+    await flushPromises()
+    await w.find('.zc-sql-editor').setValue('SELECT dev 的脚本')
+    await w.find('.zc-sql-tab-add').trigger('click') // 切页本身就把旧页落盘
+    await w.setProps({ env: 'prod' })
+    await flushPromises()
+    expect(w.findAll('.zc-sql-tab')).toHaveLength(1)
+    await w.setProps({ env: 'dev' })
+    await flushPromises()
+    expect(w.findAll('.zc-sql-tab-name').map((n) => n.text())).toEqual(['query_1', 'query_2'])
+    expect(w.find('.zc-sql-editor').element.value).toBe('') // 回来时仍站在上次激活的那一页（query_2）
+    await w.findAll('.zc-sql-tab')[0].trigger('click')
+    expect(w.find('.zc-sql-editor').element.value).toBe('SELECT dev 的脚本')
+  })
+
+  it('边界：打字打到一半切 env → 进度还给旧键，新键不被写入半个字', async () => {
+    const w = mountConsole()
+    await flushPromises()
+    await w.find('.zc-sql-editor').setValue('SELECT dev 的半成品')
+    await w.setProps({ env: 'prod' })
+    await flushPromises()
+    expect(saved(tabsKey('1', 'dev')).tabs[0].sql).toBe('SELECT dev 的半成品')
+    expect(saved(tabsKey('1', 'prod'))).toBeNull()
+  })
+
+  it('边界：等待期间切到 prod，dev 的 in-flight 结果不糊到 prod 的同名页签上', async () => {
+    let settle
+    mocks.api.dbSqlBatch.mockImplementation(() => new Promise((r) => { settle = r }))
+    const w = mountConsole()
+    await flushPromises()
+    await w.find('.zc-sql-editor').setValue('SELECT 1; SELECT 2')
+    await w.find('.zc-sql-run').trigger('click')
+    await w.setProps({ env: 'prod' })
+    await flushPromises()
+    settle({ data: { results: [rowsResult(0, 'SELECT 1', [{ n: 1 }]), rowsResult(1, 'SELECT 2', [{ n: 2 }])] } })
+    await flushPromises()
+    // prod 自己那套只有一个默认 query_1，它不该凭空长出 dev 的两块结果
+    expect(w.findAll('.zc-sql-tab-name').map((n) => n.text())).toEqual(['query_1'])
+    expect(w.findAll('.zc-sql-block')).toHaveLength(0)
+    expect(w.find('.zc-sql-empty').text()).toBe('尚未执行')
+    expect(w.vm.busy).toBe(false)
+  })
+
+  it('边界：appId 变化同样换一套，不借上一个应用的页签', async () => {
+    seed([{ id: 'query_1', name: 'query_1', sql: '另一个应用的脚本' }], 0, tabsKey('2', 'dev'))
+    const w = mountConsole()
+    await flushPromises()
+    await w.find('.zc-sql-editor').setValue('SELECT 1')
+    await w.setProps({ appId: '2' })
+    await flushPromises()
+    expect(w.find('.zc-sql-editor').element.value).toBe('另一个应用的脚本')
+    expect(saved(tabsKey('1', 'dev')).tabs[0].sql).toBe('SELECT 1')
+  })
+})
+
+describe('SqlConsole 边界：本地存储降级', () => {
+  const quotaFull = () => {
+    storage.setItem = () => { throw new DOMException('quota exceeded', 'QuotaExceededError') }
+  }
+
+  it('边界：写入抛 QuotaExceededError → 出黄条且已写的脚本不被清空', async () => {
+    const w = mountConsole()
+    await flushPromises()
+    await w.find('.zc-sql-editor').setValue('SELECT 写了半小时的脚本')
+    quotaFull()
+    await w.find('.zc-sql-tab-add').trigger('click')
+    await flushPromises()
+    const warn = w.find('.zc-sql-storage-warn')
+    expect(warn.exists()).toBe(true)
+    expect(warn.attributes('role')).toBe('alert')
+    expect(warn.text()).toContain('不再自动保存')
+    expect(w.vm.saveBlocked).toBe(true)
+    // 黄条只说“存不上”，不能让用户的文本让路：切回那一页，脚本还在
+    await w.findAll('.zc-sql-tab')[0].trigger('click')
+    expect(w.find('.zc-sql-editor').element.value).toBe('SELECT 写了半小时的脚本')
+  })
+
+  it('边界：黄条出现后本次会话不再尝试写入（不跟已满的配额死磕）', async () => {
+    const setItem = vi.fn(() => { throw new DOMException('quota exceeded', 'QuotaExceededError') })
+    storage.setItem = setItem
+    const w = mountConsole()
+    await flushPromises()
+    await w.find('.zc-sql-tab-add').trigger('click')
+    expect(w.vm.saveBlocked).toBe(true)
+    setItem.mockClear()
+    await w.find('.zc-sql-tab-add').trigger('click')
+    await w.find('.zc-sql-editor').setValue('又写了一长段')
+    w.unmount() // 卸载里的兜底 flush 也不该再试
+    expect(setItem).not.toHaveBeenCalled()
+  })
+
+  it('边界：localStorage 整个不可用（隐私模式）→ 挂载不抛，写的时候同样出黄条', async () => {
+    vi.stubGlobal('localStorage', undefined)
+    const w = mountConsole()
+    await flushPromises()
+    expect(w.findAll('.zc-sql-tab')).toHaveLength(1)
+    expect(w.find('.zc-sql-storage-warn').exists()).toBe(false)
+    await w.find('.zc-sql-tab-add').trigger('click')
+    expect(w.find('.zc-sql-storage-warn').exists()).toBe(true)
+    expect(w.findAll('.zc-sql-tab')).toHaveLength(2)
+  })
+
+  it('边界：黄条期间页签照常可用（存储问题不让编辑器让路）', async () => {
+    const w = mountConsole()
+    await flushPromises()
+    quotaFull()
+    await w.find('.zc-sql-tab-add').trigger('click')
+    expect(w.vm.saveBlocked).toBe(true)
+    await w.find('.zc-sql-editor').setValue('SELECT 1; SELECT 2')
+    await w.find('.zc-sql-run').trigger('click')
+    await flushPromises()
+    expect(w.findAll('.zc-sql-block')).toHaveLength(2)
+    expect(w.findAll('.zc-sql-tab')).toHaveLength(2)
+    expect(w.vm.saveBlocked).toBe(true) // 执行成功也不重置黄条
+  })
+
+  it('边界：读盘抛异常不弹黄条——黄条只代表“存不下去”而不是“读不着”', async () => {
+    storage.getItem = () => { throw new Error('blocked by policy') }
+    const w = mountConsole()
+    await flushPromises()
+    expect(w.findAll('.zc-sql-tab')).toHaveLength(1)
+    expect(w.find('.zc-sql-tab-name').text()).toBe('query_1')
+    expect(w.find('.zc-sql-storage-warn').exists()).toBe(false)
+    expect(w.vm.saveBlocked).toBe(false)
   })
 })

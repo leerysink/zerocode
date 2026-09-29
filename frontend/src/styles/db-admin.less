@@ -492,6 +492,124 @@
   min-height: 0;
   font-family: var(--zc-db-font-sans);
 
+  // ---- 页签栏：Navicat 的查询页签观感——灰底轨道 + 白底当前页签压住下沿线 ----
+  .zc-sql-tabs {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: flex-end;
+    gap: 2px;
+    margin-bottom: 6px;
+    padding: 0 4px;
+    border-bottom: 1px solid var(--zc-db-border-strong);
+    overflow-x: auto;
+    scrollbar-width: thin;
+  }
+  .zc-sql-tab {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    max-width: 200px;
+    padding: 3px 4px 3px 10px;
+    background: var(--zc-db-chrome);
+    border: 1px solid var(--zc-db-border);
+    border-bottom-color: var(--zc-db-border-strong);
+    border-radius: var(--zc-db-radius) var(--zc-db-radius) 0 0;
+    color: var(--zc-db-text-sub);
+    font-size: 12px;
+    line-height: 18px;
+    cursor: pointer;
+    user-select: none;
+  }
+  .zc-sql-tab:hover {
+    background: var(--zc-db-accent-soft);
+    color: var(--zc-db-text);
+  }
+  // 当前页签：白底压住下沿线 + 顶部 2px 主色，一眼看清「我在哪页写」
+  .zc-sql-tab--active {
+    padding-bottom: 4px;
+    background: var(--zc-db-panel);
+    border-color: var(--zc-db-border-strong);
+    border-bottom-color: var(--zc-db-panel);
+    box-shadow: inset 0 2px 0 var(--zc-db-accent);
+    color: var(--zc-db-accent);
+    font-weight: 600;
+  }
+  .zc-sql-tab-name {
+    max-width: 140px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  // 双击原地重命名：就地长出一个 input，不弹第二个对话框（改个名字不该打断心流）
+  .zc-sql-tab-input {
+    width: 120px;
+    height: 20px;
+    padding: 0 4px;
+    border: 1px solid var(--zc-db-accent-line);
+    border-radius: 2px;
+    background: var(--zc-db-panel);
+    color: var(--zc-db-text);
+    font: inherit;
+  }
+  .zc-sql-tab-input:focus {
+    outline: none;
+    border-color: var(--zc-db-accent);
+  }
+  .zc-sql-tab-close {
+    display: inline-flex;
+    flex: 0 0 auto;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    padding: 0;
+    border: 0;
+    border-radius: 2px;
+    background: transparent;
+    color: var(--zc-db-muted);
+    font-size: 10px;
+    cursor: pointer;
+  }
+  .zc-sql-tab-close:hover {
+    background: var(--zc-db-err-bg);
+    color: var(--zc-db-err);
+  }
+  .zc-sql-tab-add {
+    display: inline-flex;
+    flex: 0 0 auto;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    margin-bottom: 1px;
+    padding: 0;
+    border: 1px dashed var(--zc-db-border-strong);
+    border-radius: var(--zc-db-radius);
+    background: transparent;
+    color: var(--zc-db-text-sub);
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .zc-sql-tab-add:hover {
+    border-color: var(--zc-db-accent);
+    background: var(--zc-db-accent-soft);
+    color: var(--zc-db-accent);
+  }
+
+  // 配额/存储不可用的黄条：跟 prod 警示条同一套语汇（浅黄底 + 3px 实心条），
+  // 但只占用一行高度，不能把编辑器顶下去。
+  .zc-sql-storage-warn {
+    flex: 0 0 auto;
+    margin-bottom: 8px;
+    padding: 6px 10px;
+    border: 1px solid #e8d4ae;
+    border-left: 3px solid var(--zc-db-warn);
+    border-radius: var(--zc-db-radius);
+    background: var(--zc-db-warn-bg);
+    color: var(--zc-db-warn);
+    font-size: 12px;
+  }
+
   .zc-sql-editor-host {
     flex: 0 0 auto;
     height: clamp(150px, 26vh, 260px);
@@ -567,6 +685,12 @@
     font-size: 12px;
     font-weight: 600;
     color: var(--zc-db-text-sub);
+  }
+  // 「执行结果 · query_2」：结果永远属于某个页签，切页时这里跟着变，避免认错归属
+  .zc-sql-results-tab {
+    margin-left: 6px;
+    color: var(--zc-db-accent);
+    font-weight: 400;
   }
   .zc-sql-results-body {
     flex: 1 1 auto;
