@@ -1,5 +1,5 @@
 <script setup>
-// 查询控制台：多页签，每页签一套脚本与结果块，**遇错即停**且失败可见（Ticket 003/004/005）。
+// 查询控制台：多页签，每页签一套脚本与一批结果，**遇错即停**且失败可见（Ticket 003/004/005/009）。
 //
 // 后端在同一连接内按序执行，某条报错则该条 status='error'、其后所有可执行条
 // status='skipped' 并立即停止，已成功的条目**不回滚**（ADR 0007）。
@@ -8,6 +8,9 @@
 // - 一个页签持有自己的 SQL 文本与结果块列表；结果只活在内存，刷新后为空（US-05）。
 // - 页签按 (appId, env) 分区落 localStorage，切环境 = 切整套页签（替掉原「切 env 清 sqlText」）。
 // - 写入失败（配额满 / 存储不可用）→ 黄条提示且本次会话不再尝试写入，编辑器文本绝不让路。
+//
+// 结果区（Ticket 009）：一条语句一个结果页签，纵向堆叠换成水平导航，DOM 里同一时刻只有
+// 激活那一块；「停在第几页」也是运行态，跟 results 一起挂在页签对象上，落盘前被削掉。
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { message, Modal } from 'ant-design-vue'
 import { CloseOutlined, PlayCircleOutlined, PlusOutlined } from '@ant-design/icons-vue'
@@ -23,12 +26,13 @@ const props = defineProps({
   tables: { type: Array, default: () => [] },
 })
 
-// 页签对象在内存里多带几个运行时字段（results / sentCount / runToken），落盘时由 store 的
-// 白名单削掉——运行态与持久态共用一个对象，省掉一份“id → 结果”的旁路映射。
+// 页签对象在内存里多带几个运行时字段（results / sentCount / resultIndex / runToken），落盘时由
+// store 的白名单削掉——运行态与持久态共用一个对象，省掉一份“id → 结果”的旁路映射。
 function withRuntime(s) {
   for (const t of s.tabs) {
     if (!Array.isArray(t.results)) t.results = []
     if (!Number.isInteger(t.sentCount)) t.sentCount = 0
+    if (!Number.isInteger(t.resultIndex)) t.resultIndex = 0
   }
   return s
 }
@@ -49,6 +53,22 @@ const results = computed(() => current.value.results)
 // 结果集的 index 是原数组下标（可能稀疏），用 length 会显示成「第 3/1 条」。
 const sentCount = computed(() => current.value.sentCount)
 const busy = ref(false)
+
+// 结果页签的落点在**渲染层**钳制：越界值（重执行后结果变少、外部把 index 写飞）只会让
+// activeResult 回落到 0，不会把面板渲染成空白——存储位本身不动，切回结果变多时还能回去。
+const activeResult = computed(() => {
+  const i = current.value.resultIndex
+  return Number.isInteger(i) && i >= 0 && i < results.value.length ? i : 0
+})
+const activeBlock = computed(() => results.value[activeResult.value] ?? null)
+
+// 点结果页签只是**看**另一条结果，不是把工作现场换了：不写 localStorage（009 裁定 2）。
+// 落点已挂在页签对象上，切脚本页签时各归各页，不串台。
+function selectResult(i) {
+  const tab = current.value
+  if (!tab) return
+  tab.resultIndex = i
+}
 
 // 汇总条：共 N 条，成功 X[，失败于第 i 条][，剩余 M 条未执行]。
 // 失败子句只在真有 error 时出现，剩余子句只在真有 skipped 时出现——
@@ -180,6 +200,13 @@ function tabById(id) {
 // 令牌是运行态字段，落盘时和 results 一起被 store 的白名单削掉。
 let runSeq = 0
 
+// 执行回来默认落在第一个失败页签（009 裁定 3），全成功落第 1 条：不用点就知道哪条炸了。
+// 用的是**数组位**而不是结果里的 index——index 可能稀疏（后端丢纯注释段），数组位才是页签顺序。
+function pickResultStart(rows) {
+  const at = Array.isArray(rows) ? rows.findIndex((r) => r && r.status === 'error') : -1
+  return at === -1 ? 0 : at
+}
+
 async function submit(list, targetId = current.value?.id) {
   busy.value = true
   const started = tabById(targetId)
@@ -188,6 +215,7 @@ async function submit(list, targetId = current.value?.id) {
     started.runToken = token
     started.results = []
     started.sentCount = list.length // 失败/未执行的序号都以此为锚
+    started.resultIndex = 0 // 新一轮先回第 1 页，结果回来后再按落点规则定位
   }
   try {
     const { results: rows } = (await dbSqlBatch(props.appId, props.env, list)).data
@@ -196,6 +224,7 @@ async function submit(list, targetId = current.value?.id) {
     if (back && back.runToken === token) {
       back.results = rows
       back.sentCount = list.length
+      back.resultIndex = pickResultStart(rows)
     }
   } catch (e) {
     message.error(e?.response?.data?.detail || '执行失败')
@@ -206,7 +235,7 @@ async function submit(list, targetId = current.value?.id) {
 
 defineExpose({
   text, results, busy, sentCount, summary, run, submit,
-  state, current, saveBlocked, createTab, closeTab, selectTab, startRename, commitRename,
+  state, current, activeResult, selectResult, saveBlocked, createTab, closeTab, selectTab, startRename, commitRename,
 })
 </script>
 
@@ -238,28 +267,41 @@ defineExpose({
     <!-- 结果区做成固定高度的面板：汇总条粘底常驻，不再随长表格滑到看不见 -->
     <div class="zc-sql-results">
       <div class="zc-sql-results-head">执行结果<span class="zc-sql-results-tab">· {{ current.name }}</span></div>
+      <!-- 结果页签：一条语句一页，只有一条时不渲染页签栏（009 裁定 4）。无 ×：它只是导航，不行使「关闭工作现场」的语义 -->
+      <div v-if="results.length > 1" class="zc-sql-rtabs" role="tablist" aria-label="语句结果页签">
+        <button v-for="(r, i) in results" :key="i" type="button" role="tab" class="zc-sql-rtab"
+                :class="{ 'zc-sql-rtab--active': i === activeResult, 'zc-sql-rtab--error': r.status === 'error', 'zc-sql-rtab--skipped': r.status === 'skipped' }"
+                :aria-selected="i === activeResult ? 'true' : 'false'" :title="r.sql"
+                @click="selectResult(i)">
+          <span class="zc-sql-rtab-no">第 {{ (r.index ?? i) + 1 }}/{{ sentCount }} 条</span>
+          <span class="zc-sql-rtab-op">{{ r.op }}</span>
+          <span v-if="r.status === 'skipped'" class="zc-sql-rtab-state">未执行</span>
+          <span v-else-if="r.status === 'error'" class="zc-sql-rtab-state zc-sql-rtab-state--error">失败</span>
+        </button>
+      </div>
       <div class="zc-sql-results-body">
         <div v-if="!results.length" class="zc-sql-empty">{{ busy ? '执行中…' : '尚未执行' }}</div>
-        <div v-for="(r, i) in results" :key="i" class="zc-sql-block"
-             :class="{ 'zc-sql-block--error': r.status === 'error', 'zc-sql-block--skipped': r.status === 'skipped' }">
+        <!-- 同一时刻只渲染激活那一块（:key 让切页签时表格的内部状态跟着重置） -->
+        <div v-else class="zc-sql-block" :key="activeResult"
+             :class="{ 'zc-sql-block--error': activeBlock.status === 'error', 'zc-sql-block--skipped': activeBlock.status === 'skipped' }">
           <div class="zc-sql-block-head">
-            <span class="zc-sql-block-no">第 {{ (r.index ?? i) + 1 }}/{{ sentCount }} 条</span>
-            <span class="zc-sql-block-op">{{ r.op }}</span>
-            <span v-if="r.duration_ms != null" class="zc-sql-block-cost">{{ r.duration_ms }}ms</span>
-            <span v-if="r.status === 'skipped'" class="zc-sql-block-state">未执行</span>
-            <span v-else-if="r.status === 'error'" class="zc-sql-block-state zc-sql-block-state--error">失败</span>
+            <span class="zc-sql-block-no">第 {{ (activeBlock.index ?? activeResult) + 1 }}/{{ sentCount }} 条</span>
+            <span class="zc-sql-block-op">{{ activeBlock.op }}</span>
+            <span v-if="activeBlock.duration_ms != null" class="zc-sql-block-cost">{{ activeBlock.duration_ms }}ms</span>
+            <span v-if="activeBlock.status === 'skipped'" class="zc-sql-block-state">未执行</span>
+            <span v-else-if="activeBlock.status === 'error'" class="zc-sql-block-state zc-sql-block-state--error">失败</span>
           </div>
-          <pre class="zc-sql-block-text">{{ r.sql }}</pre>
+          <pre class="zc-sql-block-text">{{ activeBlock.sql }}</pre>
           <!-- 失败条：PG 原文不加工不做行号定位，用 pre 留住换行；不编造结果体 -->
-          <pre v-if="r.status === 'error'" class="zc-sql-error-text">{{ r.error }}</pre>
-          <template v-else-if="r.kind === 'rows'">
-            <a-table size="small" :dataSource="r.rows"
-                     :columns="r.columns.map(c => ({ title: c, dataIndex: c }))" :pagination="false" />
-            <div v-if="r.truncated" class="zc-sql-truncated">
-              结果过大，仅显示前 {{ r.rows.length }} 行；请用 LIMIT / WHERE 收窄。
+          <pre v-if="activeBlock.status === 'error'" class="zc-sql-error-text">{{ activeBlock.error }}</pre>
+          <template v-else-if="activeBlock.kind === 'rows'">
+            <a-table size="small" :dataSource="activeBlock.rows"
+                     :columns="activeBlock.columns.map(c => ({ title: c, dataIndex: c }))" :pagination="false" />
+            <div v-if="activeBlock.truncated" class="zc-sql-truncated">
+              结果过大，仅显示前 {{ activeBlock.rows.length }} 行；请用 LIMIT / WHERE 收窄。
             </div>
           </template>
-          <div v-else-if="r.kind === 'affected'" class="zc-sql-affected">影响 {{ r.affected }} 行</div>
+          <div v-else-if="activeBlock.kind === 'affected'" class="zc-sql-affected">影响 {{ activeBlock.affected }} 行</div>
         </div>
       </div>
       <div v-if="summary" class="zc-sql-summary">{{ summary }}</div>

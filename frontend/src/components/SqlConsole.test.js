@@ -88,6 +88,13 @@ async function runWith(text, props = {}) {
   return w
 }
 
+// Ticket 009：结果区一条语句一个页签，DOM 里同一时刻**只有激活那一块**。
+// 要看第 i 条的内容得先点过去——这正是本票要锁的行为，不是测试的额外开销。
+async function viewResult(w, i) {
+  await w.findAll('.zc-sql-rtab')[i].trigger('click')
+  return w.find('.zc-sql-block')
+}
+
 beforeEach(() => {
   vi.clearAllMocks()
   storage = createStorage()
@@ -107,21 +114,39 @@ afterEach(() => { vi.unstubAllGlobals() })
 enableAutoUnmount(afterEach)
 
 describe('SqlConsole 批量执行（主流程）', () => {
-  it('两条 SELECT 拆成数组送批量端点，并渲染两个结果块', async () => {
+  it('两条 SELECT 拆成数组送批量端点，并渲染两个结果页签（只显示激活那一条）', async () => {
     const w = await runWith('SELECT 1; SELECT 2')
     expect(mocks.api.dbSqlBatch).toHaveBeenCalledTimes(1)
     expect(mocks.api.dbSqlBatch).toHaveBeenCalledWith('1', 'dev', ['SELECT 1', 'SELECT 2'])
-    const blocks = w.findAll('.zc-sql-block')
-    expect(blocks).toHaveLength(2)
-    expect(blocks[0].text()).toContain('第 1/2 条')
-    expect(blocks[1].text()).toContain('第 2/2 条')
-    expect(blocks[0].findAll('.zc-sql-table')).toHaveLength(1)
+    const rtabs = w.findAll('.zc-sql-rtab')
+    expect(rtabs).toHaveLength(2)
+    expect(rtabs[0].text()).toContain('第 1/2 条')
+    expect(rtabs[1].text()).toContain('第 2/2 条')
+    expect(rtabs[0].classes()).toContain('zc-sql-rtab--active')
+    // 纵向堆叠已被水平导航替掉：同一时刻只有一块在 DOM 里
+    expect(w.findAll('.zc-sql-block')).toHaveLength(1)
+    expect(w.find('.zc-sql-block').text()).toContain('第 1/2 条')
+    expect(w.findAll('.zc-sql-table')).toHaveLength(1)
+    expect(w.find('.zc-sql-table').text()).toContain('1')
+  })
+
+  it('点第二个结果页签：内容切成第 2 条，第 1 条的表格不在 DOM 里', async () => {
+    const w = await runWith('SELECT 1; SELECT 2')
+    const second = await viewResult(w, 1)
+    expect(second.text()).toContain('第 2/2 条')
+    expect(second.text()).toContain('SELECT 2')
+    expect(second.findAll('.zc-sql-table td').map((t) => t.text())).toEqual(['2'])
+    expect(w.findAll('.zc-sql-rtab')[1].classes()).toContain('zc-sql-rtab--active')
+    expect(w.findAll('.zc-sql-rtab')[0].classes()).not.toContain('zc-sql-rtab--active')
+    expect(w.findAll('.zc-sql-block')).toHaveLength(1)
   })
 
   it('结果块头部带 op 与耗时，让每条各自可辨认', async () => {
     const w = await runWith('SELECT 1; SELECT 2')
-    expect(w.findAll('.zc-sql-block')[0].text()).toContain('select')
-    expect(w.findAll('.zc-sql-block')[0].text()).toContain('3ms')
+    expect(w.find('.zc-sql-block').text()).toContain('select')
+    expect(w.find('.zc-sql-block').text()).toContain('3ms')
+    // 页签标题上也带 op，不用点进去就能辨认这一条是什么
+    expect(w.findAll('.zc-sql-rtab')[0].text()).toContain('select')
   })
 
   it('混合段按序渲染：写显示影响行数、读显示表格', async () => {
@@ -130,11 +155,11 @@ describe('SqlConsole 批量执行（主流程）', () => {
       rowsResult(1, 'SELECT * FROM widgets', [{ id: 1 }, { id: 2 }]),
     ] } })
     const w = await runWith("INSERT INTO widgets VALUES (1,'a'); SELECT * FROM widgets")
-    const blocks = w.findAll('.zc-sql-block')
-    expect(blocks[0].text()).toContain('影响 1 行')
-    expect(blocks[0].find('.zc-sql-table').exists()).toBe(false)
-    expect(blocks[1].find('.zc-sql-table').exists()).toBe(true)
-    expect(blocks[1].findAll('.zc-sql-table tr')).toHaveLength(2)
+    expect(w.find('.zc-sql-block').text()).toContain('影响 1 行')
+    expect(w.find('.zc-sql-block').find('.zc-sql-table').exists()).toBe(false)
+    const second = await viewResult(w, 1)
+    expect(second.find('.zc-sql-table').exists()).toBe(true)
+    expect(second.findAll('.zc-sql-table tr')).toHaveLength(2)
   })
 
   it('含非只读语句时整批只确认一次，确认后执行', async () => {
@@ -145,7 +170,8 @@ describe('SqlConsole 批量执行（主流程）', () => {
     const w = await runWith('UPDATE widgets SET name=1; DELETE FROM widgets')
     expect(mocks.antd.Modal.confirm).toHaveBeenCalledTimes(1)
     expect(mocks.api.dbSqlBatch).toHaveBeenCalledTimes(1)
-    expect(w.findAll('.zc-sql-block')).toHaveLength(2)
+    expect(w.findAll('.zc-sql-rtab')).toHaveLength(2)
+    expect(w.findAll('.zc-sql-block')).toHaveLength(1)
   })
 
   it('纯读段不弹确认', async () => {
@@ -153,13 +179,15 @@ describe('SqlConsole 批量执行（主流程）', () => {
     expect(mocks.antd.Modal.confirm).not.toHaveBeenCalled()
   })
 
-  it('截断的 SELECT 结果块展示截断提示', async () => {
+  it('截断的 SELECT 结果页签展示截断提示，未截断的那页不展示', async () => {
     mocks.api.dbSqlBatch.mockResolvedValue({ data: { results: [
       rowsResult(0, 'SELECT 1', [{ n: 1 }], { truncated: true }), rowsResult(1, 'SELECT 2', [{ n: 2 }]),
     ] } })
     const w = await runWith('SELECT 1; SELECT 2')
-    expect(w.findAll('.zc-sql-block')[0].find('.zc-sql-truncated').exists()).toBe(true)
-    expect(w.findAll('.zc-sql-block')[1].find('.zc-sql-truncated').exists()).toBe(false)
+    expect(w.find('.zc-sql-block').find('.zc-sql-truncated').exists()).toBe(true)
+    expect((await viewResult(w, 1)).find('.zc-sql-truncated').exists()).toBe(false)
+    // 切回来时提示还在：截断是每条自己的属性，不随页签切换丢失
+    expect((await viewResult(w, 0)).find('.zc-sql-truncated').exists()).toBe(true)
   })
 })
 
@@ -169,6 +197,7 @@ describe('SqlConsole 边界', () => {
     const w = await runWith('UPDATE widgets SET name=1')
     expect(mocks.antd.Modal.confirm).toHaveBeenCalledTimes(1)
     expect(mocks.api.dbSqlBatch).not.toHaveBeenCalled()
+    expect(w.findAll('.zc-sql-rtab')).toHaveLength(0)
     expect(w.findAll('.zc-sql-block')).toHaveLength(0)
   })
 
@@ -176,6 +205,7 @@ describe('SqlConsole 边界', () => {
     const w = await runWith('')
     expect(mocks.api.dbSqlBatch).not.toHaveBeenCalled()
     expect(mocks.antd.message.warning).toHaveBeenCalled()
+    expect(w.findAll('.zc-sql-rtab')).toHaveLength(0)
     expect(w.findAll('.zc-sql-block')).toHaveLength(0)
   })
 
@@ -194,8 +224,10 @@ describe('SqlConsole 边界', () => {
     mocks.api.dbSqlBatch.mockResolvedValue({ data: { results: [rowsResult(0, 'SELECT 1', [{ n: 1 }])] } })
     const w = await runWith('SELECT 1')
     expect(mocks.api.dbSqlBatch).toHaveBeenCalledWith('1', 'dev', ['SELECT 1'])
+    // 单条结果不渲染页签栏（009 裁定 4）：一个页签的页签栏是自造的复杂度
+    expect(w.findAll('.zc-sql-rtab')).toHaveLength(0)
     expect(w.findAll('.zc-sql-block')).toHaveLength(1)
-    expect(w.findAll('.zc-sql-block')[0].text()).toContain('第 1/1 条')
+    expect(w.find('.zc-sql-block').text()).toContain('第 1/1 条')
   })
 
   it('边界：执行打到当前 env（prod 亦是同一端点）', async () => {
@@ -205,9 +237,11 @@ describe('SqlConsole 边界', () => {
 
   it('边界：切换 env 清空上一次结果，不拿 dev 的结果糊 prod', async () => {
     const w = await runWith('SELECT 1')
-    expect(w.findAll('.zc-sql-block')).toHaveLength(2)
+    expect(w.findAll('.zc-sql-rtab')).toHaveLength(2)
+    expect(w.findAll('.zc-sql-block')).toHaveLength(1)
     await w.setProps({ env: 'prod' })
     await flushPromises()
+    expect(w.findAll('.zc-sql-rtab')).toHaveLength(0)
     expect(w.findAll('.zc-sql-block')).toHaveLength(0)
   })
 
@@ -215,6 +249,7 @@ describe('SqlConsole 边界', () => {
     mocks.api.dbSqlBatch.mockRejectedValue({ response: { data: { detail: '目标库不可达' } } })
     const w = await runWith('SELECT 1')
     expect(mocks.antd.message.error).toHaveBeenCalledWith('目标库不可达')
+    expect(w.findAll('.zc-sql-rtab')).toHaveLength(0)
     expect(w.findAll('.zc-sql-block')).toHaveLength(0)
   })
 
@@ -239,16 +274,24 @@ describe('SqlConsole 遇错即停与失败可见（Ticket 003）', () => {
     skippedResult(2, 'SELECT 3 AS n'),
   ] } })
 
-  it('第 2 条失败：失败块带 error 修饰类且显示 PG 原文，其后块带 skipped 类与「未执行」', async () => {
+  it('第 2 条失败：页签带 error/skipped 状态并默认停在失败页签，块带 PG 原文', async () => {
     threeStates()
     const w = await runWith("INSERT INTO widgets VALUES (21,'keep'); SELECT * FROM no_such_table; SELECT 3 AS n")
-    const blocks = w.findAll('.zc-sql-block')
-    expect(blocks).toHaveLength(3)
-    expect(blocks[0].classes()).not.toContain('zc-sql-block--error')
-    expect(blocks[1].classes()).toContain('zc-sql-block--error')
-    expect(blocks[1].text()).toContain('relation "no_such_table" does not exist')
-    expect(blocks[2].classes()).toContain('zc-sql-block--skipped')
-    expect(blocks[2].text()).toContain('未执行')
+    const rtabs = w.findAll('.zc-sql-rtab')
+    expect(rtabs).toHaveLength(3)
+    expect(rtabs[0].classes()).not.toContain('zc-sql-rtab--error')
+    expect(rtabs[1].classes()).toContain('zc-sql-rtab--error')
+    expect(rtabs[1].text()).toContain('失败')
+    expect(rtabs[2].classes()).toContain('zc-sql-rtab--skipped')
+    expect(rtabs[2].text()).toContain('未执行')
+    // 009 裁定 3：执行回来自动停在第一个失败页签，不用点就知道哪条炸了
+    expect(rtabs[1].classes()).toContain('zc-sql-rtab--active')
+    expect(w.findAll('.zc-sql-block')).toHaveLength(1)
+    expect(w.find('.zc-sql-block').classes()).toContain('zc-sql-block--error')
+    expect(w.find('.zc-sql-block').text()).toContain('relation "no_such_table" does not exist')
+    const third = await viewResult(w, 2)
+    expect(third.classes()).toContain('zc-sql-block--skipped')
+    expect(third.text()).toContain('未执行')
   })
 
   it('汇总条：共 N 条、成功 X、失败于第 i 条、剩余 M 条未执行', async () => {
@@ -271,7 +314,12 @@ describe('SqlConsole 遇错即停与失败可见（Ticket 003）', () => {
     const w = await runWith('SELECT * FROM no_such_table; SELECT 1 AS a; SELECT 2 AS b')
     expect(w.find('.zc-sql-summary').text())
       .toBe('共 3 条，成功 0，失败于第 1 条，剩余 2 条未执行')
-    expect(w.findAll('.zc-sql-block--skipped')).toHaveLength(2)
+    // 状态徽章挂在页签上，与"只渲染激活块"无关：三条各自的状态一眼可见
+    expect(w.findAll('.zc-sql-rtab--skipped')).toHaveLength(2)
+    expect(w.findAll('.zc-sql-rtab--error')).toHaveLength(1)
+    // 失败在第 1 条 → 落点就是第 1 个页签，渲染出来的那块带 error 修饰
+    expect(w.findAll('.zc-sql-rtab')[0].classes()).toContain('zc-sql-rtab--active')
+    expect(w.find('.zc-sql-block').classes()).toContain('zc-sql-block--error')
   })
 
   it('边界：最后一条失败（后面无未执行）→ 汇总不带「剩余」子句', async () => {
@@ -281,12 +329,15 @@ describe('SqlConsole 遇错即停与失败可见（Ticket 003）', () => {
     ] } })
     const w = await runWith('SELECT 1; SELECT * FROM nope')
     expect(w.find('.zc-sql-summary').text()).toBe('共 2 条，成功 1，失败于第 2 条')
+    // 失败在最后一条：落点仍跟着失败走，不停在第 1 条上
+    expect(w.findAll('.zc-sql-rtab')[1].classes()).toContain('zc-sql-rtab--active')
+    expect(w.find('.zc-sql-block').classes()).toContain('zc-sql-block--error')
   })
 
   it('边界：未执行块不编造结果体（不画表格、不写影响行数）', async () => {
     threeStates()
     const w = await runWith("INSERT INTO widgets VALUES (21,'keep'); SELECT * FROM no_such_table; SELECT 3 AS n")
-    const skipped = w.findAll('.zc-sql-block')[2]
+    const skipped = await viewResult(w, 2)
     expect(skipped.find('.zc-sql-table').exists()).toBe(false)
     expect(skipped.text()).not.toContain('影响')
     expect(skipped.text()).not.toContain('成功')
@@ -312,8 +363,10 @@ describe('SqlConsole 遇错即停与失败可见（Ticket 003）', () => {
     await flushPromises()
     await w.vm.submit(['-- 一', '-- 二', 'SELECT 3 AS n'])
     await flushPromises()
+    // 只有 1 条结果 → 不出现页签栏，但块头分母仍是发出去的 3 条
+    expect(w.findAll('.zc-sql-rtab')).toHaveLength(0)
     expect(w.findAll('.zc-sql-block')).toHaveLength(1)
-    expect(w.findAll('.zc-sql-block')[0].text()).toContain('第 3/3 条')
+    expect(w.find('.zc-sql-block').text()).toContain('第 3/3 条')
     expect(w.find('.zc-sql-summary').text()).toBe('共 3 条，成功 1')
   })
 
@@ -325,7 +378,10 @@ describe('SqlConsole 遇错即停与失败可见（Ticket 003）', () => {
     await w.find('.zc-sql-editor').setValue('SELECT 1')
     await w.find('.zc-sql-run').trigger('click')
     await flushPromises()
+    // 3 条 → 1 条：原先停在第 2 个页签，越界的激活位要钳回 0，不能渲染成空白面板
+    expect(w.findAll('.zc-sql-rtab')).toHaveLength(0)
     expect(w.findAll('.zc-sql-block')).toHaveLength(1)
+    expect(w.find('.zc-sql-block').text()).toContain('第 1/1 条')
     expect(w.findAll('.zc-sql-block--error')).toHaveLength(0)
     expect(w.find('.zc-sql-summary').text()).toBe('共 1 条，成功 1')
   })
@@ -335,22 +391,24 @@ describe('SqlConsole 遇错即停与失败可见（Ticket 003）', () => {
       response: { data: { detail: '数据库连接失败，请检查 zerocode-pg16：' } } })
     const w = await runWith('SELECT 1; SELECT 2')
     expect(mocks.antd.message.error).toHaveBeenCalledWith('数据库连接失败，请检查 zerocode-pg16：')
+    expect(w.findAll('.zc-sql-rtab')).toHaveLength(0)
     expect(w.findAll('.zc-sql-block')).toHaveLength(0)
     expect(w.find('.zc-sql-summary').exists()).toBe(false)
   })
 })
 
 describe('SqlConsole 假分号拆分（Ticket 004）', () => {
-  it("引号里的分号不切：SELECT 'a;b' AS x; SELECT 2 → 两个结果块", async () => {
+  it("引号里的分号不切：SELECT 'a;b' AS x; SELECT 2 → 两个结果页签", async () => {
     mocks.api.dbSqlBatch.mockResolvedValue({ data: { results: [
       rowsResult(0, "SELECT 'a;b' AS x", [{ x: 'a;b' }]), rowsResult(1, 'SELECT 2', [{ n: 2 }]),
     ] } })
     const w = await runWith("SELECT 'a;b' AS x; SELECT 2")
     expect(mocks.api.dbSqlBatch).toHaveBeenCalledWith('1', 'dev', ["SELECT 'a;b' AS x", 'SELECT 2'])
-    const blocks = w.findAll('.zc-sql-block')
-    expect(blocks).toHaveLength(2)
-    expect(blocks[0].text()).toContain("SELECT 'a;b' AS x")
-    expect(blocks[0].findAll('.zc-sql-table td')[0].text()).toBe('a;b')
+    expect(w.findAll('.zc-sql-rtab')).toHaveLength(2)
+    const block = w.find('.zc-sql-block')
+    expect(w.findAll('.zc-sql-block')).toHaveLength(1)
+    expect(block.text()).toContain("SELECT 'a;b' AS x")
+    expect(block.findAll('.zc-sql-table td')[0].text()).toBe('a;b')
   })
 
   it('dollar-quote 函数体内的分号不切：CREATE FUNCTION … $$ … $$ ; SELECT 1 → 恰好两条', async () => {
@@ -385,13 +443,16 @@ describe('SqlConsole 结果面板与空态（样式轮）', () => {
     await flushPromises()
     expect(w.find('.zc-sql-empty').text()).toBe('尚未执行')
     expect(w.find('.zc-sql-results-head').text()).toContain('执行结果')
+    expect(w.findAll('.zc-sql-rtab')).toHaveLength(0)
+    expect(w.find('.zc-sql-rtabs').exists()).toBe(false)
     expect(w.find('.zc-sql-summary').exists()).toBe(false)
   })
 
-  it('边界：拿到结果后空态消失，不与结果块并存', async () => {
+  it('边界：拿到结果后空态消失，结果区只留激活那一块', async () => {
     const w = await runWith('SELECT 1; SELECT 2')
     expect(w.find('.zc-sql-empty').exists()).toBe(false)
-    expect(w.findAll('.zc-sql-block')).toHaveLength(2)
+    expect(w.findAll('.zc-sql-rtab')).toHaveLength(2)
+    expect(w.findAll('.zc-sql-block')).toHaveLength(1)
   })
 
   it('边界：整体请求失败后回到空态，不残留半截结果', async () => {
@@ -401,19 +462,26 @@ describe('SqlConsole 结果面板与空态（样式轮）', () => {
     expect(w.find('.zc-sql-summary').exists()).toBe(false)
   })
 
-  it('块头状态：失败标「失败」、未执行标「未执行」、成功条不挂重复状态', async () => {
+  it('块头状态：失败页签与失败块标「失败」、未执行标「未执行」、成功条不挂重复状态', async () => {
     mocks.api.dbSqlBatch.mockResolvedValue({ data: { results: [
       affectedResult(0, "INSERT INTO widgets VALUES (1,'a')", 1),
       errorResult(1, 'SELECT * FROM nope', 'relation "nope" does not exist'),
       skippedResult(2, 'SELECT 3 AS n'),
     ] } })
     const w = await runWith("INSERT INTO widgets VALUES (1,'a'); SELECT * FROM nope; SELECT 3 AS n")
+    // 页签栏上三条的状态直接可见，不用逐页点开数
+    const rtabs = w.findAll('.zc-sql-rtab')
+    expect(rtabs[0].find('.zc-sql-rtab-state').exists()).toBe(false)
+    expect(rtabs[1].find('.zc-sql-rtab-state').text()).toBe('失败')
+    expect(rtabs[2].find('.zc-sql-rtab-state').text()).toBe('未执行')
+    // 块内 chip 只属于当前渲染的这一块：默认停在失败页，就只有一颗「失败」
     const chips = w.findAll('.zc-sql-block-state')
-    expect(chips).toHaveLength(2)
+    expect(chips).toHaveLength(1)
     expect(chips[0].classes()).toContain('zc-sql-block-state--error')
     expect(chips[0].text()).toBe('失败')
-    expect(chips[1].text()).toBe('未执行')
-    expect(w.findAll('.zc-sql-block')[0].find('.zc-sql-block-state').exists()).toBe(false)
+    // 切到成功那条不拿别的页签的状态糊人
+    expect((await viewResult(w, 0)).find('.zc-sql-block-state').exists()).toBe(false)
+    expect((await viewResult(w, 2)).find('.zc-sql-block-state').text()).toBe('未执行')
   })
 
   it('边界：耗时 null 不渲染成「nullms」', async () => {
@@ -421,7 +489,7 @@ describe('SqlConsole 结果面板与空态（样式轮）', () => {
       { ...rowsResult(0, 'SELECT 1', [{ n: 1 }]), duration_ms: null },
     ] } })
     const w = await runWith('SELECT 1')
-    expect(w.findAll('.zc-sql-block')[0].find('.zc-sql-block-cost').exists()).toBe(false)
+    expect(w.find('.zc-sql-block').find('.zc-sql-block-cost').exists()).toBe(false)
   })
 })
 
@@ -463,10 +531,12 @@ describe('SqlConsole 多页签与本地保存（Ticket 005）', () => {
   it('切换页签：文本与结果各归各页，切回来还在', async () => {
     const w = await runWith('SELECT 1; SELECT 2')
     await w.find('.zc-sql-tab-add').trigger('click')
+    expect(w.findAll('.zc-sql-rtab')).toHaveLength(0)
     expect(w.findAll('.zc-sql-block')).toHaveLength(0)
     expect(w.find('.zc-sql-editor').element.value).toBe('')
     await w.findAll('.zc-sql-tab')[0].trigger('click')
-    expect(w.findAll('.zc-sql-block')).toHaveLength(2)
+    expect(w.findAll('.zc-sql-rtab')).toHaveLength(2)
+    expect(w.findAll('.zc-sql-block')).toHaveLength(1)
     expect(w.find('.zc-sql-editor').element.value).toBe('SELECT 1; SELECT 2')
     expect(w.find('.zc-sql-summary').exists()).toBe(true)
   })
@@ -485,12 +555,16 @@ describe('SqlConsole 多页签与本地保存（Ticket 005）', () => {
 
   it('边界：结果只存内存，落盘与重挂后结果区为空（US-05）', async () => {
     const w = await runWith('SELECT 1; SELECT 2')
-    expect(w.findAll('.zc-sql-block')).toHaveLength(2)
+    expect(w.findAll('.zc-sql-rtab')).toHaveLength(2)
+    expect(w.findAll('.zc-sql-block')).toHaveLength(1)
+    await viewResult(w, 1) // 停在第 2 个结果页签：这个停留位也不能落盘
     w.unmount()
     expect(saved().tabs[0]).not.toHaveProperty('results')
     expect(saved().tabs[0]).not.toHaveProperty('sentCount')
+    expect(saved().tabs[0]).not.toHaveProperty('resultIndex')
     const again = mountConsole()
     await flushPromises()
+    expect(again.findAll('.zc-sql-rtab')).toHaveLength(0)
     expect(again.findAll('.zc-sql-block')).toHaveLength(0)
     expect(again.find('.zc-sql-empty').text()).toBe('尚未执行')
     expect(again.find('.zc-sql-summary').exists()).toBe(false)
@@ -518,6 +592,7 @@ describe('SqlConsole 多页签与本地保存（Ticket 005）', () => {
     expect(mocks.antd.Modal.confirm).toHaveBeenCalledTimes(1)
     expect(w.findAll('.zc-sql-tab')).toHaveLength(1)
     expect(w.find('.zc-sql-tab-name').text()).toBe('query_2')
+    expect(w.findAll('.zc-sql-rtab')).toHaveLength(0)
     expect(w.findAll('.zc-sql-block')).toHaveLength(0)
     expect(saved().tabs.map((t) => t.id)).toEqual(['query_2'])
   })
@@ -533,9 +608,11 @@ describe('SqlConsole 多页签与本地保存（Ticket 005）', () => {
     await w.find('.zc-sql-tab-add').trigger('click')
     settle({ data: { results: [rowsResult(0, 'SELECT 1', [{ n: 1 }]), rowsResult(1, 'SELECT 2', [{ n: 2 }])] } })
     await flushPromises()
+    expect(w.findAll('.zc-sql-rtab')).toHaveLength(0)
     expect(w.findAll('.zc-sql-block')).toHaveLength(0) // 当前页（新建的空页）没拿到别人的结果
     await w.findAll('.zc-sql-tab')[0].trigger('click')
-    expect(w.findAll('.zc-sql-block')).toHaveLength(2)
+    expect(w.findAll('.zc-sql-rtab')).toHaveLength(2)
+    expect(w.findAll('.zc-sql-block')).toHaveLength(1)
   })
 })
 
@@ -591,7 +668,8 @@ describe('SqlConsole 边界：页签上限与关闭兜底', () => {
     expect(mocks.antd.Modal.confirm).toHaveBeenCalledTimes(1)
     expect(w.findAll('.zc-sql-tab')).toHaveLength(1)
     expect(w.find('.zc-sql-editor').element.value).toBe('SELECT 1')
-    expect(w.findAll('.zc-sql-block')).toHaveLength(2)
+    expect(w.findAll('.zc-sql-rtab')).toHaveLength(2)
+    expect(w.findAll('.zc-sql-block')).toHaveLength(1)
   })
 
   it('边界：等待期间关掉发起页，补上来的同名空白页不继承别人的结果', async () => {
@@ -605,6 +683,7 @@ describe('SqlConsole 边界：页签上限与关闭兜底', () => {
     expect(w.find('.zc-sql-tab-name').text()).toBe('query_1') // 补上来的新页与发起页同名
     settle({ data: { results: [rowsResult(0, 'SELECT 1', [{ n: 1 }]), rowsResult(1, 'SELECT 2', [{ n: 2 }])] } })
     await flushPromises()
+    expect(w.findAll('.zc-sql-rtab')).toHaveLength(0)
     expect(w.findAll('.zc-sql-block')).toHaveLength(0)
     expect(w.find('.zc-sql-empty').text()).toBe('尚未执行')
   })
@@ -680,8 +759,9 @@ describe('SqlConsole 边界：切环境即切整套页签', () => {
     await flushPromises()
     settle({ data: { results: [rowsResult(0, 'SELECT 1', [{ n: 1 }]), rowsResult(1, 'SELECT 2', [{ n: 2 }])] } })
     await flushPromises()
-    // prod 自己那套只有一个默认 query_1，它不该凭空长出 dev 的两块结果
+    // prod 自己那套只有一个默认 query_1，它不该凭空长出 dev 的两个结果页签
     expect(w.findAll('.zc-sql-tab-name').map((n) => n.text())).toEqual(['query_1'])
+    expect(w.findAll('.zc-sql-rtab')).toHaveLength(0)
     expect(w.findAll('.zc-sql-block')).toHaveLength(0)
     expect(w.find('.zc-sql-empty').text()).toBe('尚未执行')
     expect(w.vm.busy).toBe(false)
@@ -755,7 +835,8 @@ describe('SqlConsole 边界：本地存储降级', () => {
     await w.find('.zc-sql-editor').setValue('SELECT 1; SELECT 2')
     await w.find('.zc-sql-run').trigger('click')
     await flushPromises()
-    expect(w.findAll('.zc-sql-block')).toHaveLength(2)
+    expect(w.findAll('.zc-sql-rtab')).toHaveLength(2)
+    expect(w.findAll('.zc-sql-block')).toHaveLength(1)
     expect(w.findAll('.zc-sql-tab')).toHaveLength(2)
     expect(w.vm.saveBlocked).toBe(true) // 执行成功也不重置黄条
   })
@@ -768,5 +849,128 @@ describe('SqlConsole 边界：本地存储降级', () => {
     expect(w.find('.zc-sql-tab-name').text()).toBe('query_1')
     expect(w.find('.zc-sql-storage-warn').exists()).toBe(false)
     expect(w.vm.saveBlocked).toBe(false)
+  })
+})
+
+describe('SqlConsole 结果页签一条一页（Ticket 009）', () => {
+  it('全成功时默认停在第 1 个结果页签，汇总条不随页签切换改变', async () => {
+    const w = await runWith('SELECT 1; SELECT 2')
+    expect(w.findAll('.zc-sql-rtab')[0].classes()).toContain('zc-sql-rtab--active')
+    expect(w.findAll('.zc-sql-rtab')[0].attributes('aria-selected')).toBe('true')
+    expect(w.findAll('.zc-sql-rtab')[1].attributes('aria-selected')).toBe('false')
+    expect(w.find('.zc-sql-rtabs').attributes('role')).toBe('tablist')
+    const summary = w.find('.zc-sql-summary').text()
+    await viewResult(w, 1)
+    // 页签只是同一批结果的水平导航：汇总始终是整批的汇总
+    expect(w.find('.zc-sql-summary').text()).toBe(summary)
+    expect(w.find('.zc-sql-summary').text()).toBe('共 2 条，成功 2')
+  })
+
+  it('边界：单条结果不渲染页签栏（一个页签的页签栏是自造的复杂度）', async () => {
+    mocks.api.dbSqlBatch.mockResolvedValue({ data: { results: [rowsResult(0, 'SELECT 1', [{ n: 1 }])] } })
+    const w = await runWith('SELECT 1')
+    expect(w.find('.zc-sql-rtabs').exists()).toBe(false)
+    expect(w.findAll('.zc-sql-rtab')).toHaveLength(0)
+    expect(w.findAll('.zc-sql-block')).toHaveLength(1)
+  })
+
+  it('边界：执行中不渲染空页签栏，只给空态占位', async () => {
+    let settle
+    mocks.api.dbSqlBatch.mockImplementation(() => new Promise((r) => { settle = r }))
+    const w = mountConsole()
+    await flushPromises()
+    await w.find('.zc-sql-editor').setValue('SELECT 1; SELECT 2')
+    await w.find('.zc-sql-run').trigger('click')
+    expect(w.find('.zc-sql-rtabs').exists()).toBe(false)
+    expect(w.findAll('.zc-sql-rtab')).toHaveLength(0)
+    expect(w.find('.zc-sql-empty').text()).toBe('执行中…')
+    settle({ data: { results: [rowsResult(0, 'SELECT 1', [{ n: 1 }]), rowsResult(1, 'SELECT 2', [{ n: 2 }])] } })
+    await flushPromises()
+    expect(w.findAll('.zc-sql-rtab')).toHaveLength(2)
+  })
+
+  it('边界：后端丢弃注释段后页签标题仍用原数组下标（第 2/3 条、第 3/3 条）', async () => {
+    mocks.api.dbSqlBatch.mockResolvedValue({ data: { results: [
+      rowsResult(1, 'SELECT 2', [{ n: 2 }]), rowsResult(2, 'SELECT 3', [{ n: 3 }]),
+    ] } })
+    const w = mountConsole()
+    await flushPromises()
+    await w.vm.submit(['-- 只是注释', 'SELECT 2', 'SELECT 3'])
+    await flushPromises()
+    const rtabs = w.findAll('.zc-sql-rtab')
+    expect(rtabs[0].text()).toContain('第 2/3 条')
+    expect(rtabs[1].text()).toContain('第 3/3 条')
+    // 落点钳在页签数组位 0（不是结果里的 index 1）：默认停在能看的第一页
+    expect(rtabs[0].classes()).toContain('zc-sql-rtab--active')
+    expect(w.find('.zc-sql-block').text()).toContain('第 2/3 条')
+  })
+
+  it('边界：结果页签的停留位挂在脚本页签对象上，切来切去不串台', async () => {
+    const w = await runWith('SELECT 1; SELECT 2')
+    await viewResult(w, 1)
+    await w.find('.zc-sql-tab-add').trigger('click') // 新页签自己停在“无结果”
+    expect(w.findAll('.zc-sql-rtab')).toHaveLength(0)
+    await w.findAll('.zc-sql-tab')[0].trigger('click')
+    // 旧页签的停留位还在：不需要重新点一遍
+    expect(w.findAll('.zc-sql-rtab')[1].classes()).toContain('zc-sql-rtab--active')
+    expect(w.find('.zc-sql-block').text()).toContain('第 2/2 条')
+    expect(w.vm.current.resultIndex).toBe(1)
+  })
+
+  it('边界：点结果页签不触发任何 localStorage 写入', async () => {
+    const w = await runWith('SELECT 1; SELECT 2')
+    await viewResult(w, 1)
+    await viewResult(w, 0)
+    // 没有持久字段发生变化：点了就写盘是多余的同步 IO
+    expect(saved()).toBeNull()
+    expect(storage.map.size).toBe(0)
+  })
+
+  it('边界：落盘形状只有 id/name/sql，结果与停留位一起被白名单削掉', async () => {
+    const w = await runWith('SELECT 1; SELECT 2')
+    await viewResult(w, 1)
+    w.unmount() // 卸载时的兜底 flush 也不能漏一个 resultIndex
+    expect(Object.keys(saved().tabs[0]).sort()).toEqual(['id', 'name', 'sql'])
+  })
+
+  it('边界：重执行后结果变少，原先停在尾页不渲染空白面板', async () => {
+    const w = await runWith('SELECT 1; SELECT 2')
+    await viewResult(w, 1)
+    mocks.api.dbSqlBatch.mockResolvedValue({ data: { results: [rowsResult(0, 'SELECT 9', [{ n: 9 }])] } })
+    await w.find('.zc-sql-editor').setValue('SELECT 9')
+    await w.find('.zc-sql-run').trigger('click')
+    await flushPromises()
+    expect(w.findAll('.zc-sql-block')).toHaveLength(1)
+    expect(w.find('.zc-sql-block').text()).toContain('第 1/1 条')
+    expect(w.find('.zc-sql-block').text()).toContain('SELECT 9')
+    expect(w.vm.current.resultIndex).toBe(0)
+  })
+
+  it('边界：selectResult 越界（负数与超出结果数）钳回 0，不把面板渲染空', async () => {
+    const w = await runWith('SELECT 1; SELECT 2')
+    await w.vm.selectResult(99)
+    expect(w.vm.activeResult).toBe(0)
+    expect(w.findAll('.zc-sql-block')).toHaveLength(1)
+    await w.vm.selectResult(-1)
+    expect(w.vm.activeResult).toBe(0)
+    expect(w.find('.zc-sql-block').text()).toContain('第 1/2 条')
+  })
+
+  it('边界：未执行的结果页签点得开（skipped 不等于不可交互）', async () => {
+    mocks.api.dbSqlBatch.mockResolvedValue({ data: { results: [
+      errorResult(0, 'SELECT * FROM nope', 'relation "nope" does not exist'),
+      skippedResult(1, 'SELECT 2'),
+    ] } })
+    const w = await runWith('SELECT * FROM nope; SELECT 2')
+    const second = await viewResult(w, 1)
+    expect(second.classes()).toContain('zc-sql-block--skipped')
+    expect(second.text()).toContain('未执行')
+    expect(w.findAll('.zc-sql-rtab')[1].attributes('disabled')).toBeUndefined()
+  })
+
+  it('边界：结果页签不是可关闭的工作现场（没有 ×）', async () => {
+    const w = await runWith('SELECT 1; SELECT 2')
+    expect(w.findAll('.zc-sql-rtab-close')).toHaveLength(0)
+    expect(w.findAll('.zc-sql-rtab button')).toHaveLength(0)
   })
 })

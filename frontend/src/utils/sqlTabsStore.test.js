@@ -293,11 +293,11 @@ describe('sqlTabsStore 边界：幂等与无效操作', () => {
 // 组件把结果块挂在页签对象上（每页签一套结果），所以结构操作只能改页签集合，
 // 不能顺手把运行时字段削掉；但落盘仍只走 id/name/sql 白名单。
 describe('sqlTabsStore 边界：运行时字段在结构操作里保留', () => {
-  const runTab = (id, sql, results) => ({ id, name: id, sql, results, sentCount: results.length })
+  const runTab = (id, sql, results, resultIndex = 0) => ({ id, name: id, sql, results, sentCount: results.length, resultIndex })
   const withRuntime = () => ({
     version: TABS_VERSION,
     active: 0,
-    tabs: [runTab('query_1', 'SELECT 1', [{ status: 'ok' }, { status: 'error' }]), runTab('query_2', 'SELECT 2', [])],
+    tabs: [runTab('query_1', 'SELECT 1', [{ status: 'ok' }, { status: 'error' }], 1), runTab('query_2', 'SELECT 2', [])],
   })
 
   it('addTab 不动已有页签的结果块，新建页签自身不带结果', () => {
@@ -319,12 +319,22 @@ describe('sqlTabsStore 边界：运行时字段在结构操作里保留', () => 
     expect(next.tabs[0].results).toHaveLength(2)
   })
 
+  // Ticket 009：结果页签的停留位跟 results 同一族——结构操作里要跟着页签走，
+  // 不然改个名就把人正在看的那一页跳回第 1 条。
+  it('边界：resultIndex 在结构操作里跟着自己的页签走，不丢也不串', () => {
+    const next = renameTab(withRuntime(), 'query_1', '对账')
+    expect(next.tabs[0].resultIndex).toBe(1)
+    expect(next.tabs[1].resultIndex).toBe(0)
+    expect(addTab(withRuntime()).tabs[2].resultIndex).toBeUndefined() // 新页签没结果，也不预造停留位
+  })
+
   it('边界：保留运行时字段的 state 落盘时仍被削成 id/name/sql', () => {
     const st = fakeStorage()
     expect(saveTabs('1', 'dev', addTab(withRuntime()), st)).toEqual({ ok: true })
     const raw = st.map.get('zc.dbq.tabs.1.dev')
     expect(raw).not.toContain('results')
     expect(raw).not.toContain('sentCount')
+    expect(raw).not.toContain('resultIndex') // 结果页签的停留位也不落盘（US-05）
     expect(Object.keys(loadTabs('1', 'dev', st).tabs[0])).toEqual(['id', 'name', 'sql'])
   })
 })
