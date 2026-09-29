@@ -273,11 +273,17 @@ describe('SqlConsole 遇错即停与失败可见（Ticket 003）', () => {
     expect(w.find('.zc-sql-table').exists()).toBe(false)
   })
 
-  it('边界：服务端丢弃了纯注释段时 index 仍按原数组，块头分母是发出去的条数', async () => {
+  it('边界：数组里带纯注释段时 index 仍按原数组，块头分母是发出去的条数', async () => {
+    // 004 之后前端拆分不再产出注释段，但后端那道 has_executable_content 兜底仍在
+    // （旁路进来的数组，如选区执行/外部填充，可能带注释段），结果集 index 会稀疏。
     mocks.api.dbSqlBatch.mockResolvedValue({ data: { results: [rowsResult(2, 'SELECT 3 AS n', [{ n: 3 }])] } })
-    const w = await runWith('-- 只是注释\n; SELECT 1\n; SELECT 3 AS n')
+    const w = mountConsole()
+    await flushPromises()
+    await w.vm.submit(['-- 一', '-- 二', 'SELECT 3 AS n'])
+    await flushPromises()
     expect(w.findAll('.zc-sql-block')).toHaveLength(1)
     expect(w.findAll('.zc-sql-block')[0].text()).toContain('第 3/3 条')
+    expect(w.find('.zc-sql-summary').text()).toBe('共 3 条，成功 1')
   })
 
   it('边界：重新执行后旧的 error/skipped 块与汇总不残留', async () => {
@@ -300,6 +306,45 @@ describe('SqlConsole 遇错即停与失败可见（Ticket 003）', () => {
     expect(mocks.antd.message.error).toHaveBeenCalledWith('数据库连接失败，请检查 zerocode-pg16：')
     expect(w.findAll('.zc-sql-block')).toHaveLength(0)
     expect(w.find('.zc-sql-summary').exists()).toBe(false)
+  })
+})
+
+describe('SqlConsole 假分号拆分（Ticket 004）', () => {
+  it("引号里的分号不切：SELECT 'a;b' AS x; SELECT 2 → 两个结果块", async () => {
+    mocks.api.dbSqlBatch.mockResolvedValue({ data: { results: [
+      rowsResult(0, "SELECT 'a;b' AS x", [{ x: 'a;b' }]), rowsResult(1, 'SELECT 2', [{ n: 2 }]),
+    ] } })
+    const w = await runWith("SELECT 'a;b' AS x; SELECT 2")
+    expect(mocks.api.dbSqlBatch).toHaveBeenCalledWith('1', 'dev', ["SELECT 'a;b' AS x", 'SELECT 2'])
+    const blocks = w.findAll('.zc-sql-block')
+    expect(blocks).toHaveLength(2)
+    expect(blocks[0].text()).toContain("SELECT 'a;b' AS x")
+    expect(blocks[0].findAll('.zc-sql-table td')[0].text()).toBe('a;b')
+  })
+
+  it('dollar-quote 函数体内的分号不切：CREATE FUNCTION … $$ … $$ ; SELECT 1 → 恰好两条', async () => {
+    mocks.api.dbSqlBatch.mockResolvedValue({ data: { results: [
+      affectedResult(0, 'CREATE FUNCTION', 0), rowsResult(1, 'SELECT 1', [{ n: 1 }]),
+    ] } })
+    await runWith('CREATE FUNCTION f() RETURNS int AS $$ BEGIN RETURN 1; END; $$ LANGUAGE plpgsql; SELECT 1')
+    expect(mocks.api.dbSqlBatch.mock.calls[0][2]).toEqual([
+      'CREATE FUNCTION f() RETURNS int AS $$ BEGIN RETURN 1; END; $$ LANGUAGE plpgsql', 'SELECT 1',
+    ])
+  })
+
+  it('边界：整段只有注释 → 前端就不发请求，提示没有可执行的语句', async () => {
+    const w = await runWith('-- 只是注释\n/* 也没别的 */')
+    expect(mocks.api.dbSqlBatch).not.toHaveBeenCalled()
+    expect(mocks.antd.message.warning).toHaveBeenCalledWith('没有可执行的语句')
+  })
+
+  it('边界：未闭合引号不瞎猜拆分点，原文整段送后端由 PG 报原文错误', async () => {
+    mocks.api.dbSqlBatch.mockResolvedValue({ data: { results: [
+      errorResult(0, "SELECT 'a;b", 'syntax error at or near "\'a;b"'),
+    ] } })
+    const w = await runWith("SELECT 'a;b")
+    expect(mocks.api.dbSqlBatch.mock.calls[0][2]).toEqual(["SELECT 'a;b"])
+    expect(w.find('.zc-sql-block--error').text()).toContain('syntax error')
   })
 })
 
