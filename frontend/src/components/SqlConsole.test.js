@@ -4,7 +4,8 @@
 //
 // CodeMirror 6 依赖真实测量与布局，happy-dom 里起不来，故本票把 SqlEditor 桩成
 // textarea：控制台的逻辑（切段、确认口径、调用批量端点、渲染）全部在桩外可测。
-// 语句级失败与 skipped 归 003、假分号归 004、多页签归 005、选区优先与格式化归 006。
+// 语句级失败与 skipped 归 003、假分号归 004、多页签归 005；006 的选区优先与格式化
+// 也只测到“控制台拿到的选区”这一层：CodeMirror 里的真实 keydown 归浏览器实测。
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
 import { h } from 'vue'
 import { enableAutoUnmount, flushPromises, mount } from '@vue/test-utils'
@@ -18,7 +19,13 @@ vi.mock('../api', () => mocks.api)
 vi.mock('ant-design-vue', () => ({ ...mocks.antd, default: { message: mocks.antd.message, Modal: mocks.antd.Modal } }))
 
 import SqlConsole from './SqlConsole.vue'
+import { format } from 'sql-formatter'
+import { FORMAT_OPTIONS } from '../utils/sqlFormat'
 import { MAX_TABS, TABS_VERSION, tabsKey } from '../utils/sqlTabsStore'
+
+// 预期串直接拿 sql-formatter 现算：这些用例锁的是“控制台把哪一段送去、替换了哪个区间”，
+// 格式化的具体输出已由 utils/sqlFormat.test.js 逐字钉住，不在这里重复一遗。
+const fmt = (s) => format(s, FORMAT_OPTIONS)
 
 const rowsResult = (index, sql, rows, extra = {}) => ({
   index, op: 'select', sql, status: 'ok', duration_ms: 3,
@@ -32,15 +39,44 @@ const errorResult = (index, sql, error) => ({
 })
 const skippedResult = (index, sql) => ({ index, op: 'select', sql, status: 'skipped' })
 
-// SqlEditor 桩：textarea 双向绑定 + 暴露 getSelectionText（本票恒空，006 才消费选区）
+// SqlEditor 桩：textarea 双向绑定 + 可控选区读数 + replaceRange 记录（Ticket 006）。
+// CodeMirror 在 happy-dom 里起不来，选区与写回这两条通道只能喂给控制台测接线；
+// 格式化本身已由 utils/sqlFormat 纯函数逐条锁住，这里不重复验它的输出。
+let stubSel = { text: '', from: 0, to: 0 }
+let stubReplace = []
 const EDITOR_STUB = {
+  name: 'SqlEditor',
+  props: ['modelValue'],
+  emits: ['update:modelValue', 'execute', 'format'],
+  render() {
+    return h('textarea', { class: 'zc-sql-editor', value: this.modelValue ?? '',
+      onInput: (e) => this.$emit('update:modelValue', e.target.value) })
+  },
+  methods: {
+    getSelectionText: () => stubSel.text,
+    getSelectionRange: () => ({ from: stubSel.from, to: stubSel.to }),
+    // 真实编辑器会就地替换 [from,to)；桩同样从 modelValue 拼出全文往后回写，
+    // 这样控制台侧的 v-model 链路（防抖落盘、文本框回显）能跟着一起验。
+    // 第四个参数 sel 是“格式化后选区应落在哪”，退化桩不接它，但记录下来了就可断言。
+    replaceRange(...args) {
+      const [from, to, insert, sel] = args
+      stubReplace.push({ from, to, insert, sel: sel ?? null })
+      const cur = this.modelValue ?? ''
+      this.$emit('update:modelValue', cur.slice(0, from) + insert + cur.slice(to))
+    },
+    focus: () => {},
+  },
+}
+// 退化桩：只有 v-model 的纯 textarea（DbAdminView.test.js 就是这么桩的），
+// 选区与写回方法全都不存在——控制台必须拿 ?.() 吃下。
+const TEXTAREA_ONLY_STUB = {
+  name: 'SqlEditor',
   props: ['modelValue'],
   emits: ['update:modelValue'],
   render() {
     return h('textarea', { class: 'zc-sql-editor', value: this.modelValue ?? '',
       onInput: (e) => this.$emit('update:modelValue', e.target.value) })
   },
-  methods: { getSelectionText: () => '' },
 }
 
 const STUBS = {
@@ -52,10 +88,10 @@ const STUBS = {
       h('tr', { key: i }, Object.values(r).map((v) => h('td', String(v))))))) } },
 }
 
-function mountConsole(props = {}) {
+function mountConsole(props = {}, stubs = {}) {
   return mount(SqlConsole, {
     props: { appId: '1', env: 'dev', tables: [{ name: 'widgets' }], ...props },
-    global: { stubs: STUBS },
+    global: { stubs: { ...STUBS, ...stubs } },
   })
 }
 
@@ -95,8 +131,21 @@ async function viewResult(w, i) {
   return w.find('.zc-sql-block')
 }
 
+// 把当前文本的 [from,to) 框成选中（选区文本由 doc 切出来，与真实编辑器一致）
+function selectIn(doc, from, to) {
+  stubSel = { from, to, text: doc.slice(from, to) }
+  return stubSel
+}
+
+async function typeInto(w, text) {
+  await w.find('.zc-sql-editor').setValue(text)
+  return w
+}
+
 beforeEach(() => {
   vi.clearAllMocks()
+  stubSel = { text: '', from: 0, to: 0 }
+  stubReplace = []
   storage = createStorage()
   vi.stubGlobal('localStorage', storage)
   mocks.antd.Modal.confirm = vi.fn(({ onOk }) => onOk && onOk())
@@ -972,5 +1021,236 @@ describe('SqlConsole 结果页签一条一页（Ticket 009）', () => {
     const w = await runWith('SELECT 1; SELECT 2')
     expect(w.findAll('.zc-sql-rtab-close')).toHaveLength(0)
     expect(w.findAll('.zc-sql-rtab button')).toHaveLength(0)
+  })
+})
+
+// ---- Ticket 006：选区优先执行 + 格式化。
+// 桩上的选区是这一票唯一可控的“编辑器输入”：先框选再点按钮，断言控制台把哪几条送去执行、
+// 格式化写回了哪个区间。格式化的具体输出由 utils/sqlFormat.test.js 逐字钉住，这里用 fmt() 现算。
+async function mountTyped(doc, stubs = {}) {
+  const w = mountConsole({}, stubs)
+  await flushPromises()
+  await typeInto(w, doc)
+  return w
+}
+
+async function runSelected(doc, from, to, stubs = {}) {
+  const w = await mountTyped(doc, stubs)
+  selectIn(doc, from, to)
+  await w.find('.zc-sql-run').trigger('click')
+  await flushPromises()
+  return w
+}
+
+async function formatDoc(doc, from, to, stubs = {}) {
+  const w = await mountTyped(doc, stubs)
+  selectIn(doc, from, to)
+  await w.find('.zc-sql-format').trigger('click')
+  await flushPromises()
+  return w
+}
+
+describe('SqlConsole 选区优先执行（Ticket 006 / US-10）', () => {
+  it('有选区只把选中的那一条送去执行，脚本原文一字不动', async () => {
+    const doc = 'SELECT 1; SELECT 2; SELECT 3'
+    mocks.api.dbSqlBatch.mockResolvedValue({ data: { results: [rowsResult(0, 'SELECT 2', [{ n: 2 }])] } })
+    const at = doc.indexOf('SELECT 2')
+    const w = await runSelected(doc, at, at + 'SELECT 2'.length)
+    expect(mocks.api.dbSqlBatch).toHaveBeenCalledTimes(1)
+    expect(mocks.api.dbSqlBatch.mock.calls[0][2]).toEqual(['SELECT 2'])
+    // “只跑选区”不是“把没选的都删掉”：执行不改写用户脚本
+    expect(w.find('.zc-sql-editor').element.value).toBe(doc)
+    // 块头分母也跟着选区走，不能报成「第 1/3 条」
+    expect(w.find('.zc-sql-summary').text()).toBe('共 1 条，成功 1')
+  })
+
+  it('选区跨两条：只执行这两条，第三条不进去', async () => {
+    const doc = 'SELECT 1; SELECT 2; SELECT 3;'
+    const w = await runSelected(doc, doc.indexOf('SELECT 2'), doc.length)
+    expect(mocks.api.dbSqlBatch.mock.calls[0][2]).toEqual(['SELECT 2', 'SELECT 3'])
+    expect(w.findAll('.zc-sql-rtab')).toHaveLength(2)
+  })
+
+  it('边界：光标塌成一个点（from === to）算无选区，照旧跑全段', async () => {
+    const doc = 'SELECT 1; SELECT 2; SELECT 3'
+    await runSelected(doc, 5, 5)
+    expect(mocks.api.dbSqlBatch.mock.calls[0][2]).toEqual(['SELECT 1', 'SELECT 2', 'SELECT 3'])
+  })
+
+  it('边界：选区只有空白 → 不发请求，提示没有可执行的语句', async () => {
+    const doc = 'SELECT 1;    ; SELECT 2'
+    const at = doc.indexOf('    ')
+    const w = await runSelected(doc, at, at + 4)
+    expect(mocks.api.dbSqlBatch).not.toHaveBeenCalled()
+    expect(mocks.antd.message.warning).toHaveBeenCalledWith('没有可执行的语句')
+    expect(w.findAll('.zc-sql-rtab')).toHaveLength(0)
+  })
+
+  it('边界：选区只有注释 → 不发请求，提示没有可执行的语句', async () => {
+    const doc = 'SELECT 1;\n-- 待确认的改动\nSELECT 2;'
+    const at = doc.indexOf('--')
+    await runSelected(doc, at, doc.indexOf('\n', at))
+    expect(mocks.api.dbSqlBatch).not.toHaveBeenCalled()
+    expect(mocks.antd.message.warning).toHaveBeenCalledWith('没有可执行的语句')
+  })
+
+  it('选区内含写语句：确认弹框只列选中的这两条，整批仍只确认一次', async () => {
+    const doc = "SELECT 1; UPDATE widgets SET name = 'a'; DELETE FROM widgets"
+    mocks.api.dbSqlBatch.mockResolvedValue({ data: { results: [
+      affectedResult(0, "UPDATE widgets SET name = 'a'", 1),
+      affectedResult(1, 'DELETE FROM widgets', 3),
+    ] } })
+    const w = await runSelected(doc, doc.indexOf('UPDATE'), doc.length)
+    expect(mocks.antd.Modal.confirm).toHaveBeenCalledTimes(1)
+    const content = mocks.antd.Modal.confirm.mock.calls[0][0].content
+    expect(content).not.toContain('SELECT 1')
+    expect(content).toContain("UPDATE widgets SET name = 'a'")
+    expect(content).toContain('DELETE FROM widgets')
+    expect(mocks.api.dbSqlBatch.mock.calls[0][2]).toEqual(["UPDATE widgets SET name = 'a'", 'DELETE FROM widgets'])
+    expect(w.findAll('.zc-sql-rtab')).toHaveLength(2)
+  })
+
+  it('边界：编辑器不暴露选区通道（纯 textarea 桩）时回落全段执行', async () => {
+    const w = await runSelected('SELECT 1; SELECT 2', 0, 9, { SqlEditor: TEXTAREA_ONLY_STUB })
+    expect(mocks.api.dbSqlBatch.mock.calls[0][2]).toEqual(['SELECT 1', 'SELECT 2'])
+    expect(w.findAll('.zc-sql-rtab')).toHaveLength(2)
+  })
+
+  it('编辑器里按 Ctrl+Enter（execute 事件）走同一个执行入口', async () => {
+    const w = await mountTyped('SELECT 1; SELECT 2')
+    w.findComponent({ name: 'SqlEditor' }).vm.$emit('execute')
+    await flushPromises()
+    expect(mocks.api.dbSqlBatch).toHaveBeenCalledTimes(1)
+    expect(w.findAll('.zc-sql-rtab')).toHaveLength(2)
+  })
+})
+
+describe('SqlConsole 格式化（Ticket 006 / US-02）', () => {
+  it('工具栏有「格式化」入口，提示语说清选中只执行选区', async () => {
+    const w = mountConsole()
+    await flushPromises()
+    expect(w.find('.zc-sql-format').text()).toContain('格式化')
+    expect(w.find('.zc-sql-hint').text()).toContain('选区')
+  })
+
+  // 验收 3 的两个快捷键得能在界面上被发现（悬停提示），不能只写在工单里。
+  // 只断言 title 里含键位，不锁死大小写与空格写法，免得改文案就红。
+  it('执行与格式化按钮带快捷键悬停提示', async () => {
+    const w = mountConsole()
+    await flushPromises()
+    expect(String(w.find('.zc-sql-run').attributes('title'))).toMatch(/Enter/i)
+    expect(String(w.find('.zc-sql-format').attributes('title'))).toMatch(/Shift\+F/i)
+  })
+
+  it('无选区点格式化：整段重排写回实际区间', async () => {
+    const doc = 'select id, name from widgets where n = 1'
+    await formatDoc(doc, 0, 0)
+    expect(stubReplace).toHaveLength(1)
+    expect(stubReplace[0].from).toBe(0)
+    expect(stubReplace[0].to).toBe(doc.length)
+    expect(stubReplace[0].insert).toBe(fmt(doc))
+  })
+
+  it('有选区只重排选中片段，未选的前后一字不动', async () => {
+    const doc = 'SELECT 1;\nselect   2 from widgets;\nSELECT 3;'
+    const at = doc.indexOf('select   2')
+    const end = doc.indexOf(';\nSELECT 3') + 1
+    const core = doc.slice(at, end)
+    const w = await formatDoc(doc, at, end)
+    expect(stubReplace[0].from).toBe(at)
+    expect(stubReplace[0].to).toBe(end)
+    expect(stubReplace[0].insert).toBe(fmt(core))
+    const next = w.find('.zc-sql-editor').element.value
+    expect(next).toBe(doc.slice(0, at) + fmt(core) + doc.slice(end))
+    expect(next.startsWith('SELECT 1;\n')).toBe(true)
+    expect(next.endsWith('\nSELECT 3;')).toBe(true)
+  })
+
+  it('格式化后选区落在重排出来的那段上，不把光标丢回文首', async () => {
+    const doc = 'SELECT 1;\nselect   2 from widgets;\nSELECT 3;'
+    const at = doc.indexOf('select   2')
+    const end = doc.indexOf(';\nSELECT 3') + 1
+    const core = doc.slice(at, end)
+    const w = await formatDoc(doc, at, end)
+    expect(stubReplace[0].sel).toEqual({ start: at, end: at + fmt(core).length })
+    const next = w.find('.zc-sql-editor').element.value
+    expect(next.slice(stubReplace[0].sel.start, stubReplace[0].sel.end)).toBe(fmt(core))
+  })
+
+  it('边界：无选区时不重设选区（sel 传 undefined，光标留在原处）', async () => {
+    await formatDoc('select 1', 3, 3)
+    expect(stubReplace[0].sel).toBeNull()
+  })
+
+  it('边界：未闭合引号的选区保持原文并 warning，一个字都不写回', async () => {
+    const doc = "SELECT 1; select 'unterminated"
+    const at = doc.indexOf('select ')
+    const w = await formatDoc(doc, at, doc.length)
+    expect(stubReplace).toHaveLength(0)
+    expect(mocks.antd.message.warning).toHaveBeenCalled()
+    expect(mocks.antd.message.info).not.toHaveBeenCalled()
+    expect(w.find('.zc-sql-editor').element.value).toBe(doc)
+  })
+
+  it('边界：空白文档点格式化只 info 不写回，不写盘', async () => {
+    const w = await formatDoc('   \n  ', 0, 0)
+    expect(stubReplace).toHaveLength(0)
+    expect(mocks.antd.message.info).toHaveBeenCalledWith('没有可格式化的内容')
+    expect(w.find('.zc-sql-editor').element.value).toBe('   \n  ')
+    expect(saved()).toBeNull()
+  })
+
+  it('边界：选区终点越过文档末尾（钳到文末）照旧格式化选中部分', async () => {
+    const doc = 'SELECT 1;\nselect 2 from widgets'
+    const at = doc.indexOf('select 2')
+    const w = await formatDoc(doc, at, doc.length + 99)
+    expect(stubReplace[0].to).toBe(doc.length)
+    expect(w.find('.zc-sql-editor').element.value).toBe('SELECT 1;\n' + fmt(doc.slice(at)))
+  })
+
+  it('边界：重复格式化幂等，第二次不再改变文本', async () => {
+    const w = await formatDoc('select  1,2 from widgets', 0, 0)
+    const first = w.find('.zc-sql-editor').element.value
+    expect(first).toBe(fmt('select  1,2 from widgets'))
+    await w.find('.zc-sql-format').trigger('click')
+    await flushPromises()
+    expect(stubReplace).toHaveLength(2)
+    expect(stubReplace[1].insert).toBe(stubReplace[0].insert)
+    expect(w.find('.zc-sql-editor').element.value).toBe(first)
+  })
+
+  it('边界：格式化不清空结果区，页签与停留位都在', async () => {
+    const w = await runWith('SELECT 1; SELECT 2')
+    await viewResult(w, 1)
+    await typeInto(w, 'select 1; select 2')
+    await w.find('.zc-sql-format').trigger('click')
+    await flushPromises()
+    expect(w.findAll('.zc-sql-rtab')).toHaveLength(2)
+    expect(w.find('.zc-sql-block').text()).toContain('第 2/2 条')
+    expect(w.vm.current.resultIndex).toBe(1)
+  })
+
+  it('边界：退化桩没有写回通道时走 v-model 整段替换，不抛错', async () => {
+    const doc = 'select 1'
+    const w = await formatDoc(doc, 0, 0, { SqlEditor: TEXTAREA_ONLY_STUB })
+    expect(stubReplace).toHaveLength(0)
+    expect(w.find('.zc-sql-editor').element.value).toBe(fmt(doc))
+  })
+
+  it('格式化后的文本照常进本地存档（不是只改了显示）', async () => {
+    const doc = 'select 1'
+    const w = await formatDoc(doc, 0, 0)
+    expect(saved()).toBeNull() // 防抖未到点
+    w.unmount() // 卸载兜底 flush
+    expect(saved().tabs[0].sql).toBe(fmt(doc))
+  })
+
+  it('编辑器里按 Ctrl+Shift+F（format 事件）走同一个格式化入口', async () => {
+    const doc = 'select 1'
+    const w = await mountTyped(doc)
+    w.findComponent({ name: 'SqlEditor' }).vm.$emit('format')
+    await flushPromises()
+    expect(stubReplace).toHaveLength(1)
+    expect(w.find('.zc-sql-editor').element.value).toBe(fmt(doc))
   })
 })

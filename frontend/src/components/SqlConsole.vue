@@ -11,6 +11,9 @@
 //
 // 结果区（Ticket 009）：一条语句一个结果页签，纵向堆叠换成水平导航，DOM 里同一时刻只有
 // 激活那一块；「停在第几页」也是运行态，跟 results 一起挂在页签对象上，落盘前被削掉。
+//
+// 选区与格式化（Ticket 006）：选区只在这里参与“取哪一段去执行”，不改写用户脚本；
+// 格式化的算法在 utils/sqlFormat.js（纯函数，能脱离编辑器单测），这里只负责读数与写回。
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { message, Modal } from 'ant-design-vue'
 import { CloseOutlined, PlayCircleOutlined, PlusOutlined } from '@ant-design/icons-vue'
@@ -18,6 +21,7 @@ import { dbSqlBatch } from '../api'
 import SqlEditor from './SqlEditor.vue'
 import { splitSqlStatements } from '../utils/sqlSplit'
 import { isReadOnlySelect } from '../utils/sqlClassify'
+import { formatRange } from '../utils/sqlFormat'
 import { MAX_TABS, addTab, loadTabs, removeTab, renameTab, saveTabs } from '../utils/sqlTabsStore'
 
 const props = defineProps({
@@ -49,6 +53,9 @@ const text = computed({
   set: (v) => { current.value.sql = v; scheduleSave() },
 })
 const results = computed(() => current.value.results)
+// 编辑器句柄：选区与写回都从这里拿。DbAdminView.test.js 那类退化的纯 textarea 桩上这些方法
+// 不存在，全部走 `?.()` + 回落全段，不让“没选区通道”把执行路径直接敲坏。
+const editorRef = ref(null)
 // 块头分母用**发出去的条数**而不是 results.length：服务端会丢弃纯注释段，
 // 结果集的 index 是原数组下标（可能稀疏），用 length 会显示成「第 3/1 条」。
 const sentCount = computed(() => current.value.sentCount)
@@ -175,7 +182,7 @@ function cancelRename() { renamingId.value = null }
 
 function run() {
   if (busy.value) return
-  const list = splitSqlStatements(text.value).map((s) => s.sql)
+  const list = splitSqlStatements(execSource()).map((s) => s.sql)
   if (!list.length) { message.warning('没有可执行的语句'); return }
   // 一次批量只确认一次：整段清单摆出来，逐条确认会在多条写时把人问疯（Q5）。
   if (list.some((s) => !isReadOnlySelect(s))) {
@@ -184,6 +191,38 @@ function run() {
     return
   }
   return submit(list)
+}
+
+// 执行段取“选区优先，否则全段”（US-10）：判定只看“选区文本是不是空字串”——
+// 真实编辑器里光标塌点时 sliceDoc 就是空串，那才是“没选”；选中一段空白不是，
+// 它就照原样交给拆分器，拆不出可执行语句就走「没有可执行的语句」提示，
+// 而不是悄悄把用户没选的那些也跑了（静默扩大执行范围比多一次点击危险得多）。
+function execSource() {
+  const sel = editorRef.value?.getSelectionText?.()
+  return typeof sel === 'string' && sel !== '' ? sel : text.value
+}
+
+// 格式化（US-02）：算法全在 formatRange 里（选区交换/钳制、剔首尾空白、抛错回退），
+// 这里只决定“能不能写、写不写得回去”：
+// - 没成功（空选区 / 解析抛错）→ 一次写回也不发，只给提示，原文一个字不让改；
+// - 有写回通道→ 就地替换 [from, to) 并把选区新位置递过去（否则整段重排会把光标丢回文首）；
+// - 只有 v-model 的退化桩→ 直接换整段文本，保证格式化不依赖编辑器能力也能用。
+function formatSql() {
+  const ed = editorRef.value
+  const range = ed?.getSelectionRange?.() ?? null
+  const res = formatRange(text.value, range?.from ?? null, range?.to ?? null)
+  if (!res.ok) {
+    // 解析不了是用户写的东西有问题（用 warning）；无事可做只是点了个空段（用 info）
+    if (res.kind === 'error') message.warning('这段 SQL 解析不了，已保持原文')
+    else message.info('没有可格式化的内容')
+    return
+  }
+  if (typeof ed?.replaceRange === 'function') {
+    ed.replaceRange(res.from, res.to, res.inserted,
+      res.selStart != null ? { start: res.selStart, end: res.selEnd } : undefined)
+    return
+  }
+  text.value = res.text
 }
 
 // target 在调用时就锁定为**发起那一页**的 id：结果回来时即使人已切到别的页签、
@@ -234,7 +273,7 @@ async function submit(list, targetId = current.value?.id) {
 }
 
 defineExpose({
-  text, results, busy, sentCount, summary, run, submit,
+  text, results, busy, sentCount, summary, run, submit, execSource, formatSql,
   state, current, activeResult, selectResult, saveBlocked, createTab, closeTab, selectTab, startRename, commitRename,
 })
 </script>
@@ -258,10 +297,12 @@ defineExpose({
     <div v-if="saveBlocked" class="zc-sql-storage-warn" role="alert">
       本地存储已满或不可用，本次不再自动保存；页签里的脚本仍在，请自行复制备份。
     </div>
-    <SqlEditor v-model="text" :tables="tables" class="zc-sql-input" />
+    <SqlEditor ref="editorRef" v-model="text" :tables="tables" class="zc-sql-input"
+               @execute="run" @format="formatSql" />
     <div class="zc-sql-tools">
-      <a-button class="zc-sql-run" type="primary" :disabled="busy" @click="run"><play-circle-outlined />执行</a-button>
-      <span class="zc-sql-hint">多条以分号分隔，按序逐条执行</span>
+      <a-button class="zc-sql-run" type="primary" :disabled="busy" title="Ctrl+Enter" @click="run"><play-circle-outlined />执行</a-button>
+      <a-button class="zc-sql-format" :disabled="busy" title="Ctrl+Shift+F" @click="formatSql">格式化</a-button>
+      <span class="zc-sql-hint">多条以分号分隔，按序逐条执行；选中则只执行选区</span>
       <span class="zc-sql-env">当前环境：{{ env }}</span>
     </div>
     <!-- 结果区做成固定高度的面板：汇总条粘底常驻，不再随长表格滑到看不见 -->
