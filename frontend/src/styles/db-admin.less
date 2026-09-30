@@ -656,6 +656,21 @@
     background: var(--zc-db-accent-hover);
     border-color: var(--zc-db-accent-hover);
   }
+  // 格式化是次级动作：与执行同高同字号对齐，但只用描边，视觉重量分出主次
+  // （ant 默认 32px 按钮跟在 28px 的执行按钮旁边会把工具栏顶高一档）
+  .zc-sql-format.ant-btn {
+    height: 28px;
+    padding: 0 12px;
+    font-size: 12px;
+    color: var(--zc-db-text);
+    border-color: var(--zc-db-border-strong);
+    border-radius: var(--zc-db-radius);
+  }
+  .zc-sql-format.ant-btn:hover {
+    color: var(--zc-db-accent);
+    border-color: var(--zc-db-accent-line);
+    background: var(--zc-db-accent-soft);
+  }
   .zc-sql-hint {
     color: var(--zc-db-text-sub);
     font-size: 12px;
