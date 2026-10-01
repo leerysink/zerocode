@@ -86,6 +86,29 @@ const STUBS = {
   'a-table': { props: ['columns', 'dataSource'], render() {
     return h('table', { class: 'zc-sql-table' }, h('tbody', (this.dataSource || []).map((r, i) =>
       h('tr', { key: i }, Object.values(r).map((v) => h('td', String(v))))))) } },
+  // a-modal 桩（Ticket 007）：确认换成逐条清单后，“有没有弹 / 列了哪几条 / 执行按钮放行没放行”
+  // 全是 DOM 事实，测试得看得见。没开就一行不渲染（残留弹框才能测出来）；
+  // ok 按钮把 ok-button-props 的 disabled 落到原生属性上，与 antd 的行为一致。
+  'a-modal': { props: ['open', 'title', 'okText', 'cancelText', 'okButtonProps'],
+    emits: ['update:open', 'ok', 'cancel'], render() {
+      if (!this.open) return null
+      return h('div', { class: 'zc-sql-modal' }, [
+        h('div', { class: 'zc-sql-modal-title' }, this.title),
+        h('div', { class: 'zc-sql-modal-body' }, this.$slots.default?.()),
+        h('div', { class: 'zc-sql-modal-footer' }, [
+          h('button', { class: 'zc-sql-confirm-cancel',
+            onClick: () => { this.$emit('update:open', false); this.$emit('cancel') } }, this.cancelText ?? '取消'),
+          h('button', { class: 'zc-sql-confirm-ok', disabled: !!this.okButtonProps?.disabled,
+            onClick: () => this.$emit('ok') }, this.okText ?? '确定'),
+        ]),
+      ])
+    } },
+  // a-input 桩：只用来接确认词。class 靠 fallthrough 落到根节点上，所以
+  // .zc-sql-confirm-phrase-input 直接就能找到这个原生 input（setValue 也就可用）。
+  'a-input': { props: ['value', 'disabled'], emits: ['update:value', 'change'], render() {
+    return h('input', { class: 'zc-sql-text-input', value: this.value ?? '', disabled: !!this.disabled,
+      onInput: (e) => { this.$emit('update:value', e.target.value)
+        this.$emit('change', { target: { value: e.target.value } }) } }) } },
 }
 
 function mountConsole(props = {}, stubs = {}) {
@@ -121,7 +144,22 @@ async function runWith(text, props = {}) {
   if (text !== null) await w.find('.zc-sql-editor').setValue(text)
   await w.find('.zc-sql-run').trigger('click')
   await flushPromises()
+  await autoConfirm(w)
   return w
+}
+
+// 007 之后，一批里含写就先弹逐条清单。既有那四十来条用例锁的是“拆分/按序执行/结果渲染”，
+// 不是确认本身（确认行为另有专组用例），这里统一按“正常用户”补上这一跳：
+// 要确认词的先把 prod 打进输入框，否则按钮禁着、点了等于没点。
+// 返回“本次有没有弹确认框”，供用例反过来断言“纯读段不该弹”。
+async function autoConfirm(w) {
+  const ok = w.find('.zc-sql-confirm-ok')
+  if (!ok.exists()) return false
+  const phraseInput = w.find('.zc-sql-confirm-phrase-input')
+  if (phraseInput.exists()) await phraseInput.setValue('prod')
+  await ok.trigger('click')
+  await flushPromises()
+  return true
 }
 
 // Ticket 009：结果区一条语句一个页签，DOM 里同一时刻**只有激活那一块**。
@@ -217,14 +255,17 @@ describe('SqlConsole 批量执行（主流程）', () => {
       affectedResult(1, 'DELETE FROM widgets', 1),
     ] } })
     const w = await runWith('UPDATE widgets SET name=1; DELETE FROM widgets')
-    expect(mocks.antd.Modal.confirm).toHaveBeenCalledTimes(1)
+    // 确认后弹框已收起来，且走的是逐条清单而不是 002 那个裸 Modal.confirm
+    expect(w.find('.zc-sql-modal').exists()).toBe(false)
+    expect(mocks.antd.Modal.confirm).not.toHaveBeenCalled()
     expect(mocks.api.dbSqlBatch).toHaveBeenCalledTimes(1)
     expect(w.findAll('.zc-sql-rtab')).toHaveLength(2)
     expect(w.findAll('.zc-sql-block')).toHaveLength(1)
   })
 
   it('纯读段不弹确认', async () => {
-    await runWith('SELECT 1; SELECT 2')
+    const w = await runWith('SELECT 1; SELECT 2')
+    expect(w.find('.zc-sql-confirm-ok').exists()).toBe(false)
     expect(mocks.antd.Modal.confirm).not.toHaveBeenCalled()
   })
 
@@ -240,12 +281,153 @@ describe('SqlConsole 批量执行（主流程）', () => {
   })
 })
 
+// Ticket 007：确认从“一句话 Modal.confirm”换成逐条清单 + prod 确认词。
+// 本组只锁这张 DOM 清单（渲染与门禁）；每条语句的 op / risk 取值本身已由
+// utils/sqlClassify.test.js 逐条钉住，这里不重复。
+async function openConfirmFor(text, props = {}) {
+  const w = mountConsole(props)
+  await flushPromises()
+  await w.find('.zc-sql-editor').setValue(text)
+  await w.find('.zc-sql-run').trigger('click')
+  await flushPromises()
+  return w
+}
+
+describe('SqlConsole 执行确认清单（Ticket 007）', () => {
+  it('含写段弹逐条清单：一条 SQL 只弹一个框，每条带序号与 op 徽章', async () => {
+    const w = await openConfirmFor("INSERT INTO widgets VALUES (1,'a'); UPDATE widgets SET name=1 WHERE id=1; SELECT * FROM widgets")
+    expect(w.findAll('.zc-sql-modal')).toHaveLength(1)
+    const items = w.findAll('.zc-sql-confirm-item')
+    expect(items).toHaveLength(3)
+    expect(items[0].text()).toContain('第 1 条')
+    expect(items.map((it) => it.find('.zc-sql-confirm-op').text())).toEqual(['insert', 'update', 'select'])
+    expect(items[2].find('.zc-sql-confirm-sql').text()).toContain('SELECT * FROM widgets')
+    // 框开着的时候一条都不发
+    expect(mocks.api.dbSqlBatch).not.toHaveBeenCalled()
+  })
+
+  it('高危条目整行标红并写明原因，只读那条不跟着一起红', async () => {
+    const w = await openConfirmFor('UPDATE widgets SET name=1; CREATE TABLE t(a int); SELECT 1')
+    const items = w.findAll('.zc-sql-confirm-item')
+    expect(items[0].classes()).toContain('zc-sql-confirm-item--risk')
+    expect(items[0].find('.zc-sql-confirm-risk').text()).toContain('无 WHERE')
+    expect(items[1].classes()).toContain('zc-sql-confirm-item--risk')
+    expect(items[1].find('.zc-sql-confirm-risk').text()).toContain('DDL')
+    // 全是红等于没有红：只读条目不能挨上高危样式
+    expect(items[2].classes()).not.toContain('zc-sql-confirm-item--risk')
+    expect(items[2].find('.zc-sql-confirm-risk').exists()).toBe(false)
+    expect(w.find('.zc-sql-modal-title').text()).toContain('3 条语句')
+    expect(w.find('.zc-sql-modal-title').text()).toContain('2 条高危')
+  })
+
+  it('dev 写段：弹清单但没有确认词输入框，执行按钮直接可用', async () => {
+    const w = await openConfirmFor('UPDATE widgets SET name=1 WHERE id=1')
+    expect(w.find('.zc-sql-confirm-phrase-input').exists()).toBe(false)
+    expect(w.find('.zc-sql-confirm-ok').element.disabled).toBe(false)
+    await w.find('.zc-sql-confirm-ok').trigger('click')
+    await flushPromises()
+    expect(mocks.api.dbSqlBatch).toHaveBeenCalledTimes(1)
+  })
+
+  it('prod 写段：确认词输对 prod 才解禁并整批发出', async () => {
+    const w = await openConfirmFor('UPDATE widgets SET name=1 WHERE id=1; DELETE FROM widgets WHERE id=2', { env: 'prod' })
+    expect(w.find('.zc-sql-confirm-phrase-input').exists()).toBe(true)
+    expect(w.find('.zc-sql-confirm-ok').element.disabled).toBe(true)
+    await w.find('.zc-sql-confirm-phrase-input').setValue('prod')
+    await flushPromises()
+    expect(w.find('.zc-sql-confirm-ok').element.disabled).toBe(false)
+    await w.find('.zc-sql-confirm-ok').trigger('click')
+    await flushPromises()
+    expect(mocks.api.dbSqlBatch).toHaveBeenCalledWith('1', 'prod', [
+      'UPDATE widgets SET name=1 WHERE id=1', 'DELETE FROM widgets WHERE id=2',
+    ])
+    expect(w.find('.zc-sql-modal').exists()).toBe(false)
+  })
+
+  it('prod 纯读段不弹框：确认词只拦写，不拦读', async () => {
+    const w = await openConfirmFor('SELECT 1; SELECT count(*) FROM widgets', { env: 'prod' })
+    expect(w.find('.zc-sql-modal').exists()).toBe(false)
+    expect(mocks.api.dbSqlBatch).toHaveBeenCalledWith('1', 'prod', ['SELECT 1', 'SELECT count(*) FROM widgets'])
+  })
+
+  it('SELECT setval：徽章仍是 select，但仍要确认（prod 连确认词一起要）', async () => {
+    const w = await openConfirmFor("SELECT setval('s', 1)", { env: 'prod' })
+    expect(w.find('.zc-sql-confirm-op').text()).toBe('select')
+    expect(w.find('.zc-sql-confirm-phrase-input').exists()).toBe(true)
+    expect(w.find('.zc-sql-confirm-ok').element.disabled).toBe(true)
+    await w.find('.zc-sql-confirm-phrase-input').setValue('prod')
+    await w.find('.zc-sql-confirm-ok').trigger('click')
+    await flushPromises()
+    expect(mocks.api.dbSqlBatch).toHaveBeenCalledTimes(1)
+  })
+
+  it('边界：确认词输错形态（PROD / pro / 带空格 / 空串 / 中文）都不放行', async () => {
+    for (const bad of ['PROD', 'Pro', 'pro', 'prod ', ' prod', '', '生产']) {
+      const w = await openConfirmFor('UPDATE widgets SET name=1 WHERE id=1', { env: 'prod' })
+      await w.find('.zc-sql-confirm-phrase-input').setValue(bad)
+      await flushPromises()
+      expect(w.find('.zc-sql-confirm-ok').element.disabled).toBe(true)
+      // 绕过按钮直接调 doConfirm 也照样不发：disabled 挡的是人，这一层挡的是程序
+      await w.vm.doConfirm()
+      await flushPromises()
+      expect(mocks.api.dbSqlBatch).not.toHaveBeenCalled()
+      w.unmount()
+    }
+  })
+
+  it('边界：超长语句默认截断，点展开才给全文', async () => {
+    const payload = 'x'.repeat(200)
+    const w = await openConfirmFor(`INSERT INTO widgets VALUES ('${payload}')`)
+    expect(w.find('.zc-sql-confirm-sql').text()).not.toContain(payload)
+    expect(w.find('.zc-sql-confirm-sql').text()).toContain('…')
+    expect(w.find('.zc-sql-confirm-toggle').exists()).toBe(true)
+    await w.find('.zc-sql-confirm-toggle').trigger('click')
+    expect(w.find('.zc-sql-confirm-sql').text()).toContain(payload)
+    expect(w.find('.zc-sql-confirm-toggle').text()).toBe('收起')
+  })
+
+  it('边界：短语句不给展开按钮，行号按拆分器的 1 基原样显示', async () => {
+    const w = await openConfirmFor('SELECT 1;\nUPDATE widgets SET a=1;\n\nDELETE FROM widgets;')
+    expect(w.findAll('.zc-sql-confirm-toggle')).toHaveLength(0)
+    expect(w.findAll('.zc-sql-confirm-at').map((n) => n.text())).toEqual(['行 1', '行 2', '行 4'])
+  })
+
+  it('边界：弹框带 wrap-class-name 样式锚点，漏了就等于 portal 出去没样式', async () => {
+    const w = await openConfirmFor('UPDATE widgets SET a=1')
+    expect(w.find('[wrap-class-name="zc-sql-confirm-modal"]').exists()).toBe(true)
+  })
+
+  it('边界：确认框开着时切了页签，结果仍回写发起那一页', async () => {
+    seed([
+      { id: 'query_1', name: 'query_1', sql: 'UPDATE widgets SET a=1' },
+      { id: 'query_2', name: 'query_2', sql: 'SELECT 9' },
+    ])
+    const w = mountConsole()
+    await flushPromises()
+    await w.find('.zc-sql-run').trigger('click')
+    await flushPromises()
+    await w.findAll('.zc-sql-tab')[1].trigger('click') // 确认期间人走开了
+    await w.find('.zc-sql-confirm-ok').trigger('click')
+    await flushPromises()
+    expect(mocks.api.dbSqlBatch).toHaveBeenCalledWith('1', 'dev', ['UPDATE widgets SET a=1'])
+    expect(w.find('.zc-sql-empty').text()).toContain('尚未执行')
+    await w.findAll('.zc-sql-tab')[0].trigger('click')
+    expect(w.findAll('.zc-sql-block')).toHaveLength(1)
+  })
+})
+
 describe('SqlConsole 边界', () => {
   it('取消二次确认则一条都不执行', async () => {
-    mocks.antd.Modal.confirm = vi.fn() // 弹了但用户取消（不调 onOk）
-    const w = await runWith('UPDATE widgets SET name=1')
-    expect(mocks.antd.Modal.confirm).toHaveBeenCalledTimes(1)
+    const w = mountConsole()
+    await flushPromises()
+    await w.find('.zc-sql-editor').setValue('UPDATE widgets SET name=1')
+    await w.find('.zc-sql-run').trigger('click')
+    await flushPromises()
+    expect(w.find('.zc-sql-confirm-ok').exists()).toBe(true)
+    await w.find('.zc-sql-confirm-cancel').trigger('click')
+    await flushPromises()
     expect(mocks.api.dbSqlBatch).not.toHaveBeenCalled()
+    expect(w.find('.zc-sql-modal').exists()).toBe(false)
     expect(w.findAll('.zc-sql-rtab')).toHaveLength(0)
     expect(w.findAll('.zc-sql-block')).toHaveLength(0)
   })
@@ -1094,18 +1276,27 @@ describe('SqlConsole 选区优先执行（Ticket 006 / US-10）', () => {
     expect(mocks.antd.message.warning).toHaveBeenCalledWith('没有可执行的语句')
   })
 
-  it('选区内含写语句：确认弹框只列选中的这两条，整批仍只确认一次', async () => {
+  it('选区内含写语句：确认清单只列选中的这两条，整批仍只确认一次', async () => {
     const doc = "SELECT 1; UPDATE widgets SET name = 'a'; DELETE FROM widgets"
     mocks.api.dbSqlBatch.mockResolvedValue({ data: { results: [
       affectedResult(0, "UPDATE widgets SET name = 'a'", 1),
       affectedResult(1, 'DELETE FROM widgets', 3),
     ] } })
     const w = await runSelected(doc, doc.indexOf('UPDATE'), doc.length)
-    expect(mocks.antd.Modal.confirm).toHaveBeenCalledTimes(1)
-    const content = mocks.antd.Modal.confirm.mock.calls[0][0].content
-    expect(content).not.toContain('SELECT 1')
-    expect(content).toContain("UPDATE widgets SET name = 'a'")
-    expect(content).toContain('DELETE FROM widgets')
+    // 007 之后确认走逐条清单：清单内容不再是 Modal.confirm 的一个字符串，得看 DOM。
+    // 执行尚未发出（点 ok 之前），此时清单正是“将要执行的那两条”。
+    expect(mocks.api.dbSqlBatch).not.toHaveBeenCalled()
+    expect(mocks.antd.Modal.confirm).not.toHaveBeenCalled()
+    const items = w.findAll('.zc-sql-confirm-item')
+    expect(items).toHaveLength(2)
+    expect(items.map((li) => li.find('.zc-sql-confirm-sql').text()))
+      .toEqual(["UPDATE widgets SET name = 'a'", 'DELETE FROM widgets'])
+    // 没选中的 SELECT 1 一条都不出现在清单里
+    expect(w.find('.zc-sql-modal').text()).not.toContain('SELECT 1')
+    // 点一次执行就整批发出，不是每条问一遍
+    await w.find('.zc-sql-confirm-ok').trigger('click')
+    await flushPromises()
+    expect(mocks.api.dbSqlBatch).toHaveBeenCalledTimes(1)
     expect(mocks.api.dbSqlBatch.mock.calls[0][2]).toEqual(["UPDATE widgets SET name = 'a'", 'DELETE FROM widgets'])
     expect(w.findAll('.zc-sql-rtab')).toHaveLength(2)
   })

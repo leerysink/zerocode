@@ -14,13 +14,16 @@
 //
 // 选区与格式化（Ticket 006）：选区只在这里参与“取哪一段去执行”，不改写用户脚本；
 // 格式化的算法在 utils/sqlFormat.js（纯函数，能脱离编辑器单测），这里只负责读数与写回。
+//
+// 确认弹框（Ticket 007）：一次点击算出一张执行计划（utils/sqlClassify.planExecution），
+// 纯读段直接执行不拦人；含写/DDL 就弹逐条清单（op 徽章 + 高危标红），prod 还要手打确认词。
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { message, Modal } from 'ant-design-vue'
 import { CloseOutlined, PlayCircleOutlined, PlusOutlined } from '@ant-design/icons-vue'
 import { dbSqlBatch } from '../api'
 import SqlEditor from './SqlEditor.vue'
 import { splitSqlStatements } from '../utils/sqlSplit'
-import { isReadOnlySelect } from '../utils/sqlClassify'
+import { planExecution } from '../utils/sqlClassify'
 import { formatRange } from '../utils/sqlFormat'
 import { MAX_TABS, addTab, loadTabs, removeTab, renameTab, saveTabs } from '../utils/sqlTabsStore'
 
@@ -180,17 +183,67 @@ function commitRename() {
 
 function cancelRename() { renamingId.value = null }
 
+// ---- 执行确认弹框（Ticket 007 / US-12、US-13）----
+// 002 那会儿是裸 Modal.confirm 把整段拼成一个 content：能确认，但看不出“哪条是写、哪条要命”。
+// 这里换成逐条清单。确认门槛取严（宁可多问一次），徽章取与后端一致，两者故意不同：
+// `SELECT setval('s',1)` 就是“徽章 select + 需要确认 + prod 要输确认词”的组合，不要当 bug 改掉。
+const PREVIEW_LIMIT = 160
+const RISK_TEXT = {
+  no_where: '无 WHERE 的 UPDATE/DELETE，将作用于全表',
+  ddl: 'DDL，将改动表结构',
+}
+const confirmOpen = ref(false)
+const execPlan = ref(null)
+const phrase = ref('')
+const expanded = ref({})
+// 确认期间人可能切了页签：发起时就把目标页钉住，别把这一段的 SQL 落到另一页的结果区。
+let confirmTargetId = null
+
+// 确认词只认字面 prod：大小写不对、前后带空格都不算输对——
+// 要的就是“亲手把环境名打一遍”这点阻力，不是做一个聪明的输入校验。
+const phraseOk = computed(() => !execPlan.value?.requirePhrase || phrase.value === 'prod')
+const riskCount = computed(() => (execPlan.value?.items ?? []).filter((i) => i.risk.length).length)
+// 标题先把“几条 / 哪个环境 / 有几条高危”说清，不用展开清单就知道这次点下去是什么量级。
+const confirmTitle = computed(() => {
+  const n = execPlan.value?.items?.length ?? 0
+  const risk = riskCount.value
+  return `确认执行 ${n} 条语句（${props.env}）${risk ? ` · ${risk} 条高危` : ''}`
+})
+
+function openConfirm(p) {
+  execPlan.value = p
+  phrase.value = ''
+  expanded.value = {}
+  confirmTargetId = current.value?.id ?? null
+  confirmOpen.value = true
+}
+
+function previewText(sql, i) {
+  if (expanded.value[i] || sql.length <= PREVIEW_LIMIT) return sql
+  return `${sql.slice(0, PREVIEW_LIMIT)}…`
+}
+const expandable = (sql) => sql.length > PREVIEW_LIMIT
+function toggleExpand(i) { expanded.value[i] = !expanded.value[i] }
+// 认不出的标记原样显示：将来 riskFlags 加新种类时，这里不要静默把风险说明吞掉
+const riskText = (risk) => risk.map((r) => RISK_TEXT[r] || r).join('；')
+
+function doConfirm() {
+  // 双保险：disabled 挡的是弹框上的按钮，这里再挡一次绕过按钮的调用（以及回车连点）
+  if (!execPlan.value || !phraseOk.value) return
+  const list = execPlan.value.items.map((i) => i.sql)
+  confirmOpen.value = false
+  return submit(list, confirmTargetId ?? undefined)
+}
+
 function run() {
   if (busy.value) return
-  const list = splitSqlStatements(execSource()).map((s) => s.sql)
-  if (!list.length) { message.warning('没有可执行的语句'); return }
-  // 一次批量只确认一次：整段清单摆出来，逐条确认会在多条写时把人问疯（Q5）。
-  if (list.some((s) => !isReadOnlySelect(s))) {
-    Modal.confirm({ title: '确认执行写操作', content: list.join(';\n'),
-      okText: '执行', okType: 'danger', onOk: () => submit(list) })
-    return
-  }
-  return submit(list)
+  const stmts = splitSqlStatements(execSource())
+  if (!stmts.length) { message.warning('没有可执行的语句'); return }
+  const plan = planExecution(stmts, props.env)
+  // 纯只读段直接执行：为 SELECT 弹一次确认只会让人学会“无脑点确定”，那比不弹更危险。
+  if (!plan.needConfirm) return submit(plan.items.map((i) => i.sql))
+  // 一次批量只确认一次：逐条确认会在多条写时把人问疯（Q5），清单式弹框两头都占到。
+  openConfirm(plan)
 }
 
 // 执行段取“选区优先，否则全段”（US-10）：判定只看“选区文本是不是空字串”——
@@ -274,6 +327,7 @@ async function submit(list, targetId = current.value?.id) {
 
 defineExpose({
   text, results, busy, sentCount, summary, run, submit, execSource, formatSql,
+  confirmOpen, execPlan, phrase, phraseOk, confirmTitle, riskCount, doConfirm, toggleExpand,
   state, current, activeResult, selectResult, saveBlocked, createTab, closeTab, selectTab, startRename, commitRename,
 })
 </script>
@@ -347,5 +401,36 @@ defineExpose({
       </div>
       <div v-if="summary" class="zc-sql-summary">{{ summary }}</div>
     </div>
+    <!-- 逐条清单式确认（US-12/US-13）：一次点击只问一遍，但每一条都得看得见——
+         裸 Modal.confirm 把整段拼成一个字符串，多条写混在一起等于没列。 -->
+    <a-modal v-model:open="confirmOpen" wrap-class-name="zc-sql-confirm-modal"
+             :title="confirmTitle" ok-text="执行" cancel-text="取消"
+             :ok-button-props="{ disabled: !phraseOk }" :mask-closable="false" @ok="doConfirm">
+      <ol class="zc-sql-confirm-list">
+        <li v-for="(it, i) in (execPlan?.items ?? [])" :key="i" class="zc-sql-confirm-item"
+            :class="{ 'zc-sql-confirm-item--risk': it.risk.length }">
+          <div class="zc-sql-confirm-meta">
+            <span class="zc-sql-confirm-no">第 {{ i + 1 }} 条</span>
+            <span class="zc-sql-confirm-op">{{ it.op }}</span>
+            <!-- startLine 是拆分器给的 1 基起始行，不能再 +1（那样每条都往后偏一行） -->
+            <span v-if="it.startLine != null" class="zc-sql-confirm-at">行 {{ it.startLine }}</span>
+            <button v-if="expandable(it.sql)" type="button" class="zc-sql-confirm-toggle"
+                    :aria-expanded="expanded[i] ? 'true' : 'false'" @click="toggleExpand(i)">
+              {{ expanded[i] ? '收起' : '展开' }}
+            </button>
+          </div>
+          <pre class="zc-sql-confirm-sql">{{ previewText(it.sql, i) }}</pre>
+          <div v-if="it.risk.length" class="zc-sql-confirm-risk">{{ riskText(it.risk) }}</div>
+        </li>
+      </ol>
+      <!-- 确认词只在 prod 且这批里有非只读时出现：认不写字面 prod 就点不动「执行」 -->
+      <div v-if="execPlan?.requirePhrase" class="zc-sql-confirm-phrase">
+        <span class="zc-sql-confirm-phrase-tip">
+          正在 prod 环境执行写操作，输入环境名 prod 以确认。
+        </span>
+        <a-input v-model:value="phrase" class="zc-sql-confirm-phrase-input" placeholder="prod"
+                 aria-label="确认词" />
+      </div>
+    </a-modal>
   </div>
 </template>
