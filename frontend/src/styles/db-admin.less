@@ -14,6 +14,7 @@
 .zc-db,
 .zc-db-drawer,
 .zc-db-dd,
+.zc-sql-confirm-modal,
 .zc-db-edit-modal {
   --zc-db-accent: #4a6d94;          // 主色加深：白字对比度 5.4:1（原 #5b7a9d 只有 4.45:1）
   --zc-db-accent-hover: #3d5c80;
@@ -632,6 +633,33 @@
     font-family: var(--zc-db-font-mono);
   }
 
+  // 补全面板（Ticket 008 / US-15）：CM 的 tooltip 挂在 view.dom 里，能吃到这套变量，
+  // 所以描边与选中色写在 Less 侧跟着操作台主色走，不塞进 EditorView.theme 的 JS 字面量。
+  // （CodeMirror 把自己的 <style> 插在页面自有样式之前，同优先级下这份能赢。）
+  .zc-sql-editor-host .cm-tooltip.cm-tooltip-autocomplete {
+    border: 1px solid var(--zc-db-border-strong);
+    border-radius: var(--zc-db-radius);
+    background: var(--zc-db-panel);
+    box-shadow: 0 6px 18px rgba(31, 45, 61, .14);
+  }
+  .zc-sql-editor-host .cm-tooltip-autocomplete ul {
+    font-family: var(--zc-db-font-mono);
+    font-size: 12px;
+    max-height: 220px;
+  }
+  .zc-sql-editor-host .cm-tooltip-autocomplete ul li[aria-selected] {
+    background: var(--zc-db-accent-soft);
+    color: var(--zc-db-text);
+  }
+  // 图标只用 T / C 两个字母：▦ ▥ 这类稀有字形在等宽字体里常常缺字，宁可朴素也别裂成豆腐块。
+  .zc-sql-editor-host .cm-completionIcon-table::after { content: "T"; }
+  .zc-sql-editor-host .cm-completionIcon-column::after { content: "C"; }
+  .zc-sql-editor-host .cm-completionIcon-table,
+  .zc-sql-editor-host .cm-completionIcon-column {
+    color: var(--zc-db-accent);
+    font-style: italic;
+  }
+
   .zc-sql-tools {
     flex: 0 0 auto;
     display: flex;
@@ -910,6 +938,150 @@
     color: var(--zc-db-text);
     font-size: 12px;
     font-weight: 600;
+  }
+}
+
+// ---- 执行确认弹框（Ticket 007 / US-12、US-13）----
+// 与行编辑弹框同理：a-modal 的 wrap portal 到 body，scoped 选择器够不着，
+// 只有 wrap-class-name 能当根（rootClassName 被 antd cssinjs 的 hashId 占用）。
+.zc-sql-confirm-modal,
+.zc-sql-confirm-modal.ant-modal-wrap {
+  font-family: var(--zc-db-font-sans);
+
+  .ant-modal {
+    top: 64px;
+    padding-bottom: 0;
+    max-width: calc(100vw - 32px);
+  }
+  .ant-modal-content {
+    border: 1px solid var(--zc-db-border-strong);
+    border-radius: var(--zc-db-radius);
+    box-shadow: 0 12px 32px rgba(31, 45, 61, .18);
+  }
+  .ant-modal-header {
+    padding: 10px 14px;
+    background: var(--zc-db-chrome);
+    border-bottom: 1px solid var(--zc-db-border-strong);
+    border-radius: var(--zc-db-radius) var(--zc-db-radius) 0 0;
+  }
+  .ant-modal-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--zc-db-text);
+  }
+  .ant-modal-close {
+    top: 8px;
+    inset-inline-end: 10px;
+    color: var(--zc-db-text-sub);
+  }
+  .ant-modal-body {
+    padding: 12px 14px;
+  }
+
+  // 清单本体：条数可能很多，高度钳住后内部滚，不能把弹框顶出视口。
+  .zc-sql-confirm-list {
+    margin: 0;
+    padding: 0;
+    max-height: 46vh;
+    overflow: auto;
+    list-style: none;
+  }
+  .zc-sql-confirm-item {
+    padding: 6px 8px;
+    border: 1px solid var(--zc-db-border);
+    border-radius: var(--zc-db-radius);
+    background: var(--zc-db-panel);
+
+    & + .zc-sql-confirm-item {
+      margin-top: 6px;
+    }
+  }
+  // 高危那条：整条目描红，不只在风险行上着色（一眼扫过清单就知道哪条要命）。
+  .zc-sql-confirm-item--risk {
+    border-color: var(--zc-db-err);
+    background: var(--zc-db-err-bg);
+  }
+  .zc-sql-confirm-meta {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 4px;
+    font-size: 11px;
+  }
+  .zc-sql-confirm-no {
+    font-family: var(--zc-db-font-mono);
+    color: var(--zc-db-text-sub);
+  }
+  .zc-sql-confirm-op {
+    padding: 0 6px;
+    border-radius: 2px;
+    background: var(--zc-db-accent-soft);
+    color: var(--zc-db-accent);
+    font-family: var(--zc-db-font-mono);
+    font-size: 11px;
+  }
+  .zc-sql-confirm-item--risk .zc-sql-confirm-op {
+    background: #f7ddd9;
+    color: var(--zc-db-err);
+  }
+  .zc-sql-confirm-at {
+    font-family: var(--zc-db-font-mono);
+    color: var(--zc-db-muted);
+  }
+  .zc-sql-confirm-toggle {
+    margin-inline-start: auto;
+    padding: 0 6px;
+    border: 1px solid var(--zc-db-border-strong);
+    border-radius: 2px;
+    background: var(--zc-db-chrome);
+    color: var(--zc-db-text-sub);
+    font-size: 11px;
+    cursor: pointer;
+
+    &:hover {
+      border-color: var(--zc-db-accent-line);
+      color: var(--zc-db-accent);
+    }
+  }
+  // 语句原文用 pre：换行与缩进是用户自己排的，确认时得看到本来面目。
+  .zc-sql-confirm-sql {
+    margin: 0;
+    padding: 4px 6px;
+    background: var(--zc-db-chrome);
+    border-radius: 2px;
+    font-family: var(--zc-db-font-mono);
+    font-size: 11px;
+    line-height: 1.5;
+    color: var(--zc-db-text);
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+  .zc-sql-confirm-risk {
+    margin-top: 4px;
+    color: var(--zc-db-err);
+    font-size: 11px;
+    font-weight: 600;
+  }
+
+  // prod 确认词：贴着底部长出来，用警示条语气而不是又一个表单字段。
+  .zc-sql-confirm-phrase {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 10px;
+    padding: 8px 10px;
+    background: var(--zc-db-warn-bg);
+    border-left: 3px solid var(--zc-db-warn);
+    border-radius: 2px;
+  }
+  .zc-sql-confirm-phrase-tip {
+    color: var(--zc-db-warn);
+    font-size: 12px;
+  }
+  .zc-sql-confirm-phrase-input {
+    width: 120px;
+    font-family: var(--zc-db-font-mono);
   }
 }
 
