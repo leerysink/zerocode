@@ -14,8 +14,8 @@ beforeEach(() => {
 })
 
 describe('config store 打开文件夹方式', () => {
-  it('默认 auto：没配过这个键的老库也能直接用', () => {
-    expect(useConfigStore().form.openFolderMode).toBe('auto')
+  it('默认 web：没配过这个键时一律弹内置文件管理器，本机直开要显式选（ADR-0009）', () => {
+    expect(useConfigStore().form.openFolderMode).toBe('web')
   })
 
   it('loadConfig 读回 fs.open_folder_mode，save 写回同一个键', async () => {

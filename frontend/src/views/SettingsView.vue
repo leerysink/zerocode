@@ -23,10 +23,11 @@ const pg = ref(null) // {ok, version|error}
 const testing = ref(false)
 
 // 「打开文件夹」三态，取值与 frontend/src/utils/openFolder.js 的常量一一对应
+// 默认是 web（ADR-0009）：不依赖“浏览器与后端同机”这个前提，对所有人的一致行为
 const openFolderModeOptions = [
-  { value: 'auto', label: '自动判定（推荐）' },
+  { value: 'web', label: '内置文件管理器（默认，推荐）' },
+  { value: 'auto', label: '自动判定（本机访问直开）' },
   { value: 'system', label: '强制系统资源管理器' },
-  { value: 'web', label: '强制内置文件管理器' },
 ]
 
 // ---- 模型库管理 ----
@@ -250,7 +251,7 @@ async function save() {
             </a-form-item>
             <a-form-item
               label="打开文件夹方式"
-              extra="自动：本机访问直接调起系统资源管理器，远端/远端桌面访问改用内置文件管理器；强制项留给容器等自动判不准的场合"
+              extra="默认在页面里弹出内置文件管理器（网页版目录）；自动判定=本机访问直开系统资源管理器、远端访问走网页；强制直开留给确定同机的场合"
             >
               <a-select v-model:value="store.form.openFolderMode" :options="openFolderModeOptions" style="width: 260px" />
             </a-form-item>

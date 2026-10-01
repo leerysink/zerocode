@@ -24,7 +24,7 @@ export const useConfigStore = defineStore('config', {
       askTimeoutSeconds: 0, // 0 = 不限制
       maxToolRounds: 30,
       historyWindow: 40,
-      openFolderMode: 'auto', // 老库里没这个键时的默认：按访问地址自动判定
+      openFolderMode: 'web', // 没配过这个键时的默认：一律弹内置文件管理器，本机直开属于显式选择（ADR-0009）
     },
     saving: false,
     loaded: false, // 是否已从后端拉到过配置（ensureLoaded 的去重依据）

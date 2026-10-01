@@ -2,11 +2,81 @@
 // 路径契约跟 GET /api/fs/ls 对齐：一律是工作区内的相对 posix 路径，工作区根为空串（后端不吐绝对路径）。
 // 只放无副作用的换算，请求与渲染留在组件里。
 
-// 上级路径：根没有上级（null），一级的上级是根（''）
-export function parentPath(path) {
-  if (!path) return null
-  const i = path.lastIndexOf('/')
-  return i < 0 ? '' : path.slice(0, i)
+// 当前焦点层：在「看得见的那几层」里挑最深的一层（同深度取先出现的，保证面包屑不随点击顺序乱跳）。
+// 只算可见层：收起 src 后，ant 并不会把 src/lib 从 expandedKeys 里带走，但树里已经看不见它了，
+// 面包屑继续指着 lib 就是在骗用户 —— 所以各级祖先没全展开的层直接跳过。
+// 根是空串，它的“深度”算 0 而不是 1 —— 直接 split('/').length 会把 'src' 看成和根同深，
+// 结果收起一级后面包屑反而退不回去。
+export function deepestPath(keys) {
+  const list = keys || []
+  let best = ''
+  let bestDepth = 0
+  for (const k of list) {
+    if (!k) continue
+    if (!ancestorsOf(k).every((a) => list.includes(a))) continue
+    const depth = k.split('/').length
+    if (depth > bestDepth) {
+      best = k
+      bestDepth = depth
+    }
+  }
+  return best
+}
+
+// /fs/ls 的一层条目 → a-tree 节点。目录不给 children（留空才能“展开时才拉这一层”），
+// 文件是叶子；size/mtime 一并带上，右侧预览区要展示元信息，不再回查一次。
+export function toTreeNodes(entries) {
+  return (entries || []).map((e) => ({
+    key: e.path,
+    title: e.name,
+    isLeaf: !e.is_dir,
+    dir: !!e.is_dir,
+    size: e.size,
+    mtime: e.mtime,
+  }))
+}
+
+// 懒加载回填：把 path 那一层的条目挂成它的 children。只重建命中路径上的那几个节点，
+// 同层无关节点直接复用引用；找不到目标（目录已被外部删掉）就原样返回，不凭空造节点。
+export function attachChildren(nodes, path, entries) {
+  const walk = (list) => {
+    let hit = false
+    const out = list.map((n) => {
+      if (n.key === path) {
+        hit = true
+        return { ...n, children: toTreeNodes(entries) }
+      }
+      if (n.children && n.children.length) {
+        const kids = walk(n.children)
+        if (kids !== n.children) {
+          hit = true
+          return { ...n, children: kids }
+        }
+      }
+      return n
+    })
+    return hit ? out : list
+  }
+  return walk(nodes || [])
+}
+
+// 按 key 找节点：组件只拿到 selectedKeys，得自己把节点元信息（大小/时间/是否目录）找回来
+export function findNode(nodes, key) {
+  for (const n of nodes || []) {
+    if (n.key === key) return n
+    if (n.children && n.children.length) {
+      const hit = findNode(n.children, key)
+      if (hit) return hit
+    }
+  }
+  return null
+}
+
+// 某一层要显示出来，得把它的各级祖先展开（不含自身：自身只是被看到，不是被展开）
+export function ancestorsOf(path) {
+  if (!path) return []
+  const parts = path.split('/')
+  return parts.slice(0, -1).map((_, i) => parts.slice(0, i + 1).join('/'))
 }
 
 // 面包屑：首项恒为工作区根本身（path=''，点击即回到根层），其后逐级拼出完整可点路径
@@ -17,11 +87,14 @@ export function buildBreadcrumb(workspaceName, path) {
   return crumbs
 }
 
-// 大小列：目录不给字节数（递归求和既不现实也误导），其余按 1024 进制保留一位
+// 大小列：目录不给字节数（递归求和既不现实也误导），size 缺失同样给占位符而不是谎报 0 B，
+// 其余按 1024 进制保留一位（负数这种脏数据按 0 B 收口，不渲染成 -5 B）
 export function formatBytes(size, isDir) {
   if (isDir) return '—'
+  if (size === null || size === undefined || size === '') return '—'
   let n = Number(size)
-  if (!Number.isFinite(n) || n <= 0) return '0 B'
+  if (!Number.isFinite(n)) return '—'
+  if (n <= 0) return '0 B'
   if (n < 1024) return `${n} B`
   const units = ['KB', 'MB', 'GB', 'TB']
   let i = -1
