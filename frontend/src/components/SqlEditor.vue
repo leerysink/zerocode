@@ -3,19 +3,24 @@
 //
 // 刻意做薄：CodeMirror 只在 onMounted 之后活在这个组件里，happy-dom 没有布局引擎，
 // 测试一律用 textarea 桩替换它，控制台的逻辑（拆分/确认/批量请求/渲染/格式化取段）全在 SqlConsole。
-// 这个壳只留三样东西：选区读数、就地写回、键盘入口（Ticket 006）。表名/列名补全（Ticket 008）从这里长。
+// 这个壳只留四样东西：选区读数、就地写回、键盘入口（Ticket 006）、补全接线（Ticket 008）。
+// 补全在这里只是把 CompletionContext 翻成 (doc, caret) 再原样交出去——「该补表名还是列名、
+// 表名从哪一段抠、缓存什么时候失效」全部在 utils/sqlCompletion.js，那里才是要被测的部分。
 import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { EditorState } from '@codemirror/state'
 import { EditorView } from '@codemirror/view'
 import { HighlightStyle, syntaxHighlighting } from '@codemirror/language'
 import { tags as t } from '@lezer/highlight'
 import { basicSetup } from 'codemirror'
+import { autocompletion } from '@codemirror/autocomplete'
 import { sql, PostgreSQL } from '@codemirror/lang-sql'
 import { sqlEditorKeymap } from './sqlEditorKeys'
 
 const props = defineProps({
   modelValue: { type: String, default: '' },
-  tables: { type: Array, default: () => [] }, // 补全数据源，Ticket 008 接线
+  // utils/sqlCompletion.createCompletionContext 的产物。必须是**引用稳定**的对象：
+  // 扩展链只在 onMounted 建一次，切 env / 表清单变化都靠调用方原地 setEnv/setTables。
+  completion: { type: Object, default: null },
 })
 const emit = defineEmits(['update:modelValue', 'execute', 'format'])
 
@@ -57,6 +62,19 @@ const consoleTheme = EditorView.theme({
 // 为什么要单独成模块 + Prec.highest，见 sqlEditorKeys.js 头注释。
 const editorKeymap = sqlEditorKeymap((event) => emit(event))
 
+// 补全源：只喂光标之前的文本（判定从来不看光标后面的内容），坐标因此可以直接当作绝对下标用。
+// 没有候选就返回 null 而不是空列表——空面板会在用户眼前闪一下，比不弹更吵。
+// override 的意义：把 basicSetup 里的按词补全和 lang-sql 自带的 schema 补全关掉，
+// 面板里只出现当前环境真实的表/列，不会冒出「上一句里打错的词」。
+const sqlCompletionSource = async (context) => {
+  const ctx = props.completion
+  if (!ctx?.completions) return null
+  const before = context.state.sliceDoc(0, context.pos)
+  const out = await ctx.completions(before, before.length)
+  if (!out?.options?.length) return null
+  return { from: out.from, options: out.options.map((o) => ({ label: o.label, type: o.type, apply: o.apply })) }
+}
+
 const host = ref(null)
 let view = null
 
@@ -71,6 +89,7 @@ onMounted(() => {
         syntaxHighlighting(classHighlightStyle),
         EditorView.lineWrapping,
         editorKeymap,
+        autocompletion({ override: [sqlCompletionSource] }),
         consoleTheme,
         EditorView.updateListener.of((u) => {
           if (u.docChanged) emit('update:modelValue', u.state.doc.toString())

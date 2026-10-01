@@ -20,10 +20,11 @@
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { message, Modal } from 'ant-design-vue'
 import { CloseOutlined, PlayCircleOutlined, PlusOutlined } from '@ant-design/icons-vue'
-import { dbSqlBatch } from '../api'
+import { dbSqlBatch, dbTableSchema } from '../api'
 import SqlEditor from './SqlEditor.vue'
 import { splitSqlStatements } from '../utils/sqlSplit'
 import { planExecution } from '../utils/sqlClassify'
+import { createCompletionContext } from '../utils/sqlCompletion'
 import { formatRange } from '../utils/sqlFormat'
 import { MAX_TABS, addTab, loadTabs, removeTab, renameTab, saveTabs } from '../utils/sqlTabsStore'
 
@@ -32,6 +33,21 @@ const props = defineProps({
   env: { type: String, required: true },
   tables: { type: Array, default: () => [] },
 })
+
+// ---- 补全上下文（Ticket 008A / US-15）
+// 只造一次、引用永久稳定：SqlEditor 的扩展链在 onMounted 里一次建好，换环境时另造一个
+// 就得重建整条 CodeMirror（光标与撤销栈一起没了），所以 env / appId / 表清单都是原地更新。
+// 表名复用 DbAdminView 已经拉好的那份 tables，不新发请求；列名要等真打了 `.` 才按表懒拉，
+// 拉失败在 sqlCompletion 里静默降级成“没候选”，不打扰也不报错。
+const completion = createCompletionContext({
+  appId: props.appId,
+  env: props.env,
+  tables: props.tables,
+  fetchSchema: (appId, env, table) => dbTableSchema(appId, env, table),
+})
+watch(() => props.appId, (value) => completion.setAppId(value))
+watch(() => props.env, (value) => completion.setEnv(value))
+watch(() => props.tables, (value) => completion.setTables(value))
 
 // 页签对象在内存里多带几个运行时字段（results / sentCount / resultIndex / runToken），落盘时由
 // store 的白名单削掉——运行态与持久态共用一个对象，省掉一份“id → 结果”的旁路映射。
@@ -328,6 +344,7 @@ async function submit(list, targetId = current.value?.id) {
 defineExpose({
   text, results, busy, sentCount, summary, run, submit, execSource, formatSql,
   confirmOpen, execPlan, phrase, phraseOk, confirmTitle, riskCount, doConfirm, toggleExpand,
+  completion,
   state, current, activeResult, selectResult, saveBlocked, createTab, closeTab, selectTab, startRename, commitRename,
 })
 </script>
@@ -351,7 +368,7 @@ defineExpose({
     <div v-if="saveBlocked" class="zc-sql-storage-warn" role="alert">
       本地存储已满或不可用，本次不再自动保存；页签里的脚本仍在，请自行复制备份。
     </div>
-    <SqlEditor ref="editorRef" v-model="text" :tables="tables" class="zc-sql-input"
+    <SqlEditor ref="editorRef" v-model="text" :completion="completion" class="zc-sql-input"
                @execute="run" @format="formatSql" />
     <div class="zc-sql-tools">
       <a-button class="zc-sql-run" type="primary" :disabled="busy" title="Ctrl+Enter" @click="run"><play-circle-outlined />执行</a-button>

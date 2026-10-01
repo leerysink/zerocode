@@ -11,7 +11,7 @@ import { h } from 'vue'
 import { enableAutoUnmount, flushPromises, mount } from '@vue/test-utils'
 
 const mocks = vi.hoisted(() => ({
-  api: { dbSqlBatch: vi.fn() },
+  api: { dbSqlBatch: vi.fn(), dbTableSchema: vi.fn() },
   antd: { message: { success: vi.fn(), error: vi.fn(), info: vi.fn(), warning: vi.fn() },
     Modal: { confirm: vi.fn(({ onOk }) => onOk && onOk()) } },
 }))
@@ -190,6 +190,8 @@ beforeEach(() => {
   mocks.api.dbSqlBatch.mockResolvedValue({ data: { results: [
     rowsResult(0, 'SELECT 1', [{ n: 1 }]), rowsResult(1, 'SELECT 2', [{ n: 2 }]),
   ] } })
+  // 补全的列接口：默认给一张空表，免得某个用例忘了改就把 undefined 当响应去削（Ticket 008A）
+  mocks.api.dbTableSchema.mockResolvedValue({ data: { columns: [] } })
 })
 
 afterEach(() => { vi.unstubAllGlobals() })
@@ -1443,5 +1445,80 @@ describe('SqlConsole 格式化（Ticket 006 / US-02）', () => {
     await flushPromises()
     expect(stubReplace).toHaveLength(1)
     expect(w.find('.zc-sql-editor').element.value).toBe(fmt(doc))
+  })
+})
+
+// Ticket 008A：判定与缓存本身已在 utils/sqlCompletion.test.js 逐条锁死，这里只测控制台这条接线——
+// props 的变化必须**原地**推进同一个上下文对象：对象一换，SqlEditor 就得重建整条 CodeMirror，
+// 光标位置和撤销栈会跟着一起没了。
+describe('SqlConsole 补全接线（Ticket 008A / US-15）', () => {
+  it('表名候选来自 props.tables，这一步不额外发请求', async () => {
+    const w = mountConsole({ tables: [{ name: 'widgets' }, { name: 'orders' }] })
+    await flushPromises()
+    const out = await w.vm.completion.completions('SELECT * FROM ')
+    expect(out.options.map((o) => o.label)).toEqual(['widgets', 'orders'])
+    expect(mocks.api.dbTableSchema).not.toHaveBeenCalled()
+  })
+
+  it('切 env 原地更新上下文并清列缓存：同一张表在新环境重新拉', async () => {
+    const w = mountConsole({ env: 'dev', tables: [] })
+    await w.vm.completion.completions('SELECT * FROM widgets.')
+    expect(mocks.api.dbTableSchema).toHaveBeenLastCalledWith('1', 'dev', 'widgets')
+    await w.setProps({ env: 'prod' })
+    expect(w.vm.completion.env).toBe('prod')
+    await w.vm.completion.completions('SELECT * FROM widgets.')
+    expect(mocks.api.dbTableSchema).toHaveBeenCalledTimes(2)
+    expect(mocks.api.dbTableSchema).toHaveBeenLastCalledWith('1', 'prod', 'widgets')
+  })
+
+  it('交给编辑器的始终是同一个上下文引用（换 env / 换 appId 都不换对象）', async () => {
+    const w = mountConsole({ appId: '1', env: 'dev' })
+    const ctx = w.vm.completion
+    await w.setProps({ env: 'prod', appId: '2' })
+    expect(w.vm.completion).toBe(ctx)
+    expect(ctx.cache.size).toBe(0)
+  })
+
+  it('边界：换应用重拉且带着新 appId（dev 库不是另一个应用的 dev 库）', async () => {
+    const w = mountConsole({ appId: '1', tables: [] })
+    await w.vm.completion.completions('SELECT * FROM widgets.')
+    await w.setProps({ appId: '2' })
+    await w.vm.completion.completions('SELECT * FROM widgets.')
+    expect(mocks.api.dbTableSchema).toHaveBeenCalledTimes(2)
+    expect(mocks.api.dbTableSchema).toHaveBeenLastCalledWith('2', 'dev', 'widgets')
+  })
+
+  it('边界：props.tables 换成新数组后立刻生效（删掉的表不再冒出来）', async () => {
+    const w = mountConsole({ tables: [{ name: 'widgets' }] })
+    await w.setProps({ tables: [{ name: 'orders' }] })
+    expect((await w.vm.completion.completions('SELECT * FROM ')).options.map((o) => o.label)).toEqual(['orders'])
+  })
+
+  it('边界：schema 接口 reject 时列候选为空且不弹错（补全失败不该打扰执行）', async () => {
+    mocks.api.dbTableSchema.mockRejectedValue(new Error('500 internal'))
+    const w = mountConsole({ tables: [] })
+    const out = await w.vm.completion.completions('SELECT * FROM nope.')
+    expect(out.options).toEqual([])
+    expect(mocks.antd.message.error).not.toHaveBeenCalled()
+    expect(mocks.antd.message.warning).not.toHaveBeenCalled()
+  })
+
+  it('边界：表清单还没拉回来（空数组）时补表名只是空列表，不抛', async () => {
+    const w = mountConsole({ tables: [] })
+    expect((await w.vm.completion.completions('SELECT * FROM ')).options).toEqual([])
+  })
+
+  it('边界：props.tables 给了脏形状（字符串数组混对象混 null）也不炸', async () => {
+    const w = mountConsole({ tables: ['widgets', { name: 'orders' }, null, 3] })
+    expect((await w.vm.completion.completions('SELECT * FROM ')).options.map((o) => o.label)).toEqual(['widgets', 'orders'])
+  })
+
+  it('SqlEditor 拿到的 completion 就是控制台那个对象（接线没接歪）', async () => {
+    const CAPTURE = {
+      name: 'SqlEditor', props: ['modelValue', 'completion'],
+      render() { return h('textarea', { class: 'zc-sql-editor' }) },
+    }
+    const w = mountConsole({}, { SqlEditor: CAPTURE })
+    expect(w.findComponent(CAPTURE).props('completion')).toBe(w.vm.completion)
   })
 })
