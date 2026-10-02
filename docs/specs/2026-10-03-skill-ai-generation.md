@@ -102,7 +102,7 @@ GENERATE_TIMEOUT_S = 60
 
 def build_llm(model_cfg: dict):                # 内部 new OpenAICompatLLM，供测试 monkeypatch
 async def generate_skill_draft(llm, prompt: str) -> dict   # {name, description, content, warnings}
-def _unwrap_fences(raw: str) -> str            # 剥 ``` 围栏与 BOM/首尾空白
+def unwrap_fences(raw: str) -> str             # 剥 ``` 围栏与 BOM/首尾空白；adopt 端也复用
 ```
 
 - LLM 调用沿用 `llm.chat_stream(messages, tools=[])` 聚合 content，
