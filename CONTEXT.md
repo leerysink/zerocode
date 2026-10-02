@@ -34,10 +34,15 @@ openssl 脚本（仓库内 make-cert）生成的本地 CA + `*.zerocode.com` 证
 ## 技能（skill）
 
 给**平台 Agent** 用的指令扩展包，遵循 Anthropic Agent Skills 开放标准
-（SKILL.md + YAML frontmatter），可从 GitHub 仓库/URL 安装。Agent 在工作区干活时
-自动遵循已启用技能。它不是生成应用的功能素材——应用打包/运行时不感知技能文件，
+（SKILL.md + YAML frontmatter）。三类来源并列（`source_type`）：`url`（SKILL.md 直链）、
+`github`（仓库扫描）、`ai`（用一句话需求描述交给账户的默认模型生成，预览可改后入库）。
+Agent 在工作区干活时自动遵循已启用技能。它不是生成应用的功能素材——应用打包/运行时不感知技能文件，
 技能只活在平台 Agent 的上下文里。技能归属**用户**（账户级技能库），依赖登录体系，
 顺序上先做登录/用户体系改造、后做技能功能。
+
+「AI 生成」是**平台侧**写入，不是 Agent 写入——技能目录对 Agent 依旧只读（ADR-0004 不改）。
+生成型技能的 `source_url` 填占位哨兵 `ai://generated`（仅为满足 `NOT NULL`，且永不发起请求），
+判定来源一律看 `source_type` 而非 `source_url`。
 
 ## 创始人（founder）
 
