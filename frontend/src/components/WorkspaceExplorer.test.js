@@ -1,5 +1,6 @@
 // @vitest-environment happy-dom
-// 内置文件管理器（左树右预览）：目录树按 GET /api/fs/ls 懒加载，展开一层才拉一层；右侧只预览文件。
+// 内置文件管理器（左树右预览，整页不是弹框）：目录树按 GET /api/fs/ls 懒加载，展开一层才拉一层；右侧只预览文件。
+// 挂载即拉根层：要不要拉、拿哪个 id 拉，是 WorkspaceFilesView 按地址判完之后的事，组件不再接收 open。
 // a-tree 桩严格照 ant-design-vue 4.x 的懒加载契约模拟：展开时若该 key 不在 loadedKeys 才调
 // props.loadData(node)，resolve 之后才 emit update:loadedKeys —— 所以组件必须自己回写 loadedKeys，
 // 桩才会把它记成「已加载」。expandAction='click' 时点行 = 先展开再 select（vc-tree/TreeNode.js:218-228
@@ -87,7 +88,6 @@ const TreeStub = {
 }
 
 const STUBS = {
-  'a-modal': slotDiv('a-modal'),
   'a-button': slotDiv('a-button'),
   'a-tree': TreeStub,
   'a-spin': slotDiv('a-spin'),
@@ -108,7 +108,7 @@ const fixture = (ws, path) => Promise.resolve(ls(path, LAYERS[path] || []))
 
 async function mountExplorer(props = {}) {
   const wrapper = mount(WorkspaceExplorer, {
-    props: { open: true, workspaceId: 7, ...props },
+    props: { workspaceId: 7, ...props },
     global: { stubs: STUBS },
   })
   await flushPromises()
@@ -146,7 +146,7 @@ beforeEach(() => {
 })
 
 describe('WorkspaceExplorer 懒加载树', () => {
-  it('打开时只拉根层一次，条目渲染成树节点', async () => {
+  it('进页面就拉根层一次，条目渲染成树节点', async () => {
     const wrapper = await mountExplorer()
 
     expect(listDir).toHaveBeenCalledTimes(1)
@@ -154,10 +154,11 @@ describe('WorkspaceExplorer 懒加载树', () => {
     expect(titles(wrapper)).toEqual(['src', 'a.md'])
   })
 
-  it('关闭时不请求目录（不因为挂载就白拉一次）', async () => {
-    mount(WorkspaceExplorer, { props: { open: false, workspaceId: 7 }, global: { stubs: STUBS } })
-    await flushPromises()
-    expect(listDir).not.toHaveBeenCalled()
+  it('字符串 id（直链地址带来的）照常拉根层，不转成 Number', async () => {
+    const wrapper = await mountExplorer({ workspaceId: '2026092201000900123' })
+
+    expect(listDir).toHaveBeenCalledWith('2026092201000900123', '')
+    expect(titles(wrapper)).toEqual(['src', 'a.md'])
   })
 
   it('展开目录才请求那一层，并把返回条目挂成子节点', async () => {
@@ -236,14 +237,13 @@ describe('WorkspaceExplorer 点行即展开（类桌面）', () => {
 })
 
 describe('WorkspaceExplorer 竞态与过期响应', () => {
-  it('展开在途时关掉弹框再打开：迟到的响应不得挂进新树，也不得记成已加载', async () => {
+  it('展开在途时点刷新重开：迟到的响应不得挂进新树，也不得记成已加载', async () => {
     const slow = deferred()
     listDir.mockImplementation((ws, p) => (p === 'src' ? slow.promise : fixture(ws, p)))
     const wrapper = await mountExplorer()
 
     await wrapper.find('.stub-tree-node[data-key="src"] .stub-tree-switch').trigger('click')
-    await wrapper.setProps({ open: false })
-    await wrapper.setProps({ open: true })
+    await wrapper.find('.zc-wex-refresh').trigger('click')
     await flushPromises()
     slow.resolve(ls('src', LAYERS.src))
     await flushPromises()
@@ -338,17 +338,28 @@ describe('WorkspaceExplorer 竞态与过期响应', () => {
     expect(listDir).toHaveBeenCalledTimes(calls)
   })
 
-  it('open 与 workspaceId 同帧变化：只拉一次根层，不按新 id 重复请求', async () => {
-    const wrapper = await mountExplorer()
-    await wrapper.setProps({ open: false })
-    await flushPromises()
+  it('刷新在途时再点一次刷新：前一次迟到的根层响应不覆盖新树', async () => {
+    const slow = deferred()
+    let rootCalls = 0
+    listDir.mockImplementation((ws, p) => {
+      if (p !== '') return fixture(ws, p)
+      rootCalls += 1
+      return rootCalls === 1 ? slow.promise : fixture(ws, p)
+    })
+    const wrapper = await mountExplorer() // 第一次根层始终在途
 
-    await wrapper.setProps({ open: true, workspaceId: 8 })
-    await flushPromises()
+    expect(titles(wrapper)).toEqual([])
 
-    expect(listDir).toHaveBeenCalledTimes(2) // 初次(ws7) + 同帧一次(ws8)
-    expect(listDir).toHaveBeenLastCalledWith(8, '')
+    await wrapper.find('.zc-wex-refresh').trigger('click') // 第二次刷新先回来
+    await flushPromises()
     expect(titles(wrapper)).toEqual(['src', 'a.md'])
+
+    slow.resolve(ls('', [file('迟到的旧数据.txt', '迟到的旧数据.txt')]))
+    await flushPromises()
+
+    expect(titles(wrapper)).toEqual(['src', 'a.md'])
+    // 过期分支不许替新一次收尾：加载态只能由当前世代自己落下
+    expect(wrapper.vm.rootLoading).toBe(false)
   })
 
   it('展开某层失败：面包屑退回还看得见的那一层，不停在失败层', async () => {
@@ -432,19 +443,17 @@ describe('WorkspaceExplorer 只读预览', () => {
 })
 
 describe('WorkspaceExplorer 展开态与异常边界', () => {
-  it('关闭再打开：展开态与 loadedKeys 一起重置，不会拿旧缓存给新数据', async () => {
+  it('刷新把展开态与 loadedKeys 一起重置，不会拿旧缓存给新数据', async () => {
     const wrapper = await mountExplorer()
     await expand(wrapper, 'src')
     expect(treeProps(wrapper).loadedKeys).toEqual(['src'])
 
-    await wrapper.setProps({ open: false })
-    await flushPromises()
-    await wrapper.setProps({ open: true })
+    await wrapper.find('.zc-wex-refresh').trigger('click')
     await flushPromises()
 
     expect(treeProps(wrapper).expandedKeys).toEqual([])
     expect(treeProps(wrapper).loadedKeys).toEqual([])
-    expect(listDir).toHaveBeenCalledTimes(3) // 初次 + 展开 src + 重开
+    expect(listDir).toHaveBeenCalledTimes(3) // 初次 + 展开 src + 刷新重拉根层
     expect(titles(wrapper)).toEqual(['src', 'a.md'])
   })
 

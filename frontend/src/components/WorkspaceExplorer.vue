@@ -1,7 +1,8 @@
 <script setup>
-// 内置「类桌面」文件管理器（工作区浏览器）：左树右预览，只读。
+// 内置「类桌面」文件管理器（工作区浏览器）：整页形态（新标签打开，ADR-0011），左树右预览，只读。
 // 为什么需要它：后端跑在服务器 / 远端桌面上时，在服务器上调起 explorer 的窗口用户根本看不见，
 // 于是「打开文件夹」降级成在网页里看目录 —— 判定与降级在调用方（FilePanel / AppsView），本组件只管展示。
+// 要不要挂载、拿哪个 id 挂载，由 WorkspaceFilesView 按地址判完之后决定，本组件挂载即拉根层。
 // 数据源 GET /api/fs/ls 懒加载：展开一层才拉一层，体积随可见范围走，不一次拉全树（ADR-0010）。
 // 只读：看目录与下载在此，编辑仍走聊天页右栏的文件面板，权限面与改造前一致。
 import { computed, ref, watch } from 'vue'
@@ -13,11 +14,10 @@ import {
 } from '../utils/fsNav'
 
 const props = defineProps({
-  open: { type: Boolean, default: false },
-  workspaceId: { type: Number, required: true },
+  // 直链地址带进来的是字符串，入口点过来的是 store 里的数字：两种都收，原样透传不转 Number
+  workspaceId: { type: [Number, String], required: true },
   workspaceName: { type: String, default: '' },
 })
-const emit = defineEmits(['update:open'])
 
 const treeData = ref([])
 const expandedKeys = ref([])
@@ -33,8 +33,8 @@ const previewNode = computed(() => findNode(treeData.value, previewPath.value))
 
 const crumbs = computed(() => buildBreadcrumb(props.workspaceName, focusPath.value))
 
-// 世代号：每次重置（关弹框重开 / 切工作区 / 点刷新）自增。
-// 在途请求回来时先比世代，不匹配就丢弃 —— 否则关掉再打开后，上一轮的迟到响应会
+// 世代号：每次重置（点刷新 / 换工作区）自增。
+// 在途请求回来时先比世代，不匹配就丢弃 —— 否则重开之后，上一轮的迟到响应会
 // 把旧工作区的子节点挂进新树、还把那一层标成“已加载”，用户再也拉不动它。
 let gen = 0
 
@@ -133,10 +133,6 @@ async function onSelect(keys) {
   }
 }
 
-function close() {
-  emit('update:open', false)
-}
-
 // 点面包屑 = 折回那一层：路径早已在树里（可见层才进面包屑），只调展开态，不再发请求
 function go(crumb, index) {
   if (index === crumbs.value.length - 1) return
@@ -144,16 +140,14 @@ function go(crumb, index) {
   expandedKeys.value = crumb.path ? ancestorsOf(crumb.path).concat(crumb.path) : []
 }
 
-// 每次重新打开、以及换工作区，都从工作区根重来，别把上次的展开态留成"惊喜"。
-// 合成一个 watch：open 与 workspaceId 同帧变化时（例如从另一个工作区直接开弹框）只拉一次根层，
-// 分成两个 watch 会各触发一次 loadRoot，同一层连发两个请求、慢的那个还可能盖掉快的。
-watch([() => props.open, () => props.workspaceId], ([open]) => {
-  if (open) loadRoot()
-}, { immediate: true })
+// 换工作区都从工作区根重来，别把上次的展开态留成"惊喜"。
+// 只 watch id：刷新按钮直接调 loadRoot，两者共用同一条重置链，不会出现两个入口各拉一次根层。
+// 也不另开一个 watch 去盯挂载时机：要不要挂、拿哪个 id 挂，是 WorkspaceFilesView 的事。
+watch(() => props.workspaceId, loadRoot, { immediate: true })
 </script>
 
 <template>
-  <a-modal :open="open" title="工作区文件" width="90%" :footer="null" @cancel="close">
+  <div class="zc-wex">
     <div class="zc-wex-bar">
       <a-button size="small" class="zc-wex-refresh" :loading="rootLoading" @click="loadRoot">
         <template #icon><reload-outlined /></template>
@@ -203,11 +197,19 @@ watch([() => props.open, () => props.workspaceId], ([open]) => {
         <p v-else class="zc-wex-hint">展开目录看下一级（点目录只展开，不占右侧），点文件在这里预览内容；二进制与大文件走下载。</p>
       </div>
     </div>
-  </a-modal>
+  </div>
 </template>
 
 <style scoped>
 /* 素雅低饱和：沿用全局 CSS 变量，不自带配色 */
+/* 整页撑满：页面外壳（WorkspaceFilesView）给出可用高度，这里只保证自己占满它 */
+.zc-wex {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  box-sizing: border-box;
+}
 .zc-wex-bar {
   display: flex;
   align-items: center;
@@ -239,14 +241,17 @@ watch([() => props.open, () => props.workspaceId], ([open]) => {
 .zc-wex-sep {
   color: var(--zc-border);
 }
-/* 左右两栏各自定高内部滚动：树再深、文件再长都不会把弹框顶成一屏瀑布 */
+/* 左右两栏各自内部滚动：树再深、文件再长都不会把整页顶成一屏瀑布 */
 .zc-wex-body {
+  flex: 1;
+  min-height: 0;
   display: flex;
-  align-items: flex-start;
+  align-items: stretch;
   gap: 12px;
 }
 .zc-wex-side {
-  height: 58vh;
+  height: 100%;
+  min-height: 0;
   overflow: auto;
   box-sizing: border-box;
 }

@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 // Task 10：AppsView 发布接线（最小挂载断言）——M2 占位文案撤掉、发布/历史入口上卡、
 // 栈闸门（非 vue3-fastapi 发布按钮置灰带说明）。弹层内部行为在 PublishModal.test 覆盖。
-import { describe, expect, it, vi, beforeEach } from 'vitest'
+import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
 import { h } from 'vue'
 import { flushPromises, mount } from '@vue/test-utils'
 
@@ -18,21 +18,23 @@ const mocks = vi.hoisted(() => ({
   },
   antd: { message: { success: vi.fn(), error: vi.fn(), info: vi.fn(), warning: vi.fn() },
     Modal: { confirm: vi.fn() } },
+  // 系统参数桩：form 是可变对象，单条用例改 openFolderMode 就能验证三种裁决分支
+  cfg: { ensureLoaded: vi.fn(async () => {}), form: { openFolderMode: 'auto' } },
 }))
 vi.mock('../api', () => mocks.api)
 vi.mock('ant-design-vue', () => mocks.antd)
-// AppsView 顶层调 useConfigStore()：无 pinia 会挂载即抛，这里给一个只读桩（openFolderMode=auto）
-vi.mock('../stores/config', () => ({
-  useConfigStore: () => ({ ensureLoaded: vi.fn(async () => {}), form: { openFolderMode: 'auto' } }),
-}))
+// AppsView 顶层调 useConfigStore()：无 pinia 会挂载即抛，这里给一个只读桩
+vi.mock('../stores/config', () => ({ useConfigStore: () => mocks.cfg }))
 
 import AppsView from './AppsView.vue'
 
 const APPS = [
   { id: 1, name: '甲', slug: 'aaa', stack: 'vue3-fastapi', scale: 'small', dev_port: 8301,
-    prod_port: 8401, status_dev: 'stopped', status_prod: 'running', current_version: 'b20260920100000' },
+    prod_port: 8401, status_dev: 'stopped', status_prod: 'running', current_version: 'b20260920100000',
+    workspace_id: 11 },
   { id: 2, name: '乙', slug: 'bbb', stack: 'static', scale: 'small', dev_port: 8302,
-    prod_port: 8402, status_dev: 'stopped', status_prod: 'stopped', current_version: null },
+    prod_port: 8402, status_dev: 'stopped', status_prod: 'stopped', current_version: null,
+    workspace_id: 12 },
 ]
 
 const slot = (name) => ({
@@ -67,7 +69,6 @@ const STUBS = {
   'a-dropdown': { name: 'a-dropdown', render() {
     return h('div', { class: 'stub-dropdown' }, [this.$slots.default?.(), this.$slots.overlay?.()]) } },
   BackButton: { name: 'BackButton', render() { return h('button', { class: 'stub-back' }, '返回') } },
-  WorkspaceExplorer: { name: 'WorkspaceExplorer', render() { return h('div', { class: 'stub-explorer' }) } },
   PublishModal: { name: 'PublishModal', render() { return h('div', { class: 'stub-pub-modal' }) } },
   PublishHistory: { name: 'PublishHistory', render() { return h('div', { class: 'stub-pub-history' }) } },
   MetricsModal: { name: 'MetricsModal', props: ['app'],
@@ -83,7 +84,12 @@ async function mountView() {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  mocks.cfg.form.openFolderMode = 'auto'
   vi.spyOn(window, 'setInterval').mockReturnValue(0)
+})
+
+afterEach(() => {
+  vi.unstubAllGlobals()
 })
 
 describe('AppsView 发布接线', () => {
@@ -267,5 +273,105 @@ describe('AppsView 卡片折叠菜单', () => {
     await wrapper.find('.stub-modal-ok').trigger('click')
     await flushPromises()
     expect(mocks.api.deleteApp).toHaveBeenCalledWith(1)
+  })
+})
+
+// ---------- 「打开工程目录」入口：与右栏文件面板共享同一裁决点（ADR-0009），
+// 内置文件管理器从弹框改成新标签整页（ADR-0011） ----------
+function stubOpen(ret = {}) {
+  const open = vi.fn(() => ret)
+  vi.stubGlobal('open', open)
+  return open
+}
+
+async function clickFolder(wrapper, index = 0) {
+  await wrapper.findAll('.zc-menu-folder')[index].trigger('click')
+  await flushPromises()
+}
+
+describe('AppsView 打开工程目录', () => {
+  it('auto + 本机访问：调起系统资源管理器，不开新标签', async () => {
+    vi.stubGlobal('location', { hostname: 'localhost' })
+    const open = stubOpen()
+    mocks.api.openFolder.mockResolvedValue({ data: { ok: true } })
+    const wrapper = await mountView()
+
+    await clickFolder(wrapper)
+
+    expect(mocks.api.openFolder).toHaveBeenCalledWith(11)
+    expect(open).not.toHaveBeenCalled()
+  })
+
+  it('auto + 远端访问：新标签打开整页，完全不请求直开', async () => {
+    vi.stubGlobal('location', { hostname: '192.168.1.20' })
+    const open = stubOpen()
+    const wrapper = await mountView()
+
+    await clickFolder(wrapper)
+
+    expect(mocks.api.openFolder).not.toHaveBeenCalled()
+    expect(open.mock.calls[0][1]).toBe('zerocode-files-11')
+    expect(decodeURIComponent(open.mock.calls[0][0])).toBe('/workspaces/11/files?name=甲')
+  })
+
+  it('直开失败：降级到新标签整页并说明原因', async () => {
+    vi.stubGlobal('location', { hostname: 'localhost' })
+    const open = stubOpen()
+    mocks.api.openFolder.mockRejectedValue({ response: { data: { detail: '找不到 xdg-open' } } })
+    const wrapper = await mountView()
+
+    await clickFolder(wrapper)
+
+    expect(open).toHaveBeenCalled()
+    expect(mocks.antd.message.info).toHaveBeenCalled()
+  })
+
+  it('系统参数强制 web：本机访问也直接开整页', async () => {
+    vi.stubGlobal('location', { hostname: 'localhost' })
+    mocks.cfg.form.openFolderMode = 'web'
+    const open = stubOpen()
+    const wrapper = await mountView()
+
+    await clickFolder(wrapper)
+
+    expect(mocks.api.openFolder).not.toHaveBeenCalled()
+    expect(open).toHaveBeenCalled()
+  })
+
+  it('边界：新标签被浏览器拦截（open 返回 null）时给出提示，不静默失败', async () => {
+    vi.stubGlobal('location', { hostname: '192.168.1.20' })
+    stubOpen(null)
+    const wrapper = await mountView()
+
+    await clickFolder(wrapper)
+
+    expect(mocks.antd.message.warning).toHaveBeenCalled()
+  })
+
+  it('边界：应用没有 workspace_id（脏数据）时不开一个必然 404 的标签', async () => {
+    vi.stubGlobal('location', { hostname: '192.168.1.20' })
+    const open = stubOpen()
+    mocks.api.listApps.mockResolvedValue({ data: [{ ...APPS[0], workspace_id: null }] })
+    const wrapper = mount(AppsView, { global: { stubs: STUBS } })
+    await flushPromises()
+
+    await clickFolder(wrapper)
+
+    expect(open).not.toHaveBeenCalled()
+    expect(mocks.antd.message.warning).toHaveBeenCalled()
+  })
+
+  it('边界：连续双击只走一次直开请求（在途闸门）', async () => {
+    vi.stubGlobal('location', { hostname: 'localhost' })
+    let resolveOpen
+    mocks.api.openFolder.mockReturnValue(new Promise((resolve) => { resolveOpen = resolve }))
+    const wrapper = await mountView()
+
+    await wrapper.findAll('.zc-menu-folder')[0].trigger('click')
+    await wrapper.findAll('.zc-menu-folder')[0].trigger('click')
+    resolveOpen({ data: { ok: true } })
+    await flushPromises()
+
+    expect(mocks.api.openFolder).toHaveBeenCalledTimes(1)
   })
 })

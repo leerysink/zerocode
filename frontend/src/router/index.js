@@ -1,7 +1,7 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import { useAuthStore } from '../stores/auth'
 
-// 路由表：/login 登录注册（public）；/ 对话页；/settings 设置页；/store 应用商店（视图均懒加载，按需分包）
+// 路由表：/login 登录注册（public）；/ 对话页；/settings 设置页；/store 应用商店；/workspaces/:id/files 内置文件管理器（视图均懒加载，按需分包）
 const routes = [
   {
     path: '/login',
@@ -33,6 +33,12 @@ const routes = [
     path: '/apps/:id/db',
     name: 'app-db',
     component: () => import('../views/DbAdminView.vue'),
+  },
+  {
+    // 地址由 utils/openFolder.js 的 workspaceFilesPath 拼，两处一致性由 router/index.test.js 钉住
+    path: '/workspaces/:id/files',
+    name: 'workspace-files',
+    component: () => import('../views/WorkspaceFilesView.vue'),
   },
   {
     path: '/store',

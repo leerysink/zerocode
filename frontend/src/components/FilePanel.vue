@@ -3,7 +3,7 @@
 // 「文件」tab：工作区文件树（GET /fs/tree → treeData）+ 顶部刷新按钮 + 打开文件夹按钮；
 //   点击文件 → 内容预览（pre）；后端对二进制/超 200KB 文件拒读（400），错误详情展示在预览区即「>200KB 提示」；
 //   「编辑」切 textarea + 保存（PUT /api/files/save），保存后刷新文件树（可能新增文件）。
-// 「打开文件夹」按 fs.open_folder_mode 分流：默认直接开内置 WorkspaceExplorer（网页里的「类桌面」文件管理器）；
+// 「打开文件夹」按 fs.open_folder_mode 分流：默认直接新标签打开内置文件管理器整页（/workspaces/{id}/files）；
 //   显式选 auto 时同机访问才调后端本机文件管理器（POST /api/fs/open-folder），直开失败也降级到内置，见 utils/openFolder.js。
 // 「变更记录」tab：GET /api/sessions/{id}/file-changes（id 倒序），逐条 DiffBlock 显示 path+action+diff。
 import { computed, onMounted, ref, watch } from 'vue'
@@ -12,9 +12,8 @@ import { FolderOpenOutlined, ReloadOutlined } from '@ant-design/icons-vue'
 import { getFileChanges, openFolder, readFile, saveFile, tree } from '../api'
 import { useChatStore } from '../stores/chat'
 import { useConfigStore } from '../stores/config'
-import { resolveOpenFolderMode } from '../utils/openFolder'
+import { openWorkspaceFilesPage, resolveOpenFolderMode } from '../utils/openFolder'
 import DiffBlock from './DiffBlock.vue'
-import WorkspaceExplorer from './WorkspaceExplorer.vue'
 
 const props = defineProps({
   workspaceId: { type: Number, required: true },
@@ -26,7 +25,6 @@ const tab = ref('files')
 const treeData = ref([])
 const treeLoading = ref(false)
 const expandedKeys = ref([])
-const explorerOpen = ref(false)
 const opening = ref(false)
 
 // 预览状态：previewError 非空表示读失败（二进制/超 200KB/越界等）
@@ -127,41 +125,46 @@ function onTabClick(key) {
   if (key === 'changes') loadChanges()
 }
 
-// 内置文件管理器的面包屑根用工作区名；没加载到名字时 WorkspaceExplorer 自己兜底显示「工作区」
+// 内置文件管理器的面包屑根与整页标题用工作区名；没加载到名字时传空串，页面自己兜底显示 #id
 const workspaceName = computed(
   () => store.workspaces.find((w) => w.id === props.workspaceId)?.name || '',
 )
 
 // 「打开文件夹」：能直开就直开——同机访问时 explorer 的窗口就开在用户眼前；
-// 远端 / 远端桌面访问时服务端开窗口用户根本看不见，直接给内置文件管理器。
+// 远端 / 远端桌面访问时服务端开窗口用户根本看不见，直接给内置文件管理器整页。
 // 直开请求失败（容器里没有 explorer/xdg-open、目录被移走等）也算"打不开"：当场降级，不把用户卡在原地。
+// 整页走新标签：聊天页与右栏展开态都不被打断，地址还能收藏。
+function openFilesPage() {
+  if (!openWorkspaceFilesPage(props.workspaceId, workspaceName.value)) {
+    message.warning('新标签没能打开（可能被浏览器拦截），请允许本站弹出窗口后重试')
+  }
+}
+
 async function openWorkspaceFolder() {
   if (opening.value) return
   opening.value = true
   try {
     await cfg.ensureLoaded()
     if (resolveOpenFolderMode(cfg.form.openFolderMode, window.location.hostname) === 'web') {
-      explorerOpen.value = true
+      openFilesPage()
       return
     }
     await openFolder(props.workspaceId)
     message.success('已在系统文件管理器中打开工作区目录')
   } catch {
-    explorerOpen.value = true
+    openFilesPage()
     message.info('无法直接打开文件夹，已改用内置文件管理器')
   } finally {
     opening.value = false
   }
 }
 
-// 工作区切换：清空预览状态、关掉内置文件管理器并重拉文件树
-// （不关掉的话，props 换了工作区而 open 仍为 true，管理器会拿着旧 path 显示旧目录）
+// 工作区切换：清空预览状态并重拉文件树（内置文件管理器是独立标签，不在这里联动关闭）
 watch(() => props.workspaceId, () => {
   selectedPath.value = ''
   content.value = ''
   previewError.value = ''
   editing.value = false
-  explorerOpen.value = false
   loadTree()
 })
 
@@ -225,11 +228,6 @@ onMounted(loadTree)
         </div>
       </a-tab-pane>
     </a-tabs>
-    <WorkspaceExplorer
-      v-model:open="explorerOpen"
-      :workspace-id="workspaceId"
-      :workspace-name="workspaceName"
-    />
   </a-layout-sider>
 </template>
 

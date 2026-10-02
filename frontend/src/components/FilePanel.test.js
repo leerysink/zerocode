@@ -1,6 +1,7 @@
 // @vitest-environment happy-dom
 // FilePanel 工具条「打开文件夹」入口的行为契约：
 //   位置在「刷新」右侧；auto 按访问地址分流；直开失败必须降级到内置文件管理器（不能只弹错误了之）。
+//   内置那一路现在是新标签打开整页，所以这里桩掉 window.open，断言拼出来的地址。
 // mock 掉 api 层与 antd message，专注验证分流本身。
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { h } from 'vue'
@@ -8,7 +9,7 @@ import { mount, flushPromises } from '@vue/test-utils'
 import { createPinia, setActivePinia } from 'pinia'
 
 vi.mock('../api', () => ({
-  // FilePanel 与 WorkspaceExplorer 直接使用
+  // FilePanel 直接使用（整页化后本组件不再挂 WorkspaceExplorer，listDir 只是历史遗留桩）
   tree: vi.fn(), readFile: vi.fn(), saveFile: vi.fn(), getFileChanges: vi.fn(),
   listDir: vi.fn(), openFolder: vi.fn(),
   // chat / config store 会经 api 层拉数据
@@ -23,7 +24,7 @@ vi.mock('ant-design-vue', () => ({
 import { tree, openFolder, listDir, getConfig } from '../api'
 import { message } from 'ant-design-vue'
 import FilePanel from './FilePanel.vue'
-import WorkspaceExplorer from './WorkspaceExplorer.vue'
+import { useChatStore } from '../stores/chat'
 
 // 只渲染默认插槽的桩：让工具条与按钮在 happy-dom 下真实存在（无编译器，故用 h 而非 template）
 const slotDiv = (name) => ({
@@ -77,6 +78,13 @@ async function clickOpen(wrapper) {
   await flushPromises()
 }
 
+// 新标签整页的可观測替身：ret 默认返回一个窗口对象（未被拦截）
+function stubOpen(ret = {}) {
+  const open = vi.fn(() => ret)
+  vi.stubGlobal('open', open)
+  return open
+}
+
 beforeEach(() => {
   vi.clearAllMocks()
   setActivePinia(createPinia())
@@ -93,46 +101,50 @@ describe('FilePanel 打开文件夹入口', () => {
     expect(labels).toEqual(['刷新', '打开文件夹'])
   })
 
-  it('auto + 本机访问：调起系统资源管理器，不开内置管理器', async () => {
+  it('auto + 本机访问：调起系统资源管理器，不碰 window.open', async () => {
     vi.stubGlobal('location', { hostname: 'localhost' })
+    const open = stubOpen()
     openFolder.mockResolvedValue({ data: { ok: true, path: 'D:/ws' } })
     const wrapper = await mountPanel('auto')
 
     await clickOpen(wrapper)
 
     expect(openFolder).toHaveBeenCalledWith(7)
-    expect(wrapper.findComponent(WorkspaceExplorer).props('open')).toBe(false)
+    expect(open).not.toHaveBeenCalled()
   })
 
-  it('auto + 远端访问（局域网 / 远端桌面）：走内置文件管理器，完全不请求直开', async () => {
+  it('auto + 远端访问（局域网 / 远端桌面）：新标签打开整页，完全不请求直开', async () => {
     vi.stubGlobal('location', { hostname: '192.168.1.20' })
+    const open = stubOpen()
     const wrapper = await mountPanel('auto')
 
     await clickOpen(wrapper)
 
     expect(openFolder).not.toHaveBeenCalled()
-    expect(wrapper.findComponent(WorkspaceExplorer).props('open')).toBe(true)
+    expect(open).toHaveBeenCalledWith('/workspaces/7/files', 'zerocode-files-7')
   })
 
-  it('直开失败：降级打开内置文件管理器并说明原因', async () => {
+  it('直开失败：降级新标签打开整页并说明原因', async () => {
     vi.stubGlobal('location', { hostname: 'localhost' })
+    const open = stubOpen()
     openFolder.mockRejectedValue({ response: { data: { detail: '打开文件夹失败：找不到 xdg-open' } } })
     const wrapper = await mountPanel('auto')
 
     await clickOpen(wrapper)
 
-    expect(wrapper.findComponent(WorkspaceExplorer).props('open')).toBe(true)
+    expect(open).toHaveBeenCalledWith('/workspaces/7/files', 'zerocode-files-7')
     expect(message.info).toHaveBeenCalled()
   })
 
-  it('系统参数强制 web：本机访问也用内置文件管理器', async () => {
+  it('系统参数强制 web：本机访问也用内置文件管理器整页', async () => {
     vi.stubGlobal('location', { hostname: 'localhost' })
+    const open = stubOpen()
     const wrapper = await mountPanel('web')
 
     await clickOpen(wrapper)
 
     expect(openFolder).not.toHaveBeenCalled()
-    expect(wrapper.findComponent(WorkspaceExplorer).props('open')).toBe(true)
+    expect(open).toHaveBeenCalledWith('/workspaces/7/files', 'zerocode-files-7')
   })
 
   it('系统参数强制 system：远端访问也照请求直开（人工覆盖优先于地址判定）', async () => {
@@ -145,15 +157,37 @@ describe('FilePanel 打开文件夹入口', () => {
     expect(openFolder).toHaveBeenCalledWith(7)
   })
 
-  it('切换工作区时关掉内置文件管理器（别让新工作区接着显示旧目录）', async () => {
+  it('边界：地址带上工作区名，整页顶栏不必再请求一次才知道标题', async () => {
     vi.stubGlobal('location', { hostname: '192.168.1.20' })
+    const open = stubOpen()
     const wrapper = await mountPanel('auto')
+    useChatStore().workspaces = [{ id: 7, name: '订单台账' }]
+
     await clickOpen(wrapper)
-    expect(wrapper.findComponent(WorkspaceExplorer).props('open')).toBe(true)
 
-    await wrapper.setProps({ workspaceId: 8 })
-    await flushPromises()
+    const url = open.mock.calls[0][0]
+    expect(url.startsWith('/workspaces/7/files?name=')).toBe(true)
+    expect(decodeURIComponent(url.split('?name=')[1])).toBe('订单台账')
+  })
 
-    expect(wrapper.findComponent(WorkspaceExplorer).props('open')).toBe(false)
+  it('边界：新标签被浏览器拦截（open 返回 null）时给出可操作的提示，不静默失败', async () => {
+    vi.stubGlobal('location', { hostname: '192.168.1.20' })
+    stubOpen(null)
+    const wrapper = await mountPanel('auto')
+
+    await clickOpen(wrapper)
+
+    expect(message.warning).toHaveBeenCalled()
+  })
+
+  it('边界：没加载到工作区名时地址是干净的，不带 ?name=', async () => {
+    vi.stubGlobal('location', { hostname: '192.168.1.20' })
+    const open = stubOpen()
+    const wrapper = await mountPanel('auto')
+
+    await clickOpen(wrapper)
+
+    expect(open.mock.calls[0][0]).toBe('/workspaces/7/files')
+    expect(message.warning).not.toHaveBeenCalled()
   })
 })

@@ -21,8 +21,7 @@ import PublishModal from '../components/PublishModal.vue'
 import { SMALL_STACKS, slugFromName, validateForm } from '../utils/appForm'
 import DeployLogPanel from '../components/DeployLogPanel.vue'
 import BackButton from '../components/BackButton.vue'
-import WorkspaceExplorer from '../components/WorkspaceExplorer.vue'
-import { resolveOpenFolderMode } from '../utils/openFolder'
+import { openWorkspaceFilesPage, resolveOpenFolderMode } from '../utils/openFolder'
 import { useConfigStore } from '../stores/config'
 
 const apps = ref([])
@@ -38,8 +37,6 @@ const rel = reactive({ open: false, app: null, title: '', summary: '' })
 const urlsCache = reactive({})
 const rename = reactive({ open: false, app: null, name: '' })
 const del = reactive({ open: false, app: null })
-// 内置文件管理器（远端访问 / 直开失败时的兜底），记哪个应用在用它
-const explorer = reactive({ open: false, app: null })
 const openingFolder = ref(false)
 const cfg = useConfigStore()
 const form = reactive({ name: '', slug: '', slugTouched: false, scale: 'small', stack: 'vue3-fastapi' })
@@ -199,22 +196,27 @@ async function doRename() {
 }
 
 // 打开工程目录：与右栏文件面板同一套判断——本机直开系统文件管理器，
-// 远端访问（服务端开窗用户看不见）或直开失败就当场降级到内置文件管理器。
+// 远端访问（服务端开窗用户看不见）或直开失败就当场降级到内置文件管理器整页。
+// 整页走新标签（与 DB 操作同一个口径）：卡片列表的展开态与滚动位置都不被打断。
+function openFilesPage(a) {
+  if (!openWorkspaceFilesPage(a.workspace_id, a.name)) {
+    message.warning('新标签没能打开（可能被浏览器拦截），请允许本站弹出窗口后重试')
+  }
+}
+
 async function openAppFolder(a) {
   if (openingFolder.value) return
   openingFolder.value = true
   try {
     await cfg.ensureLoaded()
     if (resolveOpenFolderMode(cfg.form.openFolderMode, window.location.hostname) === 'web') {
-      explorer.app = a
-      explorer.open = true
+      openFilesPage(a)
       return
     }
     await openFolder(a.workspace_id)
     message.success('已在系统文件管理器中打开工程目录')
   } catch (e) {
-    explorer.app = a
-    explorer.open = true
+    openFilesPage(a)
     message.info('无法直接打开文件夹，已改用内置文件管理器')
   } finally {
     openingFolder.value = false
@@ -258,7 +260,6 @@ function closeOverlays(appId) {
     logs.open = false
     logs.app = null
   }
-  if (explorer.open && explorer.app?.id === appId) explorer.open = false
 }
 
 // ---------- M2 发布接线 ----------
@@ -535,9 +536,6 @@ async function doRelease() {
         也保留；如需彻底清理，请自行删除目录与库。
       </p>
     </a-modal>
-
-    <workspace-explorer v-if="explorer.app" v-model:open="explorer.open"
-                        :workspace-id="explorer.app.workspace_id" :workspace-name="explorer.app.name" />
   </div>
 </template>
 
