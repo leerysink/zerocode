@@ -10,7 +10,8 @@ import pytest
 from app.skills.generator import (GENERATE_TIMEOUT_S, PROMPT_MAX, SKILL_SYSTEM_PROMPT,
                                   generate_skill_draft, unwrap_fences)
 
-pytestmark = pytest.mark.asyncio
+# 不挂模块级 pytestmark：asyncio_mode=auto（pytest.ini）已自动接管 async 用例，
+# 而本文件的 unwrap_fences / 常量等同步用例挂着该标记会各刷一条 PytestWarning（同 test_nics.py）。
 
 
 class FakeLLM:

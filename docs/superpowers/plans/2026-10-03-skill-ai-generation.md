@@ -2033,22 +2033,28 @@ git commit -m "feat(skills): AI 生成两态卡片 + 组件测试 + spec 一致�
 
 **Files:** 无新增
 
-- [ ] **Step 1: 全量 pytest**
+- [x] **Step 1: 全量 pytest**
 
 Run: `python -m pytest tests/ -q`
 Expected: PASS（全绿，含既有回归护栏）
+实际：`719 passed, 7 warnings in 515.72s`。7 条 warning 是既有的 asyncio 标记噪音；本次顺手删掉
+`tests/test_skills_generator.py` 里冗余的 `pytestmark = pytest.mark.asyncio`（pytest-asyncio 已配 auto 模式，
+重复标记反而报 PytestUnknownMarkWarning），并以 `-W error::pytest.PytestWarning` 复跑本特性两文件：
+`58 passed in 41.70s`（零 warning）。
 
-- [ ] **Step 2: 全量 vitest**
+- [x] **Step 2: 全量 vitest**
 
 Run: `npx vitest run`
 Expected: PASS（含 `skillSource.test.js` + `SkillsView.test.js`）
+实际：`Test Files 41 passed (41)` / `Tests 630 passed (630)`，Duration 31.95s。
 
-- [ ] **Step 3: 前端 build**
+- [x] **Step 3: 前端 build**
 
 Run: `npm run build`
 Expected: 无报错
+实际：`✓ built in 1.20s`，仅既有的 chunk > 500kB 体积提示（非本次引入）。
 
-- [ ] **Step 4: 浏览器冒烟六步**
+- [x] **Step 4: 浏览器冒烟六步**
 
 1. 打开技能页 → 看到「从链接安装」+ 「用 AI 生成」两张卡片
 2. 输入描述 → 点生成 → 草稿态出现（warnings 标黄、摘要行、编辑区可改）
@@ -2057,49 +2063,91 @@ Expected: 无报错
 5. 点取消 → 回输入态 → 描述文本保留
 6. 打开 Agent 对话 → 确认新生成的技能出现在可用清单中
 
-- [ ] **Step 5: 边界覆盖声明**
+实际：六步全部走完，**23/23 断言通过，无 console error / 无未捕获异常**。不靠肉眼点，改用
+`.qoder-tmp/_t9_browser_smoke.py`（CDP 直连本机 headless Chrome，交互全走 `Input` 域真实键鼠），
+截图 8 张落 `.qoder-tmp/_t9_shots/`（step1_cards / step2_draft / step3_toast / step4a_confirm /
+step4b_regenerated / step5_cancel_kept_prompt / step6_agent_reply / step7_final_list）。
+第六步的判据不依赖界面：桩模型把 Agent 请求的 messages 落盘，读回 system prompt 断言含
+`meeting-minutes-ui` 及其 description 与 skill 目录（2143 字符，已 dump 到 `_t9_agent_system_prompt.txt`）。
 
-按 `boundary-testing.md` 收尾自检：
+- [x] **Step 5: 边界覆盖声明**
 
-**已覆盖**（后端 14 条边界 → 测试名逐条对应）：
-1. generate 无副作用 → `test_generate_returns_draft_with_zero_side_effect`
-2. prompt 空/恰 4000/4001 → `test_generate_rejects_blank_prompt_as_400` / `_at_4000_` / `_at_4001_`
-3. 围栏+BOM → `test_generate_unwraps_fenced_model_output` + `test_adopt_strips_fences_from_pasted_content`
-4. 空返回 → `test_generate_empty_model_output_is_502`
-5. 不规范草稿 → `test_generate_malformed_draft_returns_200_with_warnings` + `_missing_frontmatter_` + `_unclosed_` + `_missing_required_field_`
-6. 上游异常/超时 → `test_generate_upstream_exception_is_502` + `_timeout_`
-7. 无模型 → `test_generate_without_any_model_is_400`
-8. 中文 name → `test_adopt_chinese_name_warns_and_uses_skill_slug`
-9. 同名连装 → `test_adopt_same_name_three_times_gets_unique_slugs`
-10. 超 1MB / 超 200 字符 → `test_adopt_oversize_content_is_400` + `_name_at_exactly_200_` + `_name_over_200_`
+按 `boundary-testing.md` 收尾自检（测试名已逐个回源核对到文件，不是臆写）：
+
+**已覆盖**（后端 14 组边界 → 测试名逐条对应）：
+1. generate 无副作用（只看草稿不写库）→ `test_generate_returns_draft_with_zero_side_effect`
+2. prompt 空 / 恰 4000 / 4001 → `test_generate_rejects_blank_prompt_as_400` /
+   `test_generate_prompt_at_4000_chars_is_accepted` / `test_generate_prompt_at_4001_chars_is_rejected`
+3. 围栏 + BOM + 内层代码块→ `test_generate_unwraps_fenced_model_output` +
+   `test_adopt_strips_fences_from_pasted_content` + generator 的
+   `test_unwrap_fences_strips_bom_and_blank_lines` / `_keeps_inner_code_block` / `_on_clean_text_is_noop` /
+   `_handles_empty_and_none`
+4. 模型空返回 / 纯空白 → `test_generate_empty_model_output_is_502` +
+   `test_generate_whitespace_only_model_output_is_502` +
+   `test_generate_on_empty_model_output_yields_warning_not_crash`
+5. 不规范草稿生成端只警告不拦截（200+warnings）→
+   `test_generate_malformed_draft_returns_200_with_warnings` + `test_generate_warns_when_frontmatter_missing` /
+   `_when_description_missing` / `_when_frontmatter_unclosed` / `_on_chinese_name_but_keeps_it` /
+   `_on_mixed_ascii_cjk_name`
+6. 上游异常 / 超时 → `test_generate_upstream_exception_is_502_with_reason` +
+   `test_generate_upstream_timeout_is_502`（API 层）+ `test_generate_propagates_upstream_error` +
+   `test_generate_timeout_propagates`（纯逻辑层）
+7. 无任何模型配置 → `test_generate_without_any_model_is_400`
+8. 中文 name 降为 slug → `test_adopt_chinese_name_warns_and_uses_skill_slug`
+9. 同名连装三次 → `test_adopt_same_name_three_times_gets_unique_slugs`
+10. 超 1MB / name 恰 200 / 201 → `test_adopt_oversize_content_is_400` +
+    `test_adopt_name_at_exactly_200_chars_is_accepted` + `test_adopt_name_over_200_chars_is_400` +
+    `test_persist_skill_rejects_overlong_name_as_400` / `_accepts_name_at_exactly_max`
 11. 未登录 → `test_generate_requires_login` + `test_adopt_requires_login`
 12. 跨账号隔离 → `test_adopt_cross_account_isolation`
-13. 唯一约束冲突 → `test_adopt_slug_collision_is_409_with_orphan_cleanup`
-14. 前端失败回退 → `SkillsView.test.js` 的「生成失败 → 回输入态」
+13. 唯一约束冲突 409 + 孤儿目录回收 → `test_adopt_slug_collision_is_409_with_orphan_cleanup`
+14. 前端失败回退/防重入 → `SkillsView.test.js` 的「生成失败 → 回输入态 + message.error 显示 detail」
+    /「生成在飞时连点两次只发一次请求」/「安装撞 409 → 草稿态保留」/「空描述（含纯空格）不发请求」
 
-**未覆盖**：
-- 浏览器冒烟六步（手工验证，不写自动化）。
-- 前端 `draftDirty` 的 `Modal.confirm` 取消分支（桩件下 `onOk` 不触发，仅验证 confirm 被调用）。
+另有两组不属上面 14 条但同一轮补齐的：**安装端硬拦**（spec 的另一半）
+`test_adopt_rejects_blank_content_as_400` / `test_adopt_missing_frontmatter_is_400` /
+`test_adopt_unclosed_frontmatter_is_400` / `test_adopt_missing_required_field_is_400`；
+**数据形状与列语义** `test_migration_adds_nullable_generation_prompt_column` /
+`test_name_max_is_single_source_of_truth` / `test_adopt_prompt_stored_raw_and_blank_stored_as_null` /
+`test_adopt_ignores_client_supplied_name_and_source` / `test_adopt_round_trip_with_prompt_preserved` /
+`test_constants_are_pinned`；前端的 `skillSource.test.js` 九条（空串/null/undefined/前后空格/非字符串/原型链属性）。
 
-- [ ] **Step 6: 最终提交**
+**未覆盖**（说清原因，不含糊）：
+- 真实模型（非桩）下的输出质量、长回复中途断流：本地无可用凭证，桩已覆盖 SSE 协议形状（分片/finish/done）。
+- 多用户并发写同一 slug 的竞态：单次 409 + 孤儿清理已测，真并发需多进程环境；当前有 DB 唯一约束兼底。
+- `draftDirty` 的 `Modal.confirm` 「继续编辑」分支：单测只验到 confirm 被调用（桩件下 onOk 不触发）；
+  「确认」分支已由浏览器冒烟 Step 4 实测（手改内容被覆盖），「继续编辑」分支仍靠人工。
+
+- [x] **Step 6: 最终提交**
 
 ```bash
 git add -A
 git commit -m "chore(skills): AI 生成通道全量门禁通过"
 ```
 
+### 实施订正（计划写的与实际不一致处，以实际为准）
+
+1. 技能表格空态文案是「**还没有技能**」（项目自定空态），不是 ant 默认的「暂无数据」；冒断言按前者。
+2. ant-design-vue 的按钮会在两个中文字间插空格，`innerText` 实为「安 装」「取 消」；文本定位必须先去空白再匹配。
+3. `resetDraft()` 故意不清 `prompt`（取消后保留描述是需求），因此连续两次生成必须先选中原内容再键入，否则断言会拿到拼接串。
+4. 环境事实：dev Vite 只监听 IPv6 `::1`，只能用 `http://localhost:8082` 访问（`127.0.0.1` 直接拒连）。
+5. 浏览器可用的前提：冒烟账号必须自己有一行 `model_config`（`is_default` + `owner_user_id`），
+   否则 `/generate` 按设计返回 400「未配置模型」——这是边界 7 的兜底行为，不是 bug，故修环境而不是改代码。
+6. 第六步无法在界面内直接看到技能：技能只注入进 system prompt（ADR-0004 目录对 Agent 只读），
+   所以凭证是桩模型落盘的 messages，而非截图里的一行字。
+
 ---
 
 ## 自审清单
 
-- [ ] **Spec §7 十四条逐条对到测试名**：见 Step 5 覆盖声明。
-- [ ] **占位符扫描**：全文无 TBD / TODO / "implement later" / "add appropriate error handling"。
-- [ ] **跨 Task 签名一致性**：
+- [x] **Spec §7 十四条逐条对到测试名**：见 Step 5 覆盖声明（已回源核对，并补齐了计划初稿里的缩写名）。
+- [x] **占位符扫描**：全文无 TBD / TODO / "implement later" / "add appropriate error handling"。
+- [x] **跨 Task 签名一致性**：
   - `_persist_skill(request, uid, payload, *, generation_prompt)` — Task 3 定义、Task 5/6 调用，签名一致。
   - `generator.unwrap_fences` — Task 4 定义、Task 5/6 调用、spec 第 105 行已同步。
   - `generator.build_llm(model_cfg)` — Task 4 定义、Task 5 调用。
   - `AI_SOURCE_URL = "ai://generated"` — Task 6 定义、测试用 `sapi.AI_SOURCE_URL` 引用。
   - `skillSourceLabel(sourceType)` — Task 7 定义、Task 8 调用。
   - `generateSkill(data)` / `adoptSkill(data)` — Task 7 定义、Task 8 调用。
-- [ ] **文件结构补全**：Part 1 文件结构缺 `Create frontend/src/views/SkillsView.test.js`，本 Task 8 已补。
+- [x] **文件结构补全**：Part 1 文件结构缺 `Create frontend/src/views/SkillsView.test.js`，本 Task 8 已补。
 
