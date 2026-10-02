@@ -198,7 +198,9 @@ await _persist_skill(request, uid, payload, generation_prompt=body.prompt)
   - 安装成功：复用 `finishInstall` 的 toast + `load()`，回输入态，保留描述、清草稿。
 - 新增 `frontend/src/utils/skillSource.js` 纯函数：`url→直链`、`github→GitHub`、
   `ai→AI 生成`，未知值原样显示，空/null 显示 `-`。「来源」列经它渲染。
-- 组件正确性按项目惯例走浏览器冒烟，vitest 只测纯函数。
+- 组件正确性：新增 `frontend/src/views/SkillsView.test.js`（vitest + happy-dom + 自写 STUBS，
+  对齐 `AppsView.test.js` / `StoreView.test.js` 既有惯例）钉两态卡片的状态迁移与请求参数；
+  浏览器冒烟仍保留，负责真 Antd 渲染与端到端观感。
 
 ## 6. 方案取舍（被拒的两条）
 
@@ -236,13 +238,18 @@ await _persist_skill(request, uid, payload, generation_prompt=body.prompt)
 | 11 | 未登录访问 generate / adopt | 全局 guard 401（不新造鉴权分支） |
 | 12 | 跨账号：A 生成 B 看不到 | 列表不含；PATCH/DELETE 404（沿用既有语义） |
 | 13 | adopt 撞 `(owner,slug)` 唯一约束 | 409 且孤儿目录被 `rmtree`（专盯 `_persist_skill` 抽取有无漏带清理） |
-| 14 | 生成失败后前端状态 | 回输入态、草稿区不残留半截内容（归浏览器冒烟，不强求 vitest） |
+| 14 | 生成失败后前端状态 | 回输入态、草稿区不残留半截内容（`SkillsView.test.js` 覆盖：有 detail 透出、无 detail 走兜底文案） |
 
 **回归护栏**（抽取改动的代价必须还）：`tests/test_skills_api.py`、
 `tests/test_skills_installer*.py`、`tests/test_model_resolver.py`、
 `tests/test_isolation_config_models.py`、`tests/test_config.py` 全量绿。
 
-**前端 vitest**：`skillSource.js`（`url`/`github`/`ai`/未知值/空串/null）。
+**前端 vitest**：
+- `utils/skillSource.test.js`：`url`/`github`/`ai`/未知值/空串/null/非字符串入参/前后空格/原型链属性名。
+- `views/SkillsView.test.js`：输入态与草稿态的存在性、空描述与纯空格不发请求、
+  `generating`/`adopting` 防重入、warnings 空数组不渲染 alert、安装成功回输入态并重拉列表、
+  409 与非 409 两条错误分支、取消保留描述、生成失败回输入态、`regen` 的脏草稿弹确认/干净草稿直接再生成、
+  「来源」列走标签函数。
 
 **"完成"** = 新增测试全绿 + 现有全量测试全绿 + 浏览器冒烟（生成一个真技能 → 编辑 →
 安装 → 列表显示「AI 生成」→ 开来说话确认 Agent 能读到 → 确认工作区文件树无技能文件）。

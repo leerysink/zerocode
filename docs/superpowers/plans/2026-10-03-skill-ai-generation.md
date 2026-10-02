@@ -60,7 +60,7 @@
   - `app.skills.library.NAME_MAX: int = 200`
   - `tests/test_skills_ai_api.py` 的 `_skills_data_dir` autouse fixture（把技能母本落 tmp）
 
-- [ ] **Step 1: 写迁移文件**
+- [x] **Step 1: 写迁移文件**
 
 创建 `changelog/V20261003_01_user_skill_ai.sql`：
 
@@ -76,7 +76,7 @@
 ALTER TABLE user_skill ADD COLUMN IF NOT EXISTS generation_prompt TEXT;
 ```
 
-- [ ] **Step 2: 写第一个失败测试（列存在性 + 可空）**
+- [x] **Step 2: 写第一个失败测试（列存在性 + 可空）**
 
 创建 `tests/test_skills_ai_api.py`：
 
@@ -113,12 +113,12 @@ async def test_migration_adds_nullable_generation_prompt_column(client):
     assert row[1] == "YES"
 ```
 
-- [ ] **Step 3: 跑测试确认失败**
+- [x] **Step 3: 跑测试确认失败**
 
 Run: `python -m pytest tests/test_skills_ai_api.py::test_migration_adds_nullable_generation_prompt_column -v`
 Expected: FAIL — `AssertionError: user_skill.generation_prompt 列不存在（迁移未应用）`
 
-- [ ] **Step 4: 确认迁移被自动应用后测试转绿**
+- [x] **Step 4: 确认迁移被自动应用后测试转绿**
 
 `run_migrations` 在 `test_engine` fixture 里对整个 `changelog/` 目录扫描应用，新增文件无需登记。
 
@@ -127,7 +127,7 @@ Expected: PASS（1 passed）
 
 若仍 FAIL 且报列不存在：检查文件名是否匹配 `V<8位日期>_<2位序号>_<主题>.sql`（`app/db.py::run_migrations` 按此排序），序号 `01` 是 2026-10-03 当天第一份。
 
-- [ ] **Step 5: 给 library 加 `NAME_MAX`，installer 改引它**
+- [x] **Step 5: 给 library 加 `NAME_MAX`，installer 改引它**
 
 `app/skills/library.py` 常量区（`SLUG_MAX_LEN` 那行之后）追加一行：
 
@@ -151,7 +151,7 @@ _NAME_MAX = NAME_MAX   # 单一真源：library.NAME_MAX（AI 生成通道在落
 
 `installer.py` 里两处 `if len(name) > _NAME_MAX:` 的用法与文案**一字不改**（`f"技能 name 超过 {_NAME_MAX} 字符上限"`）。
 
-- [ ] **Step 6: 写 installer 常量收敛的边界测试**
+- [x] **Step 6: 写 installer 常量收敛的边界测试**
 
 在 `tests/test_skills_ai_api.py` 末尾追加：
 
@@ -164,14 +164,14 @@ async def test_name_max_is_single_source_of_truth():
     assert installer._NAME_MAX is NAME_MAX
 ```
 
-- [ ] **Step 7: 跑 installer 回归护栏**
+- [x] **Step 7: 跑 installer 回归护栏**
 
 Run: `python -m pytest tests/test_skills_ai_api.py tests/test_skills_installer.py tests/test_skills_installer_github.py tests/test_skills_api.py -q`
 Expected: PASS（全绿；`_NAME_MAX` 改引常量后超长 name 的既有 400 用例仍过）
 
 若报 `ModuleNotFoundError: tests/test_skills_installer_github.py`：用 `Glob tests/test_skills_installer*.py` 取实际文件名再跑。
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 先把中文提交信息写进临时文件（PowerShell 控制台是 GBK，`git commit -m "中文"` 会乱码）：
 
@@ -207,12 +207,12 @@ git commit -F .qoder-tmp/_commit_skill_ai_t1.txt
     —— `s` 是**已打开的** AsyncSession（不是 session_factory），由调用方持有事务边界
   - `async resolve_model(sf, session_id: int, cfg: dict) -> dict`（签名与返回形状**完全不变**）
 
-- [ ] **Step 1: 先跑既有回归护栏，确认基线绿**
+- [x] **Step 1: 先跑既有回归护栏，确认基线绿**
 
 Run: `python -m pytest tests/test_model_resolver.py tests/test_isolation_config_models.py -q`
 Expected: PASS（重构前必须有绿基线，否则分不清是自己改坏还是本来就坏）
 
-- [ ] **Step 2: 重写 `app/agent/model_resolver.py`**
+- [x] **Step 2: 重写 `app/agent/model_resolver.py`**
 
 整文件替换为：
 
@@ -259,12 +259,12 @@ async def resolve_model(sf, session_id: int, cfg: dict) -> dict:
         return await resolve_model_for_user(s, uid, cfg)
 ```
 
-- [ ] **Step 3: 跑回归护栏确认重构零行为变化**
+- [x] **Step 3: 跑回归护栏确认重构零行为变化**
 
 Run: `python -m pytest tests/test_model_resolver.py tests/test_isolation_config_models.py -q`
 Expected: PASS（与 Step 1 同样的绿）
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 `.qoder-tmp/_commit_skill_ai_t2.txt`：
 
@@ -297,12 +297,12 @@ git commit -F .qoder-tmp/_commit_skill_ai_t2.txt
     —— `payload` 形状：`{"name": str, "description": str, "files": dict[str, bytes], "source_url": str, "subpath": str|None, "source_type": str}`；返回技能行 dict（含 `generation_prompt`）
   - `_COLUMNS` 新增 `generation_prompt`（`GET /api/skills` 与 `PATCH /api/skills/{id}` 的响应形状各多一个可空字段）
 
-- [ ] **Step 1: 跑既有回归护栏取绿基线**
+- [x] **Step 1: 跑既有回归护栏取绿基线**
 
 Run: `python -m pytest tests/test_skills_api.py -q`
 Expected: PASS
 
-- [ ] **Step 2: `_COLUMNS` 加列**
+- [x] **Step 2: `_COLUMNS` 加列**
 
 `app/api/skills.py` 第 22~23 行替换为：
 
@@ -311,7 +311,7 @@ _COLUMNS = ("id, slug, name, description, source_type, source_url, "
             "subpath, skill_dir, generation_prompt, enabled, created_at, updated_at")
 ```
 
-- [ ] **Step 3: import 补 `NAME_MAX` 与 `library`**
+- [x] **Step 3: import 补 `NAME_MAX` 与 `library`**
 
 `app/api/skills.py` 第 15~17 行替换为：
 
@@ -329,7 +329,7 @@ from app.skills.library import (NAME_MAX, SkillError, delete_skill_dir, next_fre
                                 parse_skill_md, slugify, write_skill_dir)
 ```
 
-- [ ] **Step 4: 抽出 `_persist_skill`，`install()` 尾部改调它**
+- [x] **Step 4: 抽出 `_persist_skill`，`install()` 尾部改调它**
 
 把 `app/api/skills.py` 中从 `    # 逐用户解析空闲 slug（读与写分两个会话，避免磁盘 IO 期间挂着连接）`
 （原第 67 行）到 `    return dict(row)`（原第 95 行）整段替换为一行：
@@ -386,12 +386,12 @@ async def _persist_skill(request: Request, uid, payload: dict, *,
     return dict(row)
 ```
 
-- [ ] **Step 5: 跑回归护栏确认 install 行为零变化**
+- [x] **Step 5: 跑回归护栏确认 install 行为零变化**
 
 Run: `python -m pytest tests/test_skills_api.py tests/test_skills_installer.py -q`
 Expected: PASS（含 409 冲突清孤儿、slug 后缀、磁盘母本字节一致等既有用例）
 
-- [ ] **Step 6: 补「抽取没漏掉清理」的边界测试**
+- [x] **Step 6: 补「抽取没漏掉清理」的边界测试**
 
 `tests/test_skills_ai_api.py` 末尾追加（这条测的是 install 通道，但守的是 `_persist_skill` 抽取本身）：
 
@@ -424,7 +424,7 @@ def _payload_with_name(name: str) -> dict:
 Run: `python -m pytest tests/test_skills_ai_api.py -q`
 Expected: PASS
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 `.qoder-tmp/_commit_skill_ai_t3.txt`：
 
@@ -464,7 +464,7 @@ git commit -F .qoder-tmp/_commit_skill_ai_t3.txt
     返回 `{"name": str, "description": str, "content": str, "warnings": list[str]}`；
     上游异常/超时**原样上抛**（端点映射 502），草稿不规范**不抛**（转 warnings）
 
-- [ ] **Step 1: 写失败测试（围栏剥离）**
+- [x] **Step 1: 写失败测试（围栏剥离）**
 
 创建 `tests/test_skills_generator.py`：
 
@@ -532,12 +532,12 @@ def test_unwrap_fences_handles_empty_and_none():
     assert unwrap_fences("   \n ") == ""
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `python -m pytest tests/test_skills_generator.py -q`
 Expected: FAIL — `ModuleNotFoundError: No module named 'app.skills.generator'`
 
-- [ ] **Step 3: 写 `app/skills/generator.py`**
+- [x] **Step 3: 写 `app/skills/generator.py`**
 
 ```python
 """技能 AI 生成：一句话描述 → SKILL.md 草稿（spec 2026-10-03-skill-ai-generation §5.3~§5.4）。
@@ -632,12 +632,12 @@ async def generate_skill_draft(llm, prompt: str, *,
             "content": content, "warnings": warnings}
 ```
 
-- [ ] **Step 4: 跑测试确认围栏组转绿**
+- [x] **Step 4: 跑测试确认围栏组转绿**
 
 Run: `python -m pytest tests/test_skills_generator.py -q`
 Expected: PASS（5 passed）
 
-- [ ] **Step 5: 补 warnings / 超时 / 提示词契约的边界测试**
+- [x] **Step 5: 补 warnings / 超时 / 提示词契约的边界测试**
 
 `tests/test_skills_generator.py` 末尾追加：
 
@@ -749,14 +749,14 @@ def test_constants_are_pinned():
         assert needle in SKILL_SYSTEM_PROMPT
 ```
 
-- [ ] **Step 6: 跑全量单测**
+- [x] **Step 6: 跑全量单测**
 
 Run: `python -m pytest tests/test_skills_generator.py -v`
 Expected: PASS（17 passed：围栏组 5 + 追加组 12）
 
 若 `test_generate_warns_when_description_missing` 报 warnings 内容不符：以 `library.parse_skill_md` 的**实际文案**为准（本计划里的期望值取自当前实现第 61 行），不要反过来改 library 的文案——既有 installer 测试断言过它。
 
-- [ ] **Step 7: 同步 spec 里的函数名**
+- [x] **Step 7: 同步 spec 里的函数名**
 
 `docs/specs/2026-10-03-skill-ai-generation.md` 第 105 行：
 
@@ -772,7 +772,7 @@ def unwrap_fences(raw: str) -> str             # 剥 ``` 围栏与 BOM/首尾空
 
 （提升为 public 的理由：adopt 要复用它兜住用户粘贴的围栏，私有名跨模块引用是坏味道。）
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 `.qoder-tmp/_commit_skill_ai_t4.txt`：
 
@@ -805,7 +805,7 @@ git commit -F .qoder-tmp/_commit_skill_ai_t4.txt
   - `class GenerateIn(BaseModel): prompt: str`
   - `POST /api/skills/generate` → 200 `{name, description, content, warnings}`
 
-- [ ] **Step 1: 写失败测试（主流程 + 零副作用）**
+- [x] **Step 1: 写失败测试（主流程 + 零副作用）**
 
 `tests/test_skills_ai_api.py` 顶部 import 区补：
 
@@ -899,12 +899,12 @@ async def test_generate_uses_account_default_model(client, fake_llm):
                                     "api_key": "", "model": "deepseek-chat"}]
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `python -m pytest tests/test_skills_ai_api.py -q`
 Expected: FAIL — 两条新用例 404（`{"detail":"Not Found"}`）
 
-- [ ] **Step 3: 实现端点**
+- [x] **Step 3: 实现端点**
 
 `app/api/skills.py` import 区改成（把 Task 3 Step 3 的版本补上 `generator` 与解析依赖）：
 
@@ -972,12 +972,12 @@ async def generate(request: Request, body: GenerateIn):
     return draft
 ```
 
-- [ ] **Step 4: 跑测试确认转绿**
+- [x] **Step 4: 跑测试确认转绿**
 
 Run: `python -m pytest tests/test_skills_ai_api.py -q`
 Expected: PASS
 
-- [ ] **Step 5: 补输入类与上游故障的边界测试**
+- [x] **Step 5: 补输入类与上游故障的边界测试**
 
 `tests/test_skills_ai_api.py` 末尾追加：
 
@@ -1087,7 +1087,7 @@ async def test_generate_requires_login(anon_client):
                                    json={"prompt": "p"})).status_code == 401
 ```
 
-- [ ] **Step 6: 跑全量并检查**
+- [x] **Step 6: 跑全量并检查**
 
 Run: `python -m pytest tests/test_skills_ai_api.py tests/test_skills_generator.py -v`
 Expected: PASS（全部绿）
@@ -1095,7 +1095,7 @@ Expected: PASS（全部绿）
 Run: `python -m pytest tests/test_config.py tests/test_model_resolver.py -q`
 Expected: PASS（新 import 没碰坏配置面）
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 `.qoder-tmp/_commit_skill_ai_t5.txt`：
 
@@ -1130,7 +1130,7 @@ git commit -F .qoder-tmp/_commit_skill_ai_t5.txt
   - `class AdoptIn(BaseModel): content: str; prompt: str | None = None`
   - `POST /api/skills/adopt` → 201 技能行（与 install 同形状）
 
-- [ ] **Step 1: 写失败测试（主流程 + 哨兵 + 不信任前端）**
+- [x] **Step 1: 写失败测试（主流程 + 哨兵 + 不信任前端）**
 
 `tests/test_skills_ai_api.py` 末尾追加：
 
@@ -1354,12 +1354,12 @@ async def test_adopt_prompt_stored_raw_and_blank_stored_as_null(client, fake_llm
     assert r3.json()["generation_prompt"] is None
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `python -m pytest tests/test_skills_ai_api.py -q`
 Expected: FAIL — 新用例 404（`{"detail":"Not Found"}`）
 
-- [ ] **Step 3: 实现 adopt 端点**
+- [x] **Step 3: 实现 adopt 端点**
 
 `app/api/skills.py` 在 `class GenerateIn` 之后加：
 
@@ -1403,17 +1403,17 @@ async def adopt(request: Request, body: AdoptIn):
 > 与 Step 1 的 `test_adopt_prompt_stored_raw_and_blank_stored_as_null`（断言 `"  周报  "` 原样保留）
 > 以及 spec §5.4 / §9「存描述原文」相互矛盾。以 spec 为准改实现：非空白存原文、纯空白归 NULL。
 
-- [ ] **Step 4: 跑测试确认转绿**
+- [x] **Step 4: 跑测试确认转绿**
 
 Run: `python -m pytest tests/test_skills_ai_api.py -v`
 Expected: PASS（全部绿）
 
-- [ ] **Step 5: 跑回归护栏**
+- [x] **Step 5: 跑回归护栏**
 
 Run: `python -m pytest tests/test_skills_api.py tests/test_skills_generator.py -q`
 Expected: PASS（抽取 `_persist_skill` 后 install 通道不退化）
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 `.qoder-tmp/_commit_skill_ai_t6.txt`：
 
@@ -1447,7 +1447,7 @@ git commit -F .qoder-tmp/_commit_skill_ai_t6.txt
 - Consumes: 无
 - Produces: `skillSourceLabel(sourceType: string) => string`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 创建 `frontend/src/utils/skillSource.test.js`：
 
@@ -1503,12 +1503,12 @@ describe('skillSourceLabel', () => {
 > 仓库惯例是纯函数走默认 node 环境，只有需要 DOM 的组件测试才挂 pragma。本文件是纯函数，按惯例去掉。
 > 另补 1 条非字符串入参边界，故预期为 9 passed 而非 8。
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `npx vitest run src/utils/skillSource.test.js`（在 `frontend/` 下执行）
 Expected: FAIL — `Cannot find module './skillSource'`
 
-- [ ] **Step 3: 写 `skillSource.js`**
+- [x] **Step 3: 写 `skillSource.js`**
 
 ```js
 // source_type → 中文短标签（spec §5.7）：url→直链、github→GitHub、ai→AI 生成。
@@ -1527,12 +1527,12 @@ export function skillSourceLabel(sourceType) {
 }
 ```
 
-- [ ] **Step 4: 跑测试确认转绿**
+- [x] **Step 4: 跑测试确认转绿**
 
 Run: `npx vitest run src/utils/skillSource.test.js`
 Expected: PASS（9 passed）
 
-- [ ] **Step 5: API 封装**
+- [x] **Step 5: API 封装**
 
 `frontend/src/api/index.js` 第 128 行后追加：
 
@@ -1541,7 +1541,7 @@ export const generateSkill = (data) => http.post('/skills/generate', data) // {p
 export const adoptSkill = (data) => http.post('/skills/adopt', data) // {content, prompt?}
 ```
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add frontend/src/utils/skillSource.js frontend/src/utils/skillSource.test.js frontend/src/api/index.js
@@ -1561,7 +1561,28 @@ git commit -m "feat(skills): skillSource 标签纯函数 + generateSkill/adoptSk
 - Consumes: `generateSkill` / `adoptSkill`（Task 7）、`skillSourceLabel`（Task 7）
 - Produces: 两态卡片（输入态 ↔ 草稿态）+ 「来源」列走标签函数
 
-- [ ] **Step 1: 修改 SkillsView.vue**
+> 实施订正（本 Task 落地时按仓库实测惯例调整，spec 已同步订正）：
+> 1. **`SkillsView.test.js` 用例数 10 → 16**：按 `boundary-testing.md`「边界优先」补齐 trim 边界（纯空格描述）、
+>    warnings 空数组不渲染 alert、`adopting` 防重入、409 与非 409 两条错误分支、无 detail 兜底文案、
+>    `regen` 的干净草稿分支。实测 `Test Files 1 passed / Tests 16 passed`。
+> 2. **`a-card` 桩必须声明 `props: ['title']` 并把 title 渲染成文本**：本卡片标题走属性写法
+>    `<a-card title="用 AI 生成">`，不声明 prop 的话 `text()` 取不到，`aiCard()` 会返回 undefined
+>    使全部用例崩在 `Cannot read properties of undefined`。
+> 3. **`a-textarea` 桩必须回抛 `update:value`**（照 `AppsView.test.js:203-205`）：否则 `v-model:value` 断链，
+>    `setValue` 后组件内 `prompt` 仍是空串，所有生成用例只会在 `message.warning` 分支打转。
+> 4. **`a-table` 桩每格加 `data-key`**：原计划的「来源」列断言 `expect(wrapper.text()).toContain('AI 生成')`
+>    会被卡片标题「用 AI 生成」蒙混通过；改为 `findAll('[data-key="source"]').map(c => c.text())` 精确等值比较。
+> 5. **不桩 antd 图标**：全库 `*.test.js` 0 处 `Outlined` 桩，真图标在 happy-dom 下渲染正常，
+>    原计划的 `RobotOutlined`/`ArrowLeftOutlined`/`DeleteOutlined` 三个桩删掉。
+> 6. **补 `vi.mock('vue-router', ...)`**（对齐 `StoreView.test.js:15`）：SkillsView 顶层 `useRouter()`，
+>    不桩会刷 `injection "Symbol(router)" not found` 告警。
+> 7. **409 文案改为用户视角**：原计划 `'slug 冲突，请重试（可修改 name 中的非 ASCII 字符）'`
+>    把内部术语 slug 暴露给用户，实装为 `'技能标识冲突，请修改正文里的 name 后重试'`；
+>    测试断言 `stringContaining('冲突')` 不受影响。
+> 8. **「来源」列渲染不会吃掉 `名称`/`描述` 列**：已核 `ant-design-vue/es/_util/vnode.js` 的
+>    `customRenderSlot` —— 插槽全是 Comment 节点时走 fallback 渲染原值，故未命中分支的列仍显原始字段。
+
+- [x] **Step 1: 修改 SkillsView.vue**
 
 `frontend/src/views/SkillsView.vue` 做以下改动：
 
@@ -1730,7 +1751,7 @@ function cancelDraft() {
 }
 ```
 
-- [ ] **Step 2: 写组件测试**
+- [x] **Step 2: 写组件测试**
 
 创建 `frontend/src/views/SkillsView.test.js`：
 
@@ -1956,12 +1977,12 @@ describe('SkillsView AI 生成卡片', () => {
 })
 ```
 
-- [ ] **Step 3: 跑 vitest 确认转绿**
+- [x] **Step 3: 跑 vitest 确认转绿**
 
 Run: `npx vitest run frontend/src/views/SkillsView.test.js`
 Expected: PASS（10 passed）
 
-- [ ] **Step 4: 订正 spec 三处一致性**
+- [x] **Step 4: 订正 spec 三处一致性**
 
 `docs/specs/2026-10-03-skill-ai-generation.md` 第 201 行：
 
@@ -1999,7 +2020,7 @@ Expected: PASS（10 passed）
 **前端 vitest**：`skillSource.js`（`url`/`github`/`ai`/未知值/空串/null）+ `SkillsView.test.js`（两态切换 / 防重入 / 失败回退 / 来源列渲染）。
 ```
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add frontend/src/views/SkillsView.vue frontend/src/views/SkillsView.test.js docs/specs/2026-10-03-skill-ai-generation.md
