@@ -3,6 +3,7 @@
 鉴权沿用全局 guard（/api/skills 非白名单即要求会话）；归属一律按 request.state.actor["id"]
 过滤，PATCH/DELETE 带 owner 条件、越权返 404（不区分 403，沿用登录项目裁定）。
 """
+import asyncio
 import logging
 import shutil
 
@@ -12,7 +13,9 @@ from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
-from app.skills import installer
+from app.agent.model_resolver import resolve_model_for_user
+from app.services import config_service
+from app.skills import generator, installer
 from app.skills.library import (NAME_MAX, SkillError, delete_skill_dir, next_free_slug,
                                 parse_skill_md, slugify, write_skill_dir)
 
@@ -30,6 +33,10 @@ class InstallIn(BaseModel):
 
 class PatchIn(BaseModel):
     enabled: bool
+
+
+class GenerateIn(BaseModel):
+    prompt: str
 
 
 async def _persist_skill(request: Request, uid, payload: dict, *,
@@ -110,6 +117,42 @@ async def install(request: Request, body: InstallIn):
         return JSONResponse(status_code=200, content={"candidates": payload["candidates"]})
 
     return await _persist_skill(request, uid, payload)
+
+
+@router.post("/generate")
+async def generate(request: Request, body: GenerateIn):
+    """用一句话描述让账户默认模型写一份 SKILL.md 草稿（spec §2）。
+
+    零副作用：不碰磁盘、不碰 DB——用户在草稿态关掉页面，技能库里什么都不会多出来。
+    错误按责任方分码：输入/未配模型 400，上游超时·异常·空返 502（可重试）。
+    """
+    uid = request.state.actor["id"]
+    prompt = (body.prompt or "").strip()
+    if not prompt:
+        raise HTTPException(400, "请描述你想要的技能")
+    if len(prompt) > generator.PROMPT_MAX:
+        raise HTTPException(400, f"描述超过 {generator.PROMPT_MAX} 字符上限")
+
+    async with request.app.state.session_factory() as s:
+        cfg = await config_service.get_all(s, owner_user_id=uid)
+        model_cfg = await resolve_model_for_user(s, uid, cfg)
+    if not model_cfg.get("base_url") or not model_cfg.get("model"):
+        # 全局种子恒存在，这里空只可能是用户自己把 llm.* 清了（spec §7 边界7）
+        raise HTTPException(400, "未配置模型，请先到设置页配置")
+
+    try:
+        # timeout 在这里显式传：默认参数在函数定义时就绑定好了，改
+        # generator.GENERATE_TIMEOUT_S 不重跑调用点不会生效（测试调小超时就依赖这点）。
+        draft = await generator.generate_skill_draft(
+            generator.build_llm(model_cfg), prompt, timeout=generator.GENERATE_TIMEOUT_S)
+    except asyncio.TimeoutError as e:
+        raise HTTPException(502, f"生成超时（{generator.GENERATE_TIMEOUT_S} 秒），请重试") from e
+    except Exception as e:
+        logger.warning("技能 AI 生成失败 uid=%s: %s", uid, e)
+        raise HTTPException(502, f"模型调用失败: {type(e).__name__}") from e
+    if not draft["content"].strip():
+        raise HTTPException(502, "模型返回了空内容，请重试")
+    return draft
 
 
 @router.patch("/{skill_id}")

@@ -752,7 +752,7 @@ def test_constants_are_pinned():
 - [ ] **Step 6: 跑全量单测**
 
 Run: `python -m pytest tests/test_skills_generator.py -v`
-Expected: PASS（18 passed）
+Expected: PASS（17 passed：围栏组 5 + 追加组 12）
 
 若 `test_generate_warns_when_description_missing` 报 warnings 内容不符：以 `library.parse_skill_md` 的**实际文案**为准（本计划里的期望值取自当前实现第 61 行），不要反过来改 library 的文案——既有 installer 测试断言过它。
 
@@ -958,7 +958,10 @@ async def generate(request: Request, body: GenerateIn):
         raise HTTPException(400, "未配置模型，请先到设置页配置")
 
     try:
-        draft = await generator.generate_skill_draft(generator.build_llm(model_cfg), prompt)
+        # timeout 在这里显式传：默认参数在函数定义时就绑定好了，改
+        # generator.GENERATE_TIMEOUT_S 不重跑调用点不会生效（测试调小超时就依赖这点）。
+        draft = await generator.generate_skill_draft(
+            generator.build_llm(model_cfg), prompt, timeout=generator.GENERATE_TIMEOUT_S)
     except asyncio.TimeoutError as e:
         raise HTTPException(502, f"生成超时（{generator.GENERATE_TIMEOUT_S} 秒），请重试") from e
     except Exception as e:
