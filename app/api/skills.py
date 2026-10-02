@@ -13,14 +13,14 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
 from app.skills import installer
-from app.skills.library import (SkillError, delete_skill_dir, next_free_slug,
-                                slugify, write_skill_dir)
+from app.skills.library import (NAME_MAX, SkillError, delete_skill_dir, next_free_slug,
+                                parse_skill_md, slugify, write_skill_dir)
 
 router = APIRouter(prefix="/api/skills")
 logger = logging.getLogger(__name__)
 
 _COLUMNS = ("id, slug, name, description, source_type, source_url, "
-            "subpath, skill_dir, enabled, created_at, updated_at")
+            "subpath, skill_dir, generation_prompt, enabled, created_at, updated_at")
 
 
 class InstallIn(BaseModel):
@@ -30,6 +30,51 @@ class InstallIn(BaseModel):
 
 class PatchIn(BaseModel):
     enabled: bool
+
+
+async def _persist_skill(request: Request, uid, payload: dict, *,
+                         generation_prompt: str | None = None) -> dict:
+    """母本落盘 + 技能行落库：install（远端取回）与 adopt（AI 草稿）两通道共用。
+
+    抽出来的理由：孤儿目录清理是 001~003 审查轮盯出来的（Blocker #1），并发撞
+    (owner, slug) 唯一约束的 409 + rmtree 语义必须只存在一处，复制一份最容易漏。
+
+    name 超 DDL 列宽在这里拦成 400：否则 asyncpg 抛 StringDataRightTruncation
+    （不是 IntegrityError），会走 except Exception 清完目录再原样上抛，冒成 500。
+    """
+    if len(payload["name"]) > NAME_MAX:
+        raise HTTPException(400, f"技能 name 超过 {NAME_MAX} 字符上限")
+
+    # 逐用户解析空闲 slug（读与写分两个会话，避免磁盘 IO 期间挂着连接）
+    async with request.app.state.session_factory() as s:
+        taken = {r[0] for r in (await s.execute(text(
+            "SELECT slug FROM user_skill WHERE owner_user_id=:u"), {"u": uid})).all()}
+    slug = next_free_slug(taken, slugify(payload["name"]))
+    try:
+        dest = write_skill_dir(uid, slug, payload["files"])
+    except SkillError as e:
+        raise HTTPException(400, str(e))
+
+    try:
+        async with request.app.state.session_factory() as s:
+            row = (await s.execute(text(
+                "INSERT INTO user_skill (owner_user_id, slug, name, description, "
+                "source_type, source_url, subpath, skill_dir, generation_prompt) "
+                "VALUES (:o,:sl,:n,:d,:st,:su,:sp,:sd,:gp) "
+                f"RETURNING {_COLUMNS}"),
+                {"o": uid, "sl": slug, "n": payload["name"], "d": payload["description"],
+                 "st": payload["source_type"], "su": payload["source_url"],
+                 "sp": payload["subpath"], "sd": str(dest),
+                 "gp": generation_prompt})).mappings().first()
+            await s.commit()
+    except IntegrityError:
+        shutil.rmtree(dest, ignore_errors=True)  # 撞唯一约束（并发竞态）→ 清半成品目录
+        raise HTTPException(409, "技能 slug 冲突，请重试")
+    except Exception:
+        # 长度已在前置守卫拦下，其余 DB 异常也不能留永久孤儿母本（审查 Blocker #1）
+        shutil.rmtree(dest, ignore_errors=True)
+        raise
+    return dict(row)
 
 
 @router.get("")
@@ -64,35 +109,7 @@ async def install(request: Request, body: InstallIn):
     if "candidates" in payload:
         return JSONResponse(status_code=200, content={"candidates": payload["candidates"]})
 
-    # 逐用户解析空闲 slug（读与写分两个会话，避免磁盘 IO 期间挂着连接）
-    async with request.app.state.session_factory() as s:
-        taken = {r[0] for r in (await s.execute(text(
-            "SELECT slug FROM user_skill WHERE owner_user_id=:u"), {"u": uid})).all()}
-    slug = next_free_slug(taken, slugify(payload["name"]))
-    try:
-        dest = write_skill_dir(uid, slug, payload["files"])
-    except SkillError as e:
-        raise HTTPException(400, str(e))
-
-    try:
-        async with request.app.state.session_factory() as s:
-            row = (await s.execute(text(
-                "INSERT INTO user_skill (owner_user_id, slug, name, description, "
-                "source_type, source_url, subpath, skill_dir) "
-                "VALUES (:o,:sl,:n,:d,:st,:su,:sp,:sd) "
-                f"RETURNING {_COLUMNS}"),
-                {"o": uid, "sl": slug, "n": payload["name"], "d": payload["description"],
-                 "st": payload["source_type"], "su": payload["source_url"],
-                 "sp": payload["subpath"], "sd": str(dest)})).mappings().first()
-            await s.commit()
-    except IntegrityError:
-        shutil.rmtree(dest, ignore_errors=True)  # 撞唯一约束（并发竞态）→ 清半成品目录
-        raise HTTPException(409, "技能 slug 冲突，请重试")
-    except Exception:
-        # 长度已在 installer 按 DDL 预校验，其余 DB 异常也不能留永久孤儿母本（审查 Blocker #1）
-        shutil.rmtree(dest, ignore_errors=True)
-        raise
-    return dict(row)
+    return await _persist_skill(request, uid, payload)
 
 
 @router.patch("/{skill_id}")
