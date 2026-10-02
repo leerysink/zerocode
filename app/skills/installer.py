@@ -20,14 +20,14 @@ from urllib.parse import quote, urljoin, urlparse
 import httpx
 
 from app.config import github_token
-from app.skills.library import (TOTAL_MAX_BYTES, FILE_COUNT_MAX, MAX_FILE_BYTES,
+from app.skills.library import (TOTAL_MAX_BYTES, FILE_COUNT_MAX, MAX_FILE_BYTES, NAME_MAX,
                                 SkillError, check_size_budget, parse_skill_md)
 
 # markdown 链接 ](...) 里的相对引用（排除绝对 URL、根路径、锚点）
 _LINK = re.compile(r"\]\(([^)\s]+)")
 
 _URL_MAX = 1000   # user_skill.source_url VARCHAR(1000)
-_NAME_MAX = 200   # user_skill.name VARCHAR(200)
+_NAME_MAX = NAME_MAX   # 单一真源：library.NAME_MAX（AI 生成通道在落库前也用它守卫）
 _MAX_REDIRECTS = 5
 _REF_ATTEMPTS_MAX = 200  # 直链引用尝试数硬上限：链接条数不得线性放大请求数（复审 M-2）
 _REDIR_STATUSES = {301, 302, 303, 307, 308}

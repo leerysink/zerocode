@@ -17,6 +17,7 @@ MAX_FILE_BYTES = 1024 * 1024  # 单文件 1MB（spec §3 故事3）
 TOTAL_MAX_BYTES = 10 * 1024 * 1024  # 单技能目录 10MB（spec §3 故事3，002 GitHub 通道）
 FILE_COUNT_MAX = 600                # 单技能目录文件数上限（同上）
 SLUG_MAX_LEN = 80             # slug 上限，给 next_free_slug 的 -N 后缀留空间（列宽 VARCHAR(200)）
+NAME_MAX = 200                # user_skill.name VARCHAR(200)：落库前的唯一真源，两通道共用（AI 生成 spec §5.5）
 
 
 class SkillError(Exception):
