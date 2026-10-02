@@ -1393,9 +1393,15 @@ async def adopt(request: Request, body: AdoptIn):
     payload = {"name": name, "description": description,
                "files": {"SKILL.md": content.encode("utf-8")},
                "source_url": AI_SOURCE_URL, "subpath": None, "source_type": "ai"}
-    return await _persist_skill(request, uid, payload,
-                                generation_prompt=(body.prompt or "").strip() or None)
+    # prompt 存描述**原文**不剔空白（spec §9：这一列的用途是回看当初那句原话）；
+    # 只有全空/纯空白归 NULL——空串会被读成「有描述但是空的」，与「没有描述」是两种状态。
+    raw_prompt = body.prompt if (body.prompt or "").strip() else None
+    return await _persist_skill(request, uid, payload, generation_prompt=raw_prompt)
 ```
+
+> 实施订正：本步原先写的是 `generation_prompt=(body.prompt or "").strip() or None`，
+> 与 Step 1 的 `test_adopt_prompt_stored_raw_and_blank_stored_as_null`（断言 `"  周报  "` 原样保留）
+> 以及 spec §5.4 / §9「存描述原文」相互矛盾。以 spec 为准改实现：非空白存原文、纯空白归 NULL。
 
 - [ ] **Step 4: 跑测试确认转绿**
 

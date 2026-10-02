@@ -259,3 +259,221 @@ async def test_generate_requires_login(anon_client):
     """边界11：全局 guard 兜住，端点不新造鉴权分支。"""
     assert (await anon_client.post("/api/skills/generate",
                                    json={"prompt": "p"})).status_code == 401
+
+
+# ---- Task 6: adopt 端点 ----
+
+async def test_adopt_main_flow_creates_skill_with_ai_source(client, fake_llm):
+    """主流程：generate → adopt → 列表可见 source_type='ai'、generation_prompt=描述原文。
+    母本 SKILL.md 字节级等于提交正文（不是 generate 返回的 content 的副本，是 adopt 正文）。"""
+    gen = await client.post("/api/skills/generate", json={"prompt": "帮我整理会议纪要"})
+    assert gen.status_code == 200
+    draft_content = gen.json()["content"]
+    r = await client.post("/api/skills/adopt", json={
+        "content": draft_content, "prompt": "帮我整理会议纪要"})
+    assert r.status_code == 201, r.text
+    sk = r.json()
+    assert sk["name"] == "meeting-minutes"
+    assert sk["source_type"] == "ai"
+    assert sk["source_url"] == "ai://generated"
+    assert sk["subpath"] is None
+    assert sk["generation_prompt"] == "帮我整理会议纪要"
+    # 母本字节级等于提交正文
+    md = Path(sk["skill_dir"]) / "SKILL.md"
+    assert md.read_bytes() == draft_content.strip().encode("utf-8")
+    # 列表可见
+    rows = await _skill_rows(client)
+    assert len(rows) == 1
+    assert rows[0]["source_type"] == "ai"
+    assert rows[0]["generation_prompt"] == "帮我整理会议纪要"
+
+
+async def test_adopt_round_trip_with_prompt_preserved(client, fake_llm):
+    """generate 返回体 + 前端原样回传 prompt：round-trip 不丢字段。"""
+    gen = await client.post("/api/skills/generate", json={"prompt": "周报整理"})
+    r = await client.post("/api/skills/adopt", json={
+        "content": gen.json()["content"], "prompt": "周报整理"})
+    assert r.status_code == 201
+    assert r.json()["generation_prompt"] == "周报整理"
+
+
+async def test_adopt_ignores_client_supplied_name_and_source(client, fake_llm):
+    """不信任前端：body 塞 name/description/source_type，行值仍从正文重新解析。
+    防止前端被篡改后可往 Agent 上下文注入脏 name。"""
+    gen = await client.post("/api/skills/generate", json={"prompt": "p"})
+    r = await client.post("/api/skills/adopt", json={
+        "content": gen.json()["content"],
+        "prompt": "p",
+        "name": "INJECTED-NAME",
+        "description": "INJECTED-DESC",
+        "source_type": "url"})
+    assert r.status_code == 201, r.text
+    sk = r.json()
+    assert sk["name"] == "meeting-minutes"   # 从正文解析，不是 INJECTED-NAME
+    assert sk["source_type"] == "ai"         # 硬编码，不取前端值
+
+
+async def test_adopt_strips_fences_from_pasted_content(client, fake_llm):
+    """用户可能把整段带围栏的草稿粘回来：unwrap_fences 剥完再解析。"""
+    fenced = "```markdown\n" + DRAFT_MD + "\n```"
+    r = await client.post("/api/skills/adopt", json={"content": fenced, "prompt": "p"})
+    assert r.status_code == 201, r.text
+    assert r.json()["name"] == "meeting-minutes"
+    # 母本不含围栏
+    sk = r.json()
+    md = Path(sk["skill_dir"]) / "SKILL.md"
+    assert b"```" not in md.read_bytes()
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\n\t", "```\n\n```"])
+async def test_adopt_rejects_blank_content_as_400(client, fake_llm, blank):
+    """边界：空正文/纯空白/剥完围栏后为空 → 400。"""
+    r = await client.post("/api/skills/adopt", json={"content": blank, "prompt": "p"})
+    assert r.status_code == 400, r.text
+
+
+async def test_adopt_missing_frontmatter_is_400(client, fake_llm):
+    """正文缺 frontmatter → 400 + 精确 detail（不是 500）。"""
+    r = await client.post("/api/skills/adopt", json={
+        "content": "# Just a heading\nSome body text", "prompt": "p"})
+    assert r.status_code == 400, r.text
+    assert "frontmatter" in r.text
+
+
+async def test_adopt_unclosed_frontmatter_is_400(client, fake_llm):
+    r = await client.post("/api/skills/adopt", json={
+        "content": "---\nname: x\ndescription: y\n# 正文", "prompt": "p"})
+    assert r.status_code == 400, r.text
+    assert "未闭合" in r.text
+
+
+@pytest.mark.parametrize("missing", ["name", "description"])
+async def test_adopt_missing_required_field_is_400(client, fake_llm, missing):
+    if missing == "name":
+        content = "---\ndescription: only desc\n---\nbody"
+    else:
+        content = "---\nname: only-name\n---\nbody"
+    r = await client.post("/api/skills/adopt", json={"content": content, "prompt": "p"})
+    assert r.status_code == 400, r.text
+    assert missing in r.text
+
+
+async def test_adopt_chinese_name_warns_and_uses_skill_slug(client, fake_llm):
+    """边界8：中文 name → adopt 后 slug 恰为 'skill'（slugify 退化）。"""
+    content = "---\nname: 会议纪要\ndescription: 整理会议纪要\n---\n正文"
+    r = await client.post("/api/skills/adopt", json={"content": content, "prompt": "p"})
+    assert r.status_code == 201, r.text
+    assert r.json()["slug"] == "skill"
+
+
+async def test_adopt_same_name_three_times_gets_unique_slugs(client, fake_llm):
+    """边界9：同名连装三次 → skill / skill-2 / skill-3 独立共存。"""
+    content = "---\nname: skill\ndescription: d\n---\nbody"
+    for _ in range(3):
+        r = await client.post("/api/skills/adopt", json={"content": content, "prompt": "p"})
+        assert r.status_code == 201, r.text
+    rows = await _skill_rows(client)
+    assert sorted(r["slug"] for r in rows) == ["skill", "skill-2", "skill-3"]
+    # Windows 下 read_text() 必须显式 encoding="utf-8"（默认 gbk 会抛）
+    from app.skills.library import skills_root
+    uid = await _uid(client)
+    for slug in ["skill", "skill-2", "skill-3"]:
+        md = skills_root(uid) / slug / "SKILL.md"
+        assert "name: skill" in md.read_text(encoding="utf-8")
+
+
+async def test_adopt_oversize_content_is_400(client, fake_llm):
+    """边界10：正文超 1MB → 400，且目录零残留。"""
+    header = "---\nname: big\ndescription: big skill\n---\n"
+    body = "x" * (1024 * 1024 + 1)
+    r = await client.post("/api/skills/adopt", json={"content": header + body, "prompt": "p"})
+    assert r.status_code == 400, r.text
+    assert "1MB" in r.text
+    from app.skills.library import skills_root
+    uid = await _uid(client)
+    root = skills_root(uid)
+    assert (not root.exists()) or list(root.glob("*")) == []
+
+
+async def test_adopt_name_at_exactly_200_chars_is_accepted(client, fake_llm):
+    """边界10：name 恰 200 字符 → 201。"""
+    content = f"---\nname: {'a' * 200}\ndescription: d\n---\nbody"
+    r = await client.post("/api/skills/adopt", json={"content": content, "prompt": "p"})
+    assert r.status_code == 201, r.text
+
+
+async def test_adopt_name_over_200_chars_is_400(client, fake_llm):
+    """边界10：name 超 200 → 400，detail 含 '200'，且目录零残留。"""
+    content = f"---\nname: {'a' * 201}\ndescription: d\n---\nbody"
+    r = await client.post("/api/skills/adopt", json={"content": content, "prompt": "p"})
+    assert r.status_code == 400, r.text
+    assert "200" in r.text
+    from app.skills.library import skills_root
+    uid = await _uid(client)
+    root = skills_root(uid)
+    assert (not root.exists()) or list(root.glob("*")) == []
+
+
+async def test_adopt_requires_login(anon_client):
+    """边界11：全局 guard 兜住。"""
+    assert (await anon_client.post("/api/skills/adopt",
+                                   json={"content": "x", "prompt": "p"})).status_code == 401
+
+
+async def test_adopt_cross_account_isolation(two_auth_clients):
+    """边界12：A 装的技能 B 看不到，PATCH/DELETE 404。"""
+    alice, bob = two_auth_clients
+    content = "---\nname: secret-skill\ndescription: d\n---\nbody"
+    r = await alice.post("/api/skills/adopt", json={"content": content, "prompt": "p"})
+    assert r.status_code == 201
+    skill_id = r.json()["id"]
+    # B 列表为空
+    bob_list = (await bob.get("/api/skills")).json()
+    assert bob_list == []
+    # B PATCH/DELETE 404
+    assert (await bob.patch(f"/api/skills/{skill_id}",
+                            json={"enabled": False})).status_code == 404
+    assert (await bob.delete(f"/api/skills/{skill_id}")).status_code == 404
+
+
+async def test_adopt_slug_collision_is_409_with_orphan_cleanup(client, fake_llm, monkeypatch):
+    """边界13：撞 (owner, slug) 唯一约束 → 409 且孤儿目录被清。
+    monkeypatch next_free_slug 返回固定值（禁用 -N 后缀），
+    预插一行幽灵行（skill_dir='' 绕开目录已存在分支）让 INSERT 撞唯一约束。"""
+    from app.api import skills as sapi
+    from app.skills.library import skills_root
+    uid = await _uid(client)
+    # 禁用 slug 后缀分配
+    monkeypatch.setattr(sapi, "next_free_slug", lambda taken, base: base)
+    # 预插幽灵行：skill_dir='' 让 write_skill_dir 的 dest.exists() 为 False
+    async with client.app.state.session_factory() as s:
+        await s.execute(text(
+            "INSERT INTO user_skill (owner_user_id, slug, name, description, "
+            "source_type, source_url, subpath, skill_dir) "
+            "VALUES (:o, 'meeting-minutes', 'old', 'old', 'url', 'https://x', NULL, '')"),
+            {"o": uid})
+        await s.commit()
+    content = DRAFT_MD  # name=meeting-minutes → slug=meeting-minutes → 撞
+    r = await client.post("/api/skills/adopt", json={"content": content, "prompt": "p"})
+    assert r.status_code == 409, r.text
+    # 孤儿目录必须被清
+    root = skills_root(uid)
+    assert (not root.exists()) or list(root.glob("*")) == []
+
+
+async def test_adopt_prompt_stored_raw_and_blank_stored_as_null(client, fake_llm):
+    """prompt 存原文；纯空白存 NULL（不是空串）。"""
+    gen = await client.post("/api/skills/generate", json={"prompt": "p"})
+    content = gen.json()["content"]
+    # 原文存储
+    r1 = await client.post("/api/skills/adopt", json={"content": content, "prompt": "  周报  "})
+    assert r1.status_code == 201
+    assert r1.json()["generation_prompt"] == "  周报  "
+    # 纯空白 → NULL
+    r2 = await client.post("/api/skills/adopt", json={"content": content, "prompt": "   "})
+    assert r2.status_code == 201
+    assert r2.json()["generation_prompt"] is None
+    # 缺字段 → NULL
+    r3 = await client.post("/api/skills/adopt", json={"content": content})
+    assert r3.status_code == 201
+    assert r3.json()["generation_prompt"] is None

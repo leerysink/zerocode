@@ -39,6 +39,14 @@ class GenerateIn(BaseModel):
     prompt: str
 
 
+class AdoptIn(BaseModel):
+    content: str
+    prompt: str | None = None
+
+
+AI_SOURCE_URL = "ai://generated"   # 占位哨兵（spec §9）：满足 NOT NULL，不过 SSRF 预检
+
+
 async def _persist_skill(request: Request, uid, payload: dict, *,
                          generation_prompt: str | None = None) -> dict:
     """母本落盘 + 技能行落库：install（远端取回）与 adopt（AI 草稿）两通道共用。
@@ -153,6 +161,30 @@ async def generate(request: Request, body: GenerateIn):
     if not draft["content"].strip():
         raise HTTPException(502, "模型返回了空内容，请重试")
     return draft
+
+
+@router.post("/adopt", status_code=201)
+async def adopt(request: Request, body: AdoptIn):
+    """把（可能被编辑过的）草稿正文落盘落库（spec §5.5）。
+
+    name/description 一律从正文服务端重新解析——不信任前端传值（这两个字段
+    直接进列表与 Agent 上下文）。content 走 unwrap_fences 兜住用户粘贴的围栏。
+    """
+    uid = request.state.actor["id"]
+    content = generator.unwrap_fences(body.content)
+    if not content.strip():
+        raise HTTPException(400, "草稿内容为空")
+    try:
+        name, description = parse_skill_md(content)
+    except SkillError as e:
+        raise HTTPException(400, str(e)) from e
+    payload = {"name": name, "description": description,
+               "files": {"SKILL.md": content.encode("utf-8")},
+               "source_url": AI_SOURCE_URL, "subpath": None, "source_type": "ai"}
+    # prompt 存描述**原文**不剔空白（spec §9：这一列的用途是回看当初那句原话）；
+    # 只有全空/纯空白归 NULL——空串会被读成「有描述但是空的」，与「没有描述」是两种状态。
+    raw_prompt = body.prompt if (body.prompt or "").strip() else None
+    return await _persist_skill(request, uid, payload, generation_prompt=raw_prompt)
 
 
 @router.patch("/{skill_id}")
