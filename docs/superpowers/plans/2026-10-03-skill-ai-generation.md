@@ -1452,7 +1452,7 @@ git commit -F .qoder-tmp/_commit_skill_ai_t6.txt
 创建 `frontend/src/utils/skillSource.test.js`：
 
 ```js
-// @vitest-environment happy-dom
+// source_type → 中文标签的纯函数测试（与后端 user_skill.source_type 取值对齐）。
 import { describe, expect, it } from 'vitest'
 import { skillSourceLabel } from './skillSource'
 
@@ -1486,6 +1486,11 @@ describe('skillSourceLabel', () => {
     expect(skillSourceLabel('  ai  ')).toBe('AI 生成')
   })
 
+  it('非字符串入参不抛错，按空处理（实施时补的边界）', () => {
+    expect(skillSourceLabel(0)).toBe('-')
+    expect(skillSourceLabel({})).toBe('-')
+  })
+
   it('原型链属性不命中（防 constructor/toString 误匹配）', () => {
     expect(skillSourceLabel('constructor')).toBe('constructor')
     expect(skillSourceLabel('toString')).toBe('toString')
@@ -1493,9 +1498,14 @@ describe('skillSourceLabel', () => {
 })
 ```
 
+> 实施订正：本文件原先要求首行 `// @vitest-environment happy-dom`。
+> 查 `frontend/src/utils/` 下 13 个纯函数测试（`modelForm` / `sqlSplit` / `tree` 等）均无此 pragma——
+> 仓库惯例是纯函数走默认 node 环境，只有需要 DOM 的组件测试才挂 pragma。本文件是纯函数，按惯例去掉。
+> 另补 1 条非字符串入参边界，故预期为 9 passed 而非 8。
+
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `npx vitest run frontend/src/utils/skillSource.test.js`
+Run: `npx vitest run src/utils/skillSource.test.js`（在 `frontend/` 下执行）
 Expected: FAIL — `Cannot find module './skillSource'`
 
 - [ ] **Step 3: 写 `skillSource.js`**
@@ -1519,8 +1529,8 @@ export function skillSourceLabel(sourceType) {
 
 - [ ] **Step 4: 跑测试确认转绿**
 
-Run: `npx vitest run frontend/src/utils/skillSource.test.js`
-Expected: PASS（8 passed）
+Run: `npx vitest run src/utils/skillSource.test.js`
+Expected: PASS（9 passed）
 
 - [ ] **Step 5: API 封装**
 

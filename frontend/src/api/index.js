@@ -126,6 +126,8 @@ export const listSkills = () => http.get('/skills')
 export const installSkill = (data) => http.post('/skills/install', data) // {url, subpath?}；多命中返 {candidates}
 export const patchSkill = (id, data) => http.patch(`/skills/${id}`, data) // {enabled}
 export const deleteSkill = (id) => http.delete(`/skills/${id}`)
+export const generateSkill = (data) => http.post('/skills/generate', data) // {prompt}；返草稿 {name, description, content, warnings}
+export const adoptSkill = (data) => http.post('/skills/adopt', data) // {content, prompt?}；name 由服务端从正文重新解析
 
 // ---- 应用 DB 操作台（设计 2026-09-28）----
 export const dbTables = (id, env) => http.get(`/apps/${id}/db/${env}/tables`)
