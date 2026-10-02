@@ -3,8 +3,8 @@
 // 「文件」tab：工作区文件树（GET /fs/tree → treeData）+ 顶部刷新按钮 + 打开文件夹按钮；
 //   点击文件 → 内容预览（pre）；后端对二进制/超 200KB 文件拒读（400），错误详情展示在预览区即「>200KB 提示」；
 //   「编辑」切 textarea + 保存（PUT /api/files/save），保存后刷新文件树（可能新增文件）。
-// 「打开文件夹」按 fs.open_folder_mode 分流：同机访问调后端本机文件管理器（POST /api/fs/open-folder），
-//   远端访问或直开失败则打开内置 WorkspaceExplorer（网页里的「类桌面」文件管理器），见 utils/openFolder.js。
+// 「打开文件夹」按 fs.open_folder_mode 分流：默认直接开内置 WorkspaceExplorer（网页里的「类桌面」文件管理器）；
+//   显式选 auto 时同机访问才调后端本机文件管理器（POST /api/fs/open-folder），直开失败也降级到内置，见 utils/openFolder.js。
 // 「变更记录」tab：GET /api/sessions/{id}/file-changes（id 倒序），逐条 DiffBlock 显示 path+action+diff。
 import { computed, onMounted, ref, watch } from 'vue'
 import { message } from 'ant-design-vue'
