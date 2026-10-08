@@ -10,6 +10,7 @@ from app.agent.prompts import build_system_prompt
 from app.agent.tools import ToolContext, ToolError, execute_tool
 from app.agent.mentions import expand_mentions
 from app.services import compaction_service as _comp
+from app.services import memory_service as _mem
 from app.services.message_service import add_message
 from app.services.session_title_service import ensure_session_title
 from sqlalchemy import text
@@ -140,7 +141,8 @@ class AgentRunner:
             llm = await llm
         return llm
 
-    async def _build_messages(self, session_id: int, root: Path, cfg: dict, send) -> list[dict]:
+    async def _build_messages(self, session_id: int, root: Path, cfg: dict, send,
+                              user_text: str = "") -> list[dict]:
         """自动压缩（阈值+最小新增双条件，thr=0 关闭）→ 摘要注入 system 尾部 → 水位后窗口消息。"""
         summary, wm = await _comp.latest(self.sf, session_id)
         rows = await _comp.rows_after(self.sf, session_id, wm)
@@ -168,7 +170,30 @@ class AgentRunner:
             system_text += ("\n\n<current_todos>\n"
                             + json.dumps(todos, ensure_ascii=False)
                             + "\n</current_todos>")
+        # 工作区记忆回灌（ticket 002 / D-7）：以当前任务文本为查询做关键词召回，
+        # 空命中不注空块（故事 14）——宁可不注入，也不能让空标签污染 system。
+        memories = await self._memories_of(session_id, user_text)
+        if memories:
+            system_text += ("\n\n<memories>\n"
+                            + "\n".join(self._memory_line(m) for m in memories)
+                            + "\n</memories>")
         return [{"role": "system", "content": system_text}] + history
+
+    async def _memories_of(self, session_id: int, user_text: str) -> list[dict]:
+        """session → workspace 反查后按当前任务文本召回；任一环为空就返回空（不注块）。
+
+        召回走的是服务层接缝，本版关键词、后续换向量都不必动这里。
+        """
+        ws = await _mem.workspace_id_of_session(self.sf, session_id)
+        if ws is None:
+            return []
+        return await _mem.recall_memories(self.sf, ws, user_text)
+
+    @staticmethod
+    def _memory_line(m: dict) -> str:
+        """一条记忆一行 `- [type] content`；正文里的换行折成空格，否则多行记忆会破块格式。"""
+        one_line = " ".join(str(m["content"] or "").split())
+        return f"- [{m['type']}] {one_line}"
 
     async def _drain_steering(self, session_id: int, root: Path, messages: list[dict]) -> int:
         """注入执行中的用户插话（steering）：落库为普通 user 消息 + 追加到本轮 messages。
@@ -208,7 +233,7 @@ class AgentRunner:
         titled = await ensure_session_title(self.sf, session_id, user_text)
         if titled:
             await self.send({"type": "session_title", "title": titled})
-        messages = await self._build_messages(session_id, root, cfg, self.send)
+        messages = await self._build_messages(session_id, root, cfg, self.send, user_text)
         ctx = ToolContext(root=root, session_id=session_id, session_factory=self.sf, send=self.send,
                           skills_root=await self._skills_root_of(session_id))
         max_rounds = int(cfg.get("agent.max_tool_rounds", 30))
