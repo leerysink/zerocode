@@ -7,6 +7,10 @@ MAX_READ_BYTES = 200 * 1024
 BINARY_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".pdf", ".zip", ".gz", ".exe", ".dll", ".so", ".bin", ".db", ".sqlite", ".mp3", ".mp4"}
 # 技能母本受控读面文本白名单（故事11）：references/assets 常见形态，非此列表一律拒
 SKILL_READ_EXTS = {".md", ".txt", ".json", ".csv", ".yaml", ".yml"}
+# memory_write 的操作面与查重窗口（ticket 003 / D-4：查重只给建议，不硬拦）
+MEMORY_OPS = ("create", "update", "delete")
+MEMORY_DEDUPE_TOP_K = 3
+MEMORY_PREVIEW_CHARS = 80
 
 class ToolError(Exception):
     pass
@@ -83,6 +87,18 @@ async def _record_change(ctx: ToolContext, path: str, action: str, before: str, 
                  "b": before, "af": after, "d": diff})
             await s.commit()
     await ctx.send({"type": "file_change", "path": path, "action": action, "diff": diff})
+
+
+def _memory_target_id(args: dict):
+    """update / delete 的目标 id：缺字段直接拒，空串/畸形值留给服务层报「非法的记忆 id」。
+
+    这里绝不抢先做 int 转换（大整数 id 全程按字符串传，全局红线），也不能把 None 悄悄当成
+    合法值交给服务层——那会让报错文案指向不明的类型错误。
+    """
+    raw = args.get("id")
+    if raw is None:
+        raise ToolError("memory_write 的 update / delete 必须给出记忆 id（create 返回的字符串 id）")
+    return raw
 
 async def execute_tool(ctx: ToolContext, name: str, args: dict) -> dict:
     if name == "list_dir":
@@ -199,5 +215,49 @@ async def execute_tool(ctx: ToolContext, name: str, args: dict) -> dict:
                 await s.commit()
         await ctx.send({"type": "todo_sync", "todos": todos})
         return {"ok": True, "count": len(todos)}
+
+    if name == "memory_write":
+        # 记忆归属的工作区只能由 session 反查：模型递 workspace_id 就是跨工作区写入的入口（故事 18）
+        if "workspace_id" in args:
+            raise ToolError("memory_write 不接受 workspace_id：记忆归属由当前会话的工作区决定")
+        # 只对大小写宽容（模型爱把枚举写成大写），首尾空白视为畸形参数明确拒绝，不做静默修正
+        op = str(args.get("op") or "").lower()
+        if op not in MEMORY_OPS:
+            raise ToolError(f"非法的记忆操作 {op!r}，可选：{' / '.join(MEMORY_OPS)}")
+        if ctx.session_factory is None:
+            raise ToolError("memory_write 需要会话数据库上下文，当前工具上下文不具备")
+        from app.deploy.errors import DeployError
+        from app.services import memory_service as mem
+        similar: list[dict] = []
+        try:
+            ws = await mem.workspace_id_of_session(ctx.session_factory, ctx.session_id)
+            if ws is None:
+                raise ToolError(f"当前会话不存在或未关联工作区（session_id={ctx.session_id}），记忆无处可存")
+            content = args.get("content")
+            if op == "create":
+                # 查重在落库之前：命中的必然是既有条目；非字符串 content 不进切词，交服务层报业务错误
+                if isinstance(content, str) and content.strip():
+                    similar = await mem.recall_memories(ctx.session_factory, ws, content,
+                                                        top_k=MEMORY_DEDUPE_TOP_K)
+                row = await mem.create(ctx.session_factory, ws, args.get("type"), content,
+                                       title=args.get("title"))
+            elif op == "update":
+                row = await mem.update(ctx.session_factory, ws, _memory_target_id(args),
+                                       type=args.get("type"), content=content,
+                                       title=args.get("title"))
+            else:
+                row = await mem.delete(ctx.session_factory, ws, _memory_target_id(args))
+        except DeployError as e:
+            # 服务层的业务文案原样回给模型（含可选类型清单、"记忆不存在"），不能糊成「工具执行异常」
+            raise ToolError(str(e)) from e
+        result = {"ok": True, "op": op, "id": str(row["id"]),
+                  "type": row["type"], "enabled": row["enabled"]}
+        if similar:  # D-4：给出既有条目与改用 update 的建议，但新条照常入库
+            result["similar"] = [{"id": str(m["id"]), "title": m["title"] or "",
+                                  "preview": (m["content"] or "")[:MEMORY_PREVIEW_CHARS]}
+                                 for m in similar]
+            result["hint"] = ("已存在相似记忆；若只是修订请改用 op=update 并带上对应 id，"
+                              "避免同一约定堆积多条")
+        return result
 
     raise ToolError(f"未知工具: {name}")

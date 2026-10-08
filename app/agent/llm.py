@@ -49,6 +49,24 @@ TOOLS = [
                 "status": {"type": "string", "enum": ["pending", "in_progress", "completed"],
                            "description": "状态：待办/进行中/已完成"}},
                 "required": ["content", "status"]}}}, "required": ["todos"]}}},
+    {"type": "function", "function": {
+        "name": "memory_write",
+        "description": (
+            "沉淀/维护当前工作区的长期记忆（下一次任务起自动注入上下文）。"
+            "记：用户明确的偏好与决策、项目事实与命名约定、踩过的坑（原因+规避方式）；"
+            "不记：一次性任务细节、代码/文档里本就能看出来的内容、密钥与个人信息。"
+            "一条只讲一件事；已有相似记忆请改用 update 而不是重复 create；"
+            "记忆归属由当前会话自动判定，不接受 workspace_id 参数。"
+        ),
+        "parameters": {"type": "object", "properties": {
+            "op": {"type": "string", "enum": ["create", "update", "delete"],
+                   "description": "create 新增 / update 就地改既有条目 / delete 停用既有条目"},
+            "type": {"type": "string", "enum": ["preference", "decision", "fact", "pitfall"],
+                     "description": "记忆分类：偏好/决策/事实/踩坑（create 必填，update 可选）"},
+            "content": {"type": "string", "description": "记忆正文，单条只讲一件事（create 必填，update 可选）"},
+            "title": {"type": "string", "description": "可选短标题（不超过 200 字），便于检索"},
+            "id": {"type": "string", "description": "update/delete 必填：create 返回的字符串 id"}},
+            "required": ["op"]}}},
 ]
 
 def _reasoning_of(delta):

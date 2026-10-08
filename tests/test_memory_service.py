@@ -101,7 +101,84 @@ async def test_recall_via_session_workspace_lookup(test_engine, tmp_path):
         assert hit[0]["type"] == "pitfall"
 
 
+async def test_update_changes_fields_and_refreshes_updated_at(test_engine, tmp_path):
+    """update 就地改同一行（不新增）。updated_at 列上没有触发器，必须显式 SET，否则永远停在插入时间。"""
+    ws = await mk_ws(test_engine, str(tmp_path / "a"))
+    sf = make_session_factory(test_engine)
+    row = await mem.create(sf, ws, "fact", "导出走 pandas", title="旧标题")
+    # 先把 updated_at 回拨到过去，再断它被刷新：比直接断「两次时间戳不等」稳定，不受事务精度影响
+    async with sf() as s:
+        await s.execute(text("UPDATE workspace_memory SET updated_at = '2000-01-01T00:00:00+00' "
+                             "WHERE id=:i"), {"i": row["id"]})
+        await s.commit()
+    out = await mem.update(sf, ws, row["id"], type="decision", content="导出改走 openpyxl", title="导出方案")
+    assert str(out["id"]) == str(row["id"])
+    assert out["type"] == "decision" and out["content"] == "导出改走 openpyxl"
+    assert out["title"] == "导出方案" and out["enabled"] is True
+    assert out["updated_at"] > out["created_at"]
+    listed = await mem.list_enabled(sf, ws)
+    assert [str(r["id"]) for r in listed] == [str(row["id"])]  # 仍是同一条，不产生新行
+    assert listed[0]["content"] == "导出改走 openpyxl"
+
+
+async def test_update_partial_fields_keep_others(test_engine, tmp_path):
+    """只给 content 时 type/title/enabled 必须原样保留——动态 SET 不能把未提供的字段写成 NULL。"""
+    ws = await mk_ws(test_engine, str(tmp_path / "a"))
+    sf = make_session_factory(test_engine)
+    row = await mem.create(sf, ws, "pitfall", "旧内容", title="旧标题")
+    out = await mem.update(sf, ws, row["id"], content="新内容")
+    assert out["type"] == "pitfall" and out["title"] == "旧标题" and out["enabled"] is True
+    assert out["content"] == "新内容"
+
+
+async def test_delete_soft_disables_and_keeps_row(test_engine, tmp_path):
+    """D-5：默认软删 = enabled 置 false，物理行留下（面板可恢复、审计可追）。"""
+    ws = await mk_ws(test_engine, str(tmp_path / "a"))
+    sf = make_session_factory(test_engine)
+    row = await mem.create(sf, ws, "fact", "pandas 分块导出")
+    out = await mem.delete(sf, ws, row["id"])
+    assert out["enabled"] is False and str(out["id"]) == str(row["id"])
+    assert await mem.list_enabled(sf, ws) == []
+    assert await mem.recall_memories(sf, ws, "pandas") == []
+    async with sf() as s:
+        n = (await s.execute(text("SELECT count(*) FROM workspace_memory WHERE id=:i"),
+                             {"i": row["id"]})).scalar()
+    assert n == 1
+
+
+async def test_delete_hard_removes_row(test_engine, tmp_path):
+    """硬删口子（008 面板用）：物理消失，不是留一条 enabled=false 的残留。"""
+    ws = await mk_ws(test_engine, str(tmp_path / "a"))
+    sf = make_session_factory(test_engine)
+    row = await mem.create(sf, ws, "fact", "pandas 分块导出")
+    out = await mem.delete(sf, ws, row["id"], hard=True)
+    assert str(out["id"]) == str(row["id"])
+    async with sf() as s:
+        n = (await s.execute(text("SELECT count(*) FROM workspace_memory WHERE id=:i"),
+                             {"i": row["id"]})).scalar()
+    assert n == 0
+
+
 # ---------------- 边界与异常分支 ----------------
+
+async def test_create_rejects_non_string_content(test_engine, tmp_path):
+    """模型可能把 content 递成数字：`.strip()` 的 AttributeError 必须在 service 层就挡成 DeployError。"""
+    ws = await mk_ws(test_engine, str(tmp_path / "a"))
+    sf = make_session_factory(test_engine)
+    with pytest.raises(DeployError):
+        await mem.create(sf, ws, "fact", 123)
+    assert await mem.list_enabled(sf, ws) == []
+
+
+async def test_update_rejects_unknown_type(test_engine, tmp_path):
+    ws = await mk_ws(test_engine, str(tmp_path / "a"))
+    sf = make_session_factory(test_engine)
+    row = await mem.create(sf, ws, "fact", "pandas 导出", title="旧标题")
+    with pytest.raises(DeployError) as ei:
+        await mem.update(sf, ws, row["id"], type="memo")
+    assert "memo" in str(ei.value) and "preference" in str(ei.value)
+    assert (await mem.list_enabled(sf, ws))[0]["type"] == "fact"  # 报错即未改动
+
 
 async def test_create_rejects_unknown_type(test_engine, tmp_path):
     ws = await mk_ws(test_engine, str(tmp_path / "a"))
@@ -247,6 +324,188 @@ async def test_recall_uses_stored_id_as_string_safe(test_engine, tmp_path):
 async def test_workspace_id_of_session_unknown_session(test_engine):
     sf = make_session_factory(test_engine)
     assert await mem.workspace_id_of_session(sf, 999999999) is None
+
+
+async def test_update_rejects_blank_content(test_engine, tmp_path):
+    ws = await mk_ws(test_engine, str(tmp_path / "a"))
+    sf = make_session_factory(test_engine)
+    row = await mem.create(sf, ws, "fact", "pandas 导出")
+    with pytest.raises(DeployError):
+        await mem.update(sf, ws, row["id"], content="  　  ")
+    assert (await mem.list_enabled(sf, ws))[0]["content"] == "pandas 导出"
+
+
+async def test_update_rejects_non_string_content(test_engine, tmp_path):
+    ws = await mk_ws(test_engine, str(tmp_path / "a"))
+    sf = make_session_factory(test_engine)
+    row = await mem.create(sf, ws, "fact", "pandas 导出")
+    with pytest.raises(DeployError):
+        await mem.update(sf, ws, row["id"], content=456)
+    assert (await mem.list_enabled(sf, ws))[0]["content"] == "pandas 导出"
+
+
+async def test_update_rejects_overlong_title(test_engine, tmp_path):
+    """阈值 +1（201 字）拒绝，且原行标题保持不变。"""
+    ws = await mk_ws(test_engine, str(tmp_path / "a"))
+    sf = make_session_factory(test_engine)
+    row = await mem.create(sf, ws, "fact", "pandas 导出", title="旧标题")
+    with pytest.raises(DeployError) as ei:
+        await mem.update(sf, ws, row["id"], title="标" * (mem.TITLE_MAX_LEN + 1))
+    assert "200" in str(ei.value)
+    assert (await mem.list_enabled(sf, ws))[0]["title"] == "旧标题"
+
+
+async def test_update_accepts_title_at_exact_limit(test_engine, tmp_path):
+    """阈值边界配对：刚好 200 字必须通过。"""
+    ws = await mk_ws(test_engine, str(tmp_path / "a"))
+    sf = make_session_factory(test_engine)
+    row = await mem.create(sf, ws, "fact", "pandas 导出")
+    out = await mem.update(sf, ws, row["id"], title="标" * mem.TITLE_MAX_LEN)
+    assert len(out["title"]) == mem.TITLE_MAX_LEN
+
+
+async def test_update_without_any_field_is_rejected(test_engine, tmp_path):
+    """空更新 = 调用方漏传字段，要明确失败而不是只刷新 updated_at。"""
+    ws = await mk_ws(test_engine, str(tmp_path / "a"))
+    sf = make_session_factory(test_engine)
+    row = await mem.create(sf, ws, "fact", "pandas 导出")
+    with pytest.raises(DeployError) as ei:
+        await mem.update(sf, ws, row["id"])
+    assert "更新" in str(ei.value)
+
+
+@pytest.mark.parametrize("bad_id", ["abc", "", "1.5", "-3", "0x1"])
+async def test_update_rejects_non_numeric_id(test_engine, tmp_path, bad_id):
+    """id 形态非法要给业务错误，不能透传 asyncpg 的类型异常（工具层会糊成「工具执行异常」）。"""
+    ws = await mk_ws(test_engine, str(tmp_path / "a"))
+    sf = make_session_factory(test_engine)
+    row = await mem.create(sf, ws, "fact", "pandas 导出")
+    with pytest.raises(DeployError) as ei:
+        await mem.update(sf, ws, bad_id, content="改它")
+    assert "id" in str(ei.value)
+    assert (await mem.list_enabled(sf, ws))[0]["content"] == "pandas 导出"
+
+
+@pytest.mark.parametrize("bad_id", ["²", "1²", "１２", "٣"])
+async def test_update_rejects_non_ascii_digit_id(test_engine, tmp_path, bad_id):
+    """isdigit() 认上标/全角/阿拉伯-印度数字，int() 要么抛 ValueError 要么悄悄换成别的数。
+
+    这两种失败形态都不能接受：前者冒成语义模糊的异常，后者可能改到 id 恰好等于换算结果的
+    另一行记忆。这类 id 必须统一按「非法的记忆 id」拒绝。
+    """
+    ws = await mk_ws(test_engine, str(tmp_path / "a"))
+    sf = make_session_factory(test_engine)
+    await mem.create(sf, ws, "fact", "pandas 导出")
+    with pytest.raises(DeployError) as ei:
+        await mem.update(sf, ws, bad_id, content="改它")
+    assert "非法的记忆 id" in str(ei.value)
+    with pytest.raises(DeployError) as ei:
+        await mem.delete(sf, ws, bad_id)
+    assert "非法的记忆 id" in str(ei.value)
+    assert (await mem.list_enabled(sf, ws))[0]["content"] == "pandas 导出"
+
+
+async def test_update_rejects_id_beyond_bigint_range(test_engine, tmp_path):
+    """22 位数字在 Python 里能 int()，但超了 BIGINT：必须挡成业务错误，否则 asyncpg 溢出。"""
+    ws = await mk_ws(test_engine, str(tmp_path / "a"))
+    sf = make_session_factory(test_engine)
+    await mem.create(sf, ws, "fact", "pandas 导出")
+    with pytest.raises(DeployError) as ei:
+        await mem.update(sf, ws, "9999999999999999999999", content="越界 id")
+    assert "id" in str(ei.value)
+    assert (await mem.list_enabled(sf, ws))[0]["content"] == "pandas 导出"
+
+
+async def test_update_rejects_nonexistent_id_without_creating(test_engine, tmp_path):
+    """故事 7：id 不存在 → 404 明确失败，绝不静默当成新建。"""
+    ws = await mk_ws(test_engine, str(tmp_path / "a"))
+    sf = make_session_factory(test_engine)
+    with pytest.raises(DeployError) as ei:
+        await mem.update(sf, ws, 987654321, content="不存在就改不了")
+    assert ei.value.status == 404
+    assert "不存在" in str(ei.value)
+    assert await mem.list_enabled(sf, ws) == []
+
+
+async def test_update_rejects_other_workspace_id(test_engine, tmp_path):
+    """故事 18：id 属于别的工作区 → 与「不存在」同等拒绝，他区那条原样不动。"""
+    ws_a = await mk_ws(test_engine, str(tmp_path / "a"))
+    ws_b = await mk_ws(test_engine, str(tmp_path / "b"))
+    sf = make_session_factory(test_engine)
+    row_b = await mem.create(sf, ws_b, "fact", "他区约定不得被我改")
+    with pytest.raises(DeployError) as ei:
+        await mem.update(sf, ws_a, row_b["id"], content="篡改")
+    assert ei.value.status == 404
+    assert await mem.list_enabled(sf, ws_a) == []
+    assert [r["content"] for r in await mem.list_enabled(sf, ws_b)] == ["他区约定不得被我改"]
+
+
+async def test_delete_rejects_nonexistent_id(test_engine, tmp_path):
+    ws = await mk_ws(test_engine, str(tmp_path / "a"))
+    sf = make_session_factory(test_engine)
+    with pytest.raises(DeployError) as ei:
+        await mem.delete(sf, ws, 987654321)
+    assert ei.value.status == 404
+    assert await mem.list_enabled(sf, ws) == []
+
+
+async def test_delete_rejects_other_workspace_id(test_engine, tmp_path):
+    ws_a = await mk_ws(test_engine, str(tmp_path / "a"))
+    ws_b = await mk_ws(test_engine, str(tmp_path / "b"))
+    sf = make_session_factory(test_engine)
+    row_b = await mem.create(sf, ws_b, "fact", "他区记忆不得被我停")
+    with pytest.raises(DeployError) as ei:
+        await mem.delete(sf, ws_a, row_b["id"])
+    assert ei.value.status == 404
+    assert len(await mem.list_enabled(sf, ws_b)) == 1
+
+
+async def test_delete_rejects_non_numeric_id(test_engine, tmp_path):
+    ws = await mk_ws(test_engine, str(tmp_path / "a"))
+    sf = make_session_factory(test_engine)
+    row = await mem.create(sf, ws, "fact", "pandas 导出")
+    with pytest.raises(DeployError) as ei:
+        await mem.delete(sf, ws, "abc")
+    assert "id" in str(ei.value)
+    assert len(await mem.list_enabled(sf, ws)) == 1
+
+
+async def test_delete_twice_soft_is_idempotent(test_engine, tmp_path):
+    """已停用的记忆再软删：仍是同一条且仍停用（幂等），不该报「不存在」迷惑调用方。"""
+    ws = await mk_ws(test_engine, str(tmp_path / "a"))
+    sf = make_session_factory(test_engine)
+    row = await mem.create(sf, ws, "fact", "pandas 导出")
+    await mem.delete(sf, ws, row["id"])
+    out = await mem.delete(sf, ws, row["id"])
+    assert out["enabled"] is False
+    async with sf() as s:
+        n = (await s.execute(text("SELECT count(*) FROM workspace_memory WHERE id=:i"),
+                             {"i": row["id"]})).scalar()
+    assert n == 1
+
+
+async def test_hard_delete_twice_second_fails(test_engine, tmp_path):
+    """硬删之后再删一次：行已物理消失，必须 404 而不是幂等成功。"""
+    ws = await mk_ws(test_engine, str(tmp_path / "a"))
+    sf = make_session_factory(test_engine)
+    row = await mem.create(sf, ws, "fact", "pandas 导出")
+    await mem.delete(sf, ws, row["id"], hard=True)
+    with pytest.raises(DeployError) as ei:
+        await mem.delete(sf, ws, row["id"], hard=True)
+    assert ei.value.status == 404
+
+
+async def test_update_can_re_enable_soft_deleted_row(test_engine, tmp_path):
+    """软删可撤销：enabled=True 让记忆重新进面板与召回（008 面板的恢复口子）。"""
+    ws = await mk_ws(test_engine, str(tmp_path / "a"))
+    sf = make_session_factory(test_engine)
+    row = await mem.create(sf, ws, "fact", "pandas 分块导出")
+    await mem.delete(sf, ws, row["id"])
+    assert await mem.recall_memories(sf, ws, "pandas") == []
+    out = await mem.update(sf, ws, row["id"], enabled=True)
+    assert out["enabled"] is True
+    assert [r["content"] for r in await mem.list_enabled(sf, ws)] == ["pandas 分块导出"]
+    assert len(await mem.recall_memories(sf, ws, "pandas")) == 1
 
 
 async def test_memories_cascade_when_workspace_deleted(test_engine, tmp_path):

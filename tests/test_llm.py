@@ -3,12 +3,28 @@ from types import SimpleNamespace
 
 import app.agent.llm as llm_mod
 from app.agent.llm import TOOLS, ScriptedLLM, OpenAICompatLLM
+from app.agent.tools import MEMORY_OPS
+from app.services import memory_service as mem
 
 def test_tools_schema():
     names = {t["function"]["name"] for t in TOOLS}
-    assert names == {"list_dir", "read_file", "write_file", "edit_file", "ask_user", "todo_write"}
+    assert names == {"list_dir", "read_file", "write_file", "edit_file", "ask_user", "todo_write",
+                     "memory_write"}
     w = next(t for t in TOOLS if t["function"]["name"] == "write_file")
     assert set(w["function"]["parameters"]["required"]) == {"path", "content"}
+
+def test_memory_write_schema_op_required_only():
+    """记忆工具参数面（故事 6/18）：只有 op 必填，且不向模型暴露 workspace_id。"""
+    fn = next(t for t in TOOLS if t["function"]["name"] == "memory_write")["function"]
+    assert set(fn["parameters"]["required"]) == {"op"}
+    assert "workspace_id" not in fn["parameters"]["properties"]
+    # op 也与分派层同源：schema 多一个 op 模型就能递进来、却在 execute_tool 里被判非法
+    assert set(fn["parameters"]["properties"]["op"]["enum"]) == set(MEMORY_OPS)
+
+def test_memory_write_schema_type_enum_matches_service():
+    """schema 与记忆服务分类必须同源：两边各自枚举会静默漂移，模型收到 400 也改不对。"""
+    fn = next(t for t in TOOLS if t["function"]["name"] == "memory_write")["function"]
+    assert set(fn["parameters"]["properties"]["type"]["enum"]) == set(mem.MEMORY_TYPES)
 
 @pytest.mark.asyncio
 async def test_scripted_llm_replays():
