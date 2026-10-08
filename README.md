@@ -105,10 +105,11 @@ ZeroCode 是一台跑在**你自己机器上**的 AI 应用工厂。
 前提：已安装 Docker 与 Docker Compose。
 
 ```powershell
-# 1) 启动平台数据库容器
+# 1) 启动平台数据库容器（pgvector 镜像；-v 必带，否则数据落在匿名卷里，下次 rm 就没了）
 docker run -d --name zerocode-pg16 `
+  -v zerocode-pgdata-v2:/var/lib/postgresql/data `
   -e POSTGRES_USER=zerocode -e POSTGRES_PASSWORD=zerocode123 -e POSTGRES_DB=zerocode `
-  -p 5433:5432 postgres:16-alpine
+  -p 5433:5432 pgvector/pgvector:pg16
 
 # 2) 一键拉起开发环境（自动建 venv、装依赖、起前后端）
 .\dev.bat

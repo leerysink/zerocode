@@ -44,9 +44,21 @@ tests/                 后端 pytest，与 `app/` 分层对应
 
    ```powershell
    docker run -d --name zerocode-pg16 `
+     -v zerocode-pgdata-v2:/var/lib/postgresql/data `
      -e POSTGRES_USER=zerocode -e POSTGRES_PASSWORD=zerocode123 -e POSTGRES_DB=zerocode `
-     -p 5433:5432 postgres:16-alpine
+     -p 5433:5432 pgvector/pgvector:pg16
    ```
+
+   > `-v` 不可省：不留命名卷时数据进的是匿名卷，`docker rm` 后旧库直接消失。
+   > 本仓库当前真实使用的卷是 `zerocode-pgdata-v2`（pgvector 迁移后的新卷），
+   > `zerocode-pgdata` 是迁移前的 alpine 旧卷，仅作回滚点保留。
+   >
+   > 镜像必须是 `pgvector/pgvector:pg16`（不是 `postgres:16-alpine`）：工作区记忆的语义
+   > 检索靠 `CREATE EXTENSION vector`，原生 alpine 镜像不带该扩展。已有的 alpine 容器不能
+   > 直接复用数据目录（musl/glibc 不兼容），需 `pg_dumpall` 导出后导入新卷。
+   >
+   > 无需手动 `--network zcnet`：已发布应用靠 DNS 别名 `zerocode-pg16:5432` 连库，
+   > 首次发布时 `app/deploy/provision.py::ensure_zcnet()` 会建网并把本容器接进去（幂等）。
 
 2. **安装后端依赖**：
 

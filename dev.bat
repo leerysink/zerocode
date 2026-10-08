@@ -16,7 +16,7 @@ if not errorlevel 1 goto :db_ok
 :db_warn
 echo [warn] PostgreSQL container "zerocode-pg16" is not running.
 echo        Start it yourself, or create it once with:
-echo        docker run -d --name zerocode-pg16 -e POSTGRES_USER=zerocode -e POSTGRES_PASSWORD=zerocode123 -e POSTGRES_DB=zerocode -p 5433:5432 postgres:16-alpine
+echo        docker run -d --name zerocode-pg16 -v zerocode-pgdata-v2:/var/lib/postgresql/data -e POSTGRES_USER=zerocode -e POSTGRES_PASSWORD=zerocode123 -e POSTGRES_DB=zerocode -p 5433:5432 pgvector/pgvector:pg16
 goto :db_done
 :db_ok
 echo [ok]   PostgreSQL container zerocode-pg16 is up
