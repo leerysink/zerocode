@@ -1,7 +1,9 @@
 """工作区记忆服务（ticket 002；spec 故事 1、3、6(service create)、13、14、22 的服务侧起步）。
 
-主靶心 = `recall_memories`：005 起为「先试语义、再回落关键词」的双路径（上限与混检收口留 006），
-断言集中在「按 workspace 隔离 + enabled 过滤 + 命中排序 + topK 截断 + 向量不可用时不比升级前差」。
+主靶心 = `recall_memories`：005 起为「先试语义、再回落关键词」的双路径，
+006 已在同一接缝上收口（开关/相似度阈值/topK/token 三重上限 + 混检补齐），
+那部分的用例在 tests/test_memory_recall_policy.py；本文件只守隔离、enabled 过滤、
+命中排序与降级底线（「向量不可用时不比升级前差」）。
 """
 import pytest
 from sqlalchemy import text

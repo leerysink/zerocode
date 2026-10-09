@@ -159,6 +159,95 @@ async def test_multiline_memory_content_collapses_to_one_line(test_engine, tmp_p
     assert block.strip() == "- [fact] pandas 导出 第二行 第三行"
 
 
+# ---------------- 召回配置的注入侧（ticket 006；spec 故事 15—17）----------------
+
+def _mem_cfg(**memory):
+    """注入侧要验 memory.* 必须自备 provider：`cfg_provider()` 只给 agent.*，
+    缺键走的是代码默认值，验不出「配置改了注入就变」。"""
+    base = {"agent.write_confirm": False, "agent.ask_timeout_seconds": 0,
+            "agent.max_tool_rounds": 30, "agent.history_window": 40}
+    base.update(memory)
+
+    async def _p():
+        return dict(base)
+    return _p
+
+
+async def test_memory_enabled_false_skips_the_block(test_engine, tmp_path):
+    """总开关关掉 → 一条都不召回 → 不注空块（故事 15）。"""
+    sid = await _seed(test_engine, tmp_path, "fact", "pandas 分块导出")
+    assert "<memories>" not in await _turn_system_text(
+        test_engine, sid, "pandas 导出", cfg=_mem_cfg(**{"memory.enabled": False}))
+    # 对照：同一条记忆在默认配置下照常注入，证明上一步是开关起作用而不是没命中
+    assert "<memories>" in await _turn_system_text(test_engine, sid, "pandas 导出")
+
+
+async def test_threshold_above_every_similarity_skips_the_block(test_engine, tmp_path,
+                                                                monkeypatch):
+    """全部低于阈值 → 召回为空 → 不注块；阈值放宽一档就必须又注出来。"""
+    async def fake(s, owner_user_id, texts_):
+        out = []
+        for t in texts_:
+            v = [0.0] * mem.embeddings.EMBEDDING_DIM
+            if "query" in (t or "").lower():
+                v[0] = 1.0
+            else:
+                v[0], v[1] = 0.6, 0.8      # 与查询的余弦相似度恰为 0.6
+            out.append(v)
+        return out
+    monkeypatch.setattr(mem.embeddings, "embed_for_owner", fake)
+    sid = await _seed(test_engine, tmp_path, "fact", "middle memo 导出约定")
+    assert "<memories>" not in await _turn_system_text(
+        test_engine, sid, "please query it", cfg=_mem_cfg(**{"memory.min_similarity": 0.9}))
+    low = await _turn_system_text(test_engine, sid, "please query it",
+                                  cfg=_mem_cfg(**{"memory.min_similarity": 0.1}))
+    assert "<memories>" in low and "middle memo 导出约定" in low
+
+
+async def test_max_tokens_below_first_entry_skips_the_block(test_engine, tmp_path):
+    """预算装不下任何一条时不注空块——宁可不注入，也不给模型一个空标签。"""
+    sid = await _seed(test_engine, tmp_path, "fact",
+                      "订单导出统一走 pandas 分块，避免一次性载入整表导致 OOM")
+    assert "<memories>" not in await _turn_system_text(
+        test_engine, sid, "pandas 导出", cfg=_mem_cfg(**{"memory.max_tokens": 1}))
+    assert "<memories>" in await _turn_system_text(test_engine, sid, "pandas 导出")
+
+
+async def test_top_k_from_cfg_caps_the_injected_block(test_engine, tmp_path):
+    """loop 把 owner 视角的 cfg 透传进召回接缝：配置里的 topK 要真的决定行数。"""
+    sid = await _seed(test_engine, tmp_path, "fact", "pandas 基线条目")
+    sf = make_session_factory(test_engine)
+    ws = await mem.workspace_id_of_session(sf, sid)
+    for i in range(mem.DEFAULT_TOP_K + 3):
+        await mem.create(sf, ws, "fact", f"pandas 第{i}条做法")
+    block = (await _turn_system_text(test_engine, sid, "pandas",
+                                     cfg=_mem_cfg(**{"memory.top_k": 2}))
+             ).split("<memories>")[1].split("</memories>")[0]
+    assert block.count("\n- [") == 2
+
+
+_ROWS = ({"type": "fact", "content": "pandas 导出\n第二行\t第三行"},
+         {"type": "preference", "content": None},
+         {"type": "pitfall", "content": "  前后空格  "})
+
+
+def test_loop_line_format_is_pinned_to_a_literal_shape():
+    """钉**字面量**：`_memory_line` 只是转发服务层，只写「两边相等」就是同源自比，
+    格式哪天被改坏（丢了 type 前缀 / 不折行）这两条断言仍然是绿的。"""
+    assert AgentRunner._memory_line(
+        {"type": "fact", "content": "pandas 导出\n第二行\t第三行"}
+    ) == "- [fact] pandas 导出 第二行 第三行"
+    assert AgentRunner._memory_line({"type": "preference", "content": None}) == "- [preference] "
+    assert AgentRunner._memory_line({"type": "pitfall", "content": "  前后空格  "}) \
+        == "- [pitfall] 前后空格"
+
+
+def test_loop_uses_the_service_line_formatter():
+    """token 预算估的就是注入的那一行：loop 另拼一份，两侧迟早对不上。"""
+    for row in _ROWS:
+        assert AgentRunner._memory_line(row) == mem.format_memory_line(row)
+
+
 # ---------------- 写入红线的注入侧（ticket 004；spec 故事 11、12）----------------
 
 async def test_memory_body_cannot_close_the_memories_block(test_engine, tmp_path):

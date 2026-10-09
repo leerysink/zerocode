@@ -1,19 +1,21 @@
-"""工作区记忆服务（ticket 002、003、004、005 / spec §4、§5）。
+"""工作区记忆服务（ticket 002、003、004、005、006 / spec §4、§5）。
 
 接缝清单：`create` / `list_enabled` / `recall_memories` / `workspace_id_of_session`（002），
 `update` / `delete`（003，工具与面板共用），`redact_sensitive` / `neutralize_memory_tags` /
-`sanitize_memory_text`（004，写入红线），向量写入与向量召回（005，embedding + pgvector）。
-topK 阈值与 token 封顶、降级收口留 006。
+`sanitize_memory_text`（004，写入红线），向量写入与向量召回（005，embedding + pgvector），
+`memory.*` 配置与召回收口（006：开关短路 + 阈值/topK/token 三重上限 + 无向量行混检补齐）。
 
 隔离维度是 workspace（D-1）：所有读写都必须带 workspace_id，跨工作区不可见（故事 18）。
 """
 import dataclasses
 import logging
+import math
 import re
 from sqlalchemy import text
 
 from app.agent import embeddings
 from app.deploy.errors import DeployError
+from app.services import config_service
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +41,36 @@ _ROW_COLUMNS = ("id, workspace_id, type, title, content, embedding IS NOT NULL A
 # 必须走 CAST 的列：值是 '[...]' 文本字面量，直接绑进 SET 会被当成 text。
 _VECTOR_COLUMNS = frozenset({"embedding"})
 
+# ---------------- 召回配置（ticket 006 / spec 故事 14—17）----------------
+# 默认值**只存这份代码常量**，不写 app_config 种子：种子一旦落平台级（owner NULL）行，
+# conftest 的 TRUNCATE 不清理它，memory.* 的调子就会漏给全平台每个账号（各人 topK 互相影响）。
+# 于是「没配」就是走默认，配置表里出现的 memory.* 行必然属于某个账号。
+CONFIG_ENABLED = "memory.enabled"
+CONFIG_TOP_K = "memory.top_k"
+CONFIG_MIN_SIMILARITY = "memory.min_similarity"
+CONFIG_MAX_TOKENS = "memory.max_tokens"
+# 「不配就不筛」的唯一写法：余弦相似度的值域下界。别用 0.0，理由见下面 _SIMILARITY_RANGE 的注释。
+DEFAULT_MIN_SIMILARITY = -1.0
+
+MEMORY_DEFAULTS: dict[str, object] = {
+    CONFIG_ENABLED: True,
+    CONFIG_TOP_K: DEFAULT_TOP_K,
+    CONFIG_MIN_SIMILARITY: DEFAULT_MIN_SIMILARITY,
+    CONFIG_MAX_TOKENS: 600,
+}
+
+# 合法域：越界一律 warning + 回落默认，不把脏值送进 SQL（负数进 LIMIT 直接是语法/语义错误）。
+_TOP_K_RANGE = (1, 100)
+# 阈值的合法域是余弦相似度的**完整值域** [-1, 1]，默认 -1.0 = 一条也不因阈值丢掉。
+# 这里不能取 0.0 当「不筛」：1 - 余弦距离的值域是 [-1, 1]，反向语义的记忆相似度是负数，
+# 0.0 + `>=` 会把这些行静默滤掉，而滤空走的是 `[]` 语义（不降级关键词）——
+# 等于「没配任何东西的默认档」也会让部分记忆失联，与故事 5「升级不清零」相反（ticket 006 review）。
+_SIMILARITY_RANGE = (DEFAULT_MIN_SIMILARITY, 1.0)
+_TOKEN_RANGE = (1, 20000)
+# 配置经 HTTP/JSON 传进来常常是字符串表单值，这些拼写按直觉认，认不出才回落默认。
+_FALSE_WORDS = frozenset({"false", "off", "0", "no", "none"})
+_TRUE_WORDS = frozenset({"true", "on", "1", "yes"})
+
 # 启用记忆的取数列：面板与召回看的是同一批字段，005 换检索实现时只改这一处。
 # 自带 ORDER BY：召回同分时要靠它做稳定的“新优先”截断，不能依赖扫描顺序。
 # 向量路径在它之上再加 similarity，两条路径返回的 key 集合保持一致。
@@ -52,7 +84,8 @@ _ENABLED_SELECT = (
 # 向量召回（005 / 故事 2、3）：CTE 里把字面量换成一次向量，下面 ORDER BY 与投影都能引用，
 # 免得同一个 :qv 绑三遍。`<=>` 是余弦距离（0=同向，2=反向），相似度 = 1 - 距离；
 # `embedding IS NOT NULL` 必须留着 —— NULL 行参与排序会得到 NULL 距离，顺序不可控。
-# 不设相似度下限（阈值属 006 的收口），只按距离升序取 topK。
+# 相似度下限由 Python 侧按 policy 过滤（006）：相似度是排序键的单调函数，
+# 「先 LIMIT 再过滤」与「先过滤再 LIMIT」取到的行集等价，但少一次查询、阈值口径也不绑在 SQL 里。
 _VECTOR_RECALL_HEAD = (
     "WITH q AS (SELECT CAST(:qv AS vector) AS v) "
     "SELECT id, workspace_id, type, title, content, enabled, "
@@ -372,31 +405,229 @@ async def list_enabled(session_factory, workspace_id: int) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-async def recall_memories(session_factory, workspace_id: int, query: str | None,
-                          top_k: int = DEFAULT_TOP_K) -> list[dict]:
-    """按工作区取启用记忆：能用向量就走语义检索，用不了就回落 002 的关键词。
+@dataclasses.dataclass(frozen=True)
+class RecallPolicy:
+    """一次召回的收口参数。字段语义与 `memory.*` 配置键一一对应。
 
-    回落的四种情形（本票只保证「不比升级前差」，真正的双路混检与阈值收口在 006）：
-    查询切不出文本、工作区不存在、owner 没配 embedding 档案或 provider 调用失败、
-    本工作区一条可用向量都没有。四种都返回 None 给下面那条关键词路径接管，
-    因此空查询 / 无命中仍然返回空列表 —— 调用方据此不注空块（故事 14）。
+    `top_k` 是 `int | None`：None = 不限制。这是两个口径归一后的结果：
+    配置里的 0/负数是非法值（回落默认），而调用方显式传的 `top_k<=0` 是 002/005 定下的
+    「不限制」约定（工具层拿它拉全量查重）。两套语义不能合并成一个默认值。
     """
-    semantic = await _recall_by_vector(session_factory, workspace_id, query, top_k)
-    if semantic is not None:
-        return semantic
-    return await _recall_by_keyword(session_factory, workspace_id, query, top_k)
+    enabled: bool
+    top_k: int | None
+    min_similarity: float
+    max_tokens: int
+
+
+def _parse_number(raw) -> float | None:
+    """配置值 → 有限浮点；认不了返回 None。bool 先拒：`True == 1` 会把开关当成合法的 top_k=1。"""
+    if raw is None or isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)):
+        num = float(raw)
+    elif isinstance(raw, str):
+        try:
+            num = float(raw.strip())
+        except ValueError:
+            return None
+    else:
+        return None
+    # nan / inf 走 isfinite 挡住：`inf <= 1.0` 为假所以下一步会回落，但 nan 两边比较都是假，
+    # 不拦就会把阈值算成「既不合法也不非法」的第三种东西。
+    return num if math.isfinite(num) else None
+
+
+def _coerce_bool(raw, default: bool) -> bool:
+    """开关认常见拼写（含字符串表单值）；**认不出的一律回落默认**。
+
+    不能「非空即真」：`"false"` 进 `bool()` 就是真，得到一个关不掉的开关。
+    也不能认不出就当关：误关是静默丢功能，误开最多是多注入几条。
+    """
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        low = raw.strip().lower()
+        if low in _FALSE_WORDS:
+            return False
+        if low in _TRUE_WORDS:
+            return True
+        return default
+    if raw is None or isinstance(raw, (list, dict, tuple, set)):
+        return default
+    num = _parse_number(raw)
+    return default if num is None else num != 0
+
+
+def _coerce_int(raw, bounds: tuple[int, int], default: int, key: str) -> int:
+    """整数档：非整数/越界都回落默认。2.5 不 `int()` 成 2（会默默少投一条），3.0 当整数认。"""
+    num = _parse_number(raw)
+    if num is None or not num.is_integer():
+        return default
+    value = int(num)
+    if not bounds[0] <= value <= bounds[1]:
+        logger.warning("配置 %s=%r 超出 [%s, %s]，回落默认 %s",
+                       key, raw, bounds[0], bounds[1], default)
+        return default
+    return value
+
+
+def _coerce_float(raw, bounds: tuple[float, float], default: float, key: str) -> float:
+    num = _parse_number(raw)
+    if num is None:
+        return default
+    if not bounds[0] <= num <= bounds[1]:
+        logger.warning("配置 %s=%r 超出 [%s, %s]，回落默认 %s",
+                       key, raw, bounds[0], bounds[1], default)
+        return default
+    return num
+
+
+def _resolve_policy(cfg: dict | None, top_k: int | None = None) -> RecallPolicy:
+    """把「原始配置字典 + 调用方显式 top_k」算成一份可用的策略：所有回落规则只在这一个函数里。
+
+    cfg 缺键 ≠ 关掉某项能力：只有显式的 `memory.enabled=false` 会短路。脏值一律回落默认，
+    绝不拿脏值去拼 SQL。
+    """
+    conf = cfg or {}
+    if top_k is None:
+        limit: int | None = _coerce_int(conf.get(CONFIG_TOP_K), _TOP_K_RANGE,
+                                        int(MEMORY_DEFAULTS[CONFIG_TOP_K]), CONFIG_TOP_K)
+    else:
+        # 显式入参优先于配置；<=0 或认不出的值视为「不限制」（与配置里的 0 判非法刻意不同）
+        num = _parse_number(top_k)
+        limit = None if num is None or num <= 0 else int(num)
+    return RecallPolicy(
+        enabled=_coerce_bool(conf.get(CONFIG_ENABLED), bool(MEMORY_DEFAULTS[CONFIG_ENABLED])),
+        top_k=limit,
+        min_similarity=_coerce_float(conf.get(CONFIG_MIN_SIMILARITY), _SIMILARITY_RANGE,
+                                     float(MEMORY_DEFAULTS[CONFIG_MIN_SIMILARITY]),
+                                     CONFIG_MIN_SIMILARITY),
+        max_tokens=_coerce_int(conf.get(CONFIG_MAX_TOKENS), _TOKEN_RANGE,
+                               int(MEMORY_DEFAULTS[CONFIG_MAX_TOKENS]), CONFIG_MAX_TOKENS),
+    )
+
+
+async def _config_for(session_factory, workspace_id: int) -> dict:
+    """cfg 没给出时的**唯一**取配置接缝：workspace → owner_user_id → config_service.get_all。
+
+    工作区不存在 / owner 为 NULL 都不抛：get_all 退化成平台级视图，memory.* 走代码默认。
+    召回在对话主链路上，任何配置环节都不能把回合打断。
+    """
+    async with session_factory() as s:
+        ws_row = await _workspace_owner(s, workspace_id)
+        owner = ws_row[0] if ws_row is not None else None
+        return await config_service.get_all(s, owner_user_id=owner)
+
+
+def format_memory_line(row: dict) -> str:
+    """注入行与 token 预算的**共用**格式化：`- [type] 折成单行的 content`。
+
+    两边必须同源：loop 另拼一份，则「按 600 估的预算」与「实际注入的文本」就不是同一个东西，
+    封顶会虚高。正文里的换行/制表符折成单空格，否则一条多行记忆会破「一行一条」的块结构。
+    """
+    one_line = " ".join(str(row["content"] or "").split())
+    return f"- [{row['type']}] {one_line}"
+
+
+# 汉字/假名/中文标点/全角形式都按 1 字 = 1 token 估（BPE 下常为 1—2 字/token，往多里估是安全侧），
+# 其余字符 4 个算 1 个。不引 tiktoken：那是几十 MB 词表 + 下载，而这里要的是
+# 「别把 prompt 撑爆」的保守上限，不是精确计费。
+_CJK_CHAR = re.compile(r"[\u3000-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff00-\uffff]")
+
+
+def _estimate_tokens(value) -> int:
+    """粗估一段注入文本的 token；空串 / None / 非字符串都是 0（不抛，预算不卡写入）。"""
+    if not isinstance(value, str) or not value:
+        return 0
+    cjk = len(_CJK_CHAR.findall(value))
+    return cjk + math.ceil((len(value) - cjk) / 4)
+
+
+def _truncate(rows: list[dict], limit: int | None) -> list[dict]:
+    """topK 截断；limit 为 None 表示不限制（行序已由召回路径定好，这里只尾部切）。"""
+    return rows if not limit or limit <= 0 else rows[:limit]
+
+
+def _cap_by_tokens(rows: list[dict], budget: int) -> list[dict]:
+    """按预算逐条累计，触顶即停：**整条丢弃，绝不切半条**（半条记录会把模型导向错的结论）。
+
+    是「停」不是「接着找下一条更短的」：预算是注入块的整体上限，跳着塞会让注入顺序与
+    相关度不一致，也说不清后面那条为何忽然出现。
+    """
+    out: list[dict] = []
+    used = 0
+    for row in rows:
+        cost = _estimate_tokens(format_memory_line(row))
+        if used + cost > budget:
+            break
+        used += cost
+        out.append(row)
+    return out
+
+
+def dedupe_policy(top_k: int | None = None) -> RecallPolicy:
+    """查重/列表类调用专用的策略：**不吃用户注入配置，也不查库**。
+
+    不能跟注入路径共用 _resolve_policy，否则两个与直觉相反的行为会直接溢到用户面前：
+    1. `memory.enabled=false` 只应该关掉「往 prompt 里注入」，不该关掉 memory_write 的
+       查重建议（故事 10 的防堆积提示）——否则关掉注入后同一个约定会反复入库；
+    2. 用户把 min_similarity 调高、max_tokens 压小是为了少注入，不该同时削弱查重名额。
+    所以查重固定为：启用 + 不因阈值丢弃 + 不做注入预算封顶，只保留调用方要的 topK。
+    """
+    return RecallPolicy(enabled=True, top_k=top_k if top_k and top_k > 0 else None,
+                        min_similarity=DEFAULT_MIN_SIMILARITY,
+                        max_tokens=_TOKEN_RANGE[1])
+
+
+async def recall_memories(session_factory, workspace_id: int, query: str | None,
+                          top_k: int | None = None,
+                          cfg: dict | None = None,
+                          policy: RecallPolicy | None = None) -> list[dict]:
+    """召回收口（006）：开关短路 → 向量路 + 无向量行补齐 → topK 截断 → token 封顶。
+
+    三重上限只在这一个接缝里生效，降级路也不例外：侧门不收口等于没收口。
+    顺序是「先 topK 再预算」：预算不能把 topK 的名额又放大（故事 15 的“上限”语义）。
+
+    `cfg` 由调用方传入时不再查库（loop 已解析过 owner 视角的配置，白的一次往返）；
+    `cfg=None` 走 `_config_for` 的唯一接缝。显式 `top_k<=0` = 不限制（002/005 旧约定）。
+    `policy` 给出时**直接用它**，不读 `memory.*` 也不查库：查重等非注入路径用它与用户
+    配置解耦（见 `dedupe_policy`），但行集/截断仍走同一套代码，不留第二套平行实现。
+    任何环节都返回**列表**，绝不抛：召回不许打断对话（故事 14）。
+    """
+    if policy is None:
+        policy = _resolve_policy(
+            cfg if cfg is not None else await _config_for(session_factory, workspace_id), top_k)
+    # 总开关关掉：一条 SQL 也不为召回发出去（而不是“查出来再丢弃”）
+    if not policy.enabled:
+        return []
+    semantic = await _recall_by_vector(session_factory, workspace_id, query, policy)
+    if semantic is None:
+        # 这轮根本用不上向量：全量走关键词（包括有向量的行），升级前的行为不比现在差
+        rows = await _recall_by_keyword(session_factory, workspace_id, query)
+    else:
+        # 混检：向量路拿相似度，关键词只负责补「没向量」的老条，并按 id 字符串去重。
+        # 刻意把补齐行排在向量行之后、共用同一个 topK 名额（006 review 显式登记的取舍）：
+        # 向量命中按相似度降序，相关度高于关键词补齐，因此向量路填满名额时本轮就没有补齐位。
+        # 故事 17 只保证「老条仍参与召回、不因没向量而永久失联」，不保证它一定挤进 topK；
+        # 要给老条保底名额就得把 topK 拆开，那等于抬高注入总量，与故事 15 的「上限」语义冲突。
+        rows = semantic + await _recall_by_keyword(
+            session_factory, workspace_id, query,
+            only_without_vector=True, exclude={str(r["id"]) for r in semantic})
+    return _cap_by_tokens(_truncate(rows, policy.top_k), policy.max_tokens)
 
 
 async def _recall_by_vector(session_factory, workspace_id: int, query: str | None,
-                            top_k: int) -> list[dict] | None:
-    """余弦距离升序取 topK；**返回 None 表示「这轮用不上向量」**，由调用侧降级。
+                            policy: RecallPolicy) -> list[dict] | None:
+    """余弦距离升序取 topK，相似度阈值在 Python 侧过滤。
 
-    刻意不把「0 命中」和「用不上向量」都编码成空列表：向量列全为 NULL 的工作区若按空列表
-    返回，升级就等于把它的召回整体清零（故事 5 的验收点）。反正余弦排序下只要有可用向量就
-    必然出行，空行集只可能是「没有可用向量」，此时关键词路径才看得见那些行。
-    不设相似度下限：阈值属 006，本票要的是「措辞不同也能命中」这条可 demo 的接缝。
+    **返回 None 与返回 [] 是两种相反语义，混成一个就破功**：
+    - None = 「这轮用不上向量」（查询切不出文本、工作区不存在、provider 不可用、
+      本工作区一条可用向量都没有、向量 SQL 自身出错），调用侧必须降级关键词，
+      否则升级就等于把老库的召回整体清零（故事 5 的验收点）；
+    - [] = 有向量行但全被 min_similarity 滤掉，**不许**降级让关键词把弱相关请回来（故事 16）。
 
-    向量 SQL 是本轮新增的执行面（`CAST(:qv AS vector)` / `<=>`），它自身异常同样不得打断对话：
+    反正余弦排序下只要有可用向量就必然出行，空行集只可能是「没有可用向量」。
+    向量 SQL 是 005 新增的执行面（`CAST(:qv AS vector)` / `<=>`），它自身异常同样不得打断对话：
     一律降级返回 None 让关键词接管，否则关键词路径根本没被执行到。
     """
     if not _embed_input(None, query):
@@ -410,30 +641,43 @@ async def _recall_by_vector(session_factory, workspace_id: int, query: str | Non
             return None
         sql = _VECTOR_RECALL_HEAD + "ORDER BY embedding <=> q.v"
         params: dict[str, object] = {"qv": qvec, "w": workspace_id}
-        if top_k > 0:
+        if policy.top_k and policy.top_k > 0:
             sql += " LIMIT :lim"
-            params["lim"] = top_k
+            params["lim"] = policy.top_k
         try:
             rows = (await s.execute(text(sql), params)).mappings().all()
         except Exception:  # noqa: BLE001 - 向量是新开的执行面，连 DB 异常也得留给关键词
             logger.warning("向量召回执行失败，本轮降级关键词", exc_info=True)
             return None
-    return [dict(r) for r in rows] or None
+    if not rows:
+        return None
+    # `>=` 不是 `>`：恰等于阈值的条要留下（阈值就是「包含」语义的下界）
+    return [dict(r) for r in rows if r["similarity"] >= policy.min_similarity]
 
 
 async def _recall_by_keyword(session_factory, workspace_id: int, query: str | None,
-                             top_k: int) -> list[dict]:
-    """002 的关键词召回，如今是降级路径：命中数降序 + SQL 的 id DESC 稳定截断。"""
+                             limit: int | None = None, *, only_without_vector: bool = False,
+                             exclude: set[str] | None = None) -> list[dict]:
+    """002 的关键词召回：降级主路，兼当「无向量老条」的混检补齐入口。
+
+    `only_without_vector` 是补齐的关键闸门：有向量的行归 min_similarity 管，关键词不许
+    越过阈值把它们捣回来（故事 16 的侧门）；没向量的行本来就没有相似度可谈，只能靠这里。
+    去重按**字符串**比 id：BIGINT 过 `Number()` 就撞成同一个数（全局红线）。
+    命中数降序 + SQL 的 id DESC 稳定截断；`limit` 留 None 时由调用侧统一按 topK 截。
+    """
     keywords = _keywords(query)
     if not keywords:
         return []
     async with session_factory() as s:
         rows = (await s.execute(text(_ENABLED_SELECT), {"w": workspace_id})).mappings().all()
-    hits = [(score, r) for r in rows if (score := _score(r, keywords)) > 0]
+    hits = [(score, r) for r in rows
+            if (score := _score(r, keywords)) > 0
+            and (not only_without_vector or not r["has_embedding"])
+            and (exclude is None or str(r["id"]) not in exclude)]
     # 稳定排序：只按命中数降序；同分的相对顺序由 SQL 的 id DESC 保证（新记忆优先）
     hits.sort(key=lambda x: -x[0])
     picked = [dict(r) for _score, r in hits]
-    return picked[:top_k] if top_k > 0 else picked
+    return picked[:limit] if limit and limit > 0 else picked
 
 
 async def workspace_id_of_session(session_factory, session_id: int) -> int | None:

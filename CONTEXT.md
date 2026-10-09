@@ -159,5 +159,12 @@ changelog 播种定义，判定函数不再另立一个 auto 兜底（ADR-0009�
 
 每轮对话构建 system 时，按当前任务语义检索本工作区记忆的 topK 相关条目，注入
 `<memories>` 块（与 `<context_summary>` 同一注入位）。检索底座是 pgvector + 独立
-embedding 模型（见 ADR-0012）；embedding 未配置时**降级为关键词/全文检索**，功能不
-阻断。注入受三重上限约束：topK 条数 + 相似度阈值 + token 预算封顶（沿用 `agent.*` 配置风格）。
+embedding 模型（见 ADR-0012）；embedding 未配置时**降级为关键词检索**（复用同一服务层已落的
+关键词打分，不另起一套全文组件），功能不阻断。注入受三重上限约束：topK 条数 + 相似度阈值
++ token 预算封顶，按账号可配（`memory.enabled` / `memory.top_k` / `memory.min_similarity` /
+`memory.max_tokens`）。
+
+召回策略只管「往 prompt 里塞什么」。`memory_write` 创建前的**查重（dedupe）**是另一个动作：
+它走服务层的固定策略、不吃 `memory.*`——关掉记忆注入只该停止注入，不该连带失去「这条已存在、
+建议改而不是新建」的提示。历史无向量的旧条在向量模式下由关键词**补齐**进同一份 topK 名额
+（参与召回 ≠ 一定挤进 topK）。

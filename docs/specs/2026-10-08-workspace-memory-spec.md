@@ -29,8 +29,9 @@
 - **写入**：新工具 `memory_write`（`llm.py` TOOLS + `tools.py` execute_tool 分派，与 `todo_write`
   同款），支持 `create / update / delete`；create 前查重、写入前**敏感脱敏**。用户侧经前端面板走
   同一 `memory_service` CRUD。
-- **降级**：embedding 未配置时 `recall_memories` 内部回退 Postgres 全文/`pg_trgm` 关键词检索，
-  调用方与注入路径完全无感（单一入口，不写平行实现——ADR-0012 后果条）。
+- **降级**：embedding 未配置时 `recall_memories` 内部回退 002 已落地的关键词检索（Python 侧打分：
+  拉丁词 + 中文二元滑窗），调用方与注入路径完全无感（单一入口，不写平行实现——ADR-0012 后果条）。
+  票面 D-6 原写「优先 `pg_trgm`」，006 实现时改为此案，理由见票面 006「落地偏差」。
 
 **接缝清单（测试锚点，优先复用而非新建）**：
 1. `memory_service.{create,update,delete,list,recall_memories}` —— 记忆域的唯一后端接口，绝大多数测试打这里
@@ -82,10 +83,11 @@
 14. 作为 Agent，当本 workspace 无启用记忆、或全部命中低于相似度阈值时，**不注入** `<memories>`
     空块（对齐技能空清单不渲染）。
 15. 作为 Agent，召回结果受三重上限约束：topK 条数、相似度阈值、token 预算封顶；
-    三者均可配（`memory.*`），触顶时按相似度降序截断。
+    三者均可配（`memory.enabled` / `memory.top_k` / `memory.min_similarity` / `memory.max_tokens`，
+    账号级），触顶时按相似度降序截断。
 
 ### F. 降级
-16. 作为未配置 embedding 的用户，召回自动走 Postgres 关键词/全文检索，仍能取到 topK；
+16. 作为未配置 embedding 的用户，召回自动走关键词降级路，仍能取到 topK；
     对话不因缺向量底座而报错或降级为「不召回」。
 17. 作为运维，配好 embedding 后，新写入的记忆带上向量，召回无缝切回语义检索；历史无向量旧条
     在降级检索下仍可命中（不丢）。
@@ -134,7 +136,10 @@ CREATE INDEX IF NOT EXISTS ix_ws_memory_ws_enabled ON workspace_memory (workspac
 - **D-3 向量维度**：随 embedding 模型固定；维度变更=迁移，标注为破坏性变更。
 - **D-4 查重强度**：create 前检索相似条并**提示**，不硬拦（Agent 仍可选择新建），避免误伤近义不同义。
 - **D-5 删除语义**：`delete` 采用**软删（enabled=false）优先、面板提供硬删**；工具侧默认软删，可撤销。
-- **D-6 降级检索实现**：优先 Postgres 全文 `tsvector`/`pg_trgm`，不引入外部检索组件。
+- **D-6 降级检索实现**（已定 2026-10-09，006 实现时翻案）：**复用 002 的 Python 侧关键词打分**，
+  不引入 `pg_trgm`/`tsvector`。曾定的「优先 Postgres 全文」已否掉：工作区级记忆量为几十条量级，
+  扩展依赖 + GIN 索引 + 一份平行的 SQL 检索路换来的收益为零，且中文二元滑窗已在 Python 侧实现。
+  外部检索组件依旧不引入。
 - **D-7 注入位置**：`<memories>` 与 `<context_summary>` 同由 `build_system_prompt` 之后的
   `_build_messages` 拼接追加，不改 `build_system_prompt` 签名以外的 prompt 生成结构。
 

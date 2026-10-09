@@ -82,6 +82,34 @@ async def test_llm配置按用户隔离平台级键共享(two_auth_clients):
     assert "agent.max_tool_rounds" in cfg_a and "agent.max_tool_rounds" in cfg_b
 
 
+async def test_memory配置按账号隔离不泄到平台级(two_auth_clients):
+    """Ticket 006：memory.* 进了 USER_PREFIXES。召回上限决定「往自己的 prompt 里塞多少」，
+    互相影响就是串号；默认值只存代码常量，库里不该因此多出 owner NULL 行。"""
+    alice, bob = two_auth_clients
+    uid_a = await _me(alice)
+    uid_b = await _me(bob)
+    r = await alice.put("/api/config", json={"memory.top_k": 3, "memory.max_tokens": 100})
+    assert r.status_code == 200
+    cfg_a = (await alice.get("/api/config")).json()
+    cfg_b = (await bob.get("/api/config")).json()
+    assert cfg_a["memory.top_k"] == 3 and cfg_a["memory.max_tokens"] == 100
+    # bob 完全看不到 alice 的调子（无平台级种子行可打底）
+    assert "memory.top_k" not in cfg_b and "memory.max_tokens" not in cfg_b
+    # 平台级键双方照旧共享
+    assert "agent.max_tool_rounds" in cfg_a and "agent.max_tool_rounds" in cfg_b
+    # bob 写同名键不得覆盖 alice 的行（owner+key 结合键）
+    assert (await bob.put("/api/config", json={"memory.top_k": 9})).status_code == 200
+    assert (await alice.get("/api/config")).json()["memory.top_k"] == 3
+    sf = alice.app.state.session_factory
+    async with sf() as s:
+        pairs = (await s.execute(text(
+            "SELECT owner_user_id, value FROM app_config WHERE key = 'memory.top_k' "
+            "ORDER BY owner_user_id"))).fetchall()
+    # 一人一行、各存自己的值；出现 owner NULL 就是漏给全平台（PG 升序 NULL 排最前）
+    assert [(o, v) for o, v in pairs] == [(uid_a, 3), (uid_b, 9)], \
+        "memory.* 必须只落 owner 行：平台级行不被 conftest 的 TRUNCATE 清掉，会漏给后续所有人"
+
+
 async def test_Agent会话按owner解析模型配置(two_auth_clients, tmp_path, test_engine):
     """行为关键链：各自的默认档案只服务各自的会话；直绑他人行也被回落，不串 key。"""
     alice, bob = two_auth_clients

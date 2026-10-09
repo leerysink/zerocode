@@ -58,8 +58,9 @@
 - 检索底座 = **pgvector + 独立 embedding 模型**（见 ADR-0012）；写时算向量、查时算相似度。
 - **降级**：embedding 模型未配置时，回退**关键词/全文检索**，功能不阻断；配好向量模型后自动切回。
 - **注入上限三重约束**：topK 条数 + 相似度阈值过滤 + token 预算封顶。全部可配，沿用
-  `agent.*` 配置风格（如 `memory.recall_top_k` / `memory.recall_min_similarity` /
-  `memory.recall_max_tokens`，`<=0` 语义与现有约定一致）。
+  `agent.*` 配置风格与 owner 过滤（定稿键名：`memory.enabled` / `memory.top_k` /
+  `memory.min_similarity` / `memory.max_tokens`；grill 阶段曾写 `memory.recall_*`，006 落地时
+  去掉 `recall_` 前缀，因为 `enabled` 不单属于召回路径），越界/非法值回落默认。
 
 ### 4.4 生命周期
 - 可去重、可更新、可失效（`enabled` 开关）。

@@ -8,10 +8,12 @@ id 以字符串回传，避免前端 JSON 里 19 位大整数被 Number() 截断
 """
 import asyncio
 import pytest
+from sqlalchemy import text
 from app.db import make_session_factory
 from app.agent.llm import ScriptedLLM
 from app.agent.loop import AgentRunner
 from app.agent.tools import ToolContext, ToolError, execute_tool
+from app.services import config_service
 from app.services import memory_service as mem
 from tests.test_agent_loop import Recorder, cfg_provider, delta, done, mk_session, tool_call
 
@@ -457,3 +459,68 @@ async def test_credential_only_report_carries_no_neutralization_field(test_engin
                      content="接口 password=hunter2 改读环境变量")
     assert r["redacted"] == 1
     assert "neutralized" not in r and "neutralization_note" not in r
+
+
+# ---------------- 注入配置不接管工具侧（ticket 006 review）----------------
+# `memory.*` 管的是「往 prompt 里塞什么」，不是「工具还能不能查历史」。查重若走同一份
+# 策略，关掉注入会连带把故事 10 的防堆积建议一起关掉，max_tokens=1 会把查重名额切没。
+
+_OLD = "pandas 导出 走分块"
+_NEW = "pandas 导出 统一走分块，别改用 csv"
+
+
+async def _owner_cfg(test_engine, ws: int, values: dict) -> None:
+    """把工作区挂到某个账号名下并按该账号写配置。
+
+    只写 owner 行：平台级（owner NULL）的 app_config 不被 conftest 的 TRUNCATE 清掉，
+    写进去会把 memory.* 漏给后续每一个测试。
+    """
+    sf = make_session_factory(test_engine)
+    async with sf() as s:
+        owner = (await s.execute(text("SELECT id FROM actor ORDER BY id LIMIT 1"))).scalar()
+        assert owner is not None, "client fixture 应已注册账号"
+        await s.execute(text("UPDATE workspace SET owner_user_id=:o WHERE id=:w"),
+                        {"o": owner, "w": ws})
+        await config_service.set_many(s, values, owner_user_id=owner)
+        await s.commit()
+
+
+async def _seed_duplicates(test_engine, tmp_path, values, times: int = 3):
+    """建 times 条同主题老条 + 1 条无关条，返回 (sid, 老条 id 字符串列表)。"""
+    sid = await mk_session(test_engine, tmp_path)
+    sf = make_session_factory(test_engine)
+    ws = await _ws_of(test_engine, sid)
+    olds = [await mem.create(sf, ws, "preference", f"{_OLD}{i}", title="导出规范")
+            for i in range(times)]
+    await mem.create(sf, ws, "fact", "界面配色 采用 深色主题")   # 一个关键词都不命中
+    await _owner_cfg(test_engine, ws, values)
+    return sid, [str(o["id"]) for o in olds]
+
+
+async def test_disabled_injection_still_hints_duplicates(client, test_engine, tmp_path):
+    """memory.enabled=false 只关注入：查重照常命中（关掉记忆功能不该顺手废掉防重复建议）。"""
+    sid, olds = await _seed_duplicates(test_engine, tmp_path, {"memory.enabled": False})
+    r = await _write(test_engine, sid, tmp_path, op="create", type="preference", content=_NEW)
+    assert sorted(s["id"] for s in r["similar"]) == sorted(olds)
+
+
+async def test_dedupe_list_ignores_injection_top_k(client, test_engine, tmp_path):
+    """top_k=1 是给注入设的条数上限，不该把查重的对比样本也砍到只剩一条。"""
+    sid, olds = await _seed_duplicates(test_engine, tmp_path, {"memory.top_k": 1}, times=3)
+    r = await _write(test_engine, sid, tmp_path, op="create", type="preference", content=_NEW)
+    assert sorted(s["id"] for s in r["similar"]) == sorted(olds)
+
+
+async def test_dedupe_list_survives_a_one_token_injection_budget(client, test_engine, tmp_path):
+    """max_tokens 触顶是「整条丢弃」：预算配成 1 时注入为空，但查重不许因此报无相似条目。"""
+    sid, olds = await _seed_duplicates(test_engine, tmp_path, {"memory.max_tokens": 1})
+    r = await _write(test_engine, sid, tmp_path, op="create", type="preference", content=_NEW)
+    assert sorted(s["id"] for s in r["similar"]) == sorted(olds)
+
+
+async def test_dedupe_caps_at_its_own_top_k_regardless_of_config(client, test_engine, tmp_path):
+    """查重自己也有上限（5 条老条只回 3 条）：走独立策略不等于不设限。"""
+    sid, olds = await _seed_duplicates(test_engine, tmp_path, {"memory.top_k": 100}, times=5)
+    r = await _write(test_engine, sid, tmp_path, op="create", type="preference", content=_NEW)
+    assert len(r["similar"]) == 3
+    assert all(s["id"] in olds for s in r["similar"])

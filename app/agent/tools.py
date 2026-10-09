@@ -249,8 +249,11 @@ async def execute_tool(ctx: ToolContext, name: str, args: dict) -> dict:
             if op == "create":
                 # 查重在落库之前：命中的必然是既有条目；非字符串 content 不进切词，交服务层报业务错误
                 if isinstance(content, str) and content.strip():
-                    similar = await mem.recall_memories(ctx.session_factory, ws, content,
-                                                        top_k=MEMORY_DEDUPE_TOP_K)
+                    # 查重走 dedupe_policy，不吃 `memory.*` 用户配置：关掉注入（enabled=false）
+                    # 只该停止往 prompt 里塞记忆，不该连带把防堆积建议一起关掉（故事 10）。
+                    similar = await mem.recall_memories(
+                        ctx.session_factory, ws, content,
+                        policy=mem.dedupe_policy(MEMORY_DEDUPE_TOP_K))
                 row = await mem.create(ctx.session_factory, ws, args.get("type"), content,
                                        title=title)
             elif op == "update":

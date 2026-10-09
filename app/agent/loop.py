@@ -170,30 +170,34 @@ class AgentRunner:
             system_text += ("\n\n<current_todos>\n"
                             + json.dumps(todos, ensure_ascii=False)
                             + "\n</current_todos>")
-        # 工作区记忆回灌（ticket 002 / D-7）：以当前任务文本为查询做关键词召回，
+        # 工作区记忆回灌（ticket 002 / D-7，收口见 006）：以当前任务文本为查询做召回，
         # 空命中不注空块（故事 14）——宁可不注入，也不能让空标签污染 system。
-        memories = await self._memories_of(session_id, user_text)
+        # cfg 直接复用本轮已解析的那份：开关/阈值/预算的口径必须和其余 agent.* 配置同源。
+        memories = await self._memories_of(session_id, user_text, cfg)
         if memories:
             system_text += ("\n\n<memories>\n"
                             + "\n".join(self._memory_line(m) for m in memories)
                             + "\n</memories>")
         return [{"role": "system", "content": system_text}] + history
 
-    async def _memories_of(self, session_id: int, user_text: str) -> list[dict]:
+    async def _memories_of(self, session_id: int, user_text: str,
+                           cfg: dict | None = None) -> list[dict]:
         """session → workspace 反查后按当前任务文本召回；任一环为空就返回空（不注块）。
 
-        召回走的是服务层接缝，本版关键词、后续换向量都不必动这里。
+        召回走服务层的唯一接缝 `recall_memories`：开关、相似度阈值、topK、token 封顶和
+        向量/关键词降级都在那里面，本方法只负责反查 workspace 和把 cfg 递过去。
+        cfg 由本轮传入（006）：loop 已经解析过 owner 视角的配置，服务层再查一次 app_config
+        是白的一次往返，还会出现两份真值——改配置后本轮生效与否取决于谁先查到。
         """
         ws = await _mem.workspace_id_of_session(self.sf, session_id)
         if ws is None:
             return []
-        return await _mem.recall_memories(self.sf, ws, user_text)
+        return await _mem.recall_memories(self.sf, ws, user_text, cfg=cfg)
 
     @staticmethod
     def _memory_line(m: dict) -> str:
-        """一条记忆一行 `- [type] content`；正文里的换行折成空格，否则多行记忆会破块格式。"""
-        one_line = " ".join(str(m["content"] or "").split())
-        return f"- [{m['type']}] {one_line}"
+        """注入行格式委托服务层：预算估算与实际注入必须同源（006）。"""
+        return _mem.format_memory_line(m)
 
     async def _drain_steering(self, session_id: int, root: Path, messages: list[dict]) -> int:
         """注入执行中的用户插话（steering）：落库为普通 user 消息 + 追加到本轮 messages。

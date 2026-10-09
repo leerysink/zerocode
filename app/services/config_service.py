@@ -4,7 +4,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 # 用户级键前缀（Ticket 007）：llm.* 按账号各存一份；其余（agent.*/deploy.*/store.*）
 # 维持平台级共享（owner NULL）——拷问阶段裁定。
-USER_PREFIXES = ("llm.",)
+# memory.* 走同一套（Ticket 006）：召回上限决定「往 prompt 里塞多少自己的内容」，
+# 与 llm.* 一样是各人可调、不该互相影响的开关。
+USER_PREFIXES = ("llm.", "memory.")
 
 
 def _is_user_key(k: str) -> bool:
@@ -15,7 +17,7 @@ async def get_all(session: AsyncSession, owner_user_id: int | None = None) -> di
     """配置读取（dbcred.* 永不外显）。
 
     传 owner_user_id 时给出「用户视图」：平台级行（owner NULL）打底，
-    用户自己的 llm.* 行覆盖——用户行存在用之，否则回落全局（工单 007 优先级）。
+    用户自己的 USER_PREFIXES 行覆盖——用户行存在用之，否则回落全局（工单 007 优先级）。
     不传保持平台级视图（只有 owner NULL 行）。"""
     rows = (await session.execute(text(
         "SELECT key, value, owner_user_id FROM app_config "
@@ -29,7 +31,7 @@ async def get_all(session: AsyncSession, owner_user_id: int | None = None) -> di
 
 async def set_many(session: AsyncSession, values: dict,
                    owner_user_id: int | None = None) -> None:
-    """写入按键分流（Ticket 007）：llm.* 落到 owner 行（传了账号才落），
+    """写入按键分流（Ticket 007）：USER_PREFIXES 里的键落到 owner 行（传了账号才落），
     其余键恒写 owner NULL 平台行——普通用户改 agent.* 影响全平台是既定取舍。"""
     for k, v in values.items():
         owner = owner_user_id if _is_user_key(k) else None
