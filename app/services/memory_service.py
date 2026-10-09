@@ -1,11 +1,13 @@
-"""工作区记忆服务（ticket 002、003 / spec §4、§5）。
+"""工作区记忆服务（ticket 002、003、004 / spec §4、§5）。
 
 接缝清单：`create` / `list_enabled` / `recall_memories` / `workspace_id_of_session`（002），
-`update` / `delete`（003，工具与面板共用）。真语义（embedding + 向量索引）留 005，
+`update` / `delete`（003，工具与面板共用），`redact_sensitive` / `neutralize_memory_tags` /
+`sanitize_memory_text`（004，写入红线）。真语义（embedding + 向量索引）留 005，
 topK 阈值与 token 封顶、降级收口留 006。
 
 隔离维度是 workspace（D-1）：所有读写都必须带 workspace_id，跨工作区不可见（故事 18）。
 """
+import dataclasses
 import re
 from sqlalchemy import text
 
@@ -34,6 +36,113 @@ _ENABLED_SELECT = (
     "FROM workspace_memory WHERE workspace_id=:w AND enabled "
     "ORDER BY id DESC"
 )
+
+
+# ---------------- 写入红线：凭据脱敏 + 结构中和（ticket 004 / spec 故事 11、12）----------------
+# 道闸放服务层而不是工具层：面板（008）与工具（003）共用同一对 create/update，前端绕不过去。
+# 占位符统一 <redacted:kind>。app/api/models.py 里的 MASK="sk-***" 是「PUT 时保留原密钥」的
+# 哨兵，和这里的语义无关，不复用、也不改动。
+
+REDACTED_TEMPLATE = "<redacted:{}>"
+# 每条规则的值位都挂这个负向前瞻：同一处凭据只遮一次，二次调用「文本不变 + 计数归零」。
+# 工具层与服务层各过一道闸，没有它就等于「已脱敏 N 处」重复计数、占位符套娃。
+_NOT_REDACTED = r"(?!<redacted:)"
+# 值的右边界：空白、引号、半角结构标点、中日韩标点都算断点。
+# 半角括号/@/#/% 留在值里（真密钥常用），全角一律当分隔符 —— 否则中文正文里的
+# 「password=hunter2，改成读环境变量」会把后半句一并吃掉，记忆就作废了。
+# 代价：紧跟密令后面没有标点时（「password=abc123别写进代码」）会连读一起遮，
+# 宁可过度脱敏也不能漏；密令本身含中文时整段被遮仍是安的方向。
+_VALUE_CHARS = r"[^\s\"',;\u3000-\u303f\uff00-\uffef\u2010-\u2027\u2030-\u205e]"
+_VALUE = _VALUE_CHARS + "+"
+
+
+def _key_value_pattern(keys: str) -> re.Pattern:
+    """拼 key: value / key=value 形态的正则：只吃值、保留键与分隔符，回看时还知道是哪个字段。
+
+    键名右边界用否定前瞻卡住，让 client_secret、access_token 这类复合键在整词起点命中，
+    而不是被短键名从中间截走再重复计数。
+    """
+    return re.compile(
+        rf"(?P<keep>(?:{keys})(?![\w\-])\s*[:=]\s*){_NOT_REDACTED}[\"']?{_VALUE}[\"']?",
+        re.I)
+
+
+# 顺序即应用顺序：键值规则必须排在裸 sk- 之前，否则 api_key=sk-... 会被算成两处。
+SENSITIVE_RULES: tuple[tuple[str, re.Pattern], ...] = (
+    ("private_key", re.compile(
+        r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----",
+        re.S)),
+    # 连接串里的口令：scheme://user:pass@host，只遮 pass —— 协议/主机/库名都是有用的上下文。
+    ("password", re.compile(
+        r"(?P<keep>[a-z][a-z0-9+.\-]{1,40}://[^\s:/@]{1,80}:)" + _NOT_REDACTED
+        + r"[^\s:/@]{1,200}(?=@)", re.I)),
+    ("password", _key_value_pattern(r"passwords?|passwds?|pwd")),
+    ("api_key", _key_value_pattern(r"api[\s\-_]?keys?|access[\s\-_]?keys?")),
+    ("secret", _key_value_pattern(r"client[\s\-_]?secrets?|secrets?(?:[\s\-_]?keys?)?")),
+    ("token", _key_value_pattern(r"auth[\s\-_]?tokens?|access[\s\-_]?tokens?|tokens?")),
+    # Bearer 词的凭据同样吃 _VALUE 边界：用裸的「非空白」会把「，后半句说明」整段吞掉。
+    # {8,} 是下限：「Bearer 认证」这种讨论凭据形态的句子不该被遮。
+    ("token", re.compile(r"(?P<keep>\bbearer\s+)" + _NOT_REDACTED + _VALUE_CHARS + r"{8,}", re.I)),
+    ("api_key", re.compile(r"(?<![\w\-])sk[\-_][A-Za-z0-9\-_]{8,}")),
+)
+
+
+def _redact_sub(match: re.Match, kind: str) -> str:
+    """有 keep 组的规则保留键名与原分隔符，只把值换成占位符；没有的就整段替换。"""
+    keep = match.group("keep") if "keep" in match.re.groupindex else ""
+    return f"{keep}{REDACTED_TEMPLATE.format(kind)}"
+
+
+def redact_sensitive(value: str) -> tuple[str, int]:
+    """把正文里的凭据换成 <redacted:kind>，返回（净化后文本, 脱敏处数）。
+
+    命中即替换、原明文不回传也不落库；空串与非字符串原样返回，交给 _check_* 去给业务错误。
+    """
+    if not isinstance(value, str) or not value:
+        return value, 0
+    total = 0
+    for kind, pat in SENSITIVE_RULES:
+        value, hits = pat.subn(lambda m, k=kind: _redact_sub(m, k), value)
+        total += hits
+    return value, total
+
+
+# 只中和记忆注入块的标记，不做通用标签清洗：<b>、a < b 这些正文必须原样保留。
+_MEMORY_TAG = re.compile(r"</?memories\b[^<>]*>", re.I)
+
+
+def neutralize_memory_tags(value: str) -> tuple[str, int]:
+    """把 </memories> 之类的块标记换成全角，防止一条记忆提前闭合注入块（故事 12 的越狱位）。"""
+    if not isinstance(value, str) or not value:
+        return value, 0
+    return _MEMORY_TAG.subn(
+        lambda m: m.group(0).replace("<", "＜").replace(">", "＞"), value)
+
+
+@dataclasses.dataclass(frozen=True)
+class SanitizeOutcome:
+    """一次净化的分类结果。两类命中性质不同，计数不能合并成一个数字：
+
+    `secrets` 是被换成占位符的凭据处数，`tags` 是被转成全角的注入块标记处数。
+    工具层要分开告诉模型「遮了密码」还是「只改了标签」，混成一个数会让模型
+    误判自己写了凭据（正文里只有一个 </memories> 时谎报「已脱敏 1 处凭据」）。
+    """
+    text: object
+    secrets: int
+    tags: int
+
+
+def sanitize_memory_text(value: str) -> SanitizeOutcome:
+    """写入前的唯一净化关卡：先遮凭据、再中和块标记，两类命中分开计数。
+
+    脱敏可能把文本变长（占位符比短密码长），调用方必须在净化之后复核长度，不能截断了事。
+    非字符串原样透传（text 就是进来的那个值、两个计数都 0），业务错误留给 _check_*。
+    """
+    if not isinstance(value, str):
+        return SanitizeOutcome(text=value, secrets=0, tags=0)
+    clean, secrets = redact_sensitive(value)
+    clean, tags = neutralize_memory_tags(clean)
+    return SanitizeOutcome(text=clean, secrets=secrets, tags=tags)
 
 
 def _check_type(type: str) -> None:
@@ -82,6 +191,12 @@ async def create(session_factory, workspace_id: int, type: str, content: str,
     """落一条记忆，返回整行（含 id，BIGINT）。校验不过即抛 DeployError，绝不落半条。"""
     _check_type(type)
     _check_content(content)
+    # 净化放在入库之前：库里、日志里、事件流里都不留原始明文（票面红线）。
+    content = sanitize_memory_text(content).text
+    # title 同过一道闸：注入行当下只拼 content，但 title 同样是不可信文本，
+    # 面板（008）与后续可能上块的标题都会直接用；字段间信任级别不能不一致。
+    # 且必须在净化后再复核长度：占位符可能比原值长，静默截断会顶破 VARCHAR(200)。
+    title = sanitize_memory_text(title).text
     _check_title(title)
     async with session_factory() as s:
         ws = (await s.execute(text("SELECT 1 FROM workspace WHERE id=:w"),
@@ -114,8 +229,10 @@ async def update(session_factory, workspace_id: int, memory_id, *, type: str | N
         fields["type"] = type
     if content is not None:
         _check_content(content)
+        content = sanitize_memory_text(content).text
         fields["content"] = content
     if title is not None:
+        title = sanitize_memory_text(title).text
         _check_title(title)
         fields["title"] = title
     if enabled is not None:

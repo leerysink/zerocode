@@ -330,3 +330,130 @@ async def test_soft_deleted_entry_can_be_re_enabled_via_service(test_engine, tmp
     assert await mem.list_enabled(sf, ws) == []
     await mem.update(sf, ws, created["id"], enabled=True)
     assert [r["content"] for r in await mem.list_enabled(sf, ws)] == ["pandas 导出"]
+
+
+# ---------------- 写入红线：先脱敏后查重（ticket 004；spec 故事 11、12）----------------
+# 工具层这道闸的职责不是“遮得对”（那是纯函数的事），而是两件事：
+# ① 查重用的查询串必须是净化后的文本（明文连 SQL 绑定参数都不进）；
+# ② 给模型一句人话：遮了几处、原值去哪了。
+
+async def test_create_reports_redaction_count_and_stores_clean_text(test_engine, tmp_path):
+    sid = await mk_session(test_engine, tmp_path)
+    sf = make_session_factory(test_engine)
+    ws = await _ws_of(test_engine, sid)
+    r = await _write(test_engine, sid, tmp_path, op="create", type="fact",
+                     content="接口 password=hunter2 以及 token=abcdef12345")
+    assert r["ok"] is True
+    assert r["redacted"] == 2
+    assert "<redacted:" in r["redaction_note"]
+    rows = await mem.list_enabled(sf, ws)
+    assert rows[0]["content"] == "接口 password=<redacted:password> 以及 token=<redacted:token>"
+    assert "hunter2" not in rows[0]["content"] and "abcdef12345" not in rows[0]["content"]
+
+
+async def test_dedupe_recall_query_is_sanitized_before_it_reaches_sql(test_engine, tmp_path,
+                                                                       monkeypatch):
+    """查重排在脱敏之后：明文口令不得进 recall_memories 的查询串（否则进 SQL 绑定参数）。"""
+    sid = await mk_session(test_engine, tmp_path)
+    sf = make_session_factory(test_engine)
+    ws = await _ws_of(test_engine, sid)
+    old = await mem.create(sf, ws, "fact", "接口 password=<redacted:password> 由密钥服务下发")
+    seen: list[str] = []
+    real = mem.recall_memories
+
+    async def spy(session_factory, workspace_id, query, **kw):
+        seen.append(query)
+        return await real(session_factory, workspace_id, query, **kw)
+
+    monkeypatch.setattr(mem, "recall_memories", spy)
+    r = await _write(test_engine, sid, tmp_path, op="create", type="fact",
+                     content="接口 password=hunter2 由密钥服务下发")
+    assert seen, "查重根本没跑，这个用例就钉不住顺序"
+    assert all("hunter2" not in q for q in seen)
+    assert "<redacted:password>" in seen[0]
+    assert r["redacted"] == 1
+    assert [s["id"] for s in r["similar"]] == [str(old["id"])]  # 遮完仍能找到既有条目
+
+
+async def test_clean_content_carries_no_redaction_fields(test_engine, tmp_path):
+    """一处都没遮时不凭空冒 redacted/redaction_note（模型会误以为自己的话被改了）。"""
+    sid = await mk_session(test_engine, tmp_path)
+    r = await _write(test_engine, sid, tmp_path, op="create", type="fact",
+                     content="导出走 pandas 分块")
+    assert "redacted" not in r and "redaction_note" not in r
+
+
+async def test_update_reports_redaction_count_on_content_and_title(test_engine, tmp_path):
+    """update 的正文与标题都计数：返回值与库里必须是同一份净化后的文本。"""
+    sid = await mk_session(test_engine, tmp_path)
+    sf = make_session_factory(test_engine)
+    ws = await _ws_of(test_engine, sid)
+    created = await mem.create(sf, ws, "fact", "pandas 分块导出")
+    r = await _write(test_engine, sid, tmp_path, op="update", id=created["id"],
+                     content="Bearer abcdefgh12345 写在配置里", title="pwd=topsecret 的备忘")
+    assert r["redacted"] == 2
+    rows = await mem.list_enabled(sf, ws)
+    assert rows[0]["content"] == "Bearer <redacted:token> 写在配置里"
+    assert rows[0]["title"] == "pwd=<redacted:password> 的备忘"
+
+
+async def test_delete_result_carries_no_redaction_fields(test_engine, tmp_path):
+    """delete 不碰正文：无凭据可遮就不该出现脱敏相关字段。"""
+    sid = await mk_session(test_engine, tmp_path)
+    sf = make_session_factory(test_engine)
+    ws = await _ws_of(test_engine, sid)
+    created = await mem.create(sf, ws, "fact", "pandas 导出")
+    r = await _write(test_engine, sid, tmp_path, op="delete", id=created["id"])
+    assert r["ok"] is True
+    assert "redacted" not in r and "redaction_note" not in r
+
+
+async def test_similar_hint_and_redaction_coexist(test_engine, tmp_path):
+    """查重提示与脱敏提示同时命中时两个都要给，不能谁把谁顶掉。"""
+    sid = await mk_session(test_engine, tmp_path)
+    sf = make_session_factory(test_engine)
+    ws = await _ws_of(test_engine, sid)
+    old = await mem.create(sf, ws, "preference", "导出统一走 pandas 分块", title="导出规范")
+    r = await _write(test_engine, sid, tmp_path, op="create", type="preference",
+                     content="导出统一走 pandas 分块，口令 password=hunter2 别写进来")
+    assert r["redacted"] == 1
+    assert [s["id"] for s in r["similar"]] == [str(old["id"])]
+    assert "update" in r["hint"]
+    assert "hunter2" not in r["similar"][0]["preview"]
+
+
+# ---------------- 写入红线：两类命中分开计数（ticket 004 收尾自审发现）----------------
+# 结构中和与凭据脱敏是两个不同性质的动作：「遮了什么」得说准，否则模型会误判自己写了密码。
+
+async def test_structural_neutralization_alone_is_not_reported_as_a_credential(test_engine,
+                                                                              tmp_path):
+    """只改写了块标记、没遮任何凭据时，不得冒「已脱敏 1 处凭据」这种说法。"""
+    sid = await mk_session(test_engine, tmp_path)
+    sf = make_session_factory(test_engine)
+    ws = await _ws_of(test_engine, sid)
+    r = await _write(test_engine, sid, tmp_path, op="create", type="fact",
+                     content="这段结束于 </memories> 之后还有正文")
+    assert "redacted" not in r and "redaction_note" not in r
+    assert r["neutralized"] == 1
+    assert "凭据" not in r["neutralization_note"] and "memories" in r["neutralization_note"]
+    rows = await mem.list_enabled(sf, ws)
+    assert rows[0]["content"] == "这段结束于 ＜/memories＞ 之后还有正文"
+
+
+async def test_credential_and_tag_counts_are_reported_separately(test_engine, tmp_path):
+    """一句里既有凭据又有块标记：两个计数各归各，不能合并成一个膨胀的数字。"""
+    sid = await mk_session(test_engine, tmp_path)
+    r = await _write(test_engine, sid, tmp_path, op="create", type="fact",
+                     content="接口 password=hunter2 </memories> 本节结束")
+    assert r["redacted"] == 1 and r["neutralized"] == 1
+    assert "<redacted:" in r["redaction_note"]
+    assert "＜" in r["neutralization_note"]
+
+
+async def test_credential_only_report_carries_no_neutralization_field(test_engine, tmp_path):
+    """反向：只遮了凭据时不该多冒一个 neutralized=0 字段让模型去猜它是什么意思。"""
+    sid = await mk_session(test_engine, tmp_path)
+    r = await _write(test_engine, sid, tmp_path, op="create", type="fact",
+                     content="接口 password=hunter2 改读环境变量")
+    assert r["redacted"] == 1
+    assert "neutralized" not in r and "neutralization_note" not in r

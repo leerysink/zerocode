@@ -234,17 +234,29 @@ async def execute_tool(ctx: ToolContext, name: str, args: dict) -> dict:
             if ws is None:
                 raise ToolError(f"当前会话不存在或未关联工作区（session_id={ctx.session_id}），记忆无处可存")
             content = args.get("content")
+            title = args.get("title")
+            secrets = neutralized = 0
+            if op in ("create", "update"):
+                # 工具层先过一道闸，再拿净化后的文本去查重：查重是带 content 做 SQL 查询的，
+                # 顺序反了就等于把明文口令塞进绑定参数与语句日志里（服务层那一道是幂等的）。
+                # 两类命中分开累加：遮凭据和改标签是两件事，合并计数会谎报「遮了密码」。
+                # 非字符串原样透传（计数全 0），仍由服务层给「必须是字符串」的业务错误。
+                content_outcome = mem.sanitize_memory_text(content)
+                title_outcome = mem.sanitize_memory_text(title)
+                content, title = content_outcome.text, title_outcome.text
+                secrets = content_outcome.secrets + title_outcome.secrets
+                neutralized = content_outcome.tags + title_outcome.tags
             if op == "create":
                 # 查重在落库之前：命中的必然是既有条目；非字符串 content 不进切词，交服务层报业务错误
                 if isinstance(content, str) and content.strip():
                     similar = await mem.recall_memories(ctx.session_factory, ws, content,
                                                         top_k=MEMORY_DEDUPE_TOP_K)
                 row = await mem.create(ctx.session_factory, ws, args.get("type"), content,
-                                       title=args.get("title"))
+                                       title=title)
             elif op == "update":
                 row = await mem.update(ctx.session_factory, ws, _memory_target_id(args),
                                        type=args.get("type"), content=content,
-                                       title=args.get("title"))
+                                       title=title)
             else:
                 row = await mem.delete(ctx.session_factory, ws, _memory_target_id(args))
         except DeployError as e:
@@ -258,6 +270,15 @@ async def execute_tool(ctx: ToolContext, name: str, args: dict) -> dict:
                                  for m in similar]
             result["hint"] = ("已存在相似记忆；若只是修订请改用 op=update 并带上对应 id，"
                               "避免同一约定堆积多条")
+        if secrets:  # 没遮任何东西就不冒这组字段，否则模型会以为自己的话被莫名改了
+            result["redacted"] = secrets
+            result["redaction_note"] = (f"已脱敏 {secrets} 处凭据（占位符 <redacted:kind>），"
+                                        "原值不入库；需要凭据时从密钥服务或环境变量现取")
+        if neutralized:  # 改标签≠遮凭据：文案里不能出现「凭据」，否则模型会误判自己写了密码
+            result["neutralized"] = neutralized
+            result["neutralization_note"] = (f"已中和 {neutralized} 处记忆块标记"
+                                             "（</memories> 改写为 ＜/memories＞），"
+                                             "避免单条记忆提前闭合注入块")
         return result
 
     raise ToolError(f"未知工具: {name}")
