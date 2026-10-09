@@ -10,7 +10,7 @@ import { Modal, message } from 'ant-design-vue'
 import { ArrowLeftOutlined, ExclamationCircleOutlined } from '@ant-design/icons-vue'
 import { deleteModel, createModel, listModels, pgStatus, testLLM, updateModel } from '../api'
 import { useConfigStore } from '../stores/config'
-import { buildModelPayload, emptyModelForm, validateModelForm } from '../utils/modelForm'
+import { buildModelPayload, emptyModelForm, MODEL_KIND_OPTIONS, modelKindLabel, validateModelForm } from '../utils/modelForm'
 
 const store = useConfigStore()
 // 设置页是无侧栏的独立页，回退优先走浏览器历史；直接输 URL 进来时历史为空 → 兜底回对话首页。
@@ -39,9 +39,12 @@ const modelSaving = ref(false)
 const editingId = ref(null)
 const modelForm = ref(emptyModelForm())
 // 表格约定：columns + bodyCell 模板渲染（默认标记与操作列）
+// 类型列（Ticket 005）：chat 与 embedding 两类档案同居一个列表，不分栏就必须看得出来哪条是向量档案，
+// 否则用户设了「默认」却不知道默认的是哪一类。
 const modelColumns = [
   { title: '名称', dataIndex: 'name' },
   { title: '模型', dataIndex: 'model' },
+  { title: '类型', dataIndex: 'kind', width: 110 },
   { title: 'Base URL', dataIndex: 'base_url' },
   { title: '默认', dataIndex: 'is_default', width: 80 },
   { title: '操作', key: 'action', width: 130 },
@@ -67,11 +70,13 @@ function openCreate() {
 function openEdit(record) {
   editingId.value = record.id
   // api_key 掩码不入表单：留空提交 = 保留原密钥（saveModel 里填哨兵）
+  // kind 必须从行里带回来：后端「不传 = 不改类型」，但表单是个完整载荷，缺值会被归一成 chat
   modelForm.value = {
     name: record.name,
     base_url: record.base_url,
     api_key: '',
     model: record.model,
+    kind: record.kind,
     is_default: record.is_default,
   }
   modelModal.value = true
@@ -183,7 +188,10 @@ async function save() {
           size="small"
         >
           <template #bodyCell="{ column, record }">
-            <template v-if="column.dataIndex === 'is_default'">
+            <template v-if="column.dataIndex === 'kind'">
+              <a-tag :color="record.kind === 'embedding' ? 'purple' : 'default'">{{ modelKindLabel(record.kind) }}</a-tag>
+            </template>
+            <template v-else-if="column.dataIndex === 'is_default'">
               <a-tag v-if="record.is_default" color="blue">默认</a-tag>
             </template>
             <template v-else-if="column.key === 'action'">
@@ -208,6 +216,9 @@ async function save() {
             </a-form-item>
             <a-form-item label="模型名" required>
               <a-input v-model:value="modelForm.model" placeholder="deepseek-chat" />
+            </a-form-item>
+            <a-form-item label="类型" required extra="向量模型只参与工作区记忆的语义召回，不会出现在对话模型下拉里">
+              <a-select v-model:value="modelForm.kind" :options="MODEL_KIND_OPTIONS" style="width: 220px" />
             </a-form-item>
             <a-form-item label="API Key" :required="editingId == null" extra="新建必填；编辑留空表示保留原密钥">
               <a-input-password v-model:value="modelForm.api_key" placeholder="sk-..." />

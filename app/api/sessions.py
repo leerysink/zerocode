@@ -89,8 +89,10 @@ async def set_session_model(request: Request, session_id: int, body: ModelIn):
         await _require_session(s, session_id, uid)
         if body.model_config_id is not None:
             # 档案存在性按当前账号验（Ticket 007）：别人的档案与不存在同口径 404，不泄露存在性
+            # kind 必限 chat（Ticket 005）：会话只能绑对话档案，否则这里返回 ok、
+            # resolve_model 随后按 kind='chat' 把它过滤掉静默回落——「已切换」是个假信号。
             ok = (await s.execute(text(
-                "SELECT 1 FROM model_config WHERE id=:i AND owner_user_id=:u"),
+                "SELECT 1 FROM model_config WHERE id=:i AND kind = 'chat' AND owner_user_id=:u"),
                 {"i": body.model_config_id, "u": uid})).first()
             if not ok:
                 raise HTTPException(404, "模型不存在")

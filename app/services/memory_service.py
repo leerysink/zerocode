@@ -1,17 +1,21 @@
-"""工作区记忆服务（ticket 002、003、004 / spec §4、§5）。
+"""工作区记忆服务（ticket 002、003、004、005 / spec §4、§5）。
 
 接缝清单：`create` / `list_enabled` / `recall_memories` / `workspace_id_of_session`（002），
 `update` / `delete`（003，工具与面板共用），`redact_sensitive` / `neutralize_memory_tags` /
-`sanitize_memory_text`（004，写入红线）。真语义（embedding + 向量索引）留 005，
+`sanitize_memory_text`（004，写入红线），向量写入与向量召回（005，embedding + pgvector）。
 topK 阈值与 token 封顶、降级收口留 006。
 
 隔离维度是 workspace（D-1）：所有读写都必须带 workspace_id，跨工作区不可见（故事 18）。
 """
 import dataclasses
+import logging
 import re
 from sqlalchemy import text
 
+from app.agent import embeddings
 from app.deploy.errors import DeployError
+
+logger = logging.getLogger(__name__)
 
 # 记忆分类（spec §4）：偏好 / 决策 / 事实 / 踩坑。新增分类改这里 + 迁移注释即可。
 MEMORY_TYPES = ("preference", "decision", "fact", "pitfall")
@@ -26,16 +30,44 @@ _LATIN_WORD = re.compile(r"[a-z0-9_]+")
 
 # 单行回读列：create/update/delete 返回同一集字段（含 created_at/updated_at），
 # 面板与工具都拿得到时间戳，不再各自拼 SQL。
-_ROW_COLUMNS = ("id, workspace_id, type, title, content, embedding, enabled, "
-                "created_at, updated_at")
+# 向量列刻意不回读成值而是回读成 has_embedding 布尔位：asyncpg 没有 vector 编解码器，
+# embedding 原样取回就是 1024 个浮点数的字符串（实测约 2KB/条），既撑大 tool_result 的
+# token，又会顺着 007 的 API 漏进前端；面板只需要知道「这条有没有向量」。
+_ROW_COLUMNS = ("id, workspace_id, type, title, content, embedding IS NOT NULL AS has_embedding, "
+                "enabled, created_at, updated_at")
+
+# 必须走 CAST 的列：值是 '[...]' 文本字面量，直接绑进 SET 会被当成 text。
+_VECTOR_COLUMNS = frozenset({"embedding"})
 
 # 启用记忆的取数列：面板与召回看的是同一批字段，005 换检索实现时只改这一处。
 # 自带 ORDER BY：召回同分时要靠它做稳定的“新优先”截断，不能依赖扫描顺序。
+# 向量路径在它之上再加 similarity，两条路径返回的 key 集合保持一致。
 _ENABLED_SELECT = (
-    "SELECT id, workspace_id, type, title, content, enabled, created_at, updated_at "
+    "SELECT id, workspace_id, type, title, content, enabled, "
+    "embedding IS NOT NULL AS has_embedding, created_at, updated_at "
     "FROM workspace_memory WHERE workspace_id=:w AND enabled "
     "ORDER BY id DESC"
 )
+
+# 向量召回（005 / 故事 2、3）：CTE 里把字面量换成一次向量，下面 ORDER BY 与投影都能引用，
+# 免得同一个 :qv 绑三遍。`<=>` 是余弦距离（0=同向，2=反向），相似度 = 1 - 距离；
+# `embedding IS NOT NULL` 必须留着 —— NULL 行参与排序会得到 NULL 距离，顺序不可控。
+# 不设相似度下限（阈值属 006 的收口），只按距离升序取 topK。
+_VECTOR_RECALL_HEAD = (
+    "WITH q AS (SELECT CAST(:qv AS vector) AS v) "
+    "SELECT id, workspace_id, type, title, content, enabled, "
+    "embedding IS NOT NULL AS has_embedding, created_at, updated_at, "
+    "1 - (embedding <=> q.v) AS similarity "
+    "FROM workspace_memory, q "
+    "WHERE workspace_id=:w AND enabled AND embedding IS NOT NULL "
+)
+
+
+def _set_clause(fields: dict) -> str:
+    """拼 SET 片段：列名只来自调用侧的硬编码分支，值一律走绑定参数。"""
+    return ", ".join(
+        f"{col}=CAST(:{col} AS vector)" if col in _VECTOR_COLUMNS else f"{col}=:{col}"
+        for col in fields)
 
 
 # ---------------- 写入红线：凭据脱敏 + 结构中和（ticket 004 / spec 故事 11、12）----------------
@@ -145,6 +177,49 @@ def sanitize_memory_text(value: str) -> SanitizeOutcome:
     return SanitizeOutcome(text=clean, secrets=secrets, tags=tags)
 
 
+# ---------------- 向量（ticket 005 / spec 故事 2、5，D-3 定维）----------------
+# 写入与召回共用同一个入向量文本口径（标题 + 正文）：两边拼接规则不一致，
+# 就变成“按标题算的向量”去配“按正文算的向量”，同一个 owner 自己跟自己有距离。
+
+
+def _embed_input(title, content) -> str:
+    """拼送去 embedding 的文本：只拿非空字符串段，段间一个换行。
+
+    标题缺失就不留前导换行（否则同一段正文因标题有无而向量漂移）；
+    非字符串（比如还没过校验的中间态）当作缺失处理，由调用侧判断要不要算。
+    """
+    parts = [p.strip() for p in (title, content) if isinstance(p, str) and p.strip()]
+    return "\n".join(parts)
+
+
+async def _embedding_literal(s, owner_user_id, title, content) -> str | None:
+    """把文本换成入库/查询用的向量字面量；**任何不可用都返回 None，绝不抛**。
+
+    `s` 复用调用侧已打开的会话（不另开连接，免得在写入事务里再套一层）；
+    进 embedding 的文本在这里再过一道凭据遮断：写入侧的文本已由 004 净化过，但**召回侧的 query
+    是对话原文**，而 kind='embedding' 是用户另配的一个供应商（可以与对话模型不同厂商），
+    少一道闸就是新开一条明文外发通道。脱敏对已净化文本幂等，两边口径依旧一致。
+    """
+    payload = _embed_input(title, content)
+    if not payload:
+        return None
+    payload = redact_sensitive(payload)[0]
+    vecs = await embeddings.embed_for_owner(s, owner_user_id, [payload])
+    if not vecs:
+        return None
+    return embeddings.vector_literal(vecs[0])
+
+
+async def _workspace_owner(s, workspace_id) -> tuple | None:
+    """取工作区的 owner 整行；工作区不存在返回 None。
+
+    必须用 `.first()` 取行而不是 `.scalar()`：后者的 None 同时代指「无行」与
+    「行存在但 owner 为 NULL」，前者要 404，后者照常写（无主遗留档案也是合法配置）。
+    """
+    return (await s.execute(text("SELECT owner_user_id FROM workspace WHERE id=:w"),
+                            {"w": workspace_id})).first()
+
+
 def _check_type(type: str) -> None:
     if type not in MEMORY_TYPES:
         raise DeployError(
@@ -199,16 +274,19 @@ async def create(session_factory, workspace_id: int, type: str, content: str,
     title = sanitize_memory_text(title).text
     _check_title(title)
     async with session_factory() as s:
-        ws = (await s.execute(text("SELECT 1 FROM workspace WHERE id=:w"),
-                              {"w": workspace_id})).scalar()
-        if ws is None:
+        ws_row = await _workspace_owner(s, workspace_id)
+        if ws_row is None:
             raise DeployError(f"工作区不存在：{workspace_id}", status=404)
+        # 向量在净化之后、落库之前算（005）。算不出就是 NULL，行照常进：
+        # embedding 是可选增强，不能让它把记忆写入带倒（故事 5）。
+        # provider 层的维度校验把字面量锁在 EMBEDDING_DIM，不会把异维向量送到定维列上。
+        embedding = await _embedding_literal(s, ws_row[0], title, content)
         row = (await s.execute(text(
-            "INSERT INTO workspace_memory (workspace_id, type, title, content, enabled) "
-            "VALUES (:w, :type, :title, :content, :enabled) "
+            "INSERT INTO workspace_memory (workspace_id, type, title, content, embedding, enabled) "
+            "VALUES (:w, :type, :title, :content, CAST(:embedding AS vector), :enabled) "
             "RETURNING " + _ROW_COLUMNS),
             {"w": workspace_id, "type": type, "title": title, "content": content,
-             "enabled": enabled})).mappings().first()
+             "embedding": embedding, "enabled": enabled})).mappings().first()
         await s.commit()
     return dict(row)
 
@@ -239,14 +317,31 @@ async def update(session_factory, workspace_id: int, memory_id, *, type: str | N
         fields["enabled"] = bool(enabled)
     if not fields:
         raise DeployError("没有需要更新的记忆字段（type / content / title / enabled 至少给一个）")
-    # 列名只来自上面四个硬编码分支，不取自模型传入的字段名；值全走绑定参数
-    sets = ", ".join(f"{col}=:{col}" for col in fields)
     async with session_factory() as s:
+        # 先读旧行：算向量要拿「改完之后的完整文本」（只改 title 就得拿旧正文一起算），
+        # 404 也只能在这里判：UPDATE…RETURNING 读不到旧值。
+        cur = (await s.execute(text(
+            "SELECT m.title, m.content, w.owner_user_id FROM workspace_memory m "
+            "JOIN workspace w ON w.id = m.workspace_id "
+            "WHERE m.id=:i AND m.workspace_id=:w"),
+            {"i": mid, "w": workspace_id})).first()
+        if cur is None:
+            raise DeployError(f"记忆不存在：{memory_id}", status=404)
+        if "content" in fields or "title" in fields:
+            # 只改 type/enabled 时不重算：文本没动，既省一次调用也不会把可用向量刷成 NULL。
+            # 算不出来就写 NULL：陈旧向量比没向量危险——它会按旧文本把这条召回出来。
+            fields["embedding"] = await _embedding_literal(
+                s, cur[2],
+                fields["title"] if "title" in fields else cur[0],
+                fields["content"] if "content" in fields else cur[1])
+        # 列名只来自上面几个硬编码分支，不取自模型传入的字段名；值全走绑定参数
         row = (await s.execute(text(
-            f"UPDATE workspace_memory SET {sets}, updated_at=now() "
+            f"UPDATE workspace_memory SET {_set_clause(fields)}, updated_at=now() "
             "WHERE id=:i AND workspace_id=:w RETURNING " + _ROW_COLUMNS),
             dict(fields, i=mid, w=workspace_id))).mappings().first()
         await s.commit()
+    # 旧行读到过不等于本行还在：并发硬删/工作区级联删除会让 RETURNING 空行，
+    # 少了这道判空就是 dict(None) 的 TypeError，到工具层只糊得出「工具执行异常」。
     if row is None:
         raise DeployError(f"记忆不存在：{memory_id}", status=404)
     return dict(row)
@@ -279,10 +374,56 @@ async def list_enabled(session_factory, workspace_id: int) -> list[dict]:
 
 async def recall_memories(session_factory, workspace_id: int, query: str | None,
                           top_k: int = DEFAULT_TOP_K) -> list[dict]:
-    """按工作区取启用记忆，用关键词命中数排序后截断 topK。
+    """按工作区取启用记忆：能用向量就走语义检索，用不了就回落 002 的关键词。
 
-    空查询 / 切不出词的查询 / 无命中都返回空列表 —— 调用方据此不注空块（故事 14）。
+    回落的四种情形（本票只保证「不比升级前差」，真正的双路混检与阈值收口在 006）：
+    查询切不出文本、工作区不存在、owner 没配 embedding 档案或 provider 调用失败、
+    本工作区一条可用向量都没有。四种都返回 None 给下面那条关键词路径接管，
+    因此空查询 / 无命中仍然返回空列表 —— 调用方据此不注空块（故事 14）。
     """
+    semantic = await _recall_by_vector(session_factory, workspace_id, query, top_k)
+    if semantic is not None:
+        return semantic
+    return await _recall_by_keyword(session_factory, workspace_id, query, top_k)
+
+
+async def _recall_by_vector(session_factory, workspace_id: int, query: str | None,
+                            top_k: int) -> list[dict] | None:
+    """余弦距离升序取 topK；**返回 None 表示「这轮用不上向量」**，由调用侧降级。
+
+    刻意不把「0 命中」和「用不上向量」都编码成空列表：向量列全为 NULL 的工作区若按空列表
+    返回，升级就等于把它的召回整体清零（故事 5 的验收点）。反正余弦排序下只要有可用向量就
+    必然出行，空行集只可能是「没有可用向量」，此时关键词路径才看得见那些行。
+    不设相似度下限：阈值属 006，本票要的是「措辞不同也能命中」这条可 demo 的接缝。
+
+    向量 SQL 是本轮新增的执行面（`CAST(:qv AS vector)` / `<=>`），它自身异常同样不得打断对话：
+    一律降级返回 None 让关键词接管，否则关键词路径根本没被执行到。
+    """
+    if not _embed_input(None, query):
+        return None
+    async with session_factory() as s:
+        ws_row = await _workspace_owner(s, workspace_id)
+        if ws_row is None:
+            return None
+        qvec = await _embedding_literal(s, ws_row[0], None, query)
+        if qvec is None:
+            return None
+        sql = _VECTOR_RECALL_HEAD + "ORDER BY embedding <=> q.v"
+        params: dict[str, object] = {"qv": qvec, "w": workspace_id}
+        if top_k > 0:
+            sql += " LIMIT :lim"
+            params["lim"] = top_k
+        try:
+            rows = (await s.execute(text(sql), params)).mappings().all()
+        except Exception:  # noqa: BLE001 - 向量是新开的执行面，连 DB 异常也得留给关键词
+            logger.warning("向量召回执行失败，本轮降级关键词", exc_info=True)
+            return None
+    return [dict(r) for r in rows] or None
+
+
+async def _recall_by_keyword(session_factory, workspace_id: int, query: str | None,
+                             top_k: int) -> list[dict]:
+    """002 的关键词召回，如今是降级路径：命中数降序 + SQL 的 id DESC 稳定截断。"""
     keywords = _keywords(query)
     if not keywords:
         return []

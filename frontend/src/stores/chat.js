@@ -290,7 +290,8 @@ export const useChatStore = defineStore('chat', {
       }
     },
     async loadModels() {
-      this.models = (await listModels()).data
+      // 只要对话档案：kind='embedding' 的向量模型产不出文本，进下拉就是「选中即报错」（Ticket 005）
+      this.models = (await listModels('chat')).data
     },
     async setModel(id) {
       const sid = this.currentSessionId

@@ -56,6 +56,18 @@ async def test_B把A的模型档案绑到自己会话得404(two_auth_clients, tm
     assert r2.status_code == 200
 
 
+async def test_会话只能绑对话档案_embedding档案得404(client, tmp_path):
+    """Ticket 005 引入 kind 后的新缝：不卡 kind 就绑得上、PATCH 回 ok，
+    而 resolve_model 随后按 kind='chat' 把它过滤掉静默回落——「已切换」是个假信号。"""
+    _, sess = await _mk_ws_session(client, str(tmp_path / "k"))
+    vec = await _mk_model(client, "向量档", "https://vec.invalid/v1", kind="embedding")
+    r = await client.patch(f"/api/sessions/{sess['id']}/model",
+                           json={"model_config_id": vec["id"]})
+    assert r.status_code == 404
+    # 绑不上就要保持原样，不能留一个永远解析不到的绑定在会话行上
+    assert (await client.get(f"/api/sessions/{sess['id']}")).json()["model_config_id"] is None
+
+
 async def test_llm配置按用户隔离平台级键共享(two_auth_clients):
     alice, bob = two_auth_clients
     r = await alice.put("/api/config", json={"llm.model": "from-alice"})

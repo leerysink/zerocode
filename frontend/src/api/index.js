@@ -50,7 +50,9 @@ export const listDir = (workspaceId, path) =>
 export const openFolder = (workspaceId) => http.post('/fs/open-folder', { workspace_id: workspaceId })
 
 // ---- 模型库与会话级模型（交互增强） ----
-export const listModels = () => http.get('/models')
+// kind（Ticket 005）：'chat' / 'embedding' 两类档案共用一套表；不传就是全部（设置页要分类型展示）。
+// 对话模型下拉必须显式传 'chat'，否则向量档案会混进可选列表。
+export const listModels = (kind) => http.get('/models', { params: kind ? { kind } : {} })
 export const createModel = (data) => http.post('/models', data)
 export const updateModel = (id, data) => http.put(`/models/${id}`, data)
 export const deleteModel = (id) => http.delete(`/models/${id}`)

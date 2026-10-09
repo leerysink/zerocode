@@ -1,7 +1,7 @@
 """工作区记忆服务（ticket 002；spec 故事 1、3、6(service create)、13、14、22 的服务侧起步）。
 
-主靶心 = `recall_memories`：本版关键词起步（真语义留 005、上限与降级收口留 006），
-断言集中在「按 workspace 隔离 + enabled 过滤 + 关键词命中数排序 + topK 截断」。
+主靶心 = `recall_memories`：005 起为「先试语义、再回落关键词」的双路径（上限与混检收口留 006），
+断言集中在「按 workspace 隔离 + enabled 过滤 + 命中排序 + topK 截断 + 向量不可用时不比升级前差」。
 """
 import pytest
 from sqlalchemy import text
@@ -658,3 +658,289 @@ async def test_raw_secret_cannot_be_used_as_a_recall_query(test_engine, tmp_path
     assert await mem.recall_memories(sf, ws, "hunter2") == []
     assert [h["content"] for h in await mem.recall_memories(sf, ws, "password")] == [
         "登录入口 pwd=<redacted:password>"]
+
+
+# ---------------- 向量召回（ticket 005 / 故事 2、3、5）----------------
+# 假 provider：把「属于同一语义组」的文本映射到同一个 one-hot 维度，组内相似度 1.0、
+# 组间 0.0 —— 这就是「措辞不同也能命中」的最小可 demo 形态，且完全不联网。
+_SEM_GROUPS = (
+    ("导出", "分块", "pandas", "下载", "拆分", "oom"),
+    ("登录", "鉴权", "口令", "会话", "cookie"),
+    ("配色", "主题", "样式", "antd"),
+)
+
+
+def _sem_vector(payload: str) -> list[float] | None:
+    """命中某个语义组就给那一维置 1；一个都不属于就返回 None（=算不出来）。"""
+    low = (payload or "").lower()
+    vec = [0.0] * mem.embeddings.EMBEDDING_DIM
+    for i, group in enumerate(_SEM_GROUPS):
+        if any(w.lower() in low for w in group):
+            vec[i] = 1.0
+            return vec
+    return None
+
+
+def _use_semantic_provider(monkeypatch, calls: list | None = None) -> None:
+    """把 embeddings.embed_for_owner 换成假 provider；calls 记录 (owner, texts) 供口径断言。"""
+    async def fake(s, owner_user_id, texts):
+        if not texts:
+            return []
+        if calls is not None:
+            calls.append((owner_user_id, list(texts)))
+        out = []
+        for t in texts:
+            v = _sem_vector(t)
+            if v is None:
+                return None
+            out.append(v)
+        return out
+    monkeypatch.setattr(mem.embeddings, "embed_for_owner", fake)
+
+
+def _use_broken_provider(monkeypatch) -> None:
+    """模拟「没配 embedding 档案 / provider 挂了」：任何一次都算不出来。"""
+    async def fake(s, owner_user_id, texts):
+        return [] if not texts else None
+    monkeypatch.setattr(mem.embeddings, "embed_for_owner", fake)
+
+
+async def test_vectorRecallHitsSynonymQueryThatKeywordPathMisses(test_engine, tmp_path, monkeypatch):
+    """本票的靶心：查询与记忆没有一个共同词，靠关键词一条也召回不出来，靠语义能召回。
+
+    两条路径分开断言，才算证明「是向量起的作用」而不是关键词碰巧命中。"""
+    ws = await mk_ws(test_engine, str(tmp_path / "a"))
+    sf = make_session_factory(test_engine)
+    _use_semantic_provider(monkeypatch)
+    await mem.create(sf, ws, "fact", "订单导出统一走 pandas 分块，避免 OOM")
+    query = "把报表下载下来要不要先拆分"
+    hit = await mem.recall_memories(sf, ws, query)
+    assert [h["content"] for h in hit] == ["订单导出统一走 pandas 分块，避免 OOM"]
+    assert hit[0]["similarity"] == pytest.approx(1.0)
+    # 同一查询走关键词路径必须空手而归（升级前后不是同一条代码在起作用）
+    assert await mem._recall_by_keyword(sf, ws, query, mem.DEFAULT_TOP_K) == []
+
+
+async def test_createStoresVectorAndReturnsFlagNotTheVectorItself(test_engine, tmp_path, monkeypatch):
+    """返回值只带 has_embedding：1024 个浮点数的字符串漏进 tool_result 就是白烧 token。"""
+    ws = await mk_ws(test_engine, str(tmp_path / "a"))
+    sf = make_session_factory(test_engine)
+    _use_semantic_provider(monkeypatch)
+    row = await mem.create(sf, ws, "fact", "登录态一律刷新 cookie", title="鉴权")
+    assert row["has_embedding"] is True
+    assert "embedding" not in row
+    async with sf() as s:
+        dims = (await s.execute(text(
+            "SELECT vector_dims(embedding) FROM workspace_memory WHERE id=:i"),
+            {"i": row["id"]})).scalar()
+    assert dims == mem.embeddings.EMBEDDING_DIM
+
+
+async def test_createWithoutProviderStillStoresRowWithNullVector(test_engine, tmp_path, monkeypatch):
+    """故事 5：embedding 是可选增强，算不出来记忆本身照样要落库。"""
+    ws = await mk_ws(test_engine, str(tmp_path / "a"))
+    sf = make_session_factory(test_engine)
+    _use_broken_provider(monkeypatch)
+    row = await mem.create(sf, ws, "fact", "订单导出走 pandas 分块")
+    assert row["has_embedding"] is False
+    assert [r["content"] for r in await mem.list_enabled(sf, ws)] == ["订单导出走 pandas 分块"]
+    assert (await mem.recall_memories(sf, ws, "pandas 导出"))[0]["has_embedding"] is False
+
+
+async def test_updateWithProviderFailureClearsStaleVector(test_engine, tmp_path, monkeypatch):
+    """文本改了但向量算不出来 → 必须刷成 NULL：陈旧向量会按旧文本把这条召回出来。"""
+    ws = await mk_ws(test_engine, str(tmp_path / "a"))
+    sf = make_session_factory(test_engine)
+    _use_semantic_provider(monkeypatch)
+    row = await mem.create(sf, ws, "fact", "订单导出走 pandas 分块")
+    assert row["has_embedding"] is True
+    _use_broken_provider(monkeypatch)
+    out = await mem.update(sf, ws, row["id"], content="改成逐行流式读取，不再分块")
+    assert out["has_embedding"] is False
+
+
+async def test_updateWithoutTextChangeKeepsExistingVector(test_engine, tmp_path, monkeypatch):
+    """只改 type/enabled 不重算：文本没动，既省一次调用也不会把可用向量刷成 NULL。"""
+    ws = await mk_ws(test_engine, str(tmp_path / "a"))
+    sf = make_session_factory(test_engine)
+    _use_semantic_provider(monkeypatch)
+    row = await mem.create(sf, ws, "fact", "登录态一律刷新 cookie")
+    _use_broken_provider(monkeypatch)
+    out = await mem.update(sf, ws, row["id"], enabled=False)
+    assert out["has_embedding"] is True and out["enabled"] is False
+    out2 = await mem.update(sf, ws, row["id"], type="decision")
+    assert out2["has_embedding"] is True
+
+
+async def test_recallFallsBackToKeywordWhenStoredRowsHaveNoVectors(test_engine, tmp_path, monkeypatch):
+    """升级不清零：老记忆全是 NULL 向量，新 provider 上线后仍能按关键词召回（故事 5 的验收点）。"""
+    ws = await mk_ws(test_engine, str(tmp_path / "a"))
+    sf = make_session_factory(test_engine)
+    _use_broken_provider(monkeypatch)
+    await mem.create(sf, ws, "fact", "订单导出走 pandas 分块")
+    _use_semantic_provider(monkeypatch)
+    hit = await mem.recall_memories(sf, ws, "pandas 导出")
+    assert len(hit) == 1
+    assert "similarity" not in hit[0]  # 走的确实是关键词那条路
+
+
+async def test_recallFallsBackToKeywordWhenQueryCannotBeEmbedded(test_engine, tmp_path, monkeypatch):
+    """混合状态：能算向量的那条走向量，provider 认不出的那条仍靠关键词命中（不是二选一全局开关）。"""
+    ws = await mk_ws(test_engine, str(tmp_path / "a"))
+    sf = make_session_factory(test_engine)
+    _use_semantic_provider(monkeypatch)
+    await mem.create(sf, ws, "fact", "订单导出走 pandas 分块")   # 有向量
+    await mem.create(sf, ws, "fact", "缓存穿透要加互斥锁")        # provider 认不出 → NULL 向量
+    hit = await mem.recall_memories(sf, ws, "缓存穿透")
+    assert [h["content"] for h in hit] == ["缓存穿透要加互斥锁"]
+
+
+async def test_vectorRecallSkipsDisabledMemories(test_engine, tmp_path, monkeypatch):
+    """停用即不可见（故事 22）：软删的行向量还在，但绝不能被语义检索捞回来。"""
+    ws = await mk_ws(test_engine, str(tmp_path / "a"))
+    sf = make_session_factory(test_engine)
+    _use_semantic_provider(monkeypatch)
+    exported = await mem.create(sf, ws, "fact", "订单导出走 pandas 分块")
+    await mem.create(sf, ws, "fact", "登录态一律刷新 cookie")
+    await mem.update(sf, ws, exported["id"], enabled=False)
+    hit = await mem.recall_memories(sf, ws, "报表下载拆分")
+    assert [h["content"] for h in hit] == ["登录态一律刷新 cookie"]
+
+
+async def test_vectorRecallScopedToWorkspace(test_engine, tmp_path, monkeypatch):
+    """隔离（故事 18）：另一个工作区里有语义完全相同的一条，也不得串到这里。"""
+    ws_a = await mk_ws(test_engine, str(tmp_path / "a"))
+    ws_b = await mk_ws(test_engine, str(tmp_path / "b"))
+    sf = make_session_factory(test_engine)
+    _use_semantic_provider(monkeypatch)
+    await mem.create(sf, ws_a, "fact", "订单导出走 pandas 分块")
+    await mem.create(sf, ws_b, "fact", "订单导出走 pandas 分块")
+    hit = await mem.recall_memories(sf, ws_a, "报表下载")
+    assert len(hit) == 1
+    assert str(hit[0]["workspace_id"]) == str(ws_a)
+
+
+async def test_recallForMissingWorkspaceReturnsEmptyList(test_engine, tmp_path, monkeypatch):
+    """边界：工作区不存在不得抛错打断对话，两条路径都空手返回 []。"""
+    sf = make_session_factory(test_engine)
+    _use_semantic_provider(monkeypatch)
+    assert await mem.recall_memories(sf, 999999999999, "pandas 导出") == []
+
+
+async def test_vectorRecallOrdersByDistanceAndHonoursTopK(test_engine, tmp_path, monkeypatch):
+    """排序与截断：距离升序；top_k<=0 表示不限制（与 agent.* 参数的同款约定）。"""
+    ws = await mk_ws(test_engine, str(tmp_path / "a"))
+    sf = make_session_factory(test_engine)
+    weights = {"near": 1.0, "mid": 0.4, "far": 0.0}
+
+    async def fake(s, owner_user_id, texts):
+        out = []
+        for t in texts:
+            v = [0.0] * mem.embeddings.EMBEDDING_DIM
+            v[0] = 1.0
+            for word, w in weights.items():
+                if word in (t or ""):
+                    v[1] = w
+            out.append(v)
+        return out
+    monkeypatch.setattr(mem.embeddings, "embed_for_owner", fake)
+    for content in ("alpha far", "alpha mid", "alpha near"):
+        await mem.create(sf, ws, "fact", content)
+    hit = await mem.recall_memories(sf, ws, "alpha near", 2)
+    assert [h["content"] for h in hit] == ["alpha near", "alpha mid"]
+    assert hit[0]["similarity"] == pytest.approx(1.0, abs=1e-6)
+    assert hit[1]["similarity"] < hit[0]["similarity"]
+    assert len(await mem.recall_memories(sf, ws, "alpha near", 0)) == 3
+
+
+async def test_vectorIsComputedFromRedactedTextOnly(test_engine, tmp_path, monkeypatch):
+    """红线：向量必须在 004 净化之后算，否则明文凭据换个形态又落进库（embedding 可被反推）。"""
+    ws = await mk_ws(test_engine, str(tmp_path / "a"))
+    sf = make_session_factory(test_engine)
+    calls: list = []
+    _use_semantic_provider(monkeypatch, calls)
+    row = await mem.create(sf, ws, "fact", "数据库口令 pwd=hunter2，登录走 cookie")
+    sent = "\n".join(t for _owner, texts in calls for t in texts)
+    assert "hunter2" not in sent
+    assert "<redacted:password>" in sent
+    assert row["has_embedding"] is True
+
+
+async def test_updateRecomputesVectorFromMergedNewText(test_engine, tmp_path, monkeypatch):
+    """只改 title 也要拿「改完之后的完整文本」去算：新旧字段各算一半 = 自己跟自己有距离。"""
+    ws = await mk_ws(test_engine, str(tmp_path / "a"))
+    sf = make_session_factory(test_engine)
+    calls: list = []
+    _use_semantic_provider(monkeypatch, calls)
+    row = await mem.create(sf, ws, "fact", "订单导出走 pandas 分块")
+    calls.clear()
+    out = await mem.update(sf, ws, row["id"], title="报表")
+    assert out["has_embedding"] is True
+    assert calls[0][1] == ["报表\n订单导出走 pandas 分块"]
+    assert calls[0][0] is None  # 工作区无主 → owner 原样传 None，不得凭空造一个
+
+
+async def test_recallFallsBackToKeywordWhenVectorSqlErrors(test_engine, tmp_path, monkeypatch):
+    """降级面要盖到 SQL 执行层：向量自身把库打炸也不得打断整轮对话。
+
+    `CAST(:qv AS vector)` / `<=>` 是本轮新增的执行面，异常冒到 loop 就是对话失败，
+    关键词回落形同虚设。用坏字面量制造真实的 pgvector 解析失败，比 mock execute 更贴成因。
+    """
+    ws = await mk_ws(test_engine, str(tmp_path / "a"))
+    sf = make_session_factory(test_engine)
+    _use_semantic_provider(monkeypatch)
+    await mem.create(sf, ws, "fact", "订单导出走 pandas 分块")
+    monkeypatch.setattr(mem.embeddings, "vector_literal", lambda vec: "not-a-vector")
+    hit = await mem.recall_memories(sf, ws, "pandas 导出")
+    assert [h["content"] for h in hit] == ["订单导出走 pandas 分块"]
+    assert "similarity" not in hit[0]  # 回落的确实是关键词那条路
+
+
+async def test_recallQueryIsRedactedBeforeLeavingToEmbedding(test_engine, tmp_path, monkeypatch):
+    """召回的 query 是对话原文，而 kind='embedding' 是用户另配的一个供应商（可不同厂商）：
+    少一道遮断就是 005 新开的一条明文外发通道。"""
+    ws = await mk_ws(test_engine, str(tmp_path / "a"))
+    sf = make_session_factory(test_engine)
+    calls: list = []
+    _use_semantic_provider(monkeypatch, calls)
+    await mem.create(sf, ws, "fact", "登录入口 pwd=hunter2")
+    calls.clear()
+    hit = await mem.recall_memories(sf, ws, "登录入口 password=hunter2")
+    sent = "\n".join(t for _owner, texts in calls for t in texts)
+    assert calls, "query 确实送到了 embedding 侧（否则下面两条断言恒真）"
+    assert "hunter2" not in sent
+    assert "<redacted:password>" in sent
+    assert len(hit) == 1  # 遮断不影响召回：占位符里的键名仍参与语义/关键词
+
+
+async def test_updateReturns404WhenRowVanishesBetweenReadAndWrite(test_engine, tmp_path, monkeypatch):
+    """边界（并发）：旧行读到过不等于本行还在——中途被硬删必须给 404，不是 dict(None) 的 TypeError。"""
+    ws = await mk_ws(test_engine, str(tmp_path / "a"))
+    sf = make_session_factory(test_engine)
+    _use_broken_provider(monkeypatch)
+    row = await mem.create(sf, ws, "fact", "订单导出走 pandas 分块")
+    real_literal = mem._embedding_literal
+
+    async def delete_then_none(s, owner_user_id, title, content):
+        # 接缝就在“读完旧行、还没下 UPDATE”这一瞬：模拟另一个请求把这条彻底删了
+        async with sf() as killer:
+            await killer.execute(text("DELETE FROM workspace_memory WHERE id=:i"),
+                                 {"i": row["id"]})
+            await killer.commit()
+        return await real_literal(s, owner_user_id, title, content)
+
+    monkeypatch.setattr(mem, "_embedding_literal", delete_then_none)
+    with pytest.raises(DeployError) as err:
+        await mem.update(sf, ws, row["id"], content="改成逐行流式读取")
+    assert err.value.status == 404
+
+
+def test_embedInputJoinsTitleAndContentWithoutStrayBlank():
+    """纯函数边界：缺标题不留前导换行（否则同一段正文因标题有无而向量漂移），非串当缺失。"""
+    assert mem._embed_input("导出规范", "走 pandas") == "导出规范\n走 pandas"
+    assert mem._embed_input(None, "走 pandas") == "走 pandas"
+    assert mem._embed_input("   ", "走 pandas") == "走 pandas"
+    assert mem._embed_input(123, "走 pandas") == "走 pandas"
+    assert mem._embed_input("导出规范", None) == "导出规范"
+    assert mem._embed_input(None, "") == ""
+    assert mem._embed_input("", " ") == ""

@@ -1,13 +1,17 @@
 import { describe, it, expect } from 'vitest'
-import { API_KEY_MASK, emptyModelForm, validateModelForm, buildModelPayload } from './modelForm'
+import {
+  API_KEY_MASK, DEFAULT_MODEL_KIND, emptyModelForm, modelKindLabel,
+  validateModelForm, buildModelPayload,
+} from './modelForm'
 
 describe('emptyModelForm', () => {
-  it('返回全空的新建表单', () => {
+  it('返回全空的新建表单（类型默认 chat）', () => {
     expect(emptyModelForm()).toEqual({
       name: '',
       base_url: '',
       api_key: '',
       model: '',
+      kind: 'chat',
       is_default: false,
     })
   })
@@ -19,6 +23,7 @@ describe('validateModelForm', () => {
     base_url: 'https://api.deepseek.com/v1',
     api_key: 'sk-x',
     model: 'deepseek-chat',
+    kind: 'chat',
     is_default: false,
   }
 
@@ -40,6 +45,26 @@ describe('validateModelForm', () => {
     expect(validateModelForm({ ...ok, model: '\t' }, false)).toBe('请填写模型名')
     expect(validateModelForm({ ...ok, api_key: ' ' }, false)).toBe('请填写 API Key')
   })
+
+  // ---- kind 边界（Ticket 005）----
+  it('embedding 是合法类型', () => {
+    expect(validateModelForm({ ...ok, kind: 'embedding' }, false)).toBeNull()
+  })
+
+  it('kind 缺失视为未选，编辑态也照样拦（缺值提交会把已有向量档案刷回 chat）', () => {
+    const { kind, ...noKind } = ok
+    expect(validateModelForm(noKind, true)).toBe('请选择模型类型')
+    expect(validateModelForm({ ...ok, kind: '' }, false)).toBe('请选择模型类型')
+    expect(validateModelForm({ ...ok, kind: null }, false)).toBe('请选择模型类型')
+  })
+
+  it('kind 拼错（如 vl）不静默接受', () => {
+    expect(validateModelForm({ ...ok, kind: 'vl' }, false)).toBe('请选择模型类型')
+  })
+
+  it('其他字段已不合法时先报其他字段（kind 排在末位）', () => {
+    expect(validateModelForm({ ...ok, name: '', kind: 'vl' }, false)).toBe('请填写名称')
+  })
 })
 
 describe('buildModelPayload', () => {
@@ -48,6 +73,7 @@ describe('buildModelPayload', () => {
     base_url: 'https://x/v1',
     api_key: 'sk-new',
     model: 'm',
+    kind: 'chat',
     is_default: true,
   }
 
@@ -57,6 +83,7 @@ describe('buildModelPayload', () => {
       base_url: 'https://x/v1',
       api_key: 'sk-new',
       model: 'm',
+      kind: 'chat',
       is_default: true,
     })
   })
@@ -85,5 +112,29 @@ describe('buildModelPayload', () => {
     expect(payload.name).toBe('D')
     expect(payload.base_url).toBe('https://x/v1')
     expect(payload.model).toBe('m')
+  })
+
+  // ---- kind 边界（Ticket 005）----
+  it('embedding 原样提交', () => {
+    expect(buildModelPayload({ ...form, kind: 'embedding' }, false).kind).toBe('embedding')
+  })
+
+  it('kind 缺失或非法时兜底 chat（校验层已拦下，这里只是不往载荷里送 undefined）', () => {
+    expect(buildModelPayload({ ...form, kind: undefined }, false).kind).toBe(DEFAULT_MODEL_KIND)
+    expect(buildModelPayload({ ...form, kind: 'VL' }, true).kind).toBe(DEFAULT_MODEL_KIND)
+  })
+})
+
+describe('modelKindLabel', () => {
+  it('已知类型给中文标题', () => {
+    expect(modelKindLabel('chat')).toBe('对话模型')
+    expect(modelKindLabel('embedding')).toBe('向量模型（记忆召回）')
+  })
+
+  it('未知类型原样回显、空值不报错（不能把列表渲染成空白）', () => {
+    expect(modelKindLabel('vl')).toBe('vl')
+    expect(modelKindLabel('')).toBe('')
+    expect(modelKindLabel(null)).toBe('')
+    expect(modelKindLabel(undefined)).toBe('')
   })
 })
