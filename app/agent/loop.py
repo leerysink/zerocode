@@ -9,6 +9,7 @@ from pathlib import Path
 from app.agent.prompts import build_system_prompt
 from app.agent.tools import ToolContext, ToolError, execute_tool
 from app.agent.mentions import expand_mentions
+from app.agent.redact import redact_tool_calls_args
 from app.services import compaction_service as _comp
 from app.services import memory_service as _mem
 from app.services.message_service import add_message
@@ -260,24 +261,39 @@ class AgentRunner:
                 elif ev["type"] == "done":
                     final = ev["message"]
             if final.get("tool_calls"):
+                # 凭据遮断（Ticket 010）：三个持久/展示出口（落库、回注、事件推送）共用
+                # 同一份净化后的 tool_calls；工具执行 _dispatch 仍收原始 args——会话历史防
+                # 泄露 ≠ 破坏工具本意，fs_write 之类得能把用户真正要写的凭据落盘。
+                original_calls = final["tool_calls"]
+                sanitized_calls, _ = redact_tool_calls_args(original_calls)
+                final["tool_calls"] = sanitized_calls
                 await add_message(self.sf, session_id, "assistant", content=final.get("content"),
-                                  tool_args={"tool_calls": final["tool_calls"]})
+                                  tool_args={"tool_calls": sanitized_calls})
                 messages.append({"role": "assistant", "content": final.get("content"),
-                                 "tool_calls": final["tool_calls"]})
-                for tc in final["tool_calls"]:
+                                 "tool_calls": sanitized_calls})
+                # 结构被 redact 原样保留（id/type/name 不变、只改 arguments），按位次配对：
+                # exec_tc 供工具真实执行，push_tc 供前端事件展示。等长同序是配对成立的前提，
+                # 加一道廉价护栏：万一将来给 redact 加了过滤分支致列表变短，在这里显式炸，
+                # 不要静默丢一个工具调用 / 错位 tool_call_id 配对（OpenAI 兼容 API 会 400）。
+                assert len(sanitized_calls) == len(original_calls)
+                for exec_tc, push_tc in zip(original_calls, sanitized_calls):
                     if cancel.is_set():
                         raise _Cancelled()
-                    name = tc["function"]["name"]
+                    name = exec_tc["function"]["name"]
                     try:
-                        args = json.loads(tc["function"]["arguments"] or "{}")
+                        exec_args = json.loads(exec_tc["function"]["arguments"] or "{}")
                     except json.JSONDecodeError:
-                        args = {}
-                    await self.send({"type": "tool_call", "name": name, "args": args})
-                    result = await self._dispatch(ctx, cfg, session_id, name, args, cancel)
-                    await add_message(self.sf, session_id, "tool", tool_call_id=tc.get("id"),
+                        exec_args = {}
+                    try:
+                        push_args = json.loads(push_tc["function"]["arguments"] or "{}")
+                    except json.JSONDecodeError:
+                        push_args = {}
+                    await self.send({"type": "tool_call", "name": name, "args": push_args})
+                    result = await self._dispatch(ctx, cfg, session_id, name, exec_args, cancel)
+                    await add_message(self.sf, session_id, "tool", tool_call_id=exec_tc.get("id"),
                                       tool_name=name, tool_result=result)
                     await self.send({"type": "tool_result", "name": name, "result": result})
-                    messages.append({"role": "tool", "tool_call_id": tc.get("id"),
+                    messages.append({"role": "tool", "tool_call_id": exec_tc.get("id"),
                                      "content": json.dumps(result, ensure_ascii=False)})
                 continue
             await add_message(self.sf, session_id, "assistant", content=final.get("content"),
