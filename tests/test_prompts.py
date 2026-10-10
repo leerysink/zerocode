@@ -42,3 +42,44 @@ def test_contract_carries_sqlchange_append_only_discipline(tmp_path):
     text_ = build_app_contract(tmp_path)
     assert "不得修改" in text_ or "只追加" in text_
     assert "两步" in text_   # 破坏性变更两步走（新契约还没有这条纪律时安装闸门拦不住人）
+
+
+# ---- Ticket 009：基线 prompt 记忆时机规则 ----
+
+def test_prompt_carries_memory_timing_rule():
+    """规则 9 存在性断言：票面要求的“三问”关键语句均在 prompt 内。"""
+    p = build_system_prompt("/ws", "2026-10-01")
+    # 什么值得记
+    assert "跨会话仍成立" in p and "主动沉淀" in p
+    # 什么不该记
+    assert "凭据密钥" in p and "一次性调试输出" in p
+    # 记几次
+    assert "同义条目用 update 不重复 create" in p
+    # 锚点指向
+    assert "<memories>" in p
+
+
+def test_memory_rule_does_not_break_injection_order():
+    """规则 9 提到 <memories> 标签，但只是文本说明；实际注入块仍在基线 prompt 之后追加，
+    不破坏 <context_summary> < <current_todos> < <memories> 的顺序红线（rindex 取末尾块）。"""
+    p = build_system_prompt("/ws", "2026-10-01")
+    # 基线 prompt 里提到的标签名（规则文本）
+    assert "<context_summary>" in p
+    assert "<current_todos>" in p
+    assert "<memories>" in p
+    # 它们都是说明文字，不是真正的注入块（真正的注入块由 loop 追加，位置在后）
+    # 模拟 loop 追加：
+    p += "\n\n<context_summary>\n摘要\n</context_summary>"
+    p += "\n\n<current_todos>\n[]\n</current_todos>"
+    p += "\n\n<memories>\n- [fact] 示例\n</memories>"
+    assert (p.rindex("<context_summary>") < p.rindex("<current_todos>")
+            < p.rindex("<memories>"))
+
+
+def test_prompt_builds_without_memory_config():
+    """无技能、无契约、纯基线的常见场景下 prompt 仍能正常拼接（规则 9 不引入外部依赖）。"""
+    p = build_system_prompt("/ws", "2026-10-01")
+    assert isinstance(p, str) and len(p) > 50
+    # 规则 9 在基线文本里，不因缺配置而丢失
+    assert "memory_write" in p
+

@@ -98,11 +98,11 @@ async def test_tool_written_memory_injects_on_next_run(test_engine, tmp_path):
                          lambda *a, **k: asyncio.sleep(0, None), lambda *a, **k: True)
     status = await runner.run(sid, "先写个接口", asyncio.Event())
     assert status == "idle"
-    assert "<memories>" not in llm.received[0][0]["content"]  # 写之前没有记忆块
+    assert "</memories>" not in llm.received[0][0]["content"]  # 写之前没有记忆块（基线规则 9 提到标签名但不含闭合标签）
     status = await runner.run(sid, "接口字段怎么命名", asyncio.Event())
     assert status == "idle"
     system_text = llm.received[-1][0]["content"]
-    assert "<memories>" in system_text and "接口字段一律返回驼峰命名" in system_text
+    assert "</memories>" in system_text and "接口字段一律返回驼峰命名" in system_text
 
 
 async def test_tool_result_carries_ok_and_error_text_to_model(test_engine, tmp_path):
