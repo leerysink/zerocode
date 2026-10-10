@@ -142,3 +142,16 @@ export const dbSqlExec = (id, env, sql) => http.post(`/apps/${id}/db/${env}/sql`
 export const dbSqlBatch = (id, env, statements) =>
   http.post(`/apps/${id}/db/${env}/sql/batch`, { statements })
 export const dbAudit = (id, params = {}) => http.get(`/apps/${id}/db/audit`, { params })
+
+// ---- 工作区记忆（Ticket 007）----
+// id 一律按字符串处理，不得 Number() 转换 19 位大整数（JS 精度截断会改错行）。
+// 列表返回 `res` 整对象（不是 `res.data`）：截断信号在响应头里（`x-memory-truncated` /
+// `x-memory-limit`），返回体维持裸数组。axios 读时头名是小写。
+export const listMemories = (workspaceId, limit) =>
+  http.get(`/workspaces/${workspaceId}/memory`, { params: limit != null ? { limit } : {} })
+export const createMemory = (workspaceId, data) =>
+  http.post(`/workspaces/${workspaceId}/memory`, data) // {type, content, title?, enabled?}
+export const updateMemory = (workspaceId, memoryId, data) =>
+  http.patch(`/workspaces/${workspaceId}/memory/${memoryId}`, data) // {type?, content?, title?, enabled?}
+export const deleteMemory = (workspaceId, memoryId) =>
+  http.delete(`/workspaces/${workspaceId}/memory/${memoryId}`)

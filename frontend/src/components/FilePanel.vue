@@ -14,6 +14,7 @@ import { useChatStore } from '../stores/chat'
 import { useConfigStore } from '../stores/config'
 import { openWorkspaceFilesPage, resolveOpenFolderMode } from '../utils/openFolder'
 import DiffBlock from './DiffBlock.vue'
+import MemoryPanel from './MemoryPanel.vue'
 
 const props = defineProps({
   workspaceId: { type: Number, required: true },
@@ -226,6 +227,9 @@ onMounted(loadTree)
         <div v-else class="zc-fp-changes">
           <DiffBlock v-for="c in changes" :key="c.id" :diff="c.diff" :path="c.path" :action="c.action" />
         </div>
+      </a-tab-pane>
+      <a-tab-pane key="memory" tab="记忆">
+        <MemoryPanel :workspace-id="props.workspaceId" />
       </a-tab-pane>
     </a-tabs>
   </a-layout-sider>
