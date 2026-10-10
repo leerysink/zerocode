@@ -77,6 +77,15 @@ def _unified_diff(path: str, before: str, after: str) -> str:
         fromfile=f"a/{path}", tofile=f"b/{path}"))
 
 async def _record_change(ctx: ToolContext, path: str, action: str, before: str, after: str, msg_id: int | None = None):
+    # 会话侧凭据遮断（Ticket 010 第四出口）：before/after/diff 会整体落平台库 file_change
+    # 并把 diff 推给 WebSocket——这是 tool_args 三出口之外、把用户写进工作区的口令复制进
+    # 平台侧的第四个明文出口。用户真正要写的明文留在工作区文件里（那是用户自己的域、
+    # 且已在本收口之前写盘），平台侧历史/事件只保留可看懂的改动结构（键名、非敏感上下文）。
+    # 复用同一张规则表（memory_service.redact_sensitive），不另抄正则；先遮 before/after
+    # 再据此算 diff，保证三列互相对应、不会一列遮了一列没遮。
+    from app.services.memory_service import redact_sensitive
+    before, _ = redact_sensitive(before)
+    after, _ = redact_sensitive(after)
     diff = _unified_diff(path, before, after)
     if ctx.session_factory is not None:
         async with ctx.session_factory() as s:
