@@ -1,17 +1,28 @@
-"""工作区记忆服务（ticket 002、003、004、005、006 / spec §4、§5）。
+"""工作区记忆服务（ticket 002、003、004、005、006、007 / spec §4、§5）。
 
 接缝清单：`create` / `list_enabled` / `recall_memories` / `workspace_id_of_session`（002），
 `update` / `delete`（003，工具与面板共用），`redact_sensitive` / `neutralize_memory_tags` /
 `sanitize_memory_text`（004，写入红线），向量写入与向量召回（005，embedding + pgvector），
-`memory.*` 配置与召回收口（006：开关短路 + 阈值/topK/token 三重上限 + 无向量行混检补齐）。
+`memory.*` 配置与召回收口（006：开关短路 + 阈值/topK/token 三重上限 + 无向量行混检补齐），
+`require_workspace` / `list_memories` / `check_panel_limit`（007，面板读面与归属闸）。
 
 隔离维度是 workspace（D-1）：所有读写都必须带 workspace_id，跨工作区不可见（故事 18）。
+
+owner 闸的取舍（007 review M-1）：本模块的 `create` / `update` / `delete` / `list_memories` 只收
+`workspace_id`，**不收 owner 参数**，归属过滤靠调用方在之前先过 `require_workspace`。功能上等价
+（workspace_id 本身就是行归属的充分条件），但它是一处时序耦合：任何新入口漏调一次
+`require_workspace`，就是静默的跨账号读写。所以规矩是硬的 —— HTTP 面的归属闸由
+`app/api/memories.py` 的 **router 级 dependencies**（`guard_workspace`）机械强制，
+新增 handler 无需自己调用；Python 侧直调本模块读写仍须先过 `require_workspace`。
+不把 owner 折进这四个函数的签名，是为了不牵动 002~006 已有的调用面与测试
+（工具侧走的是会话归属那道闸）。取舍登记在 `app/api/memories.py` 模块 docstring。
 """
 import dataclasses
 import logging
 import math
 import re
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 
 from app.agent import embeddings
 from app.deploy.errors import DeployError
@@ -24,8 +35,15 @@ MEMORY_TYPES = ("preference", "decision", "fact", "pitfall")
 # 注入 prompt 的默认条数上限；top_k <= 0 表示不限制（与 agent.* 参数的 <=0 不限制约定一致）
 DEFAULT_TOP_K = 5
 TITLE_MAX_LEN = 200
+# 单条正文上限：远大于任何一条原子记忆的实际体量，纯粹是防护栅（面板可以整篇粘贴）。
+# 取 2 万字是为了「不会误伤真实使用」：召回侧另有 token 预算封顶，这里只管存储与回读。
+CONTENT_MAX_LEN = 20_000
 # BIGINT 上界：模型幻觉出 22 位 id 时 int() 能过但 asyncpg 会溢出，必须在这层挡住
 _BIGINT_MAX = 2 ** 63 - 1
+# 错误文案里回显用户输入要封顶：4301 位的 id 直接 repr 出来就是一条 4300+ 字节的 detail
+# （前端弹一个错误框能滚满一屏），`type` 这类字段本身没有别的长度闸，传多大就回显多大。
+# 截断只发生在**回显**上，校验本身照旧按完整输入判。
+_ECHO_MAX = 80
 
 _CJK_RUN = re.compile(r"[\u4e00-\u9fff]+")
 _LATIN_WORD = re.compile(r"[a-z0-9_]+")
@@ -253,10 +271,18 @@ async def _workspace_owner(s, workspace_id) -> tuple | None:
                             {"w": workspace_id})).first()
 
 
+def _brief(value) -> str:
+    """把任意用户输入压成一段有界的 repr，供错误文案安全回显（长度闸见 `_ECHO_MAX`）。"""
+    shown = repr(value)
+    if len(shown) > _ECHO_MAX:
+        shown = f"{shown[:_ECHO_MAX]}…（原输入 {len(str(value))} 字符）"
+    return shown
+
+
 def _check_type(type: str) -> None:
     if type not in MEMORY_TYPES:
         raise DeployError(
-            f"未知的记忆类型 {type!r}，可选：{' / '.join(MEMORY_TYPES)}")
+            f"未知的记忆类型 {_brief(type)}，可选：{' / '.join(MEMORY_TYPES)}")
 
 
 def _check_content(content) -> None:
@@ -265,6 +291,12 @@ def _check_content(content) -> None:
         raise DeployError("记忆内容不能为空")
     if not isinstance(content, str):
         raise DeployError(f"记忆内容必须是字符串，收到 {type(content).__name__}")
+    # 条数封顶（007 的 limit）之外还得有单条封顶：content 列是 TEXT，面板上贴一整篇
+    # 文档也能落库，500 条 × 无上限就是一次把前端读爆。工具侧的 content 受模型输出规模
+    # 天然约束，面板侧没有这层约束，所以闸必须落在服务层而不是前端。
+    if len(content) > CONTENT_MAX_LEN:
+        raise DeployError(f"记忆内容不能超过 {CONTENT_MAX_LEN} 字，收到 {len(content)} 字；"
+                          "记忆是原子结论，请把长文拆开或只留可复用的那一句")
 
 
 def _check_title(title) -> None:
@@ -276,22 +308,59 @@ def _check_title(title) -> None:
         raise DeployError(f"记忆标题不能超过 {TITLE_MAX_LEN} 字")
 
 
-def _as_id(memory_id) -> int:
-    """id 允许 int 或纯数字串（大整数一律字符串传输，禁中途 int() 截断）。
+def normalize_title(title) -> str | None:
+    """空标题一律落成 NULL，不留空串（沿用 skills 侧「空串视作未给」的口径）。
+
+    面板里一条 `title=""` 会渲染成空白单元格，用户分不清是没标题还是标题被吞了；
+    PATCH 传空串也就顺带有了「清空标题」的写法。
+    """
+    return None if title is None or not title.strip() else title
+
+
+def parse_id(value, label: str = "记忆") -> int:
+    """BIGINT id 的统一解析：允许 int 或纯数字串（大整数一律字符串传输，禁中途 int() 截断）。
 
     非数字/负数/超 BIGINT 都给业务错误，不能让 asyncpg 的类型或溢出异常冒到工具层
-    被包成语义模糊的「工具执行异常」。
+    被包成语义模糊的「工具执行异常」，也不能冒成 HTTP 500。
 
     必须同时卡 isascii：`isdigit()` 认上标/全角/阿拉伯-印度数字，`int()` 对前两者要么抛
     ValueError、要么**悄悄换成另一个数**（"１２"→12），后者会改到毫不相干的另一行记忆。
+
+    位数要在 `int()` 之前判，且**按原始串判**：CPython 默认 `sys.set_int_max_str_digits=4300`，
+    一个 5000 位的全数字串会在这里抛 ValueError（不是 DeployError，路由的 except 接不住）→ 500。
+    BIGINT 的十进制最长就是 19 位，超了必然越界，不必真的把它转成整数才知道。
+    这里不能用 `lstrip("0")` 后的长度判：上限数的就是原始位数、前导零同样计入，
+    `"0" * 4301` 去零后长度归 0 会绕过闸门照样 500（007 二轮 review M-4）。
+
+    前导零一律拒绝（`"007"` 不是 `7`）：本模块对 id 从不做事后静默修正，
+    悄悄换数会改到毫不相干的另一行，和上面 `isascii` 那条防的是同一个坑。
     """
-    text_id = str(memory_id).strip()
+    text_id = str(value).strip()
     if not (text_id.isascii() and text_id.isdigit()):
-        raise DeployError(f"非法的记忆 id：{memory_id!r}")
-    value = int(text_id)
-    if value > _BIGINT_MAX:
-        raise DeployError(f"记忆 id 超出整数范围：{memory_id!r}")
-    return value
+        raise DeployError(f"非法的{label} id：{_brief(value)}")
+    if len(text_id) > len(str(_BIGINT_MAX)):
+        raise DeployError(f"{label} id 超出整数范围：{_brief(value)}")
+    if len(text_id) > 1 and text_id.startswith("0"):
+        raise DeployError(f"非法的{label} id：{_brief(value)}")
+    out = int(text_id)
+    if out > _BIGINT_MAX:
+        raise DeployError(f"{label} id 超出整数范围：{_brief(value)}")
+    return out
+
+
+# asyncpg 的 sqlstate：23503 = foreign_key_violation。
+_SQLSTATE_FOREIGN_KEY = "23503"
+
+
+def _is_fk_violation(exc: IntegrityError) -> bool:
+    """只认外键违例，其余完整性错误原样抛（`create` 的 404 兜底靠它收窄）。
+
+    「本表只有 FK 一个完整性约束」是**当下**事实（见 changelog/V20261008_01_workspace_memory.sql），
+    不是永久属性：日后给这张表加 UNIQUE/CHECK（比如「同 workspace 内 type+title 去重」是很自然的
+    演进），裸 `except IntegrityError` 会把撞约束的真实写失败谎报成「工作区不存在」404，
+    把排查方向整个带偏。按 sqlstate 判据就不依赖那句假设。
+    """
+    return getattr(exc.orig, "sqlstate", None) == _SQLSTATE_FOREIGN_KEY
 
 
 async def create(session_factory, workspace_id: int, type: str, content: str,
@@ -304,23 +373,36 @@ async def create(session_factory, workspace_id: int, type: str, content: str,
     # title 同过一道闸：注入行当下只拼 content，但 title 同样是不可信文本，
     # 面板（008）与后续可能上块的标题都会直接用；字段间信任级别不能不一致。
     # 且必须在净化后再复核长度：占位符可能比原值长，静默截断会顶破 VARCHAR(200)。
-    title = sanitize_memory_text(title).text
+    title = normalize_title(sanitize_memory_text(title).text)
     _check_title(title)
     async with session_factory() as s:
         ws_row = await _workspace_owner(s, workspace_id)
         if ws_row is None:
-            raise DeployError(f"工作区不存在：{workspace_id}", status=404)
+            # 文案不带 id，与 `require_workspace` 逐字节相同：HTTP 面上「工作区不存在」
+            # 只能有一种回显，否则并发删工作区时同一失败条件会露出两种文案。
+            raise DeployError("工作区不存在", status=404)
         # 向量在净化之后、落库之前算（005）。算不出就是 NULL，行照常进：
         # embedding 是可选增强，不能让它把记忆写入带倒（故事 5）。
         # provider 层的维度校验把字面量锁在 EMBEDDING_DIM，不会把异维向量送到定维列上。
         embedding = await _embedding_literal(s, ws_row[0], title, content)
-        row = (await s.execute(text(
-            "INSERT INTO workspace_memory (workspace_id, type, title, content, embedding, enabled) "
-            "VALUES (:w, :type, :title, :content, CAST(:embedding AS vector), :enabled) "
-            "RETURNING " + _ROW_COLUMNS),
-            {"w": workspace_id, "type": type, "title": title, "content": content,
-             "embedding": embedding, "enabled": enabled})).mappings().first()
-        await s.commit()
+        try:
+            row = (await s.execute(text(
+                "INSERT INTO workspace_memory (workspace_id, type, title, content, embedding, enabled) "
+                "VALUES (:w, :type, :title, :content, CAST(:embedding AS vector), :enabled) "
+                "RETURNING " + _ROW_COLUMNS),
+                {"w": workspace_id, "type": type, "title": title, "content": content,
+                 "embedding": embedding, "enabled": enabled})).mappings().first()
+            await s.commit()
+        except IntegrityError as e:
+            # 「工作区还在」这条判断和本条 INSERT 不在同一事务里（`require_workspace` 又是第三个
+            # 会话），READ COMMITTED 下中间被人删掉工作区就会在这里撞 FK。asyncpg 的
+            # ForeignKeyViolation 不是 DeployError，路由的 `except DeployError` 接不住 → 500。
+            # 只把 FK 折成 404（判据见 `_is_fk_violation`），别的完整性违例照旧往上抛，
+            # 不谎报成「工作区不存在」。文案复用上面同一句 404，保持「工作区不存在」
+            # 在 HTTP 面上只有一种回显。未 commit 的事务由 `async with` 退出时回滚，不会留半条。
+            if not _is_fk_violation(e):
+                raise
+            raise DeployError("工作区不存在", status=404) from e
     return dict(row)
 
 
@@ -333,7 +415,7 @@ async def update(session_factory, workspace_id: int, memory_id, *, type: str | N
     ② 一个字段都没给 → 明确失败，不能只刷个 updated_at 让调用方以为改成了；
     ③ updated_at 必须显式 SET（表上没有触发器）。
     """
-    mid = _as_id(memory_id)
+    mid = parse_id(memory_id)
     fields: dict[str, object] = {}
     if type is not None:
         _check_type(type)
@@ -343,7 +425,7 @@ async def update(session_factory, workspace_id: int, memory_id, *, type: str | N
         content = sanitize_memory_text(content).text
         fields["content"] = content
     if title is not None:
-        title = sanitize_memory_text(title).text
+        title = normalize_title(sanitize_memory_text(title).text)
         _check_title(title)
         fields["title"] = title
     if enabled is not None:
@@ -359,7 +441,9 @@ async def update(session_factory, workspace_id: int, memory_id, *, type: str | N
             "WHERE m.id=:i AND m.workspace_id=:w"),
             {"i": mid, "w": workspace_id})).first()
         if cur is None:
-            raise DeployError(f"记忆不存在：{memory_id}", status=404)
+            # 回显走 `_brief`：`parse_id` 已把 id 限到 19 字符，但服务层还被工具侧直调，
+            # 模型递进来的任意长 id 不该原样拼进 detail（m-1 的口径，一处不留第二套写法）。
+            raise DeployError(f"记忆不存在：{_brief(memory_id)}", status=404)
         if "content" in fields or "title" in fields:
             # 只改 type/enabled 时不重算：文本没动，既省一次调用也不会把可用向量刷成 NULL。
             # 算不出来就写 NULL：陈旧向量比没向量危险——它会按旧文本把这条召回出来。
@@ -376,7 +460,7 @@ async def update(session_factory, workspace_id: int, memory_id, *, type: str | N
     # 旧行读到过不等于本行还在：并发硬删/工作区级联删除会让 RETURNING 空行，
     # 少了这道判空就是 dict(None) 的 TypeError，到工具层只糊得出「工具执行异常」。
     if row is None:
-        raise DeployError(f"记忆不存在：{memory_id}", status=404)
+        raise DeployError(f"记忆不存在：{_brief(memory_id)}", status=404)
     return dict(row)
 
 
@@ -385,7 +469,7 @@ async def delete(session_factory, workspace_id: int, memory_id, hard: bool = Fal
 
     软删可重复执行且结果一致（幂等）；硬删第二次就是 404，因为行真的没了。
     """
-    mid = _as_id(memory_id)
+    mid = parse_id(memory_id)
     stmt = ("DELETE FROM workspace_memory WHERE id=:i AND workspace_id=:w RETURNING "
             + _ROW_COLUMNS) if hard else (
         "UPDATE workspace_memory SET enabled=FALSE, updated_at=now() "
@@ -394,7 +478,7 @@ async def delete(session_factory, workspace_id: int, memory_id, hard: bool = Fal
         row = (await s.execute(text(stmt), {"i": mid, "w": workspace_id})).mappings().first()
         await s.commit()
     if row is None:
-        raise DeployError(f"记忆不存在：{memory_id}", status=404)
+        raise DeployError(f"记忆不存在：{_brief(memory_id)}", status=404)
     return dict(row)
 
 
@@ -403,6 +487,69 @@ async def list_enabled(session_factory, workspace_id: int) -> list[dict]:
     async with session_factory() as s:
         rows = (await s.execute(text(_ENABLED_SELECT), {"w": workspace_id})).mappings().all()
     return [dict(r) for r in rows]
+
+
+# ---------------- 面板读面与归属闸（ticket 007 / spec 故事 11、18）----------------
+# 记忆条数本身不设总量上限（用户自己攒），但一次 HTTP 回读必须封顶：
+# 集到几千条的账号打开面板就是同步拉爆自己，所以“不传 limit”不等于“全量”。
+PANEL_LIMIT_DEFAULT = 200
+PANEL_LIMIT_MAX = 500
+
+
+async def require_workspace(session_factory, workspace_id: int, owner_user_id) -> None:
+    """归属闸：工作区存在且属于 `owner_user_id` 才放行；传 None = 不看归属（创始人）。
+
+    越权与不存在**同一个 404、同一句文案**（沿用 workspaces.delete 的既有口径：
+    “工作区不存在”不带 id、不分 403）：拆成 403/404 就等于告诉探测者“这行真的存在”。
+    无主遗留行（owner NULL）对非创始人一律 404：写入侧（002）允许无主工作区落记忆
+    是历史遗留兼容，但面板是权限入口，不能比工具宽松。
+
+    本函数是模块 docstring 里那条硬规矩的唯一执行点：HTTP 面上的归属闸挂在
+    `app/api/memories.py` 的 **router 级 dependencies** 上（007 二轮 review M-1 定为机械强制，
+    不再依赖 handler 自觉调用），服务层这四个读写函数自己不查归属，Python 侧直调时仍须先过它。
+    """
+    async with session_factory() as s:
+        row = await _workspace_owner(s, workspace_id)
+    if row is None or (owner_user_id is not None and row[0] != owner_user_id):
+        # 文案不拼 workspace_id：两种情形必须逐字节相同，否则“存在但不属于你”就能被探测出来
+        raise DeployError("工作区不存在", status=404)
+
+
+def check_panel_limit(limit) -> int:
+    """面板条数只能落在 1..PANEL_LIMIT_MAX。
+
+    0/负数/越上限都是调用方写错，不「静默按默认」：静默会让前端一个比较符号写反
+    就变成“永远只返 200 条”这种难查的错位。
+
+    bool 特判只防 Python 直调（`limit=True` 会被当成 1 条，True 是 int 的子类）：HTTP 面上 query
+    参数由 pydantic 解析，`limit=true` 到不了这里就已经 422，测试别指望这道闸回 400。
+    """
+    if not isinstance(limit, int) or isinstance(limit, bool):
+        raise DeployError(f"limit 必须是整数，收到 {type(limit).__name__}")
+    if limit < 1 or limit > PANEL_LIMIT_MAX:
+        raise DeployError(f"limit 必须在 1..{PANEL_LIMIT_MAX} 之间，收到 {limit}")
+    return limit
+
+
+async def list_memories(session_factory, workspace_id: int,
+                        limit: int) -> tuple[list[dict], bool]:
+    """面板读面：**含停用行**（新→旧），条数封顶；返回 `(行, 是否还有没取完的行)`。
+
+    与 `list_enabled` 是两道不同的读面，不能复用：停用的记忆必须在面板里看得见，
+    否则用户没法把它再打开；而召回侧反过来——关掉了就不该进 prompt。
+
+    第二个返回值是截断信号：封顶之后面板没有分页，多过上限的老记忆既看不见也删不掉，
+    用户会读成数据丢失。所以内部多取一行来探测（`LIMIT size+1`），让调用方能给出「已被
+    截断、请改大 limit 或清理老记忆」的提示（007 的 GET 用响应头下发，008 面板据此显示）。
+    """
+    size = check_panel_limit(limit)
+    async with session_factory() as s:
+        rows = (await s.execute(text(
+            f"SELECT {_ROW_COLUMNS} FROM workspace_memory WHERE workspace_id=:w "
+            "ORDER BY id DESC LIMIT :l"),
+            {"w": workspace_id, "l": size + 1})).mappings().all()
+    truncated = len(rows) > size
+    return [dict(r) for r in rows[:size]], truncated
 
 
 @dataclasses.dataclass(frozen=True)

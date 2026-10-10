@@ -168,6 +168,9 @@ def create_app(database_url: str | None = None) -> FastAPI:
     # 账户级技能库（Ticket 001 / ADR-0004）：/api/skills 列表 + 直链安装
     from app.api import skills as skills_api
     app.include_router(skills_api.router)
+    # 工作区记忆面板（Ticket 007）：/api/workspaces/{id}/memory，与 memory_write 工具同一份数据
+    from app.api import memories as memories_api
+    app.include_router(memories_api.router)
     app.include_router(ws_router)
 
     # ---- 全局登录 guard（Ticket 002 / ADR-0003）：/api/* 除 /api/auth/* 外一律要求会话 ----
