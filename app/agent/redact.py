@@ -14,8 +14,25 @@
 from __future__ import annotations
 
 import json
+import re
 
-from app.services.memory_service import redact_sensitive
+from app.services.memory_service import redact_sensitive, REDACTED_MARKER
+
+# 完整占位符形态：前缀 + kind 词 + 闭合 `>`，与 REDACTED_TEMPLATE 产物严格同形。
+# 故意要求闭合：叙述性文本里的裸 `<redacted:`、`<redacted: 待定>`（含空格/中文、无闭合）
+# 不算占位符，不应被写盘护栏误伤。
+_REDACTED_FULL = re.compile(rf"{re.escape(REDACTED_MARKER)}[A-Za-z0-9_]+>")
+
+
+def contains_redaction_marker(value) -> bool:
+    """是否含平台遮断占位符标记 `<redacted:kind>`（Ticket 010 第五出口衍生护栏）。
+
+    跨轮历史从净化库重建，模型看到的前一次 tool_result 已是 `<redacted:kind>` 占位符；
+    若它把占位符当作文件真实内容递回写盘工具，而工具执行收的是原始 args，就会把
+    占位符字面量真写进工作区文件。护栏只认**完整标记**（带闭合 `>`），不误伤普通
+    含尖括号正文或叙述性文本。非字符串一律返回 False。
+    """
+    return isinstance(value, str) and _REDACTED_FULL.search(value) is not None
 
 
 def _redact_value(v):
@@ -78,3 +95,19 @@ def redact_tool_calls_args(tool_calls: list[dict]) -> tuple[list[dict], int]:
             # 不含任何敏感形态时原文一字不改
             result.append(tc)
     return result, total
+
+
+def redact_tool_result(result):
+    """遮断工具返回值里的凭据（Ticket 010 第五出口：落库 + WS 推送走净化版）。
+
+    复用同一张规则表递归走 dict/list，把每个 str 值里的凭据换成 <redacted:kind>；
+    返回**新对象**、绝不就地改——loop 里净化版给库/事件，原文仍回注当轮模型，
+    两条口径共用同一个 result 入参，改坏了模型就读不到真实文件内容。
+    非容器 / 空值原样透传（_redact_deep 对 int/bool/None 直接返回）。
+    顶层直接是 str 时也要遮（_redact_deep 会把非容器原样返回，不跑规则），否则未来
+    返回纯文本的工具会绕过遮断。
+    """
+    if isinstance(result, str):
+        return redact_sensitive(result)[0]
+    sanitized, _ = _redact_deep(result)
+    return sanitized

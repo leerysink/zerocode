@@ -126,10 +126,14 @@ def _set_clause(fields: dict) -> str:
 # 占位符统一 <redacted:kind>。app/api/models.py 里的 MASK="sk-***" 是「PUT 时保留原密钥」的
 # 哨兵，和这里的语义无关，不复用、也不改动。
 
-REDACTED_TEMPLATE = "<redacted:{}>"
+# 平台保留的遮断占位符前缀：护栏（Ticket 010 第五出口衍生）据此识别「占位符被模型
+# 当成文件真实内容」的写盘请求；改这个常量即改全局，不要再抄第二份字面量。
+REDACTED_MARKER = "<redacted:"
+REDACTED_TEMPLATE = f"{REDACTED_MARKER}{{}}>"
 # 每条规则的值位都挂这个负向前瞻：同一处凭据只遮一次，二次调用「文本不变 + 计数归零」。
 # 工具层与服务层各过一道闸，没有它就等于「已脱敏 N 处」重复计数、占位符套娃。
-_NOT_REDACTED = r"(?!<redacted:)"
+# 前瞻里的标记从 REDACTED_MARKER 派生（`<`/`:` 在正则里无特殊义，re.escape 逐字等价），不再抄第二份。
+_NOT_REDACTED = rf"(?!{re.escape(REDACTED_MARKER)})"
 # 值的右边界：空白、引号、半角结构标点、中日韩标点都算断点。
 # 半角括号/@/#/% 留在值里（真密钥常用），全角一律当分隔符 —— 否则中文正文里的
 # 「password=hunter2，改成读环境变量」会把后半句一并吃掉，记忆就作废了。

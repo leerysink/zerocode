@@ -9,7 +9,7 @@ from pathlib import Path
 from app.agent.prompts import build_system_prompt
 from app.agent.tools import ToolContext, ToolError, execute_tool
 from app.agent.mentions import expand_mentions
-from app.agent.redact import redact_tool_calls_args
+from app.agent.redact import redact_tool_calls_args, redact_tool_result
 from app.services import compaction_service as _comp
 from app.services import memory_service as _mem
 from app.services.message_service import add_message
@@ -290,9 +290,14 @@ class AgentRunner:
                         push_args = {}
                     await self.send({"type": "tool_call", "name": name, "args": push_args})
                     result = await self._dispatch(ctx, cfg, session_id, name, exec_args, cancel)
+                    # 凭据遮断（Ticket 010 第五出口）：tool_result 落库 / WS 推送走净化版，
+                    # 但**当轮回注模型仍用原文**——read_file 的真实内容必须进 messages，
+                    # 否则模型看不到文件、edit_file 构造不出 old_string。平台侧库/事件不留
+                    # 明文；跨轮从净化库重建历史，回注自然无明文（要再看可 read_file 重读）。
+                    sanitized_result = redact_tool_result(result)
                     await add_message(self.sf, session_id, "tool", tool_call_id=exec_tc.get("id"),
-                                      tool_name=name, tool_result=result)
-                    await self.send({"type": "tool_result", "name": name, "result": result})
+                                      tool_name=name, tool_result=sanitized_result)
+                    await self.send({"type": "tool_result", "name": name, "result": sanitized_result})
                     messages.append({"role": "tool", "tool_call_id": exec_tc.get("id"),
                                      "content": json.dumps(result, ensure_ascii=False)})
                 continue

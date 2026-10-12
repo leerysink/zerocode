@@ -166,6 +166,13 @@ async def execute_tool(ctx: ToolContext, name: str, args: dict) -> dict:
         if f == Path(ctx.root).resolve() or f.is_dir():
             raise ToolError(f"路径必须是文件: {args.get('path')}")
         content = str(args.get("content") or "")
+        # 第五出口衍生护栏（Ticket 010）：跨轮历史里的 tool_result 是净化版占位符，
+        # 模型若把它当作真实内容写回，会把 <redacted:kind> 字面量静默写坏工作区文件。
+        # 工具执行收的是原始 args，故只能在写盘入口拦下带平台保留标记的内容。
+        from app.agent.redact import contains_redaction_marker
+        if contains_redaction_marker(content):
+            raise ToolError("content 含平台遮断占位符 <redacted:...>，那不是文件真实内容；"
+                            "请先 read_file 重新读取该文件取原文后再写入")
         existed = f.exists()
         try:
             before = f.read_text(encoding="utf-8") if existed else ""
@@ -188,6 +195,12 @@ async def execute_tool(ctx: ToolContext, name: str, args: dict) -> dict:
         if f.suffix.lower() in BINARY_EXTS:
             raise ToolError(f"不支持编辑二进制文件: {args.get('path')}")
         old, new = str(args.get("old_string")), str(args.get("new_string"))
+        # 第五出口衍生护栏（Ticket 010）：old/new 任一侧含遮断占位符都拒绝——否则拿占位符
+        # 去匹配真实内容必然错位，或把占位符字面量写进文件（跨轮历史里 tool_result 已净化）。
+        from app.agent.redact import contains_redaction_marker
+        if contains_redaction_marker(old) or contains_redaction_marker(new):
+            raise ToolError("old_string/new_string 含平台遮断占位符 <redacted:...>，那不是文件真实内容；"
+                            "请先 read_file 重新读取该文件取原文后再编辑")
         try:
             # newline='' 字节保真：读取保留原 \r\n 不做统一换行，替换后原样写回
             with open(f, "r", encoding="utf-8", newline="") as fh:
