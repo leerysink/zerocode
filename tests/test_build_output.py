@@ -1629,6 +1629,20 @@ PYPI_ENV = "ZEROCODE_PYPI_MIRROR"
 NPM_ENV = "ZEROCODE_NPM_REGISTRY"
 
 
+@pytest.fixture(autouse=True)
+def _neutralize_host_packaging_env(monkeypatch):
+    """每个用例起手清掉打包机上的四个 ZEROCODE_* 取值位。
+
+    这四个变量是「三级取值」的中间那级（显式参数 > 打包机 env > 默认），而打包功能本身就鼓励
+    「配一次以后每次发布自动带上」——于是配过它们的机器上，pytest 进程会继承这份用户级变量，
+    把所有「不给就零注入 / 产物逐字不变」的断言莫名打红（实测：setx 之后 test_apt_mirror_rewrites…
+    与 test_pypi_mirror_injects… 等三条同时红，而换台机器全绿）。需要取值的用例自己 setenv，
+    monkeypatch 的时序在本清除之后，覆盖得了。
+    """
+    for name in (GATEWAY_ENV, APT_ENV, PYPI_ENV, NPM_ENV):
+        monkeypatch.delenv(name, raising=False)
+
+
 def test_default_mirrors_inject_nothing_into_dockerfile_or_compose(fake_repo, monkeypatch):
     """三个镜像源都不传时，Dockerfile 与 compose 的注入位必须与加这个功能之前逐字一致。
 
