@@ -13,10 +13,19 @@ services:
       - "80:80"
       - "443:443"
     environment:
-      # 本机 Docker Desktop：host.docker.internal 经内嵌 DNS 解析到宿主
-      # 上服务器同机部署：改回 127.0.0.1（IP 字面量，proxy_pass 直连不经 DNS）
-      UPSTREAM_HOST: host.docker.internal
+      # 应用容器把 prod 端口发布在宿主上，所以网关要连的是宿主而不是自己的回环。
+      # host.docker.internal 配合下面的 extra_hosts: host-gateway 在 Linux 上同样成立
+      # （Docker 20.10+），本机与服务器用同一个值即可。
+      # 刻意不要改成 127.0.0.1：桥接容器里的 127.0.0.1 是容器自己，那里没任何东西
+      # 监听 8212，结果是每个请求都 connection refused。
+      UPSTREAM_HOST: ${ZEROCODE_GATEWAY_UPSTREAM:-host.docker.internal}
       ROUTES_PATH: /etc/nginx/routes/routes.json
+      # 域名后缀，必须与平台侧的 ZEROCODE_GATEWAY_DOMAIN 一致（app/deploy/nics.py 用它拼出
+      # 控制台展示的 https://{slug}.<域名>）。两边不一致的症状是「地址显示正常，点进去全 404」。
+      #
+      # 注意本文件是一个独立的 compose 项目：它的 .env 在 gateway/ 下，不是仓库根。
+      # 所以换域名时两处都要设：gateway/.env（给本网关）与平台的 .env（给后端）。
+      GATEWAY_DOMAIN: ${ZEROCODE_GATEWAY_DOMAIN:-zerocode.com}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
@@ -24,4 +33,6 @@ services:
       - ./lua:/etc/nginx/lua:ro
       - ./404.html:/etc/nginx/404.html:ro
       - ./routes:/etc/nginx/routes:ro
+      # :ro 是从容器视角；acme.sh / make-cert 在宿主写这个目录不受影响。
+      # 证书固定叫 gateway.crt / gateway.key（见 nginx.conf），换域名或换 CA 都不用改配置。
       - ./certs:/etc/nginx/certs:ro

@@ -3,6 +3,7 @@
 渲染器用 __KEY__ 标记避免与 ${} 冲突；产出 deploy/dev-compose.yml + deploy/.env，
 发布时追加 deploy/prod-compose.yml 并把 .env 的 PROD_*/PROD_VERSION 补成真值。"""
 from pathlib import Path
+import os
 import re
 import secrets
 
@@ -43,6 +44,37 @@ STACK_SECRETS = {"vue3-springboot": ("JWT_SECRET", "REDIS_PASSWORD")}
 
 _MARKER_RE = re.compile(r"__[A-Z][A-Z0-9_]*__")   # 只认渲染器自己的标记形态，不误伤 yaml 合法内容
 
+# 依赖镜像源：从打包时烘进平台容器的环境变量读，零注入承诺——没设就不写对应行，compose 字节不变。
+# prod 栈不注入：prod 是 `build: ../backend`，pip/npm install 在镜像构建期跑，compose environment 对它无效。
+_MIRROR_URL_RE = re.compile(r"https?://[^\s]+")
+
+
+def _mirror_env(name: str) -> str | None:
+    """从 os.environ 读镜像源地址；空值视同未设，畸形值整包失败（不静默丢弃）。"""
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return None
+    if not _MIRROR_URL_RE.fullmatch(raw):
+        raise DeployError(f"环境变量 {name}={raw!r} 形态非法（须 http(s):// 开头的完整地址）",
+                          status=500)
+    return raw
+
+
+def _pip_env_block() -> str:
+    """dev 栈 backend 的 PIP_INDEX_URL 注入块；没设时返回空串，compose 字节不变。"""
+    v = _mirror_env("ZEROCODE_PYPI_MIRROR")
+    return f"\n      PIP_INDEX_URL: {v}" if v else ""
+
+
+def _npm_env_block() -> str:
+    """dev 栈 frontend 的 NPM_CONFIG_REGISTRY 注入块；没设时返回空串，compose 字节不变。
+
+    替换串自带前导 `\\n    environment:\\n      `：原本 frontend 服务没有 environment 段，
+    注入块要自己开；默认空串时不留空行、不破 golden。
+    """
+    v = _mirror_env("ZEROCODE_NPM_REGISTRY")
+    return f"\n    environment:\n      NPM_CONFIG_REGISTRY: {v}" if v else ""
+
 _DEV_COMPOSE = """name: zc-__SLUG__-dev
 networks:
   default: {}
@@ -57,7 +89,7 @@ __MIGRATE_SVC__
       - ../backend:/src
     environment:
       DATABASE_URL: postgresql+asyncpg://${DEV_USER}:${DEV_PASSWORD}@zerocode-pg16:5432/${DEV_DB}
-      APP_PORT: "8000"
+      APP_PORT: "8000"__PIP_ENV__
     command: sh -c "pip install -r requirements.txt && uvicorn app.main:app --reload --host 0.0.0.0 --port 8000"
     networks: [default, zcnet]
     depends_on:
@@ -69,7 +101,7 @@ __MIGRATE_SVC__
     volumes:
       - ../frontend:/src
       - __FE_VOL__
-    command: sh -c "npm install && npm run dev -- --host 0.0.0.0 --port 5173"
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0 --port 5173"__NPM_ENV__
     ports:
       - "__DEV_PORT__:5173"
     depends_on:
@@ -135,7 +167,7 @@ __MIGRATE_SVC__
     volumes:
       - ../frontend:/src
       - __FE_VOL__
-    command: sh -c "npm install && npm run dev -- --host 0.0.0.0 --port 5173"
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0 --port 5173"__NPM_ENV__
     ports:
       - "__DEV_PORT__:5173"
     depends_on:
@@ -153,7 +185,7 @@ services:
     volumes:
       - ../frontend:/src
       - __FE_VOL__
-    command: sh -c "npm install && npm run dev -- --host 0.0.0.0 --port 5173"
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0 --port 5173"__NPM_ENV__
     ports:
       - "__DEV_PORT__:5173"
 volumes:
@@ -288,7 +320,9 @@ def render_dev_compose(meta: dict) -> str:
          .replace("__FE_VOL_NAME__", VOLUME_NAME)
          .replace("__M2_VOL__", _m2_volume())
          .replace("__M2_VOL_NAME__", M2_VOLUME_NAME)
-         .replace("__SLUG__", slug))
+         .replace("__SLUG__", slug)
+         .replace("__PIP_ENV__", _pip_env_block())
+         .replace("__NPM_ENV__", _npm_env_block()))
     # 自检：模板声明过的标记必须全部被替换（与 scaffold 的 {{ 残留自检同构，审查 I-3）
     residue = sorted(m for m in _markers_of(sources) if m in y)
     if residue:

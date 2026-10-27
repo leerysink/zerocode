@@ -25,6 +25,15 @@ apps/
 # 平台数据区（技能母本等运行时落盘，本机生成不入库）
 data/
 
+# 演示部署交付包（build-output.bat 每次整目录重建；内含预置应用源码副本，不入库）
+# 通配后缀是为了盖住打包时的暂存/备份目录 build-output.staging/ 与 build-output.old/；
+# 尾斜杠限定只匹配目录，所以入口脚本 build-output.bat 不会被误伤。
+build-output*/
+# 上传服务器前把交付包压成的 zip 同理不入库：它就是 build-output/ 的另一种形态，
+# 上千 KB 的生成物混进版本库，只会让每次重新打包都产生一次无意义的二进制 diff。
+# 注意上一行的尾斜杠只管目录，管不到它，所以必须单列一条。
+build-output*.zip
+
 # SDD workspace
 .superpowers/
 # 一次性工单/草稿产物（本机工作记录，不入库）

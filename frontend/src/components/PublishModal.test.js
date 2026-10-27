@@ -71,7 +71,7 @@ beforeEach(() => {
   vi.clearAllMocks()
   writeText = vi.fn().mockResolvedValue(undefined)
   Object.defineProperty(window.navigator, 'clipboard', { value: { writeText }, configurable: true })
-  mocks.api.appUrls.mockResolvedValue({ data: { domain: 'https://todo8.zerocode.com' } })
+  mocks.api.appUrls.mockResolvedValue({ data: { domain: 'https://todo8.example.test' } })
 })
 afterEach(() => vi.restoreAllMocks())
 
@@ -215,7 +215,7 @@ describe('PublishModal 完成态', () => {
   async function doneOk() {
     const ctx = mountModal()
     ctx.dep.lastDone.value = { type: 'publish_done', ok: true,
-      url: 'https://todo8.zerocode.com', version: 'b20260921120000' }
+      url: 'https://todo8.example.test', version: 'b20260921120000' }
     await flushPromises()
     return ctx
   }
@@ -223,22 +223,78 @@ describe('PublishModal 完成态', () => {
   it('大号 URL 展示 + 点击复制（发布完成以网关域名为准）', async () => {
     const { wrapper } = await doneOk()
     const link = wrapper.find('.zc-pub-url')
-    expect(link.text()).toContain('https://todo8.zerocode.com')
+    expect(link.text()).toContain('https://todo8.example.test')
     await link.trigger('click')
-    expect(writeText).toHaveBeenCalledWith('https://todo8.zerocode.com')
+    expect(writeText).toHaveBeenCalledWith('https://todo8.example.test')
   })
 
   it('无 done.url 时回退到 appUrls 域名', async () => {
     const ctx = mountModal()
     ctx.dep.lastDone.value = { type: 'publish_done', ok: true, version: 'b20260921120000' }
     await flushPromises()
-    expect(ctx.wrapper.find('.zc-pub-url').text()).toContain('https://todo8.zerocode.com')
+    expect(ctx.wrapper.find('.zc-pub-url').text()).toContain('https://todo8.example.test')
   })
 
   it('收口即 emit done 通知父级刷新', async () => {
     const { wrapper, dep } = mountModal()
     dep.lastDone.value = { type: 'publish_done', ok: true, url: 'http://x' }
     await flushPromises()
+    expect(wrapper.emitted('done')).toBeTruthy()
+  })
+})
+
+// ---------- 完成态地址的两个来源都拿不到时（ADR-0016：前端不持有域名常量） ----------
+// 这里原本拼 `https://{slug}.<写死域名>` 兜底。那个兜底把后端一个**刻意**的留白填成了假地址：
+// nics.app_urls 在 slug 缺位时回空串而不是拼一个必然无效的域名，prod.py 也会把空串当作 url 发下来。
+describe('PublishModal 完成态地址来源', () => {
+  function doneNoUrl() {
+    const ctx = mountModal()
+    ctx.dep.lastDone.value = { type: 'publish_done', ok: true, version: 'b20260921120000' }
+    return ctx
+  }
+
+  it('边界：done.url 缺失且 appUrls 回空 domain → 不渲染链接，也不拼一个域名出来', async () => {
+    mocks.api.appUrls.mockResolvedValue({ data: { domain: '' } })
+    const { wrapper } = doneNoUrl()
+    await flushPromises()
+
+    expect(wrapper.find('.zc-pub-url').exists()).toBe(false)
+    expect(wrapper.find('.zc-pub-nourl').exists()).toBe(true)   // 如实说明，不留白也不编
+  })
+
+  it('边界：done.url 是空串（prod.py 把 app_urls 的空 domain 原样发了下来）→ 同样不编', async () => {
+    mocks.api.appUrls.mockResolvedValue({ data: {} })
+    const ctx = mountModal()
+    ctx.dep.lastDone.value = { type: 'publish_done', ok: true, url: '', version: 'b1' }
+    await flushPromises()
+
+    expect(ctx.wrapper.find('.zc-pub-url').exists()).toBe(false)
+    expect(ctx.wrapper.find('.zc-pub-nourl').exists()).toBe(true)
+  })
+
+  it('边界：appUrls 请求抛错（loadUrls 吞掉异常置 null）→ 不降级到写死域名', async () => {
+    mocks.api.appUrls.mockRejectedValue(new Error('boom'))
+    const { wrapper } = doneNoUrl()
+    await flushPromises()
+
+    expect(wrapper.find('.zc-pub-url').exists()).toBe(false)
+    expect(wrapper.find('.zc-pub-nourl').exists()).toBe(true)
+  })
+
+  it('边界：拿不到地址时「复制给同事」也隐藏（否则复制出去的是个空串）', async () => {
+    mocks.api.appUrls.mockResolvedValue({ data: { domain: '' } })
+    const { wrapper } = doneNoUrl()
+    await flushPromises()
+
+    expect(wrapper.text()).not.toContain('复制给同事')
+  })
+
+  it('地址拿不到不影响「已上线」本身：成功文案与 done 事件仍然在', async () => {
+    mocks.api.appUrls.mockResolvedValue({ data: { domain: '' } })
+    const { wrapper } = doneNoUrl()
+    await flushPromises()
+
+    expect(wrapper.find('.zc-pub-done').text()).toContain('已上线')
     expect(wrapper.emitted('done')).toBeTruthy()
   })
 })

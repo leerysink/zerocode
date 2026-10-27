@@ -4,7 +4,9 @@
 
 ## 平台网关（gateway）
 
-独立的 OpenResty 容器，仓库顶层 `gateway/` 目录编排，人工 `docker compose up -d` 长驻。
+独立的 OpenResty 容器，仓库顶层 `gateway/` 目录编排，人工 `docker compose -f gateway/docker-compose.yml up -d` 长驻。
+交付包会带上它的配置（`certs/` 私钥与运行期 `routes.json` 除外），但它仍是独立 compose 项目，
+不随平台 `docker compose up` 启停（ADR-0018）。
 职责：终止 TLS（自签通配证书）+ 按应用域名动态路由到各应用 prod 端口。
 平台后端不管它的启停，只喂它路由数据。应用容器本身不感知 HTTPS。
 
@@ -168,3 +170,53 @@ embedding 模型（见 ADR-0012）；embedding 未配置时**降级为关键词�
 它走服务层的固定策略、不吃 `memory.*`——关掉记忆注入只该停止注入，不该连带失去「这条已存在、
 建议改而不是新建」的提示。历史无向量的旧条在向量模式下由关键词**补齐**进同一份 topK 名额
 （参与召回 ≠ 一定挤进 topK）。
+
+## build-output（发布产物包）
+
+把平台打到演示服务器所需的**一次性交付目录**，由 `build-output.bat`（入口）调 Python 脚本生成，
+可反复重跑、每次覆盖重建。内容边界：后端源码与 Dockerfile、前端 `dist`、合成的 `init.sql`、
+`docker-compose.yml`、`.env.example`、部署说明、预置应用源码。**不含**镜像 tar、不含任何凭据。
+它是生成物而非真相源——真相仍在 `changelog/`、`app/`、`frontend/` 与各应用的 `app.json`。
+
+## init.sql（全量初始化脚本）
+
+build-output 里的单一 SQL 交付物：由 `changelog/V*.sql` 按日期顺序**合成**的全量脚本，
+外加数据段（平台默认配置 + 预置应用元数据行）。它不是第二份 schema 真相——不手写、不维护，
+每次发布重新合成。重放语义固定为「只补不覆盖」：结构段幂等 DDL，数据段 `ON CONFLICT DO NOTHING`，
+服务器上现场产生的内容永不被洗掉（ADR-0014）。它只覆盖**平台库 zerocode**；应用分库仍由平台
+运行期 `provision_env` 自动供给，口令不入此文件。
+
+## 预置应用（preset app）
+
+打包进 build-output 的既有应用工程，只带源码目录（剔除 `deploy/` 与依赖目录），其
+`workspace` / `app_project` 元数据行由打包脚本从 `app.json` 生成为种子数据，`owner_user_id`
+留 NULL——服务器上第一个注册的账号按既有创始人事务自动承接。应用的分库、凭据、schema 迁移
+一律不进打包，仍走平台既有机制；其中 dev 凭据在**首次预览时惰性供给**（ADR-0015），所以预置
+应用的顺序固定是「先预览、后发布」（正式环境复用 dev 凭据，跳过预览直接发布会被 500 拦下）。
+打包时必须做 prod/dev 端口冲突检测（存量 `app.json` 存在重复端口）。
+
+## 部署根（deploy root）
+
+服务器上放置 build-output 的**固定绝对路径**（约定 `/opt/zerocode`），同时是容器内路径——
+两边必须逐字相同（ADR-0013）。预置应用的 `root_path` 一律重写为 `<部署根>/apps/<slug>`。
+它不是可自由摆放的目录：改动部署根等于要重算所有 `root_path`。
+
+## 同路径挂载（same-path mount）
+
+后端容器把 `<部署根>/apps`、`<部署根>/data`、`<部署根>/store` 三个目录**挂载到容器内的同一条
+绝对路径**（而非 `/app` 之类的常规位置）。三条挂载的理由并不相同：`apps/` 是**必须**同路径——
+平台在容器内用宿主路径执行 `docker compose -f <root_path>/deploy/*-compose.yml`，而宿主 daemon
+解析的是宿主视角的路径，两边逐字一致时挂载才成立；`data/` 与 `store/` 只需**挂出来**——它们是
+运行期落盘（技能库、商店包），不挂就落进容器可写层，`docker compose up -d --build` 一重建就没，
+路径是否与宿主相同并不影响正确性，只是为了统一按部署根管理。平台代码（`app/`、`frontend/dist`）
+烘进镜像、**不参与同路径绑定**——否则 bind mount 会把镜像内容遮住，版本锁在宿主目录上。
+它是「后端容器化后仍能起应用栈」的唯一前提，代价就是部署根被钉死。
+
+## 依赖镜像源（dependency mirror）
+
+打包期可选注入的四个出网生态换源位：apt（Debian 源 + docker CE 仓库，只收**裸主机名**）、PyPI 与 npm
+registry（这两项收**完整 http(s) 地址**）。默认全部留空——不给时交付物逐字节不变。apt 只作用于镜像
+构建期，因此**不进容器 env**；PyPI / npm 以同名变量贯通三段（打包参数 → compose 的 `${VAR:-打包值}`
+→ 平台转注进应用 dev 栈），运维在服务器 `.env` 里改一次即长期生效。给不给运行期覆盖位的判据是「有没有
+运行期消费方」：部署根是反例（三处同源，所以钉死）。prod 栈不注入——compose 的 `environment:` 对
+`build:` 无效（ADR-0017）。

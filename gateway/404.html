@@ -18,7 +18,9 @@
 <body>
   <div class="card">
     <h1>应用暂未就绪</h1>
-    <p>域名 <code>{{SLUG}}.zerocode.com</code> 对应的应用当前<b>未运行</b>或不存在。</p>
+    <!-- {{SLUG}} 与 {{DOMAIN}} 由 gateway/lua/router.lua 的 render_404 填入。域名不得写死：
+         在真实域名上展示一个不存在的 zerocode.com 地址，会把人引向完全错误的排查方向。 -->
+    <p>域名 <code>{{SLUG}}.{{DOMAIN}}</code> 对应的应用当前<b>未运行</b>或不存在。</p>
     <p class="hint">请到 Zerocode 控制台启动该应用的正式环境，稍后刷新即可。</p>
   </div>
 </body>

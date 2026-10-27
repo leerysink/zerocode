@@ -39,8 +39,11 @@ const failText = computed(() => (done.value?.error
 const isDestructive = computed(() => done.value?.code === 'schema_destructive')
 const destructiveList = computed(() => (Array.isArray(done.value?.destructive)
   ? done.value.destructive : []))
-const mainUrl = computed(() => done.value?.url || urls.value?.domain
-  || `https://${props.app.slug}.zerocode.com`)
+// 地址只有两个来源：发布完成事件里的 url，与 app_urls 接口的 domain。两个都拿不到就是空串——
+// 不在前端拼域名兜底（ADR-0016：域名的事实来源只在后端一处，前端再放一份常量必然漂移）。
+// 更要紧的是：后端在 slug 缺位时**故意**回空串而不是拼一个必然无效的地址，前端一兜就把这个
+// 刻意留白填成了假地址，而它在界面上和真地址长得一模一样。
+const mainUrl = computed(() => done.value?.url || urls.value?.domain || '')
 
 // 失败收口时把仍处 running 的步骤标为红叉（事件流失败不再发 publish_step failed，由前端补语义）
 const stepsView = computed(() => Object.entries(STEP_LABELS).map(([key, label]) => {
@@ -167,11 +170,17 @@ async function start() {
 
     <template v-if="doneOk">
       <p class="zc-pub-done">已上线 ✓</p>
-      <a class="zc-pub-url" :href="mainUrl" target="_blank"
-         @click.prevent="copyText(mainUrl)">{{ mainUrl }} <copy-outlined /></a>
-      <a-space style="margin: 6px 0">
-        <a-button size="middle" @click="copyText(`访问地址：${mainUrl}`)">复制给同事</a-button>
-      </a-space>
+      <template v-if="mainUrl">
+        <a class="zc-pub-url" :href="mainUrl" target="_blank"
+           @click.prevent="copyText(mainUrl)">{{ mainUrl }} <copy-outlined /></a>
+        <a-space style="margin: 6px 0">
+          <a-button size="middle" @click="copyText(`访问地址：${mainUrl}`)">复制给同事</a-button>
+        </a-space>
+      </template>
+      <p v-else class="zc-pub-nourl">
+        已上线，但访问地址没取到。可在应用卡片上重试；若反复如此，检查平台与网关的
+        <code>GATEWAY_DOMAIN</code> 是否一致、以及该应用 slug 是否为空。
+      </p>
     </template>
 
     <template v-if="doneFail && isDestructive">
@@ -223,6 +232,9 @@ async function start() {
 .zc-pub-done { color: #5b8a72; font-weight: 600; margin: 10px 0 4px; }
 .zc-pub-url { display: inline-block; font-size: 17px; font-weight: 600; color: var(--zc-primary);
               text-decoration: none; word-break: break-all; }
+.zc-pub-nourl { margin: 6px 0; padding: 8px 10px; font-size: 12px; color: var(--zc-text-sub);
+                background: #f7f8fa; border: 1px solid #e6e8eb; border-radius: 4px; }
+.zc-pub-nourl code { font-family: Consolas, monospace; }
 .zc-pub-fail { background: #fdf3f2; border: 1px solid #eadcdb; color: #b96a6a; border-radius: 4px;
                padding: 8px 10px; font-size: 12px; white-space: pre-wrap; word-break: break-all; }
 .zc-pub-destr { margin: 6px 0 10px; padding-left: 20px; font-size: 12px; color: #b96a6a; }

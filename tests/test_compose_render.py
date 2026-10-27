@@ -431,3 +431,133 @@ def test_render_prod_compose_fastapi_matches_golden():
     """
     golden = Path(__file__).parent / "golden" / "prod-compose.fastapi.yml"
     assert compose.render_prod_compose(META) == golden.read_text(encoding="utf-8")
+
+
+# ---- 应用 dev 栈的依赖镜像源注入
+#
+# 变量由打包时烘进平台容器（build_output.py 写的 `${ZEROCODE_PYPI_MIRROR:-打包值}`），渲染器在
+# 平台容器里读 os.environ 再转注进应用的 dev 栈——于是服务器上改一次 deploy 层的 .env 就同时管住
+# 平台自己与它起出来的每个应用，不必重跑打包。三个边界要紧：没设时零注入（旧 golden 不动）、
+# 只给一个时另一个服务不许凭空长出 environment 段、畸形值要响而不是静默丢。
+
+PYPI_ENV = "ZEROCODE_PYPI_MIRROR"
+NPM_ENV = "ZEROCODE_NPM_REGISTRY"
+
+
+@pytest.fixture(autouse=True)
+def _neutralize_host_mirror_env(monkeypatch):
+    """每个用例起手清掉宿主机上的镜像源变量。
+
+    这个功能鼓励的正是「打包机上 setx 一次，以后每次发布自动带上」，而 pytest 进程会继承那份
+    用户级变量——不隔离的话，同一份代码在配过镜像源的机器上会让 golden 逐字节比对与零注入用例
+    莫名变红（换台机器又是绿的，最难查的那种）。需要取值的用例自己 setenv，覆盖本清除。
+    """
+    for name in (PYPI_ENV, NPM_ENV):
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_dev_compose_injects_nothing_without_mirror_env():
+    """零注入：两个变量都没设时，backend 的 env 段与 command 行紧贴，frontend 不长出 environment。"""
+    y = compose.render_dev_compose(META)
+    assert "PIP_INDEX_URL" not in y and "NPM_CONFIG_REGISTRY" not in y
+    # 字节级：注入标记空替换后不得留下空行（标记附在行尾而不是占独立模板行的全部理由）
+    assert 'APP_PORT: "8000"\n    command:' in y
+    doc = yaml.safe_load(y)
+    assert "environment" not in doc["services"]["frontend"]
+    assert set(doc["services"]["backend"]["environment"]) == {"DATABASE_URL", "APP_PORT"}
+    assert "__" not in y                            # 标记不得残留
+
+
+def test_dev_compose_injects_pypi_and_npm_from_env(monkeypatch):
+    """两个都设：fastapi dev 栈的 backend 收 pip、frontend 收 npm，且整份仍是合法 yaml。"""
+    monkeypatch.setenv(PYPI_ENV, "https://mirrors.aliyun.com/pypi/simple")
+    monkeypatch.setenv(NPM_ENV, "https://registry.npmmirror.com")
+    y = compose.render_dev_compose(META)
+    doc = yaml.safe_load(y)
+    assert doc["services"]["backend"]["environment"]["PIP_INDEX_URL"] == \
+        "https://mirrors.aliyun.com/pypi/simple"
+    assert doc["services"]["frontend"]["environment"]["NPM_CONFIG_REGISTRY"] == \
+        "https://registry.npmmirror.com"
+    assert "${{" not in y and "__" not in y
+    # 注入后服务名与卷的引用↔声明关系不能变（compose 的 undefined volume 是 up 期硬失败）
+    assert _named_volume_refs(doc) == set(doc["volumes"])
+
+
+def test_dev_compose_npm_only_does_not_fabricate_backend_pip(monkeypatch):
+    """只给 npm：backend 的 env 段不得多出 pip 行；frontend 的 environment 段由注入块自己开。"""
+    monkeypatch.setenv(NPM_ENV, "https://registry.npmmirror.com")
+    y = compose.render_dev_compose(META)
+    assert "PIP_INDEX_URL" not in y
+    doc = yaml.safe_load(y)
+    assert doc["services"]["frontend"]["environment"] == {
+        "NPM_CONFIG_REGISTRY": "https://registry.npmmirror.com"}
+    # migrate 片段与 backend 各有一段、frontend 新开一段：行计数盯的是「没多长出第四段」
+    assert y.count("environment:") == 3
+    assert set(doc["services"]["backend"]["environment"]) == {"DATABASE_URL", "APP_PORT"}
+
+
+def test_dev_compose_pypi_only_keeps_frontend_environmentless(monkeypatch):
+    """只给 pip：frontend 不得凭空长出一个空的 environment 段（compose 会吃 KeyError 之外的怪错）。"""
+    monkeypatch.setenv(PYPI_ENV, "https://pypi.tuna.tsinghua.edu.cn/simple")
+    doc = yaml.safe_load(compose.render_dev_compose(META))
+    assert doc["services"]["backend"]["environment"]["PIP_INDEX_URL"] == \
+        "https://pypi.tuna.tsinghua.edu.cn/simple"
+    assert "environment" not in doc["services"]["frontend"]
+
+
+@pytest.mark.parametrize("stack", ["static", "vue3-springboot"])
+def test_dev_compose_non_fastapi_stacks_inject_npm_only(monkeypatch, stack):
+    """static 与 vue3-springboot 栈里没有 pip 消费方：即使两个变量都设，也只注入 npm。
+
+    SB 的后端是 maven（mvn spring-boot:run），maven 仓库镜像不在本次参数范围内，所以它的
+    backend 段保持原样——这条断言同时把这个缺口钉住：想顺手给 SB 后端加 PIP_INDEX_URL 会红。
+    """
+    monkeypatch.setenv(PYPI_ENV, "https://mirrors.aliyun.com/pypi/simple")
+    monkeypatch.setenv(NPM_ENV, "https://registry.npmmirror.com")
+    m = copy.deepcopy(META)
+    m["stack"] = stack
+    y = compose.render_dev_compose(m)
+    doc = yaml.safe_load(y)
+    assert doc["services"]["frontend"]["environment"]["NPM_CONFIG_REGISTRY"] == \
+        "https://registry.npmmirror.com"
+    assert "PIP_INDEX_URL" not in y
+    assert "__" not in y
+    assert _named_volume_refs(doc) == set(doc["volumes"])
+
+
+def test_prod_compose_ignores_mirror_env(monkeypatch):
+    """诚实缺口钉住：prod 栈靠 `build: ../backend` 出镜像，pip/npm 跑在**构建容器**里，
+    compose 的 environment 段对 build 阶段无效——所以这里一律不注入。
+
+    设了变量也必须与 golden 逐字节一致：将来若要覆盖 prod 构建期，走的是 build args 而非
+    environment，届时这条断言会红着提醒一并重生 golden，而不是留下两份静默不一致的产物。
+    """
+    monkeypatch.setenv(PYPI_ENV, "https://mirrors.aliyun.com/pypi/simple")
+    monkeypatch.setenv(NPM_ENV, "https://registry.npmmirror.com")
+    golden = Path(__file__).parent / "golden" / "prod-compose.fastapi.yml"
+    assert compose.render_prod_compose(META) == golden.read_text(encoding="utf-8")
+    y = compose.render_prod_compose(META_SB)
+    assert "PIP_INDEX_URL" not in y and "NPM_CONFIG_REGISTRY" not in y
+
+
+@pytest.mark.parametrize("value", [
+    "mirrors.aliyun.com/pypi/simple",   # 不带协议：pip/npm 要的是完整地址
+    "not a url",                        # 含空白
+    "ftp://mirrors.aliyun.com",         # 非 http(s)
+])
+def test_dev_compose_rejects_malformed_mirror_env(monkeypatch, value):
+    """畸形值整栈失败（DeployError），不静默丢弃：静默丢的结果是服务器上照旧装不到依赖。"""
+    for name in (PYPI_ENV, NPM_ENV):
+        monkeypatch.setenv(name, value)
+    with pytest.raises(DeployError, match="ZEROCODE_"):
+        compose.render_dev_compose(META)
+
+
+@pytest.mark.parametrize("value", ["", "   "])
+def test_dev_compose_blank_mirror_env_counts_as_unset(monkeypatch, value):
+    """空值与纯空白都视同未设：不报错、不注入（与打包机 env 的通行规则一致）。"""
+    for name in (PYPI_ENV, NPM_ENV):
+        monkeypatch.setenv(name, value)
+    y = compose.render_dev_compose(META)
+    assert "PIP_INDEX_URL" not in y and "NPM_CONFIG_REGISTRY" not in y
+    assert 'APP_PORT: "8000"\n    command:' in y

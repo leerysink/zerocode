@@ -9,7 +9,11 @@ from pathlib import Path
 
 MARK_START, MARK_END = "<!-- zc:publish -->", "<!-- /zc:publish -->"
 # 中央网关通配域名后缀（见 gateway/）：prod 访问地址统一为 https://{slug}.{GATEWAY_DOMAIN}。
-# 换域名只改这里 + 网关侧证书/nginx server_name；默认 zerocode.com，可用 env 覆盖便于测试/多环境。
+# 换域名要同时改两处 env：平台侧（本变量）与网关侧 gateway/.env 的同名变量——compose 把它透传
+# 成容器内的 GATEWAY_DOMAIN，lua 用它从 Host 头里剥出 slug（gateway/lua/router.lua），404 页文案
+# 也用它（gateway/404.html）。两边对不上的症状是「控制台显示的地址看着正常，点进去全 404」。
+# 证书要重签成对应域名；nginx.conf 的 server_name（catch-all）与证书文件名都与域名无关，不用改。
+# 默认 zerocode.com，可用 env 覆盖便于测试/多环境。
 GATEWAY_DOMAIN = os.environ.get("ZEROCODE_GATEWAY_DOMAIN", "zerocode.com")
 # Docker 默认 bridge 网段：候选里出现它多半不是用户要的局域网地址，只标注不剔除。
 # 模块级常量：lan_candidates 每次调用都重建 /12 网络是白花的开销（T4 审查移交）。
