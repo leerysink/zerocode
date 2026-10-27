@@ -31,6 +31,21 @@ def _m2_volume() -> str:
 
 M2_VOLUME = _m2_volume()
 
+# pip 下载缓存卷。dev 后端把依赖装进容器可写层，而停预览走 `compose down`（不带 -v）——容器一销毁
+# 包和缓存同归于尽，下一次预览只能重新联网全量下载。这里只救缓存（下载不重复），不把卷直接挂到
+# /usr/local/lib/python3.12/site-packages：那会连镜像自带的 pip/setuptools 一起遮住，卷初为空时
+# 连 `pip` 命令本身都不在了。
+PIP_VOLUME_NAME = "pip_cache"
+PIP_MOUNT_PATH = "/root/.cache/pip"
+
+
+def _pip_volume() -> str:
+    """与 _fe_volume() 同构：挂载条目与顶层声明同源。"""
+    return f"{PIP_VOLUME_NAME}:{PIP_MOUNT_PATH}"
+
+
+PIP_VOLUME = _pip_volume()
+
 UPLOADS_VOLUME = "uploads"          # 上传件卷：镜像重建不丢历史文件（prod 唯一的文件持久化位）
 REDIS_DATA_VOLUME = "redis-data"    # Redis 命名卷：prod 开 AOF，重启不丢会话/缓存基座
 
@@ -87,6 +102,7 @@ __MIGRATE_SVC__
     working_dir: /src
     volumes:
       - ../backend:/src
+      - __PIP_VOL__
     environment:
       DATABASE_URL: postgresql+asyncpg://${DEV_USER}:${DEV_PASSWORD}@zerocode-pg16:5432/${DEV_DB}
       APP_PORT: "8000"__PIP_ENV__
@@ -108,6 +124,7 @@ __MIGRATE_SVC__
       - backend
 volumes:
   __FE_VOL_NAME__: {}
+  __PIP_VOL_NAME__: {}
 """
 
 _MIGRATE_SVC = """  migrate:
@@ -320,6 +337,8 @@ def render_dev_compose(meta: dict) -> str:
          .replace("__FE_VOL_NAME__", VOLUME_NAME)
          .replace("__M2_VOL__", _m2_volume())
          .replace("__M2_VOL_NAME__", M2_VOLUME_NAME)
+         .replace("__PIP_VOL__", _pip_volume())
+         .replace("__PIP_VOL_NAME__", PIP_VOLUME_NAME)
          .replace("__SLUG__", slug)
          .replace("__PIP_ENV__", _pip_env_block())
          .replace("__NPM_ENV__", _npm_env_block()))

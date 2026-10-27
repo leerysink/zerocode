@@ -64,7 +64,7 @@ def test_volume_name_is_single_source_of_truth(monkeypatch):
     monkeypatch.setattr(compose, "VOLUME_NAME", "fe_cache")
     y = compose.render_dev_compose(META)
     doc = yaml.safe_load(y)
-    assert doc["volumes"] == {"fe_cache": {}}      # 顶层声明跟随改名
+    assert doc["volumes"] == {"fe_cache": {}, compose.PIP_VOLUME_NAME: {}}   # 顶层声明跟随改名，且不误伤另一条卷
     assert "fe_cache:/src/node_modules" in y       # 服务挂载同步跟随，二者不脱钩
     assert _named_volume_refs(doc) == set(doc["volumes"])
 
@@ -310,6 +310,48 @@ def test_m2_volume_name_is_single_source_of_truth(monkeypatch):
     assert set(doc["volumes"]) == {compose.VOLUME_NAME, "mvn_repo"}
     assert "mvn_repo:/root/.m2" in doc["services"]["backend"]["volumes"]
     assert _named_volume_refs(doc) == set(doc["volumes"])
+
+
+def test_dev_backend_caches_pip_downloads_in_a_named_volume():
+    """pip 的下载缓存必须落在具名卷里，否则每次起预览都重新联网全量下。
+
+    dev 后端是 `pip install -r requirements.txt` 装进**容器可写层**，而停预览走的是
+    `compose down`（不带 -v）：容器一销毁，刚装好的包和 /root/.cache/pip 一起没了，于是下一次
+    预览面对空缓存只能重下。同一条 compose 里前端有 fe_node_modules、大型栈有 m2，唯独 Python
+    没有对应卷——症状就是「npm 秒过、pip 重下」。
+
+    这里钉的是缓存卷（下载不再重复），不是 site-packages 卷：把卷直接挂到
+    /usr/local/lib/python3.12/site-packages 会连镜像自带的 pip/setuptools 一起遮住，卷初为空时
+    连 `pip` 命令本身都不在了。
+    """
+    doc = yaml.safe_load(compose.render_dev_compose(META))
+    vols = doc["services"]["backend"]["volumes"]
+    assert f"{compose.PIP_VOLUME_NAME}:{compose.PIP_MOUNT_PATH}" in vols
+    assert compose.PIP_VOLUME_NAME in doc["volumes"]        # 顶层声明，否则 up 报 undefined volume
+    assert _named_volume_refs(doc) == set(doc["volumes"])   # 引用↔声明一致
+
+
+def test_pip_volume_name_is_single_source_of_truth(monkeypatch):
+    """与 fe / m2 卷同一条规矩：改卷名只动 PIP_VOLUME_NAME，挂载条目与顶层声明不脱钩。"""
+    assert compose.PIP_VOLUME == f"{compose.PIP_VOLUME_NAME}:{compose.PIP_MOUNT_PATH}"
+    monkeypatch.setattr(compose, "PIP_VOLUME_NAME", "pip_wheels")
+    doc = yaml.safe_load(compose.render_dev_compose(META))
+    assert set(doc["volumes"]) == {compose.VOLUME_NAME, "pip_wheels"}
+    assert "pip_wheels:/root/.cache/pip" in doc["services"]["backend"]["volumes"]
+    assert _named_volume_refs(doc) == set(doc["volumes"])
+
+
+def test_pip_cache_volume_only_where_pip_runs():
+    """卷只长在真正跑 pip 的那个服务上：塞进公共片段会让 static 与大型栈凭空多出一个空卷。
+
+    大型栈的 dev 后端是 `mvn spring-boot:run`（依赖走 m2 卷），static 连 backend 都没有，
+    两边挂 pip 缓存卷都不会有任何字节写进去，却会让 `docker volume ls` 里多出一排僵尸卷。
+    """
+    for stack in ("static", "vue3-springboot"):
+        m = copy.deepcopy(META)
+        m["stack"] = stack
+        y = compose.render_dev_compose(m)
+        assert "pip" not in y.replace("PIP_INDEX_URL", ""), f"{stack} 长出了 pip 缓存卷"
 
 
 def test_legacy_stacks_match_golden_files():
