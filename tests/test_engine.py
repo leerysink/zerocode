@@ -158,11 +158,22 @@ class _Seams:
         self.health_ok = True
         self.health_calls = []
         self.joint_calls = []        # B3 的 dev 联合探针（前端 + 后端），与只探前端的那条分开记
+        # dev 凭据惰性供给（ADR-0015）：真 provision_env 会连实例建库建角色，单测里一律替身接管
+        self.provision_result = {"db": "stub_dev", "user": "stub_dev", "password": "stub-pw"}
+        self.provision_calls = []
+        self.provision_error = None
         monkeypatch.setattr(engine, "docker", self.docker)
         monkeypatch.setattr(engine, "run_sqlchange", self._run_sqlchange)
         monkeypatch.setattr(engine, "preflight_docker", self._preflight)
         monkeypatch.setattr(engine, "wait_frontend_health", self._health)
         monkeypatch.setattr(engine, "wait_dev_health", self._dev_health)
+        monkeypatch.setattr(engine, "provision_env", self._provision_env)
+
+    async def _provision_env(self, sf, slug, env):
+        self.provision_calls.append({"slug": slug, "env": env})
+        if self.provision_error:
+            raise self.provision_error
+        return dict(self.provision_result)
 
     async def _run_sqlchange(self, app_dir, env, cred, on_log=None):
         self.mig_calls.append({"app_dir": app_dir, "env": env, "cred": cred, "on_log": on_log})
@@ -354,18 +365,77 @@ async def test_stop_dev_step_logs(sf, make_app, seams):
 
 
 
-async def test_start_dev_requires_cred_before_any_container(sf, make_app, seams):
-    """dev 凭据缺失 → 409 中文引导，且在起任何 docker 命令之前收口（fail-closed）。"""
-    app = await make_app("zccred", prod_port=8290, dev_port=8291)
+async def _drop_dev_cred(sf, slug: str) -> None:
+    """抹掉 dbcred.<slug>.dev 行，造出「元数据在、凭据不在」的预置应用态（ADR-0015）。"""
     async with sf() as s:
-        await s.execute(text("DELETE FROM app_config WHERE key LIKE 'dbcred.zccred.%'"))
+        await s.execute(text("DELETE FROM app_config WHERE key LIKE :p"), {"p": f"dbcred.{slug}.%"})
         await s.commit()
+
+
+async def test_start_dev_lazily_provisions_missing_dev_cred(sf, make_app, seams):
+    """dev 凭据缺失 → 现场供给分库，而不是 409 判死（预置应用搬到新机器的唯一活路）。
+
+    补建出来的凭据必须真的流下去：渲染 deploy/.env 与 sqlchange 迁移都用它，不能拿着 None 继续跑。
+    """
+    app = await make_app("zclazy", prod_port=8290, dev_port=8291)
+    await _drop_dev_cred(sf, "zclazy")
+    seams.provision_result = {"db": "zclazy_dev", "user": "zclazy_dev", "password": "gen-pw-1"}
+    hub, events = _hub_spy()
+    seams.docker.script["compose up"] = (0, "Container frontend Started")
+
+    res = await engine.start_dev(sf, app, notify=hub.publish)
+
+    assert seams.provision_calls == [{"slug": "zclazy", "env": "dev"}]
+    assert res["status"] == "running" and res["url"] == "http://localhost:8291"
+    assert seams.mig_calls[0]["cred"]["password"] == "gen-pw-1"      # 补建凭据真被迁移用上
+    env = (ROOT / "zclazy" / "deploy" / ".env").read_text(encoding="utf-8")
+    assert "DEV_PASSWORD=gen-pw-1" in env                            # 也真被渲染进 .env
+    assert await _db_status(sf, app["id"]) == "running"
+    joined = "\n".join(_dev_logs(events))
+    assert "现场供给分库" in joined and "zclazy_dev" in joined        # 演示时观众能看见发生了什么
+
+
+async def test_start_dev_lazy_provision_failure_blocks_stack(sf, make_app, seams):
+    """边界：供给本身失败（平台库连不上/账号无建库权限）→ 503 可读引导，且不起任何容器、不跑迁移。"""
+    app = await make_app("zclazy2", prod_port=8288, dev_port=8289)
+    await _drop_dev_cred(sf, "zclazy2")
+    seams.provision_error = RuntimeError("connection refused")
+
     with pytest.raises(DeployError) as ei:
         await engine.start_dev(sf, app)
-    assert ei.value.status == 409 and "凭据" in str(ei.value)
-    assert seams.docker.keys() == []
-    assert seams.mig_calls == []
+
+    assert ei.value.status == 503
+    assert "供给失败" in str(ei.value) and "connection refused" in str(ei.value)
+    assert seams.docker.keys() == [] and seams.mig_calls == []
     assert await _db_status(sf, app["id"]) == "error"
+
+
+async def test_start_dev_incomplete_provisioned_cred_blocks_stack(sf, make_app, seams):
+    """边界：供给回来的凭据缺口令 → 宁可 500 报错，也不把空口令渲染进 .env
+    （大型栈 compose 的 `${VAR:?}` 会在解析期拒收，错误面比这条守卫难懂得多）。"""
+    app = await make_app("zclazy3", prod_port=8286, dev_port=8287)
+    await _drop_dev_cred(sf, "zclazy3")
+    seams.provision_result = {"db": "zclazy3_dev", "user": "zclazy3_dev", "password": ""}
+
+    with pytest.raises(DeployError) as ei:
+        await engine.start_dev(sf, app)
+
+    assert ei.value.status == 500 and "不完整" in str(ei.value)
+    assert seams.docker.keys() == [] and seams.mig_calls == []
+    assert not (ROOT / "zclazy3" / "deploy" / ".env").exists()      # 半成品 .env 一个字节都不落
+    assert await _db_status(sf, app["id"]) == "error"
+
+
+async def test_start_dev_with_existing_cred_never_reprovisions(sf, make_app, seams):
+    """边界：凭据健在（本地常规路径）→ 一次 provision 都不许发，否则等于给存量库换口令。"""
+    app = await make_app("zchas", prod_port=8284, dev_port=8285)
+    seams.docker.script["compose up"] = (0, "Container frontend Started")
+
+    await engine.start_dev(sf, app)
+
+    assert seams.provision_calls == []
+    assert seams.mig_calls[0]["cred"]["password"] == "fake-pw"        # 用的是库里既有凭据
+    assert await _db_status(sf, app["id"]) == "running"
 
 
 async def test_start_dev_docker_unavailable(sf, make_app, seams):
@@ -660,6 +730,55 @@ async def test_wait_frontend_health_still_only_probes_root(monkeypatch):
     monkeypatch.setattr(engine.httpx, "AsyncClient", FakeClient)
     assert await engine.wait_frontend_health(8211, 2)
     assert seen == ["http://127.0.0.1:8211/"]
+
+
+# ---------- 探针地址与预览展示地址可配（平台自身容器化部署） ----------
+
+async def test_probe_host_env_moves_the_request_target(monkeypatch):
+    """平台跑在容器里时，应用发布的预览端口在**宿主**上：探针必须连 ZEROCODE_PREVIEW_PROBE_HOST。
+
+    连 127.0.0.1 的旧行为在容器化部署下永远连不到（那一侧没有任何监听），240s 全轮连接拒绝，
+    把其实已经就绪的栈报成「健康等待期内未就绪」。
+    """
+    FakeClient, seen = _client_returning(lambda url: 200)
+    monkeypatch.setattr(engine.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setenv("ZEROCODE_PREVIEW_PROBE_HOST", "host.docker.internal")
+    assert await engine.wait_frontend_health(8213, 2)
+    assert seen == ["http://host.docker.internal:8213/"]
+
+
+async def test_preview_url_without_config_keeps_localhost(monkeypatch):
+    """没配基址时展示地址仍是 http://localhost:<port>（存量单机部署的行为一字不动）。"""
+    from app.deploy.settings import preview_url
+    monkeypatch.delenv("ZEROCODE_PREVIEW_HOST", raising=False)
+    assert preview_url(8213) == "http://localhost:8213"
+
+
+async def test_preview_url_uses_base_host_env(monkeypatch):
+    from app.deploy.settings import preview_url
+    monkeypatch.setenv("ZEROCODE_PREVIEW_HOST", "10.0.1.25")
+    assert preview_url(8213) == "http://10.0.1.25:8213"
+
+
+async def test_start_dev_separates_probe_and_preview_addresses(sf, make_app, seams, monkeypatch):
+    """等待那行报的是探针真正连的地址，收口行与返回值给的是用户打得开的预览地址。"""
+    monkeypatch.setenv("ZEROCODE_PREVIEW_PROBE_HOST", "host.docker.internal")
+    monkeypatch.setenv("ZEROCODE_PREVIEW_HOST", "10.0.1.25")
+    app = await make_app("zcdual", prod_port=8258, dev_port=8259)
+    hub, events = _hub_spy()
+    res = await engine.start_dev(sf, app, notify=hub.publish)
+    steps = [l for l in _dev_logs(events) if l.startswith(engine.LOG_PREFIX)]
+    assert res["url"] == "http://10.0.1.25:8259"
+    assert "http://10.0.1.25:8259" in steps[-1]
+    assert any("http://host.docker.internal:8259" in l for l in steps)
+
+
+async def test_dev_status_url_follows_preview_base_host(sf, make_app, seams, monkeypatch):
+    """预览抽屉与「复制地址」读的是 dev_status.url，它必须跟着基址走，否则远程部署仍拿到 localhost。"""
+    monkeypatch.setenv("ZEROCODE_PREVIEW_HOST", "10.0.1.25")
+    app = await make_app("zcdsthost", prod_port=8254, dev_port=8255)
+    st = await engine.dev_status(sf, app)
+    assert st["url"] == "http://10.0.1.25:8255"
 
 
 async def test_health_timeout_by_stack():

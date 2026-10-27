@@ -31,9 +31,11 @@ import AppsView from './AppsView.vue'
 const APPS = [
   { id: 1, name: '甲', slug: 'aaa', stack: 'vue3-fastapi', scale: 'small', dev_port: 8301,
     prod_port: 8401, status_dev: 'stopped', status_prod: 'running', current_version: 'b20260920100000',
+    preview_url: 'http://10.0.1.25:8301',
     workspace_id: 11 },
   { id: 2, name: '乙', slug: 'bbb', stack: 'static', scale: 'small', dev_port: 8302,
     prod_port: 8402, status_dev: 'stopped', status_prod: 'stopped', current_version: null,
+    preview_url: 'http://10.0.1.25:8302',
     workspace_id: 12 },
 ]
 
@@ -175,6 +177,33 @@ describe('AppsView 发布接线', () => {
     const title = wrapper.find('.zc-metrics-title')
     expect(title.text()).toContain('甲')
     expect(title.text()).toContain('运行中')
+  })
+})
+
+// ---------- 预览地址：由后端 preview_url 给（前端硬拼 localhost 时，远程部署下那个地址
+// 指向的是访问者自己的机器，端口倒是对的——错的是宿主） ----------
+describe('AppsView 预览地址', () => {
+  let writeText
+  beforeEach(() => {
+    writeText = vi.fn().mockResolvedValue(undefined)
+    Object.defineProperty(window.navigator, 'clipboard',
+      { value: { writeText }, configurable: true })
+  })
+
+  it('「复制预览地址」写的是后端的 preview_url', async () => {
+    const wrapper = await mountView()
+    await wrapper.findAll('.zc-menu-copy')[0].trigger('click')
+    await flushPromises()
+    expect(writeText).toHaveBeenCalledWith('http://10.0.1.25:8301')
+  })
+
+  it('卡片「打开」链接指向 preview_url，而不是 localhost 拼端口', async () => {
+    mocks.api.listApps.mockResolvedValue({ data: [{ ...APPS[0], status_dev: 'running' }] })
+    const wrapper = mount(AppsView, { global: { stubs: STUBS } })
+    await flushPromises()
+    const link = wrapper.findAll('.stub-card')[0].findAll('a')
+      .find((x) => x.text().includes('打开'))
+    expect(link.attributes('href')).toBe('http://10.0.1.25:8301')
   })
 })
 
@@ -373,5 +402,108 @@ describe('AppsView 打开工程目录', () => {
     await flushPromises()
 
     expect(mocks.api.openFolder).toHaveBeenCalledTimes(1)
+  })
+})
+
+// ---------- 卡片「正式地址」：域名的唯一事实来源是后端 app_urls（ADR-0016） ----------
+// 前端补一个域名兜底看着无害，实际是两条故障：① 后端在 slug 缺位时**故意**回空串（不谎拼），
+// 前端一兜就把这个刻意留白填成了假地址；② ensureUrls 静默吞异常，所以兜底恰好在「接口挂了」
+// 时触发——用户点一下，剪贴板里是条死链，而它和真地址在界面上长得一模一样。
+describe('AppsView 正式地址', () => {
+  const prodLink = (wrapper, i = 0) => wrapper.findAll('.stub-card')[i].findAll('a')
+    .find((x) => x.text().includes('正式地址'))
+
+  let writeText
+  beforeEach(() => {
+    writeText = vi.fn().mockResolvedValue(undefined)
+    Object.defineProperty(window.navigator, 'clipboard',
+      { value: { writeText }, configurable: true })
+  })
+
+  it('正常：后端回了 domain → 原样写剪贴板并提示已复制', async () => {
+    mocks.api.appUrls.mockResolvedValue({ data: { domain: 'https://aaa.example.test' } })
+    const wrapper = await mountView()
+
+    await prodLink(wrapper).trigger('click')
+    await flushPromises()
+
+    expect(mocks.api.appUrls).toHaveBeenCalledWith(1)
+    expect(writeText).toHaveBeenCalledWith('https://aaa.example.test')
+    expect(mocks.antd.message.success).toHaveBeenCalledWith('已复制')
+  })
+
+  it('边界：appUrls 抛错（ensureUrls 静默）→ 不写剪贴板，改为显式提示', async () => {
+    mocks.api.appUrls.mockRejectedValue(new Error('boom'))
+    const wrapper = await mountView()
+
+    await prodLink(wrapper).trigger('click')
+    await flushPromises()
+
+    expect(writeText).not.toHaveBeenCalled()
+    expect(mocks.antd.message.success).not.toHaveBeenCalled()
+    expect(mocks.antd.message.warning).toHaveBeenCalled()
+  })
+
+  it('边界：后端故意回空串 domain（slug 缺位）→ 前端不补一个域名顶上', async () => {
+    mocks.api.appUrls.mockResolvedValue({ data: { domain: '' } })
+    const wrapper = await mountView()
+
+    await prodLink(wrapper).trigger('click')
+    await flushPromises()
+
+    expect(writeText).not.toHaveBeenCalled()
+    expect(mocks.antd.message.warning).toHaveBeenCalled()
+  })
+
+  it('边界：响应里没有 domain 字段（后端换契约/脏数据）→ 同样不写剪贴板', async () => {
+    mocks.api.appUrls.mockResolvedValue({ data: {} })
+    const wrapper = await mountView()
+
+    await prodLink(wrapper).trigger('click')
+    await flushPromises()
+
+    expect(writeText).not.toHaveBeenCalled()
+    expect(mocks.antd.message.warning).toHaveBeenCalled()
+  })
+
+  it('边界：http + IP 访问控制台时 navigator.clipboard 不存在 → 报错而非静默无反应', async () => {
+    // 非安全上下文（http://159.75.185.70:8100）里 navigator.clipboard 是 undefined，
+    // 直接 .writeText 抛 TypeError。copyUrl 原本没有 catch，结果是点了什么都没发生。
+    Object.defineProperty(window.navigator, 'clipboard',
+      { value: undefined, configurable: true })
+    mocks.api.appUrls.mockResolvedValue({ data: { domain: 'https://aaa.example.test' } })
+    const wrapper = await mountView()
+
+    await prodLink(wrapper).trigger('click')
+    await flushPromises()
+
+    expect(mocks.antd.message.error).toHaveBeenCalledWith('复制失败，请手动选择地址')
+    expect(mocks.antd.message.success).not.toHaveBeenCalled()
+  })
+
+  it('边界：剪贴板写入被拒（权限/窗口失焦）→ 不谎报已复制', async () => {
+    writeText.mockRejectedValue(new Error('NotAllowedError'))
+    mocks.api.appUrls.mockResolvedValue({ data: { domain: 'https://aaa.example.test' } })
+    const wrapper = await mountView()
+
+    await prodLink(wrapper).trigger('click')
+    await flushPromises()
+
+    expect(mocks.antd.message.error).toHaveBeenCalledWith('复制失败，请手动选择地址')
+    expect(mocks.antd.message.success).not.toHaveBeenCalled()
+  })
+
+  it('取不到地址时不缓存空结果：下一次点击会重新问后端（可重试）', async () => {
+    mocks.api.appUrls.mockRejectedValueOnce(new Error('boom'))
+      .mockResolvedValueOnce({ data: { domain: 'https://aaa.example.test' } })
+    const wrapper = await mountView()
+
+    await prodLink(wrapper).trigger('click')
+    await flushPromises()
+    await prodLink(wrapper).trigger('click')
+    await flushPromises()
+
+    expect(mocks.api.appUrls).toHaveBeenCalledTimes(2)
+    expect(writeText).toHaveBeenCalledWith('https://aaa.example.test')
   })
 })

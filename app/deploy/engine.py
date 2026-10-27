@@ -14,8 +14,10 @@ import httpx
 from sqlalchemy import text
 from app.deploy import compose as compose_mod
 from app.deploy.errors import DeployError
-from app.deploy.provision import read_cred
-from app.deploy.settings import deploy_cfg, health_timeout
+# provision_env 按模块级名字引入（同 D-1）：惰性供给在单测里可被 monkeypatch 接管，
+# 否则用例会在共享测试实例上真建库建角色（副作用跨用例泄漏）。
+from app.deploy.provision import provision_env, read_cred
+from app.deploy.settings import deploy_cfg, health_timeout, preview_probe_host, preview_url
 # 迁移入口按模块级名字引入（D-1）：引擎内以 bare name 调用，测试 monkeypatch engine.run_sqlchange 生效
 from app.deploy.sqlrun import run_sqlchange
 
@@ -151,17 +153,21 @@ async def _step(app_id, notify, message: str, *, since: float | None = None,
     await _notify(notify, app_id, {"type": "dev_log", "line": line})
 
 
-async def _all_200(port: int, paths: tuple, timeout: int) -> bool:
+async def _all_200(port: int, paths: tuple, timeout: int, host: str | None = None) -> bool:
     """轮询到超时为止：给定的一组路径全部 200 才算就绪（任一非 200 就连本轮一起不算过）。
 
     按 deadline 计时而不是「轮数 × 1s」（与 prod.wait_prod_health 同形）：一轮本身要花时间
     （httpx 单请求 2s 超时），按轮数计会把「900s」拖成十几分钟。
+
+    `host` 是探针连应用发布端口用的宿主地址，缺省取 `preview_probe_host()`：应用端口发布在宿主上，
+    平台自己跑在容器里时 127.0.0.1 那一侧永远没有监听。
     """
+    target = host or preview_probe_host()
     async with httpx.AsyncClient(timeout=2.0) as c:
         deadline = time.monotonic() + max(int(timeout), 1)
         while True:
             try:
-                codes = [(await c.get(f"http://127.0.0.1:{port}{p}")).status_code for p in paths]
+                codes = [(await c.get(f"http://{target}:{port}{p}")).status_code for p in paths]
                 if all(code == 200 for code in codes):
                     return True
             except Exception:
@@ -171,19 +177,20 @@ async def _all_200(port: int, paths: tuple, timeout: int) -> bool:
             await asyncio.sleep(1)
 
 
-async def wait_frontend_health(port: int, timeout: int) -> bool:
-    """前端健康判定（规格 03 §4.3）：GET http://localhost:<port>/ 拿到 200 即就绪。"""
-    return await _all_200(port, ("/",), timeout)
+async def wait_frontend_health(port: int, timeout: int, host: str | None = None) -> bool:
+    """前端健康判定（规格 03 §4.3）：GET `<probe host>:<port>/` 拿到 200 即就绪。"""
+    return await _all_200(port, ("/",), timeout, host)
 
 
-async def wait_dev_health(port: int, timeout: int, backend_path: str) -> bool:
+async def wait_dev_health(port: int, timeout: int, backend_path: str,
+                          host: str | None = None) -> bool:
     """dev 联合健康：前端 `/` 与经 dev proxy 打到后端的 `backend_path` 都要 200。
 
     大型栈后端在容器里 `mvn spring-boot:run`，前端先起、后端后起——只探前端会出现
     「预览已就绪、后端还在编译」的假绿（规格 §5.4）。两个探针都从 dev 端口进：模板的 vite
     `server.proxy` 已把 `/api` 转发到 backend 服务，因此这里不必知道后端端口（它也没对外暴）。
     """
-    return await _all_200(port, ("/", backend_path), timeout)
+    return await _all_200(port, ("/", backend_path), timeout, host)
 
 
 async def start_dev(sf, app: dict, notify=None) -> dict:
@@ -207,7 +214,7 @@ async def start_dev(sf, app: dict, notify=None) -> dict:
         root = await _app_root(sf, app)
         cred = await read_cred(sf, app["slug"], "dev")
         if not cred:
-            raise DeployError("dev 数据库凭据缺失，请删除应用后重建（或检查 dbcred 配置）", status=409)
+            cred = await _ensure_dev_cred(sf, app_id, app["slug"], notify, t0)
         compose_mod.ensure_deploy_files(root, app, {"dev": cred})
         port = _dev_port(app)
         await _step(app_id, notify, f"✓ 已渲染 deploy/（dev-compose.yml + .env），dev 端口 {port}",
@@ -240,23 +247,26 @@ async def start_dev(sf, app: dict, notify=None) -> dict:
         # deploy → services 就地取用是 prod.py 已有的惯例，提到模块顶会变成循环导入。
         from app.services.app_service import HEALTH_BY_STACK
         backend_path = (HEALTH_BY_STACK.get(stack) or "") if stack in JOINT_HEALTH_STACKS else ""
+        probe = preview_probe_host()
         if backend_path:
-            await _step(app_id, notify, f"→ 等待预览就绪（前端 / 与后端 {backend_path}，最长 {timeout}s）；"
+            await _step(app_id, notify, f"→ 等待预览就绪（探测 http://{probe}:{port}/ 与后端 {backend_path}，"
+                                        f"最长 {timeout}s）；"
                                         f"首次启动可能要数分钟（后端在装依赖与编译），请勿重复点「重启」")
             ok = await wait_dev_health(port, timeout, backend_path)
-            fail = (f"dev 预览在健康等待期内未就绪（端口 {port}，需前端 / 与后端 {backend_path} 同时 200，"
-                    f"后端可能仍在编译，详情看 dev 日志）")
+            fail = (f"dev 预览在健康等待期内未就绪（探测 http://{probe}:{port}，需前端 / 与后端 "
+                    f"{backend_path} 同时 200，后端可能仍在编译，详情看 dev 日志）")
         else:
-            await _step(app_id, notify, f"→ 等待前端就绪 http://localhost:{port}（最长 {timeout}s）")
+            await _step(app_id, notify,
+                        f"→ 等待前端就绪（探测 http://{probe}:{port}/，最长 {timeout}s）")
             ok = await wait_frontend_health(port, timeout)
-            fail = f"dev 前端在健康等待期内未就绪（端口 {port}）"
+            fail = f"dev 前端在健康等待期内未就绪（探测 http://{probe}:{port}/）"
         if not ok:
             raise DeployError(fail)
         await _set_status(sf, app_id, "running")
         await _step(app_id, notify,
-                    f"✓ 预览已就绪 http://localhost:{port}，总耗时 {time.monotonic() - t0:.1f}s")
+                    f"✓ 预览已就绪 {preview_url(port)}，总耗时 {time.monotonic() - t0:.1f}s")
         await _notify(notify, app_id, {"type": "dev_status", "status": "running"})
-        return {"status": "running", "url": f"http://localhost:{port}"}
+        return {"status": "running", "url": preview_url(port)}
     except DeployError as e:
         await _step(app_id, notify,
                     f"✗ 启动预览失败：{str(e).splitlines()[0][:200]}"
@@ -271,6 +281,33 @@ async def start_dev(sf, app: dict, notify=None) -> dict:
         await _set_status(sf, app_id, "error")
         await _notify(notify, app_id, {"type": "dev_status", "status": "error", "message": str(e)})
         raise DeployError(f"启动预览失败: {e}") from e
+
+
+async def _ensure_dev_cred(sf, app_id: int, slug: str, notify, t0: float) -> dict:
+    """dev 凭据惰性供给（ADR-0015）：库里没有 `dbcred.<slug>.dev` 时现场建库建角色并登记。
+
+    为什么需要：凭据原先只在 `app_service.create_app` 里生成一次，没有任何补建路径。把应用元数据行
+    种子到另一台机器（build-output 预置应用）时，那一行不存在，旧行为是 409「请删除应用后重建」——
+    在演示机上等于预置应用全是死的，而重建会连源码目录一起抹掉。
+
+    三道守卫（缺任一条都比继续跑更便宜）：
+    - 供给抛错 → 503：平台库连不上或连接账号无建库权限，属基础设施不可用，与 db_admin 的 503 口径一致；
+    - 供给结果缺 db/口令 → 500：对齐 `create_app` 的同款守卫。空口令渲染进 .env 后，大型栈 compose 的
+      `${VAR:?}` 会在**文件解析期**拒收，报出来的是 compose 的英文错，比这里早失败难懂得多；
+    - 凭据健在时本函数根本不被调用（调用方判空），存量库的口令永不被换掉。
+    """
+    await _step(app_id, notify, f"→ dev 凭据缺失，现场供给分库 {slug}_dev")
+    try:
+        cred = await provision_env(sf, slug, "dev")
+    except DeployError:
+        raise                                     # 已带状态码与中文引导，原样上抛不套壳
+    except Exception as e:
+        raise DeployError(f"dev 分库供给失败（{slug}_dev）：{e}", status=503) from e
+    if not (cred or {}).get("db") or not cred.get("password"):
+        raise DeployError(f"dev 分库供给结果不完整（{slug}_dev），"
+                          f"请检查平台库连接账号是否具备建库建角色权限", status=500)
+    await _step(app_id, notify, f"✓ dev 分库已供给并登记凭据（{cred['db']}）", since=t0)
+    return cred
 
 
 async def stop_dev(sf, app: dict, notify=None) -> dict:
@@ -315,7 +352,7 @@ async def dev_status(sf, app: dict) -> dict:
                              "--format", "json", cwd=str(root))
     row = await get_status_dev(sf, app["id"])
     return {"status_dev": row, "compose_ps": log if code == 0 else "",
-            "url": f"http://localhost:{_dev_port(app)}"}
+            "url": preview_url(_dev_port(app))}
 
 
 # ---------- 预览日志（「查看日志」面板的容器侧来源） ----------

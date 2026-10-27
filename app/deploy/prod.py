@@ -19,7 +19,7 @@ from app.deploy.errors import DeployError
 from app.deploy.engine import (preflight_docker, _app_root, _compose_meta, _notify,
                                LOG_PREFIX)
 from app.deploy.provision import read_cred, provision_env
-from app.deploy.settings import deploy_cfg, health_timeout, build_timeout
+from app.deploy.settings import deploy_cfg, health_timeout, build_timeout, preview_probe_host, preview_url
 from app.deploy.sqlrun import run_sqlchange
 from app.deploy.schemacheck import verify_dev_matches_files, parity_block_message
 from app.deploy import schemadiff
@@ -76,21 +76,23 @@ async def image_exists(tag: str) -> bool:
 
 
 async def wait_prod_health(root: Path, port: int, timeout: int,
-                           stack: str = "vue3-fastapi") -> tuple[bool, dict]:
+                           stack: str = "vue3-fastapi", host: str | None = None) -> tuple[bool, dict]:
     """联合健康（04 §4.3 最简路径）：GET / 200 且（非 static）GET /api/health 200——
     /api 由 T3b 的 nginx 反代进后端，单端口即前后端联合判定。
-    root 形参当前探针不用（http 走 127.0.0.1）——保留供 T7 日志取用（控制者裁定，不删）。"""
+    root 形参当前探针不用（http 走 `host`，缺省 `preview_probe_host()`）——保留供 T7 日志取用
+    （控制者裁定，不删）。"""
+    target = host or preview_probe_host()
     checks = {"frontend": False, "api": stack == "static"}
     async with httpx.AsyncClient(timeout=3.0) as c:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             try:
-                checks["frontend"] = (await c.get(f"http://127.0.0.1:{port}/")).status_code == 200
+                checks["frontend"] = (await c.get(f"http://{target}:{port}/")).status_code == 200
             except Exception:
                 checks["frontend"] = False
             if checks["frontend"] and stack != "static":
                 try:
-                    checks["api"] = (await c.get(f"http://127.0.0.1:{port}/api/health")).status_code == 200
+                    checks["api"] = (await c.get(f"http://{target}:{port}/api/health")).status_code == 200
                 except Exception:
                     checks["api"] = False
             if checks["frontend"] and checks["api"]:
@@ -134,7 +136,7 @@ async def prod_start(sf, app: dict, notify=None) -> dict:
             raise DeployError(f"正式环境体检未通过（{checks}），容器保持运行供排查")
         await set_status(sf, app_id, "running")
         await _notify(notify, app_id, {"type": "prod_status", "status": "running"})
-        await _step(app_id, notify, f"✓ 正式环境已就绪 http://localhost:{_prod_port(app)}", since=t0)
+        await _step(app_id, notify, f"✓ 正式环境已就绪 {preview_url(_prod_port(app))}", since=t0)
         return {"status": "running"}
     except DeployError as e:
         await set_status(sf, app_id, "error")
@@ -341,7 +343,7 @@ async def publish(sf, app: dict, notify=None, *, force: bool = False,
     def done_payload(ok: bool, error: str = "", payload: dict | None = None) -> dict:
         # 失败时 version 回指 prev_version：前端卡片继续显示「在服务的版本」，不虚报新版本
         out = {"type": "publish_done", "ok": ok, "version": version if ok else prev_version,
-               "url": f"http://localhost:{_prod_port(app)}", "error": error}
+               "url": preview_url(_prod_port(app)), "error": error}
         if payload:
             out["code"] = payload.get("code")            # 本期恒 "schema_destructive"
             out["destructive"] = payload.get("destructive")

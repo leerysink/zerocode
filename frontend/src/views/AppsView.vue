@@ -165,8 +165,17 @@ async function resetDev(a) {
   })
 }
 async function copyUrl(url) {
-  await navigator.clipboard.writeText(url)
-  message.success('已复制')
+  // navigator.clipboard 只在安全上下文（https 或 localhost）存在：用 IP + http 访问控制台时它是
+  // undefined，直接 .writeText 抛 TypeError。同文件的 copyPreviewUrl、DeployLogPanel 的 copyAll
+  // 都包了 catch，只有这个函数没有——而它是卡片「正式地址」与预览抽屉「复制地址」的共用出口，
+  // 结果是点了什么都没发生，连「复制失败」也不说。
+  try {
+    if (!navigator.clipboard) throw new Error('clipboard unavailable outside a secure context')
+    await navigator.clipboard.writeText(url)
+    message.success('已复制')
+  } catch {
+    message.error('复制失败，请手动选择地址')
+  }
 }
 // 查看日志：独立抽屉，栈没起也能打开（上一次启动失败在哪一步，只有这里看得到）
 function openLogs(a) {
@@ -175,8 +184,6 @@ function openLogs(a) {
 }
 
 // ---- 卡片 ☰ 菜单：重命名 / 打开工程目录 / 复制预览地址 / 查看日志 / 删除 ----
-const devUrl = (a) => `http://localhost:${a.dev_port}`
-
 function openRename(a) {
   rename.app = a
   rename.name = a.name
@@ -225,7 +232,7 @@ async function openAppFolder(a) {
 
 async function copyPreviewUrl(a) {
   try {
-    await navigator.clipboard.writeText(devUrl(a))
+    await navigator.clipboard.writeText(a.preview_url)
     message.success('预览地址已复制')
   } catch (e) {
     message.error('复制失败，请手动选择地址')
@@ -307,8 +314,15 @@ async function ensureUrls(a) {
 }
 async function copyProdUrl(a) {
   await ensureUrls(a)
-  const u = urlsCache[a.id]
-  await copyUrl(u?.domain || `https://${a.slug}.zerocode.com`)
+  // 拿不到就如实说，不拼一个域名兜底（ADR-0016：域名的事实来源只在后端一处）。两条路径都会
+  // 走到这里：ensureUrls 把请求异常静默吞掉了（hover 懒加载失败不该打扰用户），而后端在 slug
+  // 缺位时**故意**回空串。兜底拼出来的地址是条死链，而它和真地址在界面上无法区分。
+  const url = urlsCache[a.id]?.domain
+  if (!url) {
+    message.warning('正式地址暂时取不到，请稍后重试')
+    return
+  }
+  await copyUrl(url)
 }
 
 // ---------- M3-a 商店：发布到商店（只认真实在服的 prod 版本，闸门在后端） ----------
@@ -380,7 +394,7 @@ async function doRelease() {
         </template>
         <p class="zc-line">
           预览：{{ statusText(a.status_dev) }} · 端口 {{ a.dev_port }}
-          <a v-if="a.status_dev === 'running'" :href="`http://localhost:${a.dev_port}`"
+          <a v-if="a.status_dev === 'running'" :href="a.preview_url"
              target="_blank">打开</a>
         </p>
         <p class="zc-line sub" @mouseenter="ensureUrls(a)">

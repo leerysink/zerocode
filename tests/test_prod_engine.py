@@ -362,6 +362,35 @@ async def test_image_exists_real_docker_negative():
     assert await prod.image_exists("zc-no-such-app-frontend:prod-never-built") is False
 
 
+async def test_wait_prod_health_probes_configured_host(monkeypatch):
+    """prod 探针与 dev 同一条病：平台在容器里时 127.0.0.1 连不到宿主上发布的应用端口。"""
+    seen = []
+
+    class FakeClient:
+        def __init__(self, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url):
+            seen.append(url)
+
+            class R:
+                status_code = 200
+            return R()
+
+    monkeypatch.setattr(prod.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setenv("ZEROCODE_PREVIEW_PROBE_HOST", "host.docker.internal")
+    ok, checks = await prod.wait_prod_health(Path("D:/__none__"), 8213, 2, "vue3-fastapi")
+    assert ok and checks == {"frontend": True, "api": True}
+    assert seen == ["http://host.docker.internal:8213/",
+                    "http://host.docker.internal:8213/api/health"]
+
+
 async def test_wait_prod_health_static_api_always_true():
     """static 栈 api 恒 True（无后端可查）；死端口前端不通 → 整体 False，但 checks 形态完整。"""
     ok, checks = await prod.wait_prod_health(Path("D:/__none__"), 59997, 1, "static")

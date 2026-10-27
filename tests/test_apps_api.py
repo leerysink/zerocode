@@ -78,6 +78,33 @@ async def test_create_and_list(client):
     assert r4.status_code == 404                       # D-2：不存在的 id → 404（非 500）
 
 
+async def _row_by_slug(client, slug):
+    rows = [a for a in (await client.get("/api/apps")).json() if a["slug"] == slug]
+    assert len(rows) == 1, rows
+    return rows[0]
+
+
+async def test_list_and_detail_carry_preview_url(client, monkeypatch):
+    """预览链接由后端按 `ZEROCODE_PREVIEW_HOST` 生成并随列表/详情回表：
+
+    前端此前硬拼 `http://localhost:${dev_port}`，远程部署时那个地址指向访问者自己的机器。
+    """
+    monkeypatch.setenv("ZEROCODE_PREVIEW_HOST", "10.0.1.25")
+    assert (await client.post("/api/apps", json=BODY)).status_code == 201
+    row = await _row_by_slug(client, SLUG)
+    assert row["preview_url"] == f"http://10.0.1.25:{row['dev_port']}"
+    detail = (await client.get(f"/api/apps/{row['id']}")).json()
+    assert detail["preview_url"] == row["preview_url"]
+
+
+async def test_list_preview_url_defaults_to_localhost(client, monkeypatch):
+    """没配基址时仍是 localhost（单机部署的存量行为一字不动）。"""
+    monkeypatch.delenv("ZEROCODE_PREVIEW_HOST", raising=False)
+    assert (await client.post("/api/apps", json=BODY)).status_code == 201
+    row = await _row_by_slug(client, SLUG)
+    assert row["preview_url"] == f"http://localhost:{row['dev_port']}"
+
+
 async def test_create_conflict_and_bad_request(client):
     body = {"name": "x", "slug": SLUG, "scale": "small", "stack": "vue3-fastapi"}
     assert (await client.post("/api/apps", json=body)).status_code == 201

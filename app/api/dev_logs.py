@@ -56,5 +56,5 @@ async def dev_logs(request: Request, app_id: int, tail: int = 200, since_seq: in
     container, note = await engine.container_logs(sf, app, n)
     lines = engine.merge_logs(platform, container)
     return {"lines": lines, "note": note, "status_dev": app.get("status_dev"),
-            "url": (f"http://localhost:{app['dev_port']}" if app.get("dev_port") else ""),
+            "url": app.get("preview_url") or "",
             "last_seq": platform[-1]["seq"] if platform else since}

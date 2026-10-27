@@ -12,7 +12,7 @@ from app.deploy import provision, scaffold
 from app.deploy import gateway_routes
 from app.deploy.errors import DeployError
 from app.deploy.ports import allocate_pair
-from app.deploy.settings import REPO_ROOT, deploy_cfg, resolve_apps_root
+from app.deploy.settings import REPO_ROOT, deploy_cfg, preview_url, resolve_apps_root
 from app.deploy.slugs import validate_slug
 
 SCALES = ("small", "large")
@@ -214,6 +214,16 @@ async def _rollback(session_factory, root_path: Path, slug: str, app_id: int | N
     shutil.rmtree(root_path, ignore_errors=True)
 
 
+def _with_preview_url(row: dict) -> dict:
+    """回表补 `preview_url`：预览链接由后端按部署基址生成，前端不再硬拼 localhost。
+
+    硬拼出来的地址在远程部署下指向的是访问者自己的机器，端口倒是没错——错的是宿主。
+    """
+    port = row.get("dev_port")
+    row["preview_url"] = preview_url(port) if port else ""
+    return row
+
+
 async def list_apps(session_factory, *, owner_user_id: int | None = None) -> list[dict]:
     """应用列表（应用页与侧栏分组共用）。带上 workspace.root_path：
     侧栏一行就是一个应用，确认删除时要当场把「工程目录还在哪儿」说清楚。
@@ -242,7 +252,7 @@ async def list_apps(session_factory, *, owner_user_id: int | None = None) -> lis
     for r in rows:
         d = to_dict(r)
         d["store"] = by_app.get(int(d["id"]))
-        out.append(d)
+        out.append(_with_preview_url(d))
     return out
 
 
@@ -270,7 +280,7 @@ async def get_app(session_factory, app_id: int, *, owner_user_id: int | None = N
             {"i": app_id})).mappings().first()
     d = to_dict(row)
     d["store"] = to_dict(link) if link else None
-    return d
+    return _with_preview_url(d)
 
 
 async def rename_app(session_factory, app_id: int, name: str, *,

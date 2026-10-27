@@ -1,4 +1,5 @@
 # app/deploy/settings.py
+import os
 from pathlib import Path
 from sqlalchemy import text
 
@@ -61,3 +62,26 @@ def build_timeout(cfg: dict, stack: str) -> int:
     if stack == "vue3-springboot":
         return int(cfg.get("deploy.build_timeout_large") or base)
     return base
+
+
+# 预览端口的两个宿主地址。应用栈把 dev/prod 端口发布在**宿主**上，而平台自身可能是宿主进程
+# （dev.bat，127.0.0.1 就是宿主）也可能跑在容器里（build-output 演示部署，127.0.0.1 是容器自己）——
+# 后者连不到任何应用端口，探针会把已经就绪的栈等成一整个超时窗口的连接拒绝，最后报「未就绪」。
+# 两个地址分开是因为受众不同：探测方是平台进程，展示方是用户的浏览器。
+PROBE_HOST_ENV = "ZEROCODE_PREVIEW_PROBE_HOST"
+PREVIEW_HOST_ENV = "ZEROCODE_PREVIEW_HOST"
+
+
+def preview_probe_host() -> str:
+    """健康探针连接应用发布端口的宿主地址；平台容器化部署时配 `host.docker.internal`。"""
+    return os.environ.get(PROBE_HOST_ENV, "").strip() or "127.0.0.1"
+
+
+def preview_base_host() -> str:
+    """预览地址对外展示的宿主：单机就是 localhost，服务器上填 IP 或域名。"""
+    return os.environ.get(PREVIEW_HOST_ENV, "").strip() or "localhost"
+
+
+def preview_url(port) -> str:
+    """用户能打开的预览地址（端口为应用的 dev/prod 发布端口）。"""
+    return f"http://{preview_base_host()}:{port}"

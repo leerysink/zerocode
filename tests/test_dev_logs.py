@@ -253,6 +253,19 @@ async def test_dev_logs_endpoint_merges_both_sources(client, dev_app, monkeypatc
     assert body["last_seq"] == lines[1]["seq"]
 
 
+async def test_dev_logs_url_follows_preview_base_host(client, dev_app, monkeypatch):
+    """日志面板顶部的「预览地址」也读后端，基址一换就要跟着换（否则远程部署复制到的还是 localhost）。"""
+    monkeypatch.setenv("ZEROCODE_PREVIEW_HOST", "10.0.1.25")
+
+    async def fake_container(sf, app, tail=200):
+        return [], ""
+
+    monkeypatch.setattr(eng_mod, "container_logs", fake_container)
+    r = await client.get(f"/api/apps/{dev_app}/dev/logs")
+    assert r.status_code == 200, r.text
+    assert r.json()["url"] == "http://10.0.1.25:8265"
+
+
 async def test_dev_logs_endpoint_fail_soft_when_docker_missing(client, dev_app, monkeypatch):
     hub = client.app.state.deploy_hub
     hub.publish(dev_app, {"app_id": dev_app, "type": "dev_log", "line": "[zerocode] ✗ 启动预览失败"})
