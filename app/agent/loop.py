@@ -35,7 +35,8 @@ class AgentRunner:
         self.send = send
         self.ask = ask
         self.confirm = confirm
-        # 执行中用户插话（steering）的取空回调：async (session_id) -> list[str]，
+        # 执行中用户插话（steering）的取空回调：async (session_id) -> list[dict]，
+        # 项为 {content, attachment_ids, client_msg_id}（兼容裸字符串）；
         # 缺省 None = 不支持插话（旧调用方与单测保持原签名可用）
         self.pop_pending = pop_pending
 
@@ -257,22 +258,37 @@ class AgentRunner:
 
         只在**工具边界**调用（一轮开始时工具结果已全部入列），绝不能插在 assistant(tool_calls)
         与它的 tool 结果之间 —— 拆散那一对会让 OpenAI 兼容接口直接 400。
-        注入后回 steering_done，前端据此摘掉「排队中」角标（气泡本身是发送时就乐观落下的）。
+        队列项是对象 {content, attachment_ids, client_msg_id}（兼容老的裸字符串）：
+        带图插话与普通消息同一条路径落库绑定附件，再按本 run 的视觉能力渲染给模型。
+        注入后回 steering_done（带 client_msg_id），前端据此摘掉「排队中」角标并校验送达。
         返回注入条数（调用方据此判断"还要不要再走一轮"）。
         """
+        from app.services import attachment_service as _att
         if not self.pop_pending:
             return 0
         injected = 0
-        for raw in await self.pop_pending(session_id):
-            text_ = (raw or "").strip()
-            if not text_:
+        for item in await self.pop_pending(session_id):
+            if isinstance(item, str):
+                item = {"content": item, "attachment_ids": [], "client_msg_id": None}
+            text_ = (item.get("content") or "").strip()
+            ids = item.get("attachment_ids") or []
+            if not text_ and not ids:
                 continue
-            # expand_mentions 无 @ 标记时返回 None（不是原文！）——直接塞给模型就等于把
-            # 用户这句话丢掉，必须回落到原文
-            expanded = expand_mentions(root, text_) or text_
-            await add_message(self.sf, session_id, "user", content=text_, context_content=expanded)
-            messages.append({"role": "user", "content": expanded})
-            await self.send({"type": "steering_done", "content": text_})
+            expanded = expand_mentions(root, text_) if text_ else None
+            try:
+                row = await add_message(self.sf, session_id, "user", content=text_,
+                                        context_content=expanded, attachment_ids=ids)
+            except ValueError as e:
+                # 附件在排队期间被占用/删除：这句插话无法完整送达，单独报错并继续，
+                # 不能连累队列里后面的插话，也不能让整轮 run 崩掉
+                await self.send({"type": "error", "message": f"插话未能送达：{e}"})
+                continue
+            files = await _att.for_llm(self.sf, [row["id"]]) if ids else {}
+            content = self._user_content(text_, row.get("attachments") or [], True,
+                                         files.get(row["id"], []))
+            messages.append({"role": "user", "content": content})
+            await self.send({"type": "steering_done", "content": text_,
+                             "client_msg_id": item.get("client_msg_id")})
             injected += 1
         return injected
 

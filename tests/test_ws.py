@@ -351,7 +351,9 @@ def test_ws_busy_is_non_terminal(client):
         for _ in range(6):
             if ws.receive_json()["type"] == "ask_user":
                 break
-        hub.pending[sid] = [f"占位{i}" for i in range(20)]  # 顶到默认上限
+        hub.pending[sid] = [
+            {"content": f"占位{i}", "attachment_ids": [], "client_msg_id": None}
+            for i in range(20)]  # 顶到默认上限
         ws.send_json({"type": "user_message", "content": "第 21 句"})
         assert _reject_event(ws)["type"] == "busy"
         # busy 不是终态：ask 仍挂起，应答后这一轮照常收尾
@@ -514,7 +516,9 @@ def test_ws_steering_arriving_with_final_answer_gets_a_round(client):
     def factory(cfg):
         return _SteerAfterStream(
             [done("第一段答复"), done("好，导出按钮加上")],
-            after=lambda: hub.queue(client.zc_sid, steer, 20))
+            after=lambda: hub.queue(
+                client.zc_sid,
+                {"content": steer, "attachment_ids": [], "client_msg_id": None}, 20))
     client.app.state.llm_factory = factory
     with client.websocket_connect(f"/ws/chat/{client.zc_sid}") as ws:
         ws.send_json({"type": "user_message", "content": "开始"})
@@ -539,10 +543,13 @@ def test_ws_steering_arriving_with_final_answer_gets_a_round(client):
 def test_hub_queue_cap_and_drain():
     """hub 队列：入队保序、drain 取空、超上限拒收（ws 侧按 sys_config 传上限）。"""
     hub = ChatHub()
-    assert hub.queue(1, "第一句", 2) is True
-    assert hub.queue(1, "第二句", 2) is True
-    assert hub.queue(1, "第三句", 2) is False  # 满 → ws 回 busy 非终态提示
-    assert asyncio.run(hub.pop_pending(1)) == ["第一句", "第二句"]
+    a = {"content": "第一句", "attachment_ids": [], "client_msg_id": None}
+    b = {"content": "第二句", "attachment_ids": [], "client_msg_id": None}
+    c = {"content": "第三句", "attachment_ids": [], "client_msg_id": None}
+    assert hub.queue(1, a, 2) is True
+    assert hub.queue(1, b, 2) is True
+    assert hub.queue(1, c, 2) is False  # 满 → ws 回 busy 非终态提示
+    assert asyncio.run(hub.pop_pending(1)) == [a, b]
     assert asyncio.run(hub.pop_pending(1)) == []  # drain 即清空，不重复注入
 
 
@@ -551,12 +558,14 @@ def test_session_detail_exposes_queued_steering(client):
     前端据此把「排队中」气泡还原（否则用户说了话，刷新一下就没了，跟丢消息没区别）。"""
     hub = client.app.state.hub
     sid = client.zc_sid
-    hub.queue(sid, "还在排队的一句", 20)
-    hub.queue(sid, "排第二句", 20)
+    hub.queue(sid, {"content": "还在排队的一句", "attachment_ids": [],
+                    "client_msg_id": "c1"}, 20)
+    hub.queue(sid, {"content": "排第二句", "attachment_ids": [],
+                    "client_msg_id": "c2"}, 20)
     detail = client.get(f"/api/sessions/{sid}").json()
     assert detail["pending_steering"] == [
-        {"content": "还在排队的一句", "client_msg_id": None, "attachments": []},
-        {"content": "排第二句", "client_msg_id": None, "attachments": []}]
+        {"content": "还在排队的一句", "client_msg_id": "c1", "attachments": []},
+        {"content": "排第二句", "client_msg_id": "c2", "attachments": []}]
     hub.pending.pop(sid, None)
     assert client.get(f"/api/sessions/{sid}").json()["pending_steering"] == []
 
@@ -587,3 +596,102 @@ def test_ws_manual_compact(client):
                 assert ev["summary"] == "压缩摘要OK"
                 break
         assert "compaction_done" in types
+
+
+# ---------- 聊天图片输入（WS 协议） ----------
+
+PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+
+
+def _vision_model(client, vision=True):
+    r = client.post("/api/models", json={
+        "name": "vl", "base_url": "http://x/v1", "api_key": "k",
+        "model": "vl-m", "is_default": True, "supports_vision": vision})
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def _upload(client, sid, name="a.png"):
+    r = client.post(f"/api/sessions/{sid}/attachments", params={"filename": name},
+                    content=PNG, headers={"Content-Type": "image/png"})
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
+def test_ws_pure_image_message_starts_run(client, monkeypatch, tmp_path):
+    monkeypatch.setenv("ZEROCODE_DATA_DIR", str(tmp_path / "data"))
+    _vision_model(client)
+    att_row = _upload(client, client.zc_sid)
+    client.app.state.llm_factory = lambda cfg: ScriptedLLM([done("看到了")])
+    with client.websocket_connect(f"/ws/chat/{client.zc_sid}") as ws:
+        ws.send_json({"type": "user_message", "content": "",
+                      "attachment_ids": [att_row["id"]], "client_msg_id": "c-img"})
+        for _ in range(8):
+            if ws.receive_json()["type"] == "status":
+                break
+    rows = client.get(f"/api/sessions/{client.zc_sid}/messages").json()
+    assert [r["role"] for r in rows] == ["user", "assistant"]
+    assert rows[0]["content"] == ""
+    assert rows[0]["attachments"][0]["id"] == att_row["id"]
+
+
+def test_ws_image_rejected_when_model_lacks_vision(client, monkeypatch, tmp_path):
+    monkeypatch.setenv("ZEROCODE_DATA_DIR", str(tmp_path / "data"))
+    att_row = _upload(client, client.zc_sid)
+    with client.websocket_connect(f"/ws/chat/{client.zc_sid}") as ws:
+        ws.send_json({"type": "user_message", "content": "",
+                      "attachment_ids": [att_row["id"]], "client_msg_id": "c-no"})
+        ev = _reject_event(ws)
+    assert ev["type"] == "busy" and ev["client_msg_id"] == "c-no"
+    assert ev["running"] is False
+    assert client.get(f"/api/sessions/{client.zc_sid}/messages").json() == []
+
+
+def test_ws_image_steering_binds_and_echoes_client_msg_id(client, monkeypatch, tmp_path):
+    monkeypatch.setenv("ZEROCODE_DATA_DIR", str(tmp_path / "data"))
+    _vision_model(client)
+    att_row = _upload(client, client.zc_sid)
+    client.app.state.llm_factory = lambda cfg: ScriptedLLM([
+        done(None, [_ask_tool_call()]), done("收到图片")])
+    with client.websocket_connect(f"/ws/chat/{client.zc_sid}") as ws:
+        ws.send_json({"type": "user_message", "content": "先挂着"})
+        for _ in range(6):
+            if ws.receive_json()["type"] == "ask_user":
+                break
+        ws.send_json({"type": "user_message", "content": "",
+                      "attachment_ids": [att_row["id"]], "client_msg_id": "c-steer"})
+        ws.send_json({"type": "ask_submit", "answers": [{"answer": "ok"}]})
+        evs = []
+        for _ in range(12):
+            ev = ws.receive_json()
+            evs.append(ev)
+            if ev["type"] == "status":
+                break
+    done_ev = [e for e in evs if e["type"] == "steering_done"]
+    assert done_ev and done_ev[0]["client_msg_id"] == "c-steer"
+    rows = client.get(f"/api/sessions/{client.zc_sid}/messages").json()
+    users = [r for r in rows if r["role"] == "user"]
+    assert len(users) == 2
+    assert users[1]["content"] == ""
+    assert users[1]["attachments"][0]["id"] == att_row["id"]
+
+
+def test_ws_image_steering_rejected_when_run_model_lacks_vision(client, monkeypatch, tmp_path):
+    monkeypatch.setenv("ZEROCODE_DATA_DIR", str(tmp_path / "data"))
+    att_row = _upload(client, client.zc_sid)
+    client.app.state.llm_factory = lambda cfg: ScriptedLLM([done(None, [_ask_tool_call()])])
+    with client.websocket_connect(f"/ws/chat/{client.zc_sid}") as ws:
+        ws.send_json({"type": "user_message", "content": "先挂着"})
+        for _ in range(6):
+            if ws.receive_json()["type"] == "ask_user":
+                break
+        ws.send_json({"type": "user_message", "content": "",
+                      "attachment_ids": [att_row["id"]], "client_msg_id": "c-no"})
+        ev = _reject_event(ws)
+        assert ev["type"] == "busy" and ev["client_msg_id"] == "c-no"
+        assert ev["running"] is True
+        ws.send_json({"type": "cancel"})
+        for _ in range(5):
+            if ws.receive_json()["type"] == "status":
+                break
+    assert not client.app.state.hub.pending.get(client.zc_sid)

@@ -6,8 +6,11 @@ message_done / error / status / file_change / compacting / compaction_done / bus
 steering_done（由 runner 与 hub 经 emit 下发）。error 与 status 是**本轮终态**；busy 是
 执行中被拒的非终态提示（不得据此复位前端执行态，否则「停止」按钮消失 → 发不出也停不掉的死循环）。
 
-执行中再发 user_message = 插话（steering）：进 hub.pending 队列，由 runner 在下一个
-工具边界落库注入并回 steering_done；压缩中或队列排满仍回 busy（两条路径都不落库）。
+执行中再发 user_message = 插话（steering）：进 hub.pending 队列（对象项：content +
+attachment_ids + client_msg_id），由 runner 在下一个工具边界落库绑定附件并回
+steering_done（带 client_msg_id）；压缩中、队列排满或图片插话撞上不支持视觉的本 run
+模型仍回 busy（都不落库）。busy 一律带 client_msg_id 与 running（是否仍在执行），
+前端据此只摘掉那条乐观气泡而不复位执行态。
 
 按会话分槽：同会话后连连接覆盖该会话的 emit 槽，下行事件随之切到新连接；
 断连 drop 自己的槽（防僵尸槽），跨会话互不串扰（终审修复轮2）。
@@ -21,6 +24,8 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from sqlalchemy import text as _sql
 from app.agent.llm import OpenAICompatLLM
 from app.agent.loop import AgentRunner
+from app.agent.model_resolver import resolve_model
+from app.services import attachment_service
 from app.services import compaction_service
 from app.services import config_service
 
@@ -61,6 +66,12 @@ async def ws_chat(ws: WebSocket, session_id: int):
         except Exception:
             pass  # 连接已断开等场景：静默丢弃（单用户场景无回压需求）
 
+    async def reject(message: str, client_msg_id=None, running: bool = False):
+        """非终态拒绝：带 client_msg_id（前端摘掉乐观气泡）与 running
+        （false=根本没开跑，可解锁；true=仍在执行中，保持「停止」按钮）。"""
+        await emit(session_id, {"type": "busy", "message": message,
+                                "client_msg_id": client_msg_id, "running": running})
+
     # 按会话分槽注入：同会话后连覆盖，跨会话互不影响（终审修复轮2）
     hub.set_emit(session_id, emit)
     # 重连状态自洽：连入时该会话仍在跑（刷新页面/断线重连/另开标签页），补发一帧
@@ -93,33 +104,87 @@ async def ws_chat(ws: WebSocket, session_id: int):
             msg = json.loads(await ws.receive_text())
             t = msg.get("type")
             if t == "user_message":
+                cid = msg.get("client_msg_id")
                 text_ = (msg.get("content") or "").strip()
-                if not text_:
+                raw_ids = msg.get("attachment_ids") or []
+                if not isinstance(raw_ids, list):
+                    await reject("附件参数非法", cid, running=session_id in hub.running)
                     continue
+                try:
+                    attachment_ids = list(dict.fromkeys(int(i) for i in raw_ids))
+                except (TypeError, ValueError):
+                    await reject("附件参数非法", cid, running=session_id in hub.running)
+                    continue
+                if not text_ and not attachment_ids:
+                    continue  # 空消息（无字无图）不打断也不回帧
+                if len(attachment_ids) > attachment_service.MAX_ATTACHMENTS_PER_MESSAGE:
+                    await reject(f"单条消息最多 {attachment_service.MAX_ATTACHMENTS_PER_MESSAGE} 张图片",
+                                 cid, running=session_id in hub.running)
+                    continue
+
                 if session_id in hub.running:
                     # 执行中再发一句 = **插话（steering）**：入队等下一个工具边界注入，
                     # 不另起一轮 run、也不再当错误拒收（历史上回 error 造成过
                     # 「发不出也停不掉」的死循环，见 a0cecb1）。
                     if session_id in hub.compacting:
                         # 压缩没有工具边界可注入，也没有模型会读它 —— 仍然拒收（非终态）
-                        await emit(session_id, {"type": "busy", "message": "上下文压缩中，请稍候"})
+                        await reject("上下文压缩中，请稍候", cid, running=True)
                         continue
+                    if attachment_ids:
+                        # 能力门按**本 run 实际模型**判定（不是当前默认模型）：
+                        # run 跑的是启动时解析的那个模型，中途换默认不该让插话混进读不懂图的上下文
+                        if hub.run_vision.get(session_id) is not True:
+                            await reject("当前模型不支持图片输入，请切换支持视觉的模型",
+                                         cid, running=True)
+                            continue
+                        try:
+                            await attachment_service.load_bindable(
+                                app.state.session_factory, session_id, attachment_ids)
+                        except attachment_service.AttachmentError as e:
+                            await reject(str(e), cid, running=True)
+                            continue
                     cfg_now = await config_getter()
                     cap = int(cfg_now.get("agent.steering_queue_max", 20) or 20)
-                    if not hub.queue(session_id, text_, cap):
-                        await emit(session_id, {"type": "busy",
-                                                "message": f"插话已排满（上限 {cap} 条），请等本轮跑完或点「停止」"})
+                    item = {"content": text_, "attachment_ids": attachment_ids,
+                            "client_msg_id": cid}
+                    if not hub.queue(session_id, item, cap):
+                        await reject(f"插话已排满（上限 {cap} 条），请等本轮跑完或点「停止」",
+                                     cid, running=True)
                     continue
+
+                # 新起一轮：图片消息在**建任务前**完成预校验（绑定资格 + 视觉能力），
+                # 校验失败直接拒、不落库不置 running；解析结果顺带传给任务复用，避免重复查库
+                cfg_now = None
+                model_cfg = None
+                if attachment_ids:
+                    try:
+                        await attachment_service.load_bindable(
+                            app.state.session_factory, session_id, attachment_ids)
+                    except attachment_service.AttachmentError as e:
+                        await reject(str(e), cid, running=False)
+                        continue
+                    cfg_now = await config_getter()
+                    model_cfg = await resolve_model(app.state.session_factory, session_id, cfg_now)
+                    if not model_cfg.get("supports_vision"):
+                        await reject("当前模型不支持图片输入，请切换支持视觉的模型",
+                                     cid, running=False)
+                        continue
 
                 async def send(event: dict):
                     # AgentRunner.send 是单参签名；经 hub 会话槽晚绑定转发，
                     # 同会话后连覆盖槽后事件自动切到新连接（见 busy 测试语义）
                     await hub.emit_event(session_id, event)
 
-                async def run_task(user_text_: str):
+                async def run_task(user_text_: str, attachment_ids_: list[int],
+                                   cfg_now_, model_cfg_):
+                    # 裁定 R3：hub.running 必须在任何 await 之前置位。若等 cfg/模型解析
+                    # 完再加，解析期间到达的第二条 user_message 会看到「未在跑」而再开一个
+                    # run（双跑竞态）。status 落库仍紧随其后，保持 watchdog 语义。
+                    hub.running.add(session_id)
+                    if model_cfg_ is not None:  # 图片消息已预解析：先亮能力位再等首个 await
+                        hub.run_vision[session_id] = bool(model_cfg_.get("supports_vision"))
                     cancel = asyncio.Event()
                     hub.cancel_events[session_id] = cancel
-                    hub.running.add(session_id)
                     try:
                         # 落库 'running' 激活 watchdog（spec §7 崩溃恢复）：此前全仓无代码写
                         # 'running'（schema 默认 idle，runner 终态只写 idle/error），watchdog 的
@@ -130,22 +195,29 @@ async def ws_chat(ws: WebSocket, session_id: int):
                                 "UPDATE chat_session SET status='running', updated_at=now() WHERE id=:i"),
                                 {"i": session_id})
                             await s.commit()
+                        if cfg_now_ is None:
+                            cfg_now_ = await config_getter()
+                        if model_cfg_ is None:
+                            model_cfg_ = await resolve_model(
+                                app.state.session_factory, session_id, cfg_now_)
+                        # 本 run 实际模型的能力位：执行中的图片插话按这个放行/拒绝，
+                        # 结束时清掉（下次 run 重新解析）
+                        hub.run_vision[session_id] = bool(model_cfg_.get("supports_vision"))
                         # LLM 按 run 解析一次：runner 对 callable 每轮重建实例，
                         # 而测试注入工厂每次返回新 ScriptedLLM（turns 从头重放）；
                         # 生产路径 cfg 每 run 只取一次，重建 OpenAICompatLLM 语义等价
-                        from app.agent.model_resolver import resolve_model
-                        cfg_now = await config_getter()
-                        model_cfg = await resolve_model(app.state.session_factory, session_id, cfg_now)
-                        llm = llm_factory(cfg_now, model_cfg)
+                        llm = llm_factory(cfg_now_, model_cfg_)
                         runner = AgentRunner(app.state.session_factory, llm,
                                              config_getter, send, hub.ask, hub.confirm,
                                              hub.pop_pending)
-                        await runner.run(session_id, user_text_, cancel)
+                        await runner.run(session_id, user_text_, cancel,
+                                         attachment_ids=attachment_ids_)
                     finally:
+                        hub.run_vision.pop(session_id, None)
                         hub.running.discard(session_id)
                         hub.cancel_events.pop(session_id, None)
 
-                asyncio.create_task(run_task(text_))
+                asyncio.create_task(run_task(text_, attachment_ids, cfg_now, model_cfg))
             elif t == "ask_submit":
                 await hub.submit_answers(session_id, msg.get("answers") or [])
             elif t == "confirm":

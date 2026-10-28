@@ -3,8 +3,11 @@
 - ask/confirm：挂起等待前端上行（ask_submit/confirm），cancel 时统一复位；
   confirm_request 下行事件由 AgentRunner._dispatch 统一下发（Task 7 裁定：runner 唯一
   发出方），hub.confirm 只负责挂 future 等待，避免前端收到重复卡片。
-- pending：执行中用户插话（steering）的待注入队列，runner 在下一个工具边界 pop 并落库；
+- pending：执行中用户插话（steering）的待注入队列，项为
+  {content, attachment_ids, client_msg_id}——附件随插话一起在边界绑定落库；
   cancel 时一并丢弃（未送达的插话不得偷偷活到下一次 run）。
+- run_vision：本 run 实际解析出的模型是否支持视觉。执行中的图片插话按它放行/拒绝，
+  在 run 结束时清理（不能按「当前默认模型」判断——run 跑的是启动时解析的那个模型）。
 - emits：按会话分槽的下行发送器（session_id → async (session_id, event) -> None），
   同会话后连覆盖；断连 drop 清槽（仅清自己注入的槽，防误删后连者的槽），
   跨会话互不串扰（终审修复轮2：原全局单槽会被任意会话的连接覆盖导致事件串线）。
@@ -18,18 +21,19 @@ class ChatHub:
         self.cancel_events: dict[int, asyncio.Event] = {}
         self.running: set[int] = set()
         self.compacting: set[int] = set()  # 压缩占位（无工具边界可注入，插话要区别对待）
-        self.pending: dict[int, list[str]] = {}  # 执行中插话队列：session_id → 待注入 user 文本
+        self.pending: dict[int, list[dict]] = {}  # 执行中插话：{content, attachment_ids, client_msg_id}
+        self.run_vision: dict[int, bool] = {}  # 本 run 实际模型是否支持视觉（插话能力门）
         self.emits: dict[int, callable] = {}  # session_id → 下行发送器: async (session_id, event) -> None
 
-    def queue(self, session_id, text, max_pending) -> bool:
+    def queue(self, session_id, item, max_pending) -> bool:
         """插话入队（保序）。队列满则拒收，由 ws 侧回 busy 非终态提示。"""
         q = self.pending.setdefault(session_id, [])
         if len(q) >= int(max_pending):
             return False
-        q.append(text)
+        q.append(item)
         return True
 
-    async def pop_pending(self, session_id) -> list[str]:
+    async def pop_pending(self, session_id) -> list[dict]:
         """取空即清：注入权在 runner，避免同一句被重复注入。"""
         return self.pending.pop(session_id, None) or []
 
