@@ -158,3 +158,13 @@ export const updateMemory = (workspaceId, memoryId, data) =>
   http.patch(`/workspaces/${workspaceId}/memory/${memoryId}`, data) // {type?, content?, title?, enabled?}
 export const deleteMemory = (workspaceId, memoryId) =>
   http.delete(`/workspaces/${workspaceId}/memory/${memoryId}`)
+
+// ---- 聊天图片附件 ----
+export const uploadAttachment = (sessionId, blob, filename, signal) =>
+  http.post(`/sessions/${sessionId}/attachments`, blob, {
+    params: { filename },
+    headers: { 'Content-Type': blob.type || 'image/jpeg' }, // 客户端压缩产物恒为 JPEG
+    signal,
+  })
+export const fetchAttachmentBlob = (url) =>
+  http.get(url, { responseType: 'blob', baseURL: '' }) // url 已是 /api/... 全路径
