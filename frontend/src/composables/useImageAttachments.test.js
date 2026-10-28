@@ -1,5 +1,6 @@
 // @vitest-environment happy-dom
 import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { watchEffect } from 'vue'
 
 vi.mock('../api', () => ({ uploadAttachment: vi.fn() }))
 vi.mock('../utils/imageAttachments', async (importOriginal) => ({
@@ -70,6 +71,16 @@ it('会话切换后晚到的上传结果不写回', async () => {
   resolve({ data: { id: 1, filename: 'a.png', mime: 'image/png', size_bytes: 10, url: '/api/attachments/1' } })
   await pending
   expect(c.items.value).toEqual([])
+})
+
+it('上传状态变化驱动 uploading 响应式更新', async () => {
+  const c = useImageAttachments(() => 7)
+  const seen = []
+  watchEffect(() => { seen.push(c.uploading.value) })
+  await c.addFiles([file()])
+  expect(seen).toContain(true) // 压缩/上传中至少触发过一次
+  expect(seen[seen.length - 1]).toBe(false) // 完成后回到 false
+  expect(c.uploading.value).toBe(false)
 })
 
 it('mergeRejected 直接标 ready 且按 id 去重', () => {

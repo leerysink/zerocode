@@ -1,5 +1,5 @@
 // 附件队列：校验 → 压缩 → 立即上传；会话切换中止在途请求并清空。
-import { computed, ref } from 'vue'
+import { computed, reactive, ref } from 'vue'
 import { uploadAttachment } from '../api'
 import {
   compressImage, validateCompressed, validateImageFile,
@@ -56,7 +56,8 @@ export function useImageAttachments(sessionIdGetter) {
     for (const file of Array.from(files || [])) {
       const err = validateImageFile(file, items.value.length)
       if (err) { error.value = err; continue }
-      const item = {
+      // reactive：uploadOne 直接改 item.status，裸对象不会触发依赖它的 computed/template
+      const item = reactive({
         key: `a-${++seq}`,
         file,
         filename: file.name || '图片',
@@ -64,7 +65,7 @@ export function useImageAttachments(sessionIdGetter) {
         status: 'compressing',
         error: '',
         controller: null,
-      }
+      })
       items.value.push(item)
       try {
         await uploadOne(item, sid)
