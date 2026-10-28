@@ -1,6 +1,6 @@
 # 聊天图片输入与识别（chat image input）规格说明
 
-**日期**：2026-10-29  **来源**：需求访谈  **状态**：待实现
+**日期**：2026-10-29  **来源**：需求访谈  **状态**：已实现
 **相关文件**：[ChatInput.vue](../../frontend/src/components/ChatInput.vue)、[chat.js](../../frontend/src/stores/chat.js)、[ws.py](../../app/api/ws.py)、[loop.py](../../app/agent/loop.py)、[model_resolver.py](../../app/agent/model_resolver.py)
 
 ## 1. 问题陈述

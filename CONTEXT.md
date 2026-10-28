@@ -256,3 +256,14 @@ registry（这两项收**完整 http(s) 地址**）。默认全部留空——�
 → 平台转注进应用 dev 栈），运维在服务器 `.env` 里改一次即长期生效。给不给运行期覆盖位的判据是「有没有
 运行期消费方」：部署根是反例（三处同源，所以钉死）。prod 栈不注入——compose 的 `environment:` 对
 `build:` 无效（ADR-0017）。
+
+## 聊天附件（chat attachment）
+
+- 用户在聊天输入框粘贴、拖入或选择图片后，浏览器压缩并立即上传的图片对象。
+- 存平台数据区 `data/users/{uid}/chat_uploads/{session_id}/`，不进工作区；先上传后绑定消息。
+- 只接受 PNG / JPEG / WebP / GIF；单张 ≤5MB，单条 ≤4 张且合计 ≤10MB；未发送的 24 小时后清理。
+
+## 视觉模型（vision model）
+
+- `model_config.supports_vision = true` 的对话模型；没有默认模型时用全局 `llm.supports_vision`。
+- 只有视觉模型能发送带图消息；能力位默认 false，必须在设置里显式打开。
