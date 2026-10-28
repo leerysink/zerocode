@@ -1,3 +1,4 @@
+import logging
 import os
 from pathlib import Path
 
@@ -99,6 +100,24 @@ async def test_isolation_and_404(two_auth_clients, tmp_path, monkeypatch):
     assert (await _upload(bob, sess["id"])).status_code == 404
     assert (await bob.get(att_row["url"])).status_code == 404
     assert (await alice.get("/api/attachments/999999")).status_code == 404
+
+
+async def test_upload_oserror_is_logged_not_echoed(client, tmp_path, monkeypatch, caplog):
+    """落盘失败 500：日志留全文，响应体不回显数据区路径。"""
+    monkeypatch.setenv("ZEROCODE_DATA_DIR", str(tmp_path / "data"))
+    sess = await _mk_session(client, tmp_path)
+
+    async def boom(*args, **kwargs):
+        raise OSError("/very/secret/path")
+
+    monkeypatch.setattr(att, "create_attachment", boom)
+    with caplog.at_level(logging.ERROR):
+        r = await _upload(client, sess["id"])
+    assert r.status_code == 500, r.text
+    assert "secret" not in r.text
+    assert r.json()["detail"] == "数据区不可写，请稍后重试"
+    assert any(rec.exc_info and "/very/secret/path" in str(rec.exc_info[1])
+               for rec in caplog.records)
 
 
 async def test_missing_file_returns_404(client, tmp_path, monkeypatch):

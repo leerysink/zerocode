@@ -39,6 +39,9 @@ class AgentRunner:
         # 项为 {content, attachment_ids, client_msg_id}（兼容裸字符串）；
         # 缺省 None = 不支持插话（旧调用方与单测保持原签名可用）
         self.pop_pending = pop_pending
+        # 本轮历史已内联的图片原始字节合计（_history 构建时写入）：插话带图与历史共用
+        # 同一份 MAX_INLINE_BYTES 预算，否则一次运行的内联总量可以越过上限
+        self._inline_used = 0
 
     async def _root_of(self, session_id: int):
         async with self.sf() as s:
@@ -117,17 +120,27 @@ class AgentRunner:
         meta = await _att.for_messages(self.sf, session_id, user_ids)
         with_atts = [mid for mid in user_ids if meta.get(mid)]
         inline = set(with_atts[-2:])
+        self._inline_used = 0
+        files = await _att.for_llm(self.sf, sorted(inline)) if inline else {}
         if inline:
             current_id = user_ids[-1] if user_ids else None
-            total = sum(a["size_bytes"] for mid in inline for a in meta.get(mid, []))
+
+            def _inline_bytes(mid):
+                # 只算真正会内联的图（文件仍在、data_url 非空）：外部删掉的文件既不挤占
+                # 预算，也不该把另一张有效的旧图挤成占位
+                return sum(a["size_bytes"] for a in files.get(mid, []) if a.get("data_url"))
+
+            total = sum(_inline_bytes(mid) for mid in inline)
             while total > _att.MAX_INLINE_BYTES:
                 droppable = [mid for mid in with_atts if mid in inline and mid != current_id]
                 if not droppable:
                     break
                 old = droppable[0]
                 inline.discard(old)
-                total -= sum(a["size_bytes"] for a in meta.get(old, []))
-        files = await _att.for_llm(self.sf, sorted(inline)) if inline else {}
+                total -= _inline_bytes(old)
+            # 本 run 后续插话带图要用这份账本（见 _drain_steering）
+            self._inline_used = total
+            files = {mid: atts for mid, atts in files.items() if mid in inline}
         msgs = []
         for r in rows:
             if r["role"] == "user":
@@ -286,10 +299,19 @@ class AgentRunner:
                                  "client_msg_id": item.get("client_msg_id"),
                                  "running": True})
                 continue
-            files = await _att.for_llm(self.sf, [row["id"]]) if ids else {}
-            # @展开要进模型可见内容（与主消息路径一致），否则插话里的 "@a.py" 只带原文
-            content = self._user_content(expanded or text_, row.get("attachments") or [], True,
-                                         files.get(row["id"], []))
+            atts = row.get("attachments") or []
+            need = sum(a["size_bytes"] for a in atts)
+            # 插话与历史共用一份内联预算（_history 已把本轮历史内联字节记入 _inline_used）：
+            # 超预算就降级成「较早的图片已省略」占位，绝不让一次运行的内联总量越过
+            # MAX_INLINE_BYTES。送达不受影响——消息照常落库，steering_done 照常下发。
+            if atts and self._inline_used + need <= _att.MAX_INLINE_BYTES:
+                files = await _att.for_llm(self.sf, [row["id"]])
+                self._inline_used += need
+                # @展开要进模型可见内容（与主消息路径一致），否则插话里的 "@a.py" 只带原文
+                content = self._user_content(expanded or text_, atts, True,
+                                             files.get(row["id"], []))
+            else:
+                content = self._user_content(expanded or text_, atts, False, {})
             messages.append({"role": "user", "content": content})
             await self.send({"type": "steering_done", "content": text_,
                              "client_msg_id": item.get("client_msg_id")})

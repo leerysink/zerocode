@@ -170,9 +170,12 @@ async def for_messages(sf, session_id: int, message_ids: list[int]) -> dict[int,
     if not ids:
         return {}
     async with sf() as s:
+        # ORDER BY id 是契约的一部分：气泡里的附件顺序、模型看到的 image_url 顺序、
+        # 「较早的图片已省略」文件名列表都由它决定，不能依赖 Postgres 堆顺序
         rows = (await s.execute(_sql(
             "SELECT id, message_id, filename, mime, size_bytes FROM message_attachment "
-            "WHERE session_id=:sid AND message_id IN :mids").bindparams(bindparam("mids", expanding=True)),
+            "WHERE session_id=:sid AND message_id IN :mids ORDER BY id")
+            .bindparams(bindparam("mids", expanding=True)),
             {"sid": session_id, "mids": ids})).mappings().all()
     out: dict[int, list[dict]] = {}
     for r in rows:
@@ -185,9 +188,10 @@ async def for_llm(sf, message_ids: list[int]) -> dict[int, list[dict]]:
     if not ids:
         return {}
     async with sf() as s:
+        # 与 for_messages 同序：模型收到的图片顺序必须与气泡一致
         rows = (await s.execute(_sql(
             "SELECT id, message_id, filename, mime, size_bytes, storage_path "
-            "FROM message_attachment WHERE message_id IN :mids")
+            "FROM message_attachment WHERE message_id IN :mids ORDER BY id")
             .bindparams(bindparam("mids", expanding=True)), {"mids": ids})).mappings().all()
     out: dict[int, list[dict]] = {}
     for r in rows:
@@ -260,31 +264,39 @@ async def cleanup_orphans(sf, ttl_hours: int = ORPHAN_TTL_HOURS) -> int:
             if not uploads.is_dir():
                 continue
             for sess_dir in list(uploads.iterdir()):
-                if not sess_dir.is_dir():
-                    continue
+                # 逐条目隔离：单个坏目录/坏文件（stat 失败、resolve 越界）只跳过自己。
+                # 这些异常若冒到外层，整棵树会停摆到下一个 6h tick，后面的孤儿文件全都清不掉。
                 try:
-                    sid = int(sess_dir.name)
-                except ValueError:
-                    sid = None
-                if sid is not None and sid not in live_sessions and sess_dir.stat().st_mtime < cutoff:
-                    try:
-                        shutil.rmtree(sess_dir)
-                        continue
-                    except OSError:
-                        logger.exception("删除已删会话的附件目录失败 %s", sess_dir)
-                for f in sess_dir.iterdir():
-                    if not f.is_file():
-                        continue
-                    rel = f.resolve().relative_to(root).as_posix()
-                    rel = f"users/{rel}"
-                    if rel in referenced:
-                        continue
-                    if f.stat().st_mtime >= cutoff:
+                    if not sess_dir.is_dir():
                         continue
                     try:
-                        f.unlink()
-                    except OSError:
-                        logger.exception("删除无主附件文件失败 %s", f)
+                        sid = int(sess_dir.name)
+                    except ValueError:
+                        sid = None
+                    if sid is not None and sid not in live_sessions and sess_dir.stat().st_mtime < cutoff:
+                        try:
+                            shutil.rmtree(sess_dir)
+                            continue
+                        except OSError:
+                            logger.exception("删除已删会话的附件目录失败 %s", sess_dir)
+                    for f in sess_dir.iterdir():
+                        try:
+                            if not f.is_file():
+                                continue
+                            rel = f.resolve().relative_to(root).as_posix()
+                            rel = f"users/{rel}"
+                            if rel in referenced:
+                                continue
+                            if f.stat().st_mtime >= cutoff:
+                                continue
+                            try:
+                                f.unlink()
+                            except OSError:
+                                logger.exception("删除无主附件文件失败 %s", f)
+                        except Exception:
+                            logger.exception("处理附件文件失败 %s", f)
+                except Exception:
+                    logger.exception("处理附件目录失败 %s", sess_dir)
     except Exception:
         logger.exception("扫描附件目录失败")
     return removed

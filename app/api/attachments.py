@@ -4,11 +4,15 @@
 """
 from urllib.parse import quote
 
+import logging
+
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse
 from sqlalchemy import text
 
 from app.services import attachment_service as att
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -53,8 +57,10 @@ async def upload_attachment(request: Request, session_id: int, filename: str = "
             sf, uid, session_id, att.safe_filename(filename, mime), data, mime)
     except att.AttachmentError as e:
         raise HTTPException(e.status_code, str(e))
-    except OSError as e:
-        raise HTTPException(500, f"数据区不可写：{e}")
+    except OSError:
+        # 只记日志，不回显：OSError 文案带数据区绝对路径，泄露给 owner 也无必要
+        logger.exception("附件落盘失败 session=%s", session_id)
+        raise HTTPException(500, "数据区不可写，请稍后重试")
 
 
 @router.get("/api/attachments/{attachment_id}")

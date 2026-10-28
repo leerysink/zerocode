@@ -68,13 +68,17 @@ async def test_staged_bytes_and_bindable(test_engine, tmp_path, monkeypatch):
 
 async def test_load_bindable_rejects_bound_missing_and_oversize(
         test_engine, tmp_path, monkeypatch):
+    """三个分支在真实常量下各自触发：已绑定 / 文件缺失 / 合计超限。
+
+    早前版本把 MAX_MESSAGE_BYTES 压到 10，已绑定与缺文件都会先撞合计门，
+    分支各自的文案与状态码从没被执行过（门形同虚设）。"""
     monkeypatch.setenv("ZEROCODE_DATA_DIR", str(tmp_path))
-    monkeypatch.setattr(att, "MAX_MESSAGE_BYTES", 10)
     sf = make_session_factory(test_engine)
     sid = await mk_session(test_engine, tmp_path)
     a = await att.create_attachment(sf, 7, sid, "a.png", PNG, "image/png")
     b = await att.create_attachment(sf, 7, sid, "b.png", PNG, "image/png")
 
+    # 已绑定：被 message_id IS NULL 过滤剔除 → 400「不存在或已被使用」
     async with sf() as s:
         mid = (await s.execute(sql(
             "INSERT INTO message (session_id, seq, role, content) "
@@ -83,22 +87,30 @@ async def test_load_bindable_rejects_bound_missing_and_oversize(
         bound = await att.bind_to_message(s, sid, mid, [a["id"]])
         await s.commit()
     assert [r["id"] for r in bound] == [a["id"]]
-    with pytest.raises(att.AttachmentError):
+    with pytest.raises(att.AttachmentError) as bound_err:
         await att.load_bindable(sf, sid, [a["id"]])
+    assert bound_err.value.status_code == 400
+    assert "已被使用" in str(bound_err.value)
 
-    # 文件缺失（按 storage_path 精确定位 b 的文件，别误删 a）
+    # 文件缺失：行在、文件被外部删掉 → 400，文案要求重新上传
     async with sf() as s:
         b_path = (await s.execute(sql(
             "SELECT storage_path FROM message_attachment WHERE id=:i"),
             {"i": b["id"]})).scalar()
     att.resolve_storage_path(b_path).unlink()
-    with pytest.raises(att.AttachmentError):
+    with pytest.raises(att.AttachmentError) as missing_err:
         await att.load_bindable(sf, sid, [b["id"]])
+    assert missing_err.value.status_code == 400
+    assert "文件缺失" in str(missing_err.value)
 
-    # 合计超限（MAX_MESSAGE_BYTES 被压到 10，任一真实 PNG 都超）
-    c = await att.create_attachment(sf, 7, sid, "c.png", PNG, "image/png")
-    with pytest.raises(att.AttachmentError):
-        await att.load_bindable(sf, sid, [c["id"]])
+    # 合计超限：4 张各 2.7MB（单张 < 5MB、张数 4 不触数量门），合计 10.8MB > 10MB → 413
+    chunk = PNG + b"\x00" * 2_700_000
+    ids = [(await att.create_attachment(sf, 7, sid, f"{i}.png", chunk, "image/png"))["id"]
+           for i in range(4)]
+    with pytest.raises(att.AttachmentError) as total_err:
+        await att.load_bindable(sf, sid, ids)
+    assert total_err.value.status_code == 413
+    assert "合计" in str(total_err.value)
 
 
 async def test_load_bindable_rejects_fifth_image(test_engine, tmp_path, monkeypatch):
@@ -137,6 +149,39 @@ async def test_for_messages_and_for_llm(test_engine, tmp_path, monkeypatch):
     next((tmp_path / "users" / "7" / "chat_uploads" / str(sid)).glob("*.jpg")).unlink()
     llm2 = await att.for_llm(sf, [mid])
     assert llm2[mid][1]["data_url"] is None
+
+
+async def test_for_messages_and_for_llm_order_by_id(test_engine, tmp_path, monkeypatch):
+    """顺序是契约：无 ORDER BY 时必然按堆物理顺序返回，本测试据此确定性失败。
+
+    两个附件先 a 后 b 反序改写 id：Postgres 的 UPDATE 是写新元组版本（不是原地改），
+    版本按语句顺序追加到页尾，故堆内物理顺序 [a', b'] 对应 id [9002, 9001]，与 id
+    顺序相反。顺序扫描（或按 message_id 索引回表，同按 TID 排序）只会给出物理顺序。
+    """
+    monkeypatch.setenv("ZEROCODE_DATA_DIR", str(tmp_path))
+    sf = make_session_factory(test_engine)
+    sid = await mk_session(test_engine, tmp_path)
+    a = await att.create_attachment(sf, 7, sid, "a.png", PNG, "image/png")
+    b = await att.create_attachment(sf, 7, sid, "b.png", JPEG, "image/jpeg")
+    async with sf() as s:
+        mid = (await s.execute(sql(
+            "INSERT INTO message (session_id, seq, role, content) "
+            "VALUES (:s, 1, 'user', '看图') RETURNING id"), {"s": sid})).scalar()
+        await s.commit()
+        await att.bind_to_message(s, sid, mid, [a["id"], b["id"]])
+        await s.commit()
+        await s.execute(sql("UPDATE message_attachment SET id=9002 WHERE id=:i"), {"i": a["id"]})
+        await s.execute(sql("UPDATE message_attachment SET id=9001 WHERE id=:i"), {"i": b["id"]})
+        await s.commit()
+
+    grouped = await att.for_messages(sf, sid, [mid])
+    assert [x["id"] for x in grouped[mid]] == [9001, 9002]
+    assert [x["filename"] for x in grouped[mid]] == ["b.png", "a.png"]
+    llm = await att.for_llm(sf, [mid])
+    assert [x["id"] for x in llm[mid]] == [9001, 9002]
+    # data_url 顺序必须与 id 顺序一致（模型收到的图片顺序 = 气泡顺序）
+    assert llm[mid][0]["data_url"].startswith("data:image/jpeg;base64,")
+    assert llm[mid][1]["data_url"].startswith("data:image/png;base64,")
 
 
 async def test_resolve_storage_path_blocks_traversal(tmp_path, monkeypatch):
