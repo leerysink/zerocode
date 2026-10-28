@@ -177,3 +177,58 @@ async def test_memoryEmbeddingColumnRejectsWrongDimension(test_engine, tmp_path)
                 "INSERT INTO workspace_memory (workspace_id, type, content, embedding) "
                 "VALUES (:w, 'fact', 'x', CAST(:v AS vector))"),
                 {"w": ws, "v": "[1,2,3]"})
+
+# ---------- V20261029_01：聊天图片附件 ----------
+
+async def test_chat_image_migration_schema(test_engine):
+    async with test_engine.connect() as conn:
+        cols = (await conn.execute(text(
+            "SELECT column_name, data_type, is_nullable, column_default "
+            "FROM information_schema.columns WHERE table_name='model_config'"))).all()
+        t = (await conn.execute(text("SELECT to_regclass('message_attachment')"))).scalar()
+        a_cols = (await conn.execute(text(
+            "SELECT column_name, is_nullable FROM information_schema.columns "
+            "WHERE table_name='message_attachment'"))).all()
+        idx = (await conn.execute(text(
+            "SELECT indexname, indexdef FROM pg_indexes "
+            "WHERE tablename='message_attachment'"))).all()
+    vision = {c[0]: c for c in cols}["supports_vision"]
+    assert vision[1] == "boolean" and vision[2] == "NO"
+    assert "false" in (vision[3] or "").lower()
+    assert t is not None
+    by_name = {c[0]: c[1] for c in a_cols}
+    assert by_name["message_id"] == "YES"
+    assert by_name["session_id"] == "NO"
+    names = {r[0]: r[1] for r in idx}
+    assert "idx_message_attachment_message" in names
+    assert "idx_message_attachment_session" in names
+    assert "idx_message_attachment_orphan" in names
+    assert "WHERE (message_id IS NULL)" in names["idx_message_attachment_orphan"]
+
+
+async def test_chat_image_migration_config_seed(test_engine):
+    async with test_engine.connect() as conn:
+        value = (await conn.execute(text(
+            "SELECT value FROM app_config WHERE key='llm.supports_vision' "
+            "AND owner_user_id IS NULL"))).scalar()
+    assert value is False
+
+
+async def test_chat_image_migration_replayable(test_engine):
+    from app.db import split_statements
+    from pathlib import Path
+    stmts = split_statements(
+        Path("changelog/V20261029_01_chat_image_attachment.sql").read_text(encoding="utf-8"))
+    assert len(stmts) == 6  # 加列 + 建表 + 三索引 + 种子
+    async with test_engine.begin() as conn:
+        for st in stmts:
+            await conn.execute(text(st))
+
+
+async def test_chat_image_migration_reappliesThroughRunMigrations(test_engine):
+    from app.db import run_migrations
+    target = "V20261029_01_chat_image_attachment.sql"
+    async with test_engine.begin() as conn:
+        await conn.execute(text("DELETE FROM schema_migration WHERE filename=:f"), {"f": target})
+    applied = await run_migrations(test_engine)
+    assert applied == [target]

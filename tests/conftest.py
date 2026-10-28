@@ -25,14 +25,15 @@ async def test_engine():
     # ON CONFLICT 不写目标：兼容无主键后的 ux_app_config_owner_key。
     async with engine.begin() as conn:
         await conn.execute(text(
-            "TRUNCATE message, file_change, compaction, chat_session, workspace, app_project, "
-            "model_config, deploy_record, app_instance_link, release_application, app_release, actor "
+            "TRUNCATE message_attachment, message, file_change, compaction, chat_session, workspace, "
+            "app_project, model_config, deploy_record, app_instance_link, release_application, app_release, actor "
             "RESTART IDENTITY CASCADE"))
         await conn.execute(text(
             "INSERT INTO app_config (key, value) VALUES "
             "('llm.base_url', '\"https://api.deepseek.com/v1\"'), "
             "('llm.api_key', '\"\"'), "
             "('llm.model', '\"deepseek-chat\"'), "
+            "('llm.supports_vision', 'false'), "
             "('agent.write_confirm', 'false'), "
             "('agent.ask_timeout_seconds', '0'), "
             "('agent.max_tool_rounds', '30'), "
