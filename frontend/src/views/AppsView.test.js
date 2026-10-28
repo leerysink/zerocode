@@ -1,6 +1,7 @@
 // @vitest-environment happy-dom
 // Task 10：AppsView 发布接线（最小挂载断言）——M2 占位文案撤掉、发布/历史入口上卡、
-// 栈闸门（非 vue3-fastapi 发布按钮置灰带说明）。弹层内部行为在 PublishModal.test 覆盖。
+// 栈闸门（可发布栈放行、static 置灰带说明；白名单与后端同源，漂移由
+// tests/test_deploy_basics.py 钉住）。弹层内部行为在 PublishModal.test 覆盖。
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
 import { h } from 'vue'
 import { flushPromises, mount } from '@vue/test-utils'
@@ -37,6 +38,10 @@ const APPS = [
     prod_port: 8402, status_dev: 'stopped', status_prod: 'stopped', current_version: null,
     preview_url: 'http://10.0.1.25:8302',
     workspace_id: 12 },
+  { id: 3, name: '丙', slug: 'ccc', stack: 'vue3-springboot', scale: 'large', dev_port: 8303,
+    prod_port: 8403, status_dev: 'running', status_prod: 'stopped', current_version: null,
+    preview_url: 'http://10.0.1.25:8303',
+    workspace_id: 13 },
 ]
 
 const slot = (name) => ({
@@ -135,13 +140,16 @@ describe('AppsView 发布接线', () => {
     expect(prod.text()).not.toContain('预览')
   })
 
-  it('栈闸门：非 vue3-fastapi 的发布按钮置灰带说明 title', async () => {
+  it('栈闸门：可发布栈（fastapi/springboot）放行，不可发布栈（static）置灰带说明', async () => {
     const wrapper = await mountView()
-    const pubBtns = wrapper.findAll('.stub-card')[1].findAll('.stub-a-button')
-      .filter((b) => b.text().includes('发布') && !b.text().includes('历史'))
-    expect(pubBtns.length).toBeGreaterThan(0)
-    expect(pubBtns[0].attributes('disabled')).toBeDefined()
-    expect(pubBtns[0].attributes('title')).toContain('即将上线')
+    const pubBtn = (i) => wrapper.findAll('.stub-card')[i].findAll('.stub-a-button')
+      .find((b) => b.text() === '发布')
+    // 大型栈（vue3-springboot）后端早已可发布，闸门曾因只认 fastapi 把这张按钮钉死一个迭代
+    expect(pubBtn(2).attributes('disabled')).toBeUndefined()
+    expect(pubBtn(0).attributes('disabled')).toBeUndefined()
+    const staticBtn = pubBtn(1)
+    expect(staticBtn.attributes('disabled')).toBeDefined()
+    expect(staticBtn.attributes('title')).toContain('暂不支持')
   })
 
   it('点发布打开进度弹层（PublishModal 挂载并收到 app）', async () => {
@@ -216,6 +224,8 @@ const STORE_APPS = [
   { id: 3, name: '丙i', slug: 'ccci', stack: 'vue3-fastapi', scale: 'small', dev_port: 8303,
     prod_port: 8403, status_dev: 'stopped', status_prod: 'running', current_version: 'b1',
     store: { release_slug: 'aaa', release_version: 'b1', release_title: '甲', channel: 'managed' } },
+  { id: 4, name: '丁', slug: 'ddd', stack: 'vue3-springboot', scale: 'large', dev_port: 8304,
+    prod_port: 8404, status_dev: 'stopped', status_prod: 'running', current_version: 'b1' },
 ]
 
 // 上架弹窗需要真一点的桩：open 才渲染、带 ok 按钮、输入框回写 v-model:value
@@ -255,6 +265,7 @@ describe('AppsView 商店接线', () => {
     expect(has(0)).toBe(true)
     expect(has(1)).toBe(false)   // current_version=null
     expect(has(2)).toBe(false)   // 商店实例不重复上架
+    expect(has(3)).toBe(true)    // 大型栈（vue3-springboot）同样可上架
   })
 
   it('发布到商店：菜单项点开弹窗提交调 releaseToStore(appId, {title, summary})', async () => {

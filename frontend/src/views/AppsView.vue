@@ -22,6 +22,7 @@ import { SMALL_STACKS, slugFromName, validateForm } from '../utils/appForm'
 import DeployLogPanel from '../components/DeployLogPanel.vue'
 import BackButton from '../components/BackButton.vue'
 import { openWorkspaceFilesPage, resolveOpenFolderMode } from '../utils/openFolder'
+import { canPublish } from '../utils/publishableStacks'
 import { useConfigStore } from '../stores/config'
 
 const apps = ref([])
@@ -270,8 +271,6 @@ function closeOverlays(appId) {
 }
 
 // ---------- M2 发布接线 ----------
-// 栈闸门：M2 引擎只支持 vue3-fastapi（后端未拦、UI 拦——static/其他栈按钮置灰带说明）
-const canPublish = (a) => a.stack === 'vue3-fastapi'
 function openPublish(a) {
   Object.assign(pub, { app: a, mode: 'publish', version: null, autoStart: false,
     seq: pub.seq + 1, open: true })
@@ -326,7 +325,7 @@ async function copyProdUrl(a) {
 }
 
 // ---------- M3-a 商店：发布到商店（只认真实在服的 prod 版本，闸门在后端） ----------
-const canReleaseToStore = (a) => a.stack === 'vue3-fastapi' && !!a.current_version && !a.store
+const canReleaseToStore = (a) => canPublish(a) && !!a.current_version && !a.store
 function openRelease(a) {
   Object.assign(rel, { app: a, title: a.name, summary: '', open: true })
 }
@@ -429,7 +428,7 @@ async function doRelease() {
             </span>
             <a-space :size="6">
               <a-button type="primary" ghost size="small" :disabled="!canPublish(a)"
-                        :title="canPublish(a) ? '' : '该栈发布支持即将上线'"
+                        :title="canPublish(a) ? '' : '该栈暂不支持发布'"
                         :loading="a.status_prod === 'publishing'" @click="openPublish(a)">
                 <cloud-upload-outlined /> 发布
               </a-button>
@@ -544,7 +543,7 @@ async function doRelease() {
 
     <a-modal v-model:open="del.open" title="删除应用" ok-text="确认删除" ok-type="danger" destroy-on-close
              class="zc-del-modal" @ok="doDelete">
-      <p class="zc-modal-warn">将删除应用「{{ del.app?.name }}」及其会话记录。</p>
+      <p class="zc-modal-warn">将删除应用「{{ del.app?.name }}」及其会话记录，运行中的预览与正式环境会一并停止。</p>
       <p class="zc-modal-tip">
         工程目录保留在 {{ del.app?.root_path }}，数据库 {{ del.app?.slug }}_dev / {{ del.app?.slug }}_prod
         也保留；如需彻底清理，请自行删除目录与库。

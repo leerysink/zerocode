@@ -7,6 +7,7 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { FolderOutlined, ScissorOutlined, SendOutlined, StopOutlined } from '@ant-design/icons-vue'
 import { useChatStore } from '../stores/chat'
 import { tree } from '../api'
+import ChatAppActions from './ChatAppActions.vue'
 import { activeMentionToken, applyMention } from '../utils/mentions'
 import { flattenTree } from '../utils/tree'
 
@@ -148,6 +149,7 @@ function requestCompact() {
         {{ chatStore.hint || 'Enter 发送 / Shift+Enter 换行' }}
       </span>
       <div class="zc-input-buttons">
+        <chat-app-actions />
         <a-button
           size="small"
           :disabled="running || chatStore.compacting"
