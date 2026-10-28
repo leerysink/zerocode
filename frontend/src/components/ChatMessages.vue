@@ -70,10 +70,15 @@ onMounted(scrollToBottom)
       </div>
 
       <template v-for="(m, i) in messages" :key="i">
-        <!-- user：右侧浅蓝气泡（queued = 执行中发出的插话，等下一个工具边界注入） -->
+        <!-- user：右侧浅蓝气泡（图片网格在文字之前；queued = 执行中发出的插话，等下一个工具边界注入） -->
         <div v-if="m.role === 'user'" class="zc-msg is-user">
           <div class="zc-bubble">
-            {{ m.content }}
+            <div v-if="m.attachments && m.attachments.length" class="zc-bubble-images">
+              <a-image-preview-group>
+                <a-image v-for="a in m.attachments" :key="a.id" :src="a.url" :alt="a.filename" :width="160" />
+              </a-image-preview-group>
+            </div>
+            <span v-if="m.content" class="zc-bubble-text">{{ m.content }}</span>
             <span v-if="m.queued" class="zc-queued">排队中</span>
           </div>
         </div>
@@ -209,6 +214,29 @@ onMounted(scrollToBottom)
   white-space: pre-wrap;
   word-break: break-word;
   color: var(--zc-text);
+}
+
+/* user 气泡内附件图片网格：固定 2 列 160px 缩略图，图片在前文字在后 */
+.zc-bubble-images {
+  display: grid;
+  grid-template-columns: repeat(2, 160px);
+  gap: 6px;
+  margin-bottom: 6px;
+}
+.zc-bubble-images :deep(.ant-image) {
+  width: 160px;
+  height: 160px;
+  overflow: hidden;
+  border-radius: 8px;
+}
+.zc-bubble-images :deep(img) {
+  width: 160px;
+  height: 160px;
+  object-fit: cover;
+  display: block;
+}
+.zc-bubble-text {
+  display: block;
 }
 
 /* 插话排队中的角标：低饱和暖色小标签，只表状态不抢内容 */
