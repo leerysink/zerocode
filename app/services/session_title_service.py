@@ -21,13 +21,17 @@ def derive_title(text_: str | None) -> str | None:
     return None
 
 
-async def ensure_session_title(session_factory, session_id: int, user_text: str) -> str | None:
+async def ensure_session_title(session_factory, session_id: int, user_text: str,
+                               attachment_names: list[str] | None = None) -> str | None:
     """会话标题仍是默认「新会话」时按首条消息改名，返回新标题；否则 None。
 
-    条件更新（WHERE title=DEFAULT）天然幂等：并发/重发只有一边改得到，
-    用户手动改过名的会话永不覆盖。
+    纯图片消息（无文字）用首个附件文件名兜底命名：「图片：<文件名>」；
+    有文字时文字永远优先，附件只是兜底。条件更新（WHERE title=DEFAULT）
+    天然幂等：并发/重发只有一边改得到，用户手动改过名的会话永不覆盖。
     """
     title = derive_title(user_text)
+    if not title and attachment_names:
+        title = derive_title("图片：" + attachment_names[0])
     if not title:
         return None
     async with session_factory() as s:

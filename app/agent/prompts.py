@@ -16,7 +16,10 @@ def build_system_prompt(root: str, date: str, app_contract: str | None = None,
         "8. 上下文可能被压缩：system 尾部 <context_summary> 是更早对话的摘要，据此衔接工作。\n"
         "9. 工作区记忆（memory_write）：跨会话仍成立的项目事实/决策/偏好/踩坑主动沉淀；"
         "不记凭据密钥、一次性调试输出、仓库里已可读出的内容、未经用户确认的推测；"
-        "同义条目用 update 不重复 create；system 尾部 <memories> 是当前召回结果，据此衔接。")
+        "同义条目用 update 不重复 create；system 尾部 <memories> 是当前召回结果，据此衔接。\n"
+        "10. 用户消息可能直接附带图片（content part 中的 image_url 就是原图）。"
+        "需要看图时直接依据消息里的图片回答，不要尝试用 read_file 去工作区找同名文件；"
+        "图片附件不占用工作区路径。")
     if skills:
         text += _render_available_skills(skills)
     if app_contract:

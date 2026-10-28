@@ -76,10 +76,11 @@ class AgentRunner:
         from app.skills.library import skills_root
         return skills_root(uid)
 
-    async def run(self, session_id: int, user_text: str, cancel: asyncio.Event) -> str:
+    async def run(self, session_id: int, user_text: str, cancel: asyncio.Event,
+                  attachment_ids: list[int] | None = None) -> str:
         status = "idle"
         try:
-            await self._inner(session_id, user_text, cancel)
+            await self._inner(session_id, user_text, cancel, attachment_ids)
         except _Cancelled:
             await self.send({"type": "error", "message": "已取消"})
             status = "idle"
@@ -102,13 +103,36 @@ class AgentRunner:
         summary, wm = await _comp.latest(self.sf, session_id)
         async with self.sf() as s:
             rows = (await s.execute(text(
-                "SELECT role, COALESCE(context_content, content) AS content, tool_call_id, tool_name, tool_args, tool_result "
+                "SELECT id, role, COALESCE(context_content, content) AS content, "
+                "tool_call_id, tool_name, tool_args, tool_result "
                 "FROM message WHERE session_id=:i AND seq > :w ORDER BY seq DESC LIMIT :win"),
                 {"i": session_id, "w": wm, "win": window})).mappings().all()
+        rows = list(reversed(rows))
+        # 附件只回放最近两条带图用户消息：内联原图对 token/带宽都太重，更早的退化为
+        # 文字占位（文件名仍可见，模型知道自己漏看了什么）。当前消息（窗口最后一条
+        # user）永远保留——它正是本轮要回答的对象，预算只能挤掉更早的。
+        from app.services import attachment_service as _att
+        user_ids = [r["id"] for r in rows if r["role"] == "user"]
+        meta = await _att.for_messages(self.sf, session_id, user_ids)
+        with_atts = [mid for mid in user_ids if meta.get(mid)]
+        inline = set(with_atts[-2:])
+        if inline:
+            current_id = user_ids[-1] if user_ids else None
+            total = sum(a["size_bytes"] for mid in inline for a in meta.get(mid, []))
+            while total > _att.MAX_INLINE_BYTES:
+                droppable = [mid for mid in with_atts if mid in inline and mid != current_id]
+                if not droppable:
+                    break
+                old = droppable[0]
+                inline.discard(old)
+                total -= sum(a["size_bytes"] for a in meta.get(old, []))
+        files = await _att.for_llm(self.sf, sorted(inline)) if inline else {}
         msgs = []
-        for r in reversed(rows):
+        for r in rows:
             if r["role"] == "user":
-                msgs.append({"role": "user", "content": r["content"]})
+                msgs.append({"role": "user", "content": self._user_content(
+                    r["content"], meta.get(r["id"], []), r["id"] in inline,
+                    files.get(r["id"], []))})
             elif r["role"] == "assistant":
                 m = {"role": "assistant", "content": r["content"]}
                 if r["tool_args"] and "tool_calls" in r["tool_args"]:
@@ -135,6 +159,31 @@ class AgentRunner:
                     continue
             break
         return msgs, summary
+
+    @staticmethod
+    def _user_content(text_val, meta_atts, inline: bool, file_atts) -> str | list:
+        """单条用户消息 → LLM content：无附件保持字符串；有图拼 OpenAI 多模态 parts。
+
+        内联时 text 头 + 每张图的 data_url；文件缺失（data_url 为 None）只留
+        「[图片缺失：名]」文字，不发对应 image_url part——坏 part 会让整轮请求 400。
+        占位分支反向告知模型「这里曾有图」，避免它把文件名当工作区路径去 read_file。
+        """
+        text_val = text_val or ""
+        if not meta_atts:
+            return text_val
+        if not inline:
+            names = [a["filename"] for a in meta_atts]
+            note = f"[图片 ×{len(names)}：{', '.join(names)}（较早的图片已省略）]"
+            return f"{text_val}\n\n{note}" if text_val else note
+        by_id = {a["id"]: a for a in file_atts}
+        usable = [by_id[a["id"]] for a in meta_atts if by_id.get(a["id"], {}).get("data_url")]
+        missing = [a["filename"] for a in meta_atts if not by_id.get(a["id"], {}).get("data_url")]
+        head = text_val if text_val.strip() else ("[图片]" if usable else "")
+        if missing:
+            head = (head + "\n" if head else "") + "[图片缺失：" + "，".join(missing) + "]"
+        parts = [{"type": "text", "text": head or "[图片]"}]
+        parts.extend({"type": "image_url", "image_url": {"url": a["data_url"]}} for a in usable)
+        return parts
 
     async def _llm_for(self, cfg):
         llm = self.llm(cfg) if callable(self.llm) else self.llm
@@ -174,7 +223,10 @@ class AgentRunner:
         # 工作区记忆回灌（ticket 002 / D-7，收口见 006）：以当前任务文本为查询做召回，
         # 空命中不注空块（故事 14）——宁可不注入，也不能让空标签污染 system。
         # cfg 直接复用本轮已解析的那份：开关/阈值/预算的口径必须和其余 agent.* 配置同源。
-        memories = await self._memories_of(session_id, user_text, cfg)
+        # 纯图片消息（无文字）没有召回查询词，直接用空文本召回只会命中噪声/报错，
+        # 故短路为空（不注块）。
+        memories = ([] if not (user_text or "").strip()
+                    else await self._memories_of(session_id, user_text, cfg))
         if memories:
             system_text += ("\n\n<memories>\n"
                             + "\n".join(self._memory_line(m) for m in memories)
@@ -224,18 +276,22 @@ class AgentRunner:
             injected += 1
         return injected
 
-    async def _inner(self, session_id: int, user_text: str, cancel: asyncio.Event):
+    async def _inner(self, session_id: int, user_text: str, cancel: asyncio.Event,
+                     attachment_ids: list[int] | None = None):
         cfg = await self.get_config()
         root = await self._root_of(session_id)
         # 先消费上一次 run 停止/收尾前没来得及注入的插话，再落本次新问题：
         # 保证 DB seq 与对话顺序一致（插话发生在先，新问题在后）
         await self._drain_steering(session_id, root, [])
         expanded = expand_mentions(root, user_text)
-        await add_message(self.sf, session_id, "user", content=user_text, context_content=expanded)
+        row = await add_message(self.sf, session_id, "user", content=user_text,
+                                context_content=expanded, attachment_ids=attachment_ids)
         # 自动命名（2026-09-21）：首条用户消息落库后，仍叫默认「新会话」就按内容派生改名
-        # （条件更新 WHERE title=默认：用户手动改过名的永不覆盖）；改名随即下发 session_title
-        # 供侧栏就地刷新，不等重拉列表。
-        titled = await ensure_session_title(self.sf, session_id, user_text)
+        # （条件更新 WHERE title=默认：用户手动改过名的永不覆盖）；纯图片消息用首个附件
+        # 文件名兜底；改名随即下发 session_title 供侧栏就地刷新，不等重拉列表。
+        titled = await ensure_session_title(
+            self.sf, session_id, user_text,
+            [a["filename"] for a in row.get("attachments") or []])
         if titled:
             await self.send({"type": "session_title", "title": titled})
         messages = await self._build_messages(session_id, root, cfg, self.send, user_text)
