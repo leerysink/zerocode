@@ -143,6 +143,9 @@ def create_app(database_url: str | None = None) -> FastAPI:
     app.include_router(sessions.router)
     app.include_router(files.router)
     app.include_router(models.router)
+    # 聊天图片附件（Task 4）：POST /api/sessions/{id}/attachments 上传、GET /api/attachments/{id} 读取
+    from app.api import attachments as attachments_api
+    app.include_router(attachments_api.router)
     # 部署发布套件（Task 6）：/api/apps 创建/校验 slug/列表/详情
     from app.api import apps as apps_api
     app.include_router(apps_api.router)
