@@ -7,6 +7,7 @@ const FIELD_TO_KEY = {
   baseUrl: 'llm.base_url',
   apiKey: 'llm.api_key',
   model: 'llm.model',
+  supportsVision: 'llm.supports_vision',
   writeConfirm: 'agent.write_confirm',
   askTimeoutSeconds: 'agent.ask_timeout_seconds',
   maxToolRounds: 'agent.max_tool_rounds',
@@ -20,6 +21,7 @@ export const useConfigStore = defineStore('config', {
       baseUrl: '',
       apiKey: '',
       model: '',
+      supportsVision: false, // 仅无默认对话模型时生效（model_resolver 回落全局 llm.*）
       writeConfirm: false,
       askTimeoutSeconds: 0, // 0 = 不限制
       maxToolRounds: 30,

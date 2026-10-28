@@ -4,7 +4,7 @@
 // 执行参数（write_confirm / ask_timeout_seconds / max_tool_rounds / history_window / fs.open_folder_mode）、环境状态（PG 版本）。
 // 基础配置字段映射与保存走 config store（loadConfig / save），api_key 掩码哨兵 sk-*** 由后端 PUT 过滤、不会覆盖真实密钥。
 // 模型库 api_key 契约（后端 app/api/models.py）：编辑留空 = 不改（提交时填哨兵 sk-***），新建必填；GET 永远掩码回显。
-import { createVNode, onMounted, ref } from 'vue'
+import { createVNode, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { Modal, message } from 'ant-design-vue'
 import { ArrowLeftOutlined, ExclamationCircleOutlined } from '@ant-design/icons-vue'
@@ -45,6 +45,7 @@ const modelColumns = [
   { title: '名称', dataIndex: 'name' },
   { title: '模型', dataIndex: 'model' },
   { title: '类型', dataIndex: 'kind', width: 110 },
+  { title: '能力', dataIndex: 'supports_vision', width: 90 },
   { title: 'Base URL', dataIndex: 'base_url' },
   { title: '默认', dataIndex: 'is_default', width: 80 },
   { title: '操作', key: 'action', width: 130 },
@@ -78,9 +79,16 @@ function openEdit(record) {
     model: record.model,
     kind: record.kind,
     is_default: record.is_default,
+    supports_vision: !!record.supports_vision,
   }
   modelModal.value = true
 }
+
+// 类型切到向量模型时同步关掉视觉开关（开关同时置灰，载荷层再强制 false）
+watch(
+  () => modelForm.value.kind,
+  (k) => { if (k === 'embedding') modelForm.value.supports_vision = false }
+)
 
 async function saveModel() {
   const isEdit = editingId.value != null
@@ -191,6 +199,10 @@ async function save() {
             <template v-if="column.dataIndex === 'kind'">
               <a-tag :color="record.kind === 'embedding' ? 'purple' : 'default'">{{ modelKindLabel(record.kind) }}</a-tag>
             </template>
+            <template v-else-if="column.dataIndex === 'supports_vision'">
+              <a-tag v-if="record.kind === 'chat' && record.supports_vision" color="cyan">图片</a-tag>
+              <span v-else>—</span>
+            </template>
             <template v-else-if="column.dataIndex === 'is_default'">
               <a-tag v-if="record.is_default" color="blue">默认</a-tag>
             </template>
@@ -220,6 +232,12 @@ async function save() {
             <a-form-item label="类型" required extra="向量模型只参与工作区记忆的语义召回，不会出现在对话模型下拉里">
               <a-select v-model:value="modelForm.kind" :options="MODEL_KIND_OPTIONS" style="width: 220px" />
             </a-form-item>
+            <a-form-item label="支持图片输入" extra="开启后该模型可用于聊天图片识别">
+              <a-switch
+                v-model:checked="modelForm.supports_vision"
+                :disabled="modelForm.kind === 'embedding'"
+              />
+            </a-form-item>
             <a-form-item label="API Key" :required="editingId == null" extra="新建必填；编辑留空表示保留原密钥">
               <a-input-password v-model:value="modelForm.api_key" placeholder="sk-..." />
             </a-form-item>
@@ -241,6 +259,12 @@ async function save() {
             </a-form-item>
             <a-form-item label="API Key" extra="保存后以掩码 sk-*** 显示；重新输入即覆盖">
               <a-input-password v-model:value="store.form.apiKey" placeholder="sk-***" />
+            </a-form-item>
+            <a-form-item
+              label="支持图片输入"
+              extra="仅在未配置默认对话模型时生效；有默认模型时以模型库设置为准"
+            >
+              <a-switch v-model:checked="store.form.supportsVision" />
             </a-form-item>
             <a-button type="primary" :loading="testing" @click="runTest">测试连接</a-button>
           </a-form>

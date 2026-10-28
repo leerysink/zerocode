@@ -44,3 +44,16 @@ describe('config store 打开文件夹方式', () => {
     expect(store.form.openFolderMode).toBe('web')
   })
 })
+
+describe('config store 视觉能力', () => {
+  it('loadConfig / save 读写 llm.supports_vision', async () => {
+    getConfig.mockResolvedValue({ data: { 'llm.supports_vision': true } })
+    const store = useConfigStore()
+    await store.loadConfig()
+    expect(store.form.supportsVision).toBe(true)
+
+    await store.save()
+    expect(putConfig).toHaveBeenCalledWith(
+      expect.objectContaining({ 'llm.supports_vision': true }))
+  })
+})

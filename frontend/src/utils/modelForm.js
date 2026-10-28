@@ -18,7 +18,10 @@ export function modelKindLabel(kind) {
 }
 
 export function emptyModelForm() {
-  return { name: '', base_url: '', api_key: '', model: '', kind: DEFAULT_MODEL_KIND, is_default: false }
+  return {
+    name: '', base_url: '', api_key: '', model: '',
+    kind: DEFAULT_MODEL_KIND, is_default: false, supports_vision: false,
+  }
 }
 
 // 返回首个错误的文案，全部合法返回 null。isEdit 时 api_key 允许留空（=保留原密钥）。
@@ -43,5 +46,7 @@ export function buildModelPayload(form, isEdit) {
     model: String(form.model || '').trim(),
     kind: KIND_VALUES.includes(form.kind) ? form.kind : DEFAULT_MODEL_KIND,
     is_default: !!form.is_default,
+    // 向量模型只做文本召回，视觉能力无意义：后端 PUT 也会强制 false，这里提前对齐避免状态显示与库里不一致
+    supports_vision: form.kind === 'embedding' ? false : !!form.supports_vision,
   }
 }

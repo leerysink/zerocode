@@ -13,6 +13,7 @@ describe('emptyModelForm', () => {
       model: '',
       kind: 'chat',
       is_default: false,
+      supports_vision: false,
     })
   })
 })
@@ -85,6 +86,7 @@ describe('buildModelPayload', () => {
       model: 'm',
       kind: 'chat',
       is_default: true,
+      supports_vision: false,
     })
   })
 
@@ -122,6 +124,12 @@ describe('buildModelPayload', () => {
   it('kind 缺失或非法时兜底 chat（校验层已拦下，这里只是不往载荷里送 undefined）', () => {
     expect(buildModelPayload({ ...form, kind: undefined }, false).kind).toBe(DEFAULT_MODEL_KIND)
     expect(buildModelPayload({ ...form, kind: 'VL' }, true).kind).toBe(DEFAULT_MODEL_KIND)
+  })
+
+  it('supports_vision 原样提交，embedding 强制 false', () => {
+    expect(buildModelPayload({ ...form, supports_vision: true }, false).supports_vision).toBe(true)
+    expect(buildModelPayload({ ...form, kind: 'embedding', supports_vision: true }, false)
+      .supports_vision).toBe(false)
   })
 })
 
