@@ -95,3 +95,75 @@ async def test_messages_include_reasoning(client):
                       content="答", reasoning="想了想")
     msgs = (await client.get(f"/api/sessions/{sid}/messages")).json()
     assert msgs[0]["reasoning"] == "想了想"
+
+# ---------- 图片附件（消息绑定 / 会话详情 / 回显） ----------
+
+async def _mk_ws_session(client, tmp_path):
+    ws = (await client.post("/api/workspaces", json={"root_path": str(tmp_path)})).json()
+    return ws, (await client.post("/api/sessions", json={"workspace_id": ws["id"]})).json()
+
+
+async def test_session_detail_effective_model_sources(client, tmp_path):
+    ws, sess = await _mk_ws_session(client, tmp_path)
+    sid = sess["id"]
+    d = (await client.get(f"/api/sessions/{sid}")).json()
+    assert d["effective_model"] == {
+        "id": None, "name": "deepseek-chat", "model": "deepseek-chat",
+        "supports_vision": False, "source": "global"}
+
+    dft = (await client.post("/api/models", json={
+        "name": "dft", "base_url": "http://x/v1", "api_key": "k",
+        "model": "dft-m", "is_default": True, "supports_vision": True})).json()
+    d = (await client.get(f"/api/sessions/{sid}")).json()
+    assert d["effective_model"] == {
+        "id": dft["id"], "name": "dft", "model": "dft-m",
+        "supports_vision": True, "source": "default"}
+
+    bound = (await client.post("/api/models", json={
+        "name": "bound", "base_url": "http://x/v1", "api_key": "k",
+        "model": "bound-m", "supports_vision": False})).json()
+    r = await client.patch(f"/api/sessions/{sid}/model", json={"model_config_id": bound["id"]})
+    assert r.status_code == 200
+    assert r.json()["effective_model"] == {
+        "id": bound["id"], "name": "bound", "model": "bound-m",
+        "supports_vision": False, "source": "session"}
+
+
+async def test_messages_include_attachments(client, tmp_path, monkeypatch):
+    monkeypatch.setenv("ZEROCODE_DATA_DIR", str(tmp_path / "data"))
+    from app.services.message_service import add_message
+    ws, sess = await _mk_ws_session(client, tmp_path)
+    sid = sess["id"]
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+    up = await client.post(f"/api/sessions/{sid}/attachments",
+                           params={"filename": "a.png"}, content=png,
+                           headers={"Content-Type": "image/png"})
+    att_row = up.json()
+    sf = client.app.state.session_factory
+    await add_message(sf, sid, "user", content="看图", attachment_ids=[att_row["id"]])
+    msgs = (await client.get(f"/api/sessions/{sid}/messages")).json()
+    assert msgs[0]["content"] == "看图"
+    assert msgs[0]["attachments"] == [att_row]
+
+    other = (await client.post("/api/sessions", json={"workspace_id": ws["id"]})).json()
+    assert (await client.get(f"/api/sessions/{other['id']}/messages")).json() == []
+
+
+async def test_add_message_rejects_unbindable_attachment(client, tmp_path, monkeypatch):
+    monkeypatch.setenv("ZEROCODE_DATA_DIR", str(tmp_path / "data"))
+    import pytest
+    from app.services.message_service import add_message
+    ws, sess = await _mk_ws_session(client, tmp_path)
+    sid = sess["id"]
+    # 附件挂在另一个会话里：绑定按 session 收口，跨会话的 id 必然绑不上（同时验证会话作用域）
+    other = (await client.post("/api/sessions", json={"workspace_id": ws["id"]})).json()
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+    up = await client.post(f"/api/sessions/{other['id']}/attachments",
+                           params={"filename": "a.png"}, content=png,
+                           headers={"Content-Type": "image/png"})
+    att_id = up.json()["id"]
+    sf = client.app.state.session_factory
+    with pytest.raises(ValueError):
+        await add_message(sf, sid, "user", content="x", attachment_ids=[att_id])
+    # 消息也回滚了：绑定失败不产生半条消息
+    assert (await client.get(f"/api/sessions/{sid}/messages")).json() == []

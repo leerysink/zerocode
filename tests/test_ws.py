@@ -554,7 +554,9 @@ def test_session_detail_exposes_queued_steering(client):
     hub.queue(sid, "还在排队的一句", 20)
     hub.queue(sid, "排第二句", 20)
     detail = client.get(f"/api/sessions/{sid}").json()
-    assert detail["pending_steering"] == ["还在排队的一句", "排第二句"]
+    assert detail["pending_steering"] == [
+        {"content": "还在排队的一句", "client_msg_id": None, "attachments": []},
+        {"content": "排第二句", "client_msg_id": None, "attachments": []}]
     hub.pending.pop(sid, None)
     assert client.get(f"/api/sessions/{sid}").json()["pending_steering"] == []
 
