@@ -8,6 +8,8 @@
 import json
 from sqlalchemy import text
 
+from app.services.attachment_service import IMAGE_CHAR_EQUIVALENT
+
 SUMMARY_PROMPT = (
     "你是会话摘要器。把以下对话与工具结果压缩为继续工作所需的最小上下文，"
     "必须保留：任务目标、关键决策、涉及文件与改动、当前任务清单、遗留问题。"
@@ -23,8 +25,14 @@ async def latest(sf, session_id: int) -> tuple[str | None, int]:
 async def rows_after(sf, session_id: int, after_seq: int) -> list[dict]:
     async with sf() as s:
         rows = (await s.execute(text(
-            "SELECT id, seq, role, COALESCE(context_content, content) AS content, tool_result FROM message "
-            "WHERE session_id=:i AND seq > :a ORDER BY seq"),
+            "SELECT m.id, m.seq, m.role, COALESCE(m.context_content, m.content) AS content, "
+            "m.tool_result, COALESCE(a.cnt, 0) AS attachment_count, "
+            "COALESCE(a.names, '') AS attachment_names "
+            "FROM message m LEFT JOIN ("
+            "  SELECT message_id, count(*) AS cnt, string_agg(filename, ', ' ORDER BY id) AS names "
+            "  FROM message_attachment WHERE message_id IS NOT NULL GROUP BY message_id"
+            ") a ON a.message_id = m.id "
+            "WHERE m.session_id=:i AND m.seq > :a ORDER BY m.seq"),
             {"i": session_id, "a": after_seq})).mappings().all()
     return [dict(r) for r in rows]
 
@@ -34,6 +42,7 @@ def estimate_chars(rows: list[dict]) -> int:
         n += len(r.get("content") or "")
         if r.get("tool_result") is not None:
             n += len(json.dumps(r["tool_result"], ensure_ascii=False))
+        n += IMAGE_CHAR_EQUIVALENT * int(r.get("attachment_count") or 0)
     return n
 
 async def compact(sf, llm, session_id: int, send, keep_recent: int = 8) -> dict | None:
@@ -50,6 +59,8 @@ async def compact(sf, llm, session_id: int, send, keep_recent: int = 8) -> dict 
         body = r["content"]
         if r["role"] == "tool" and r["tool_result"] is not None:
             body = json.dumps(r["tool_result"], ensure_ascii=False)
+        if r.get("attachment_count"):
+            body = (body or "") + f"\n[图片 ×{r['attachment_count']}：{r['attachment_names']}]"
         lines.append(f"[{r['seq']}][{r['role']}] {body}")
     digest = "\n".join(lines)[:120_000]
     parts = []

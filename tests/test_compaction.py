@@ -73,3 +73,40 @@ async def test_compact_failure_emits_error_only(test_engine, tmp_path):
     async with sf() as s:
         n = (await s.execute(sql("SELECT count(*) FROM compaction"), {})).scalar()
     assert n == 0
+
+
+async def test_estimate_counts_images_as_4000_chars(test_engine, tmp_path, monkeypatch):
+    monkeypatch.setenv("ZEROCODE_DATA_DIR", str(tmp_path))
+    from app.services import attachment_service as att
+    monkeypatch.setenv("ZEROCODE_DATA_DIR", str(tmp_path))
+    sf = make_session_factory(test_engine)
+    sid = await mk_session(test_engine, tmp_path)
+    a = await att.create_attachment(sf, 7, sid, "a.png", b"\x89PNG\r\n\x1a\n" + b"\0" * 8, "image/png")
+    b = await att.create_attachment(sf, 7, sid, "b.png", b"\x89PNG\r\n\x1a\n" + b"\0" * 8, "image/png")
+    from app.services.message_service import add_message
+    await add_message(sf, sid, "user", content="看图", attachment_ids=[a["id"], b["id"]])
+    rows = await comp.rows_after(sf, sid, 0)
+    assert rows[0]["attachment_count"] == 2
+    assert "a.png" in rows[0]["attachment_names"] and "b.png" in rows[0]["attachment_names"]
+    assert comp.estimate_chars(rows) == len("看图") + 8000
+
+
+async def test_compact_digest_contains_image_note_but_not_bytes(test_engine, tmp_path, monkeypatch):
+    monkeypatch.setenv("ZEROCODE_DATA_DIR", str(tmp_path))
+    from app.services import attachment_service as att
+    sf = make_session_factory(test_engine)
+    sid = await mk_session(test_engine, tmp_path)
+    a = await att.create_attachment(sf, 7, sid, "a.png", b"\x89PNG\r\n\x1a\n" + b"\0" * 8, "image/png")
+    b = await att.create_attachment(sf, 7, sid, "b.png", b"\x89PNG\r\n\x1a\n" + b"\0" * 8, "image/png")
+    from app.services.message_service import add_message
+    await add_message(sf, sid, "user", content="看图", attachment_ids=[a["id"], b["id"]])
+    for i in range(11):
+        await add_message(sf, sid, "assistant", content=f"答{i}")
+    llm = ScriptedLLM([[{"type": "content_delta", "content": "摘要"},
+                        {"type": "done", "message": {"role": "assistant", "content": "摘要", "tool_calls": None}}]])
+    rec = _Rec()
+    assert await comp.compact(sf, llm, sid, rec, keep_recent=8)
+    digest = llm.received[0][1]["content"]
+    assert "[图片 ×2：a.png, b.png]" in digest
+    assert "base64" not in digest
+    assert "image_url" not in digest
