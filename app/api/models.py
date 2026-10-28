@@ -27,6 +27,8 @@ class ModelIn(BaseModel):
     # 缺省不进字段默认值而留 None：PUT 不带 kind 必须是「不改类型」，
     # 默认 'chat' 会把一条 embedding 档案悄悄刷回 chat，向量召回当场失效。
     kind: str | None = None
+    # 缺省 None = PUT 不改；新建时按 False 处理。embedding 无论传什么都强制 False。
+    supports_vision: bool | None = None
 
 
 def _check_kind(kind) -> str:
@@ -40,8 +42,8 @@ def _row_out(r) -> dict:
     d["api_key"] = MASK if d["api_key"] else ""
     return d
 
-_SELECT = ("SELECT id, name, base_url, api_key, model, kind, is_default, created_at "
-           "FROM model_config")
+_SELECT = ("SELECT id, name, base_url, api_key, model, kind, is_default, "
+           "supports_vision, created_at FROM model_config")
 
 @router.get("")
 async def list_models(request: Request, kind: str | None = None):
@@ -64,6 +66,8 @@ async def create_model(request: Request, body: ModelIn):
     # （DB 侧由部分唯一索引 ux_model_default_per_owner_kind 兜底）
     owner_id = request.state.actor["id"]
     kind = _check_kind(body.kind) if body.kind is not None else DEFAULT_KIND
+    # 能力位在建档时只有「显式开启」一种可能：未传按 False；embedding 产不出视觉理解，强制 False。
+    vision = False if kind == "embedding" else bool(body.supports_vision)
     async with request.app.state.session_factory() as s:
         if body.is_default:
             # 清默认位必须带上 kind：少了它，设默认 embedding 会把同一用户的默认 chat 一并清掉
@@ -72,11 +76,11 @@ async def create_model(request: Request, body: ModelIn):
                 "WHERE is_default AND kind=:k AND owner_user_id IS NOT DISTINCT FROM :o"),
                 {"o": owner_id, "k": kind})
         row = (await s.execute(text(
-            "INSERT INTO model_config (name, base_url, api_key, model, is_default, owner_user_id, kind) "
-            "VALUES (:n, :b, :k, :m, :d, :o, :kind) RETURNING "
-            "id, name, base_url, api_key, model, kind, is_default, created_at"),
+            "INSERT INTO model_config (name, base_url, api_key, model, is_default, owner_user_id, "
+            "kind, supports_vision) VALUES (:n, :b, :k, :m, :d, :o, :kind, :v) RETURNING "
+            "id, name, base_url, api_key, model, kind, is_default, supports_vision, created_at"),
             {"n": body.name, "b": body.base_url, "k": body.api_key, "m": body.model,
-             "d": body.is_default, "o": owner_id, "kind": kind})).mappings().first()
+             "d": body.is_default, "o": owner_id, "kind": kind, "v": vision})).mappings().first()
         await s.commit()
     return _row_out(row)
 
@@ -84,13 +88,22 @@ async def create_model(request: Request, body: ModelIn):
 async def update_model(request: Request, model_id: int, body: ModelIn):
     uid = request.state.actor["id"]
     async with request.app.state.session_factory() as s:
-        old = (await s.execute(text("SELECT api_key, kind FROM model_config "
-                                    "WHERE id=:i AND owner_user_id=:u"),
-                                    {"i": model_id, "u": uid})).first()
+        old = (await s.execute(text(
+            "SELECT api_key, kind, supports_vision FROM model_config "
+            "WHERE id=:i AND owner_user_id=:u"),
+            {"i": model_id, "u": uid})).first()
         if not old:
             raise HTTPException(404, "模型不存在")
         new_key = old[0] if body.api_key == MASK else body.api_key
         kind = _check_kind(body.kind) if body.kind is not None else old[1]
+        # 未传 = 不动原值（布尔位没有哨兵可借，只能靠 None 区分「没给」和「给 false」）；
+        # 改成 embedding 时必须熄灯，否则会留着一条「声称能看图」的向量档案。
+        if kind == "embedding":
+            vision = False
+        elif body.supports_vision is None:
+            vision = bool(old[2])
+        else:
+            vision = bool(body.supports_vision)
         if body.is_default:
             # 默认位竞争只发生在「同一归属用户 + 同一类型」内：按目标行的 owner 清位（扩展态，Ticket 003），
             # kind 用改后的新类型（chat→embedding 的改名要把 embedding 那一类的默认位抢过来）
@@ -101,10 +114,10 @@ async def update_model(request: Request, model_id: int, body: ModelIn):
                 {"i": model_id, "k": kind})
         await s.execute(text(
             "UPDATE model_config SET name=:n, base_url=:b, api_key=:k, model=:m, "
-            "is_default=:d, kind=:kind "
+            "is_default=:d, kind=:kind, supports_vision=:v "
             "WHERE id=:i AND owner_user_id=:u"),
             {"n": body.name, "b": body.base_url, "k": new_key, "m": body.model,
-             "d": body.is_default, "kind": kind, "i": model_id, "u": uid})
+             "d": body.is_default, "kind": kind, "v": vision, "i": model_id, "u": uid})
         await s.commit()
     return {"ok": True}
 

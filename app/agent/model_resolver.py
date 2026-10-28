@@ -18,13 +18,18 @@ from sqlalchemy import text
 async def resolve_model_for_user(s, uid, cfg: dict) -> dict:
     """owner 默认对话模型行 → 全局 app_config llm.*。s 必须是已打开的会话。"""
     row = (await s.execute(text(
-        "SELECT base_url, api_key, model FROM model_config "
+        "SELECT id, name, base_url, api_key, model, supports_vision FROM model_config "
         "WHERE is_default AND kind = 'chat' AND owner_user_id IS NOT DISTINCT FROM :o "
         "ORDER BY id LIMIT 1"), {"o": uid})).first()
     if row:
-        return {"base_url": row[0], "api_key": row[1] or "", "model": row[2], "source": "default"}
-    return {"base_url": cfg.get("llm.base_url"), "api_key": cfg.get("llm.api_key") or "",
-            "model": cfg.get("llm.model"), "source": "global"}
+        return {"id": row[0], "name": row[1], "base_url": row[2],
+                "api_key": row[3] or "", "model": row[4],
+                "supports_vision": bool(row[5]), "source": "default"}
+    return {"id": None, "name": cfg.get("llm.model"),
+            "base_url": cfg.get("llm.base_url"), "api_key": cfg.get("llm.api_key") or "",
+            "model": cfg.get("llm.model"),
+            "supports_vision": bool(cfg.get("llm.supports_vision", False)),
+            "source": "global"}
 
 
 async def resolve_embedding_for_user(s, uid) -> dict | None:
@@ -48,9 +53,11 @@ async def resolve_model(sf, session_id: int, cfg: dict) -> dict:
             "SELECT model_config_id FROM chat_session WHERE id=:i"), {"i": session_id})).scalar()
         if mid is not None:
             row = (await s.execute(text(
-                "SELECT base_url, api_key, model FROM model_config "
+                "SELECT id, name, base_url, api_key, model, supports_vision FROM model_config "
                 "WHERE id=:i AND kind = 'chat' AND owner_user_id IS NOT DISTINCT FROM :o"),
                 {"i": mid, "o": uid})).first()
             if row:
-                return {"base_url": row[0], "api_key": row[1] or "", "model": row[2], "source": "session"}
+                return {"id": row[0], "name": row[1], "base_url": row[2],
+                        "api_key": row[3] or "", "model": row[4],
+                        "supports_vision": bool(row[5]), "source": "session"}
         return await resolve_model_for_user(s, uid, cfg)

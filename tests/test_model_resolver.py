@@ -5,17 +5,20 @@ from app.agent.model_resolver import (
     resolve_embedding_for_user, resolve_model, resolve_model_for_user)
 from tests.test_agent_loop import mk_session
 
-CFG = {"llm.base_url": "http://g/v1", "llm.api_key": "gk", "llm.model": "g-model"}
+CFG = {"llm.base_url": "http://g/v1", "llm.api_key": "gk", "llm.model": "g-model",
+       "llm.supports_vision": False}
 
 async def _mk_model(sf, **kw):
     async with sf() as s:
         mid = (await s.execute(sql(
-            "INSERT INTO model_config (name, base_url, api_key, model, kind, is_default, owner_user_id) "
-            "VALUES (:n, :b, :k, :m, :kd, :d, :o) RETURNING id"),
+            "INSERT INTO model_config (name, base_url, api_key, model, kind, is_default, "
+            "owner_user_id, supports_vision) "
+            "VALUES (:n, :b, :k, :m, :kd, :d, :o, :v) RETURNING id"),
             {"n": kw.get("name", "m"), "b": kw.get("base_url", "http://m/v1"),
              "k": kw.get("api_key", "mk"), "m": kw.get("model", "m-model"),
              "kd": kw.get("kind", "chat"),
-             "d": kw.get("is_default", False), "o": kw.get("owner_user_id")})).scalar()
+             "d": kw.get("is_default", False), "o": kw.get("owner_user_id"),
+             "v": kw.get("supports_vision", False)})).scalar()
         await s.commit()
     return mid
 
@@ -37,7 +40,8 @@ async def test_fallback_global(test_engine, tmp_path):
     sf = make_session_factory(test_engine)
     sid = await mk_session(test_engine, tmp_path)
     r = await resolve_model(sf, sid, CFG)
-    assert r == {"base_url": "http://g/v1", "api_key": "gk", "model": "g-model", "source": "global"}
+    assert r == {"id": None, "name": "g-model", "base_url": "http://g/v1", "api_key": "gk",
+                 "model": "g-model", "supports_vision": False, "source": "global"}
 
 async def test_default_used_when_session_null(test_engine, tmp_path):
     sf = make_session_factory(test_engine)
@@ -61,11 +65,12 @@ async def test_for_user_returns_owner_default_row(test_engine):
     """主流程：已知 uid 命中自己的默认行，不经过任何 session。"""
     sf = make_session_factory(test_engine)
     uid = await _mk_actor(sf, "mine-owner")
-    await _mk_model(sf, name="mine", model="mine-model", is_default=True, owner_user_id=uid)
+    mid_holder = await _mk_model(sf, name="mine", model="mine-model", is_default=True, owner_user_id=uid)
     async with sf() as s:
         r = await resolve_model_for_user(s, uid, CFG)
-    assert r == {"base_url": "http://m/v1", "api_key": "mk",
-                 "model": "mine-model", "source": "default"}
+    assert r == {"id": mid_holder, "name": "mine", "base_url": "http://m/v1",
+                 "api_key": "mk", "model": "mine-model", "supports_vision": False,
+                 "source": "default"}
 
 
 async def test_for_userIgnoresAnotherOwnersDefaultAsGlobal(test_engine):
@@ -104,7 +109,8 @@ async def test_for_userWithEmptyGlobalConfigYieldsNoneModel(test_engine):
     uid = await _mk_actor(sf, "nobody-owner")
     async with sf() as s:
         r = await resolve_model_for_user(s, uid, {})
-    assert r == {"base_url": None, "api_key": "", "model": None, "source": "global"}
+    assert r == {"id": None, "name": None, "base_url": None, "api_key": "",
+                 "model": None, "supports_vision": False, "source": "global"}
 
 
 # ---- kind（Ticket 005 / D-2）：对话链路不吃 embedding 档案，embedding 也不回落全局 ----
@@ -198,3 +204,30 @@ async def test_resolveEmbeddingKeepsEmptyApiKeyAsEmptyString(test_engine):
     async with sf() as s:
         r = await resolve_embedding_for_user(s, uid)
     assert r["api_key"] == "" and r["source"] == "embedding"
+
+
+# ---- 视觉能力位（聊天图片输入）：随解析结果返回，会话/默认行优先于全局 ----
+async def test_session_row_vision_wins_over_global(test_engine, tmp_path):
+    sf = make_session_factory(test_engine)
+    sid = await mk_session(test_engine, tmp_path)
+    mid = await _mk_model(sf, name="vl", supports_vision=True)
+    await _bind(sf, sid, mid)
+    r = await resolve_model(sf, sid, {**CFG, "llm.supports_vision": True})
+    assert r["source"] == "session" and r["supports_vision"] is True
+    assert r["id"] == mid and r["name"] == "vl"
+
+
+async def test_global_vision_used_without_rows(test_engine, tmp_path):
+    sf = make_session_factory(test_engine)
+    sid = await mk_session(test_engine, tmp_path)
+    r = await resolve_model(sf, sid, {**CFG, "llm.supports_vision": True})
+    assert r["source"] == "global" and r["supports_vision"] is True
+
+
+async def test_default_row_vision_overrides_global_false(test_engine, tmp_path):
+    sf = make_session_factory(test_engine)
+    sid = await mk_session(test_engine, tmp_path)
+    mid = await _mk_model(sf, name="dft", is_default=True, supports_vision=False)
+    r = await resolve_model(sf, sid, {**CFG, "llm.supports_vision": True})
+    assert r["source"] == "default" and r["id"] == mid
+    assert r["supports_vision"] is False

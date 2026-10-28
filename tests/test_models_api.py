@@ -1,8 +1,10 @@
 """Task 2：模型库 CRUD（掩码回显 / 默认唯一 / 掩码哨兵不改密钥）；Ticket 005：kind 列与逐类默认位。"""
 import pytest
 
-async def _create(client, **kw):
+async def _create(client, supports_vision=None, **kw):
     payload = {"name": "m1", "base_url": "http://x/v1", "api_key": "sk-real", "model": "deepseek-chat", **kw}
+    if supports_vision is not None:
+        payload["supports_vision"] = supports_vision
     return (await client.post("/api/models", json=payload)).json()
 
 async def test_create_and_list_masks_key(client):
@@ -106,3 +108,39 @@ async def test_put_rejectsUnknownKindKeepsRow(client, bad):
     assert (await client.put(f"/api/models/{mid}", json=dict(_MIN, kind=bad))).status_code == 400
     rows = (await client.get("/api/models")).json()
     assert rows[0]["kind"] == "embedding" and rows[0]["name"] == "m1"
+
+
+# ---- supports_vision（聊天图片输入）----
+
+async def test_supports_vision_create_defaults_false(client):
+    assert (await _create(client))["supports_vision"] is False
+
+
+async def test_supports_vision_create_and_list(client):
+    mid = (await _create(client, supports_vision=True))["id"]
+    rows = (await client.get("/api/models")).json()
+    assert rows[0]["id"] == mid and rows[0]["supports_vision"] is True
+
+
+async def test_supports_vision_put_null_keeps_value(client):
+    mid = (await _create(client, supports_vision=True))["id"]
+    body = {"name": "m1", "base_url": "http://x/v1", "api_key": "sk-***", "model": "deepseek-chat"}
+    await client.put(f"/api/models/{mid}", json=body)
+    assert (await client.get("/api/models")).json()[0]["supports_vision"] is True
+
+
+async def test_supports_vision_put_false_turns_off(client):
+    mid = (await _create(client, supports_vision=True))["id"]
+    body = {"name": "m1", "base_url": "http://x/v1", "api_key": "sk-***",
+            "model": "deepseek-chat", "supports_vision": False}
+    await client.put(f"/api/models/{mid}", json=body)
+    assert (await client.get("/api/models")).json()[0]["supports_vision"] is False
+
+
+async def test_embedding_forces_supports_vision_false(client):
+    assert (await _create(client, kind="embedding", supports_vision=True))["supports_vision"] is False
+    mid = (await _create(client, supports_vision=True))["id"]
+    body = {"name": "m1", "base_url": "http://x/v1", "api_key": "sk-***",
+            "model": "deepseek-chat", "kind": "embedding", "supports_vision": True}
+    await client.put(f"/api/models/{mid}", json=body)
+    assert (await client.get("/api/models")).json()[0]["supports_vision"] is False
