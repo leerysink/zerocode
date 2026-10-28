@@ -35,19 +35,26 @@ const devBusy = computed(() => submitting.value || isDevBusy(devStatus.value))
 const previewUrl = computed(() => polled.url.value || app.value?.preview_url || '')
 const canOpenPreview = computed(() => devStatus.value === 'running' && !!previewUrl.value)
 
-// 四个查看壳子互斥：同时至多一个开着，切会话全关（ADR-0020 后果条）。
-// 旧壳挂着上一个应用的 id 继续显示是事故源——点「发布」会发到错的库上。
-const shells = reactive({ logs: false, metrics: false, history: false, publish: false })
+// 四个查看壳子互斥：同时至多一个开着。用单一 active 源 + 可写 computed，
+// 互斥由构造保证，不需要「开这个就关其余」的遍历；v-model:open 直绑布尔也是
+// 本仓库既有的写法（AppsView 同款）。
+// 旧壳挂着上一个应用的 id 继续显示是事故源——点「发布」会发到错的库上（ADR-0020 后果条）。
+const active = ref(null)
+const shellOf = (key) =>
+  computed({ get: () => active.value === key, set: (v) => { active.value = v ? key : null } })
+const logsOpen = shellOf('logs')
+const metricsOpen = shellOf('metrics')
+const historyOpen = shellOf('history')
+const publishOpen = shellOf('publish')
+// 语义仍是「打开某个壳子」，供菜单项与重建后的自动开日志调用
 function openShell(key) {
-  for (const k of Object.keys(shells)) shells[k] = k === key
+  active.value = key
 }
-function closeShell(key) {
-  shells[key] = false
-}
+
 watch(() => chatStore.currentWorkspaceId, () => {
-  // 清场顺带解自锁：上一个会话的启动还在飞时切走，新会话不该继承那个转圈
+  // 切会话即清场，顺带解自锁：上一个会话的启动还在飞时切走，新会话不该继承那个转圈
+  active.value = null
   submitting.value = false
-  for (const k of Object.keys(shells)) shells[k] = false
 })
 
 // 栈闸门与列表页同源（utils/publishableStacks.js），不在聊天页另立一份名单
@@ -208,53 +215,49 @@ async function copyPreviewUrl() {
     </a-dropdown>
 
     <a-drawer
-      :open="shells.logs"
+      v-model:open="logsOpen"
       :title="`日志 · ${app.name}`"
       width="62%"
       :body-style="{ padding: '12px 16px' }"
       destroy-on-close
-      @update:open="(v) => (v ? openShell('logs') : closeShell('logs'))"
     >
       <!-- active 驱动面板内部 WS 的连与断：抽屉关了不落回 false 就是一条僵尸连接 -->
       <deploy-log-panel
-        v-if="shells.logs"
+        v-if="logsOpen"
         :app-id="app.id"
         :app-name="app.name"
-        :active="shells.logs"
+        :active="logsOpen"
       />
     </a-drawer>
 
     <a-modal
-      :open="shells.metrics"
+      v-model:open="metricsOpen"
       :width="920"
       :centered="true"
       :footer="null"
       destroy-on-close
-      @update:open="(v) => (v ? openShell('metrics') : closeShell('metrics'))"
     >
       <template #title>资源监控 · {{ app.name }}</template>
-      <MetricsModal v-if="shells.metrics" :key="app.id" :app="app" />
+      <MetricsModal v-if="metricsOpen" :key="app.id" :app="app" />
     </a-modal>
 
     <a-drawer
-      :open="shells.history"
+      v-model:open="historyOpen"
       :title="`发布历史 · ${app.name}`"
       width="760px"
       destroy-on-close
-      @update:open="(v) => (v ? openShell('history') : closeShell('history'))"
     >
-      <PublishHistory v-if="shells.history" :app="app" @rollback="startRollback" />
+      <PublishHistory v-if="historyOpen" :app="app" @rollback="startRollback" />
     </a-drawer>
 
     <PublishModal
-      v-if="shells.publish"
+      v-if="publishOpen"
       :key="pub.seq"
-      :open="shells.publish"
+      v-model:open="publishOpen"
       :app="pub.app"
       :mode="pub.mode"
       :rollback-version="pub.version"
       :auto-start="pub.autoStart"
-      @update:open="(v) => !v && closeShell('publish')"
       @done="loadApps"
     />
   </div>

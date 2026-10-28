@@ -227,9 +227,13 @@ function requestCompact() {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 8px;
+  /* 窄窗口下让提示自己占一行，而不是被按钮组压成三四行（按钮组是这一行的主角） */
+  flex-wrap: wrap;
   margin-top: 8px;
 }
 .zc-input-hint {
+  min-width: 0;
   font-size: 12px;
   color: var(--zc-text-sub);
 }
@@ -240,6 +244,9 @@ function requestCompact() {
 .zc-input-buttons {
   display: flex;
   align-items: center;
-  gap: 8px;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  column-gap: 8px;
+  row-gap: 6px;
 }
 </style>
