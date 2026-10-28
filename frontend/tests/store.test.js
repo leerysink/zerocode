@@ -261,7 +261,10 @@ describe('chat store 事件流', () => {
     expect(s.hint).toBe('')
     expect(s.rejectedDraft).toBe('')
     expect(s.messages.at(-1)).toMatchObject({ role: 'user', content: '再试' })
-    expect(send).toHaveBeenCalledWith(JSON.stringify({ type: 'user_message', content: '再试' }))
+    // 上行协议已带附件占位与 client_msg_id（图片输入任务）：只比对业务字段
+    const out = JSON.parse(send.mock.calls.at(-1)[0])
+    expect(out).toMatchObject({ type: 'user_message', content: '再试', attachment_ids: [] })
+    expect(out.client_msg_id).toBeTruthy()
   })
 
   it('连接未就绪时 send：先落的气泡与执行态一并回滚，文本进草稿并提示重连', () => {
@@ -283,7 +286,9 @@ describe('chat store 事件流', () => {
     s._ws = { readyState: 1, send }
     s.running = true
     expect(s.send('改成用 SQLite')).toBe(true)
-    expect(send).toHaveBeenCalledWith(JSON.stringify({ type: 'user_message', content: '改成用 SQLite' }))
+    const out = JSON.parse(send.mock.calls.at(-1)[0])
+    expect(out).toMatchObject({ type: 'user_message', content: '改成用 SQLite', attachment_ids: [] })
+    expect(out.client_msg_id).toBeTruthy()
     expect(s.messages.at(-1)).toMatchObject({ role: 'user', content: '改成用 SQLite', queued: true })
     expect(s.running).toBe(true) // 插话不另起一轮，执行态当然保持
     expect(s.hint).toBe('')
@@ -332,7 +337,7 @@ describe('chat store 事件流', () => {
     s.currentModelId = 3
     const pending = s.setModel(7)
     s.currentSessionId = 's2' // await 期间用户切到 s2
-    resolvePatch()
+    resolvePatch({ data: {} }) // axios 响应恒为对象；此处只需满足 setModel 的取数形态
     await pending
     expect(s.currentModelId).toBe(3) // s1 的模型不得写回 s2 的视图
   })

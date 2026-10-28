@@ -7,7 +7,11 @@
 // / session_title(首条消息自动命名，就地更新侧栏标题)；
 // 终态 = error / status(idle|error)，busy、status(running) 与 steering_done 都不是。
 import { defineStore } from 'pinia'
-import { getMessages, getSessionDetail, listModels, listWorkspaces, patchSessionModel, wsUrl } from '../api'
+import {
+  getMessages, getSessionDetail, listModels, listWorkspaces, patchSessionModel,
+  fetchAttachmentBlob, uploadAttachment, wsUrl,
+} from '../api'
+import { newClientMsgId } from '../utils/imageAttachments'
 
 // 「执行中被拦下」的三条文案：单点定义，本地拦截与后端 busy 回包共用同一口径
 const BUSY_HINT = '会话正在执行中：点右侧「停止」结束当前执行后即可继续发言'
@@ -57,24 +61,59 @@ export function applyEvent(store, ev) {
       // 执行中被拒（并发发消息 / 压缩中发消息）的**非终态**提示：绝不得清 running/compacting。
       // 一清红色「停止」按钮就消失，用户既发不出也停不掉，点「重试」再撞同一拒绝 ——
       // 这正是「会话正在执行中 + 重试」死循环的成因（后端因此把这类拒绝发成 busy 而非 error）。
-      const last = store.messages[store.messages.length - 1]
-      if (last && last.role === 'user' && last.content === store.pendingEcho) {
-        store.messages.pop() // 后端根本没落库：回滚乐观气泡，免得刷新后凭空消失更迷惑
-        store.rejectedDraft = store.pendingEcho // 文本交回输入框，用户不必重打
+      // 按 client_msg_id 精准回滚对应气泡（插话可有多条在飞），无 id 时退回按 pendingEcho 找最后一条。
+      const cid = ev.client_msg_id
+      let idx = -1
+      if (cid) {
+        idx = store.messages.findIndex(
+          (m) => m.role === 'user' && m.client_msg_id === cid)
       }
+      if (idx < 0 && store.pendingEcho) {
+        for (let i = store.messages.length - 1; i >= 0; i--) {
+          const m = store.messages[i]
+          if (m.role === 'user' && m.content === store.pendingEcho) { idx = i; break }
+        }
+      }
+      if (idx >= 0) {
+        const [bubble] = store.messages.splice(idx, 1)
+        // outbox 里存了原文字与附件：切走会话后只清 outbox，不把旧会话的草稿回填到新会话
+        const key = bubble.client_msg_id || cid
+        const out = key ? store.pendingOutbox[key] : null
+        if (out) {
+          if (out.sessionId === store.currentSessionId) {
+            store.rejectedDraft = out.text || ''
+            store.rejectedAttachments = out.attachments || []
+          }
+          delete store.pendingOutbox[key]
+        } else {
+          store.rejectedDraft = bubble.content || ''
+          store.rejectedAttachments = bubble.attachments || []
+        }
+      }
+      if (typeof ev.running === 'boolean') store.running = ev.running
       store.pendingEcho = ''
+      store.pendingEchoId = ''
       store.hint = ev.message || BUSY_HINT
       break
     }
     case 'steering_done': { // 插话已在工具边界被模型看见：摘掉「排队中」角标（非终态）
-      for (let i = store.messages.length - 1; i >= 0; i--) {
-        const m = store.messages[i]
-        if (m.role === 'user' && m.queued && m.content === ev.content) {
-          m.queued = false
-          break
+      let idx = -1
+      if (ev.client_msg_id) {
+        idx = store.messages.findIndex(
+          (m) => m.role === 'user' && m.client_msg_id === ev.client_msg_id)
+      }
+      if (idx < 0) {
+        for (let i = store.messages.length - 1; i >= 0; i--) {
+          const m = store.messages[i]
+          if (m.role === 'user' && m.queued && m.content === ev.content) { idx = i; break }
         }
       }
-      if (store.pendingEcho === ev.content) store.pendingEcho = '' // 已落库，不再是待回滚的乐观气泡
+      if (idx >= 0) store.messages[idx].queued = false
+      if (store.pendingEchoId === ev.client_msg_id ||
+          (!ev.client_msg_id && store.pendingEcho === ev.content)) {
+        store.pendingEcho = '' // 已落库，不再是待回滚的乐观气泡
+        store.pendingEchoId = ''
+      }
       break
     }
     case 'session_title': // 后端自动命名（首条消息顶掉默认「新会话」）：就地更新侧栏列表项，不等重拉
@@ -92,6 +131,8 @@ export function applyEvent(store, ev) {
       store.streamingThinking = ''
       store.compacting = false // 压缩失败也是终态：复位压缩按钮 loading
       store.pendingEcho = ''
+      store.pendingOutbox = {}
+      store.pendingEchoId = ''
       break
     case 'status': // 终态回执（idle/error）复位执行态；status=running 是重连补发的非终态快照
       if (ev.status === 'running') {
@@ -102,6 +143,8 @@ export function applyEvent(store, ev) {
       store.streamingThinking = ''
       store.compacting = false
       store.pendingEcho = ''
+      store.pendingOutbox = {}
+      store.pendingEchoId = ''
       break
     case 'file_change': // 挂到最近一条 tool 消息，供 diff 渲染（Task 13 最小扩展：补存 path/action 供文件名显示）
       for (let i = store.messages.length - 1; i >= 0; i--) {
@@ -132,10 +175,16 @@ export const useChatStore = defineStore('chat', {
     streamingThinking: '',
     models: [],
     currentModelId: null,
+    effectiveModel: null, // 实际生效模型（含视觉能力）：由会话详情/切换模型的响应回写
+    visionSupported: false,
     compacting: false,
     hint: '', // 执行中被拦下的一次性提示（非终态，不进气泡、不带「重试」）
     rejectedDraft: '', // busy 交还给输入框的草稿：后端没收下这句话，文本不能丢
+    rejectedAttachments: [], // 与 rejectedDraft 配套退回输入框的附件，同样不能丢
     pendingEcho: '', // 最近一次本地乐观上行的 user 文本，busy 时按它回滚气泡
+    pendingEchoId: '', // 最近一次乐观上行的 client_msg_id，精确回滚/摘角标用
+    pendingOutbox: {}, // client_msg_id -> {sessionId, text, attachments}：未被后端确认的乐观消息
+    retrying: false, // retry 重传中：防止连点并发重复上传
   }),
   actions: {
     async loadWorkspaces() {
@@ -157,18 +206,30 @@ export const useChatStore = defineStore('chat', {
       if (this.currentSessionId !== id) return
       this.todoList = detail?.todo_state || []
       this.currentModelId = detail?.model_config_id ?? null
+      this.effectiveModel = detail?.effective_model || null
+      this.visionSupported = !!detail?.effective_model?.supports_vision
       this.streamingThinking = ''
       this.compacting = false
       this.hint = ''
       this.rejectedDraft = ''
+      this.rejectedAttachments = []
       this.pendingEcho = ''
+      this.pendingEchoId = ''
+      this.pendingOutbox = {}
       // 渲染门：右栏（Task 13/14）以 currentWorkspaceId 判定；由调用方传入工作区 id
       if (workspaceId != null) this.currentWorkspaceId = workspaceId
       this.messages = data
       // 已排队但还没被注入的插话没落库（只在 hub.pending），刷新/切回来时由详情带回复原，
-      // 否则用户刚说出去的话会凭空消失
+      // 否则用户刚说出去的话会凭空消失。旧服务端可能只回字符串，两种形态都要认。
       for (const c of detail?.pending_steering || []) {
-        this.messages.push({ role: 'user', content: c, queued: true })
+        if (typeof c === 'string') {
+          this.messages.push({ role: 'user', content: c, queued: true })
+          continue
+        }
+        this.messages.push({
+          role: 'user', content: c.content || '', attachments: c.attachments || [],
+          client_msg_id: c.client_msg_id || undefined, queued: true,
+        })
       }
       this.streamingContent = ''
       this.pendingAsk = null
@@ -222,32 +283,54 @@ export const useChatStore = defineStore('chat', {
       console.warn('[chat] WS 未就绪，上行丢弃：', payload.type)
       return false
     },
-    send(text) {
+    send(payload) {
+      const { text = '', attachments = [] } =
+        typeof payload === 'string' ? { text: payload } : (payload || {})
       const content = (text || '').trim()
-      if (!content) return false
+      if (!content && !attachments.length) return false
       // 压缩中没有"下一轮边界"可注入，后端也只会回 busy —— 本地先拦下，文本留在框里
       if (this.compacting) {
         this.rejectedDraft = content
         this.hint = COMPACT_HINT
         return false
       }
+      // 非视觉模型带图会被后端拒或把图片丢掉：本地先拦下，既不产生气泡也不进 outbox
+      if (attachments.length && !this.visionSupported) {
+        this.hint = '当前模型不支持图片输入，请切换支持视觉的模型'
+        return false
+      }
       // 执行中发出 = 插话（steering）：照样上行，气泡先挂「排队中」角标，
       // 后端在下一个工具边界落库注入并回 steering_done 时摘掉
+      const clientMsgId = newClientMsgId()
       const steering = this.running
-      this.messages.push(steering ? { role: 'user', content, queued: true } : { role: 'user', content })
+      const bubble = { role: 'user', content, attachments, client_msg_id: clientMsgId }
+      if (steering) bubble.queued = true
+      this.messages.push(bubble)
+      // outbox 记录这条乐观消息的文字与附件：busy 回滚时按当前会话决定是否退回输入框
+      this.pendingOutbox[clientMsgId] = {
+        sessionId: this.currentSessionId, text: content, attachments,
+      }
       this.pendingEcho = content // busy 时按它回滚这条乐观气泡（后端可能没收下）
+      this.pendingEchoId = clientMsgId
       this.streamingContent = ''
       this.streamingThinking = ''
       this.hint = ''
       this.rejectedDraft = ''
       this.running = true
-      if (!this._uplink({ type: 'user_message', content })) {
+      if (!this._uplink({
+        type: 'user_message', content,
+        attachment_ids: attachments.map((a) => a.id),
+        client_msg_id: clientMsgId,
+      })) {
         // 上行即失败（readyState 检查后瞬间断线）：气泡与执行态一并回滚，
-        // 不留「已发出」的假象；文本回到 rejectedDraft 供连接恢复后再发
+        // 不留「已发出」的假象；文字与附件回到 rejectedDraft/rejectedAttachments 供连接恢复后再发
         this.messages.pop()
+        delete this.pendingOutbox[clientMsgId]
         this.pendingEcho = ''
+        this.pendingEchoId = ''
         this.running = false
         this.rejectedDraft = content
+        this.rejectedAttachments = attachments
         this.hint = OFFLINE_HINT
         return false
       }
@@ -269,24 +352,60 @@ export const useChatStore = defineStore('chat', {
       this.pendingAsk = null
       this.pendingConfirm = null
       // 后端 hub.cancel 会一并丢弃未注入的插话（不落库）：本地同步摘掉那些「排队中」气泡，
-      // 文本按原顺序退回输入框，别让用户以为说出去了
-      const stranded = this.messages.filter((m) => m.role === 'user' && m.queued).map((m) => m.content)
+      // 文本与附件按原顺序退回输入框，别让用户以为说出去了
+      const stranded = this.messages.filter((m) => m.role === 'user' && m.queued)
       if (stranded.length) {
         this.messages = this.messages.filter((m) => !(m.role === 'user' && m.queued))
-        this.rejectedDraft = stranded.join('\n\n')
-        this.hint = `本轮已停止：${stranded.length} 条插话未送达，文本已退回输入框`
+        const texts = stranded.map((m) => m.content).filter(Boolean)
+        this.rejectedDraft = texts.join('\n\n')
+        this.rejectedAttachments = stranded.flatMap((m) => m.attachments || [])
+        this.hint = `本轮已停止：${stranded.length} 条插话未送达，文本与图片已退回输入框`
       }
+      this.pendingOutbox = {}
       this.pendingEcho = ''
+      this.pendingEchoId = ''
       this.running = false
       this.streamingThinking = ''
     },
-    retry() {
-      // 重发最近一条用户消息
+    async retry() {
+      // 重发最近一条用户消息；带图的重试必须先重新上传，拿到新附件 ID 再发
+      if (this.retrying) return
+      let last = null
       for (let i = this.messages.length - 1; i >= 0; i--) {
-        if (this.messages[i].role === 'user') {
-          this.send(this.messages[i].content)
-          return
+        if (this.messages[i].role === 'user') { last = this.messages[i]; break }
+      }
+      if (!last) return
+      const text = last.content || ''
+      const atts = last.attachments || []
+      if (!atts.length) { this.send(text); return }
+      const sid = this.currentSessionId
+      this.retrying = true
+      try {
+        const fresh = []
+        for (const a of atts) {
+          try {
+            const { data: blob } = await fetchAttachmentBlob(a.url)
+            const { data } = await uploadAttachment(sid, blob, a.filename)
+            fresh.push({
+              id: data.id, filename: data.filename, mime: data.mime,
+              size_bytes: data.size_bytes, url: data.url,
+            })
+          } catch {
+            // 等重传期间切走会话：旧会话的草稿不得回填到新会话
+            if (this.currentSessionId !== sid) return
+            this.rejectedDraft = text
+            this.rejectedAttachments = atts
+            this.hint = '图片重新上传失败，请重新粘贴后再发'
+            return
+          }
+          if (this.currentSessionId !== sid) return
         }
+        if (!this.send({ text, attachments: fresh })) {
+          this.rejectedDraft = text
+          this.rejectedAttachments = fresh
+        }
+      } finally {
+        this.retrying = false
       }
     },
     async loadModels() {
@@ -295,9 +414,15 @@ export const useChatStore = defineStore('chat', {
     },
     async setModel(id) {
       const sid = this.currentSessionId
-      await patchSessionModel(sid, id)
+      const { data } = await patchSessionModel(sid, id)
       // 回写会话校验（T11 审查闭合）：await 期间用户可能已切换会话，仅当前仍是发起会话才回写，防陈旧覆盖
-      if (this.currentSessionId === sid) this.currentModelId = id
+      if (this.currentSessionId !== sid) return
+      this.currentModelId = id
+      // 切换后的实际生效模型可能落回全局默认：视觉能力位必须按响应回写
+      if (data?.effective_model) {
+        this.effectiveModel = data.effective_model
+        this.visionSupported = !!data.effective_model.supports_vision
+      }
     },
   },
 })
