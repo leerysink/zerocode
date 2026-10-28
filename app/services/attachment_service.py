@@ -2,10 +2,12 @@
 
 文件存在平台数据区而不是用户工作区——避免污染文件树、应用打包与 source_hash。
 """
+import asyncio
 import base64
 import logging
 import re
 import shutil
+import time
 import uuid
 from pathlib import Path
 
@@ -222,3 +224,76 @@ def remove_session_dir(uid: int, session_id: int) -> None:
         pass
     except OSError:
         logger.exception("删除会话附件目录失败 uid=%s session=%s", uid, session_id)
+
+
+async def cleanup_orphans(sf, ttl_hours: int = ORPHAN_TTL_HOURS) -> int:
+    removed = 0
+    try:
+        async with sf() as s:
+            rows = (await s.execute(_sql(
+                "DELETE FROM message_attachment WHERE message_id IS NULL "
+                "AND created_at < now() - make_interval(hours => :h) "
+                "RETURNING storage_path"), {"h": int(ttl_hours)})).mappings().all()
+            await s.commit()
+        for r in rows:
+            path = resolve_storage_path(r["storage_path"])
+            if path is not None:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    logger.exception("删除孤儿附件文件失败 %s", path)
+            removed += 1
+    except Exception:
+        logger.exception("清理未绑定附件失败")
+
+    try:
+        root = Path(data_dir()).resolve() / "users"
+        if not root.is_dir():
+            return removed
+        async with sf() as s:
+            live_sessions = set((await s.execute(_sql("SELECT id FROM chat_session"))).scalars().all())
+            referenced = set((await s.execute(_sql(
+                "SELECT storage_path FROM message_attachment"))).scalars().all())
+        cutoff = time.time() - int(ttl_hours) * 3600
+        for user_dir in root.iterdir():
+            uploads = user_dir / "chat_uploads"
+            if not uploads.is_dir():
+                continue
+            for sess_dir in list(uploads.iterdir()):
+                if not sess_dir.is_dir():
+                    continue
+                try:
+                    sid = int(sess_dir.name)
+                except ValueError:
+                    sid = None
+                if sid is not None and sid not in live_sessions and sess_dir.stat().st_mtime < cutoff:
+                    try:
+                        shutil.rmtree(sess_dir)
+                        continue
+                    except OSError:
+                        logger.exception("删除已删会话的附件目录失败 %s", sess_dir)
+                for f in sess_dir.iterdir():
+                    if not f.is_file():
+                        continue
+                    rel = f.resolve().relative_to(root).as_posix()
+                    rel = f"users/{rel}"
+                    if rel in referenced:
+                        continue
+                    if f.stat().st_mtime >= cutoff:
+                        continue
+                    try:
+                        f.unlink()
+                    except OSError:
+                        logger.exception("删除无主附件文件失败 %s", f)
+    except Exception:
+        logger.exception("扫描附件目录失败")
+    return removed
+
+
+async def cleanup_loop(sf, interval_seconds: int = 6 * 3600):
+    while True:
+        await asyncio.sleep(interval_seconds)
+        try:
+            await cleanup_orphans(sf)
+        except Exception:
+            logger.exception("附件清理循环失败")

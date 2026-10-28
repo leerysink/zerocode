@@ -1,7 +1,10 @@
+import asyncio
+
 from fastapi import APIRouter, Request, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import text
 
+from app.services import attachment_service
 from app.services.session_title_service import DEFAULT_TITLE
 
 router = APIRouter(prefix="/api/sessions")
@@ -111,6 +114,8 @@ async def delete_session(request: Request, session_id: int):
         await _require_session(s, session_id, uid)
         await s.execute(text("DELETE FROM chat_session WHERE id=:i"), {"i": session_id})
         await s.commit()
+    # 兜底删除附件目录：commit 之后执行，remove_session_dir 自身吞掉 OSError，不影响删除响应
+    await asyncio.to_thread(attachment_service.remove_session_dir, uid, session_id)
     return {"ok": True}
 
 @router.get("/{session_id}/messages")

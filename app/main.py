@@ -110,6 +110,10 @@ def create_app(database_url: str | None = None) -> FastAPI:
         metrics_disk = asyncio.create_task(deploy_metrics.disk_loop(app))
         # 应用资源监控·容器高频采集循环（Ticket 004：CPU/内存，docker stats 轮询）。
         metrics_container = asyncio.create_task(deploy_metrics.container_loop(app))
+        # 聊天图片附件（Task 5）：孤儿附件 24h 清理循环，先睡后清，单拍异常循环内吞掉。
+        from app.services import attachment_service
+        attachment_cleanup = asyncio.create_task(
+            attachment_service.cleanup_loop(app.state.session_factory))
         yield
         watchdog.cancel()
         with suppress(asyncio.CancelledError):
@@ -120,6 +124,9 @@ def create_app(database_url: str | None = None) -> FastAPI:
         metrics_container.cancel()
         with suppress(asyncio.CancelledError):
             await metrics_container
+        attachment_cleanup.cancel()
+        with suppress(asyncio.CancelledError):
+            await attachment_cleanup
         # 优雅退出：停掉仍在跑的 dev 栈（prod 不受影响，FR3-04）；同样不得因 Docker 侧异常而卡住关闭
         try:
             from app.deploy import engine as deploy_engine
