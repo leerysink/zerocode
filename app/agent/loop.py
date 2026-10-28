@@ -279,12 +279,16 @@ class AgentRunner:
                 row = await add_message(self.sf, session_id, "user", content=text_,
                                         context_content=expanded, attachment_ids=ids)
             except ValueError as e:
-                # 附件在排队期间被占用/删除：这句插话无法完整送达，单独报错并继续，
-                # 不能连累队列里后面的插话，也不能让整轮 run 崩掉
-                await self.send({"type": "error", "message": f"插话未能送达：{e}"})
+                # 附件在排队期间被占用/删除：这句插话无法完整送达，单独提示并继续，
+                # 不能连累队列里后面的插话，也不能让整轮 run 崩掉。必须用**非终态**
+                # busy：error 会被前端当本轮终态清掉执行态，而这轮其实还在跑
+                await self.send({"type": "busy", "message": f"插话未能送达：{e}",
+                                 "client_msg_id": item.get("client_msg_id"),
+                                 "running": True})
                 continue
             files = await _att.for_llm(self.sf, [row["id"]]) if ids else {}
-            content = self._user_content(text_, row.get("attachments") or [], True,
+            # @展开要进模型可见内容（与主消息路径一致），否则插话里的 "@a.py" 只带原文
+            content = self._user_content(expanded or text_, row.get("attachments") or [], True,
                                          files.get(row["id"], []))
             messages.append({"role": "user", "content": content})
             await self.send({"type": "steering_done", "content": text_,

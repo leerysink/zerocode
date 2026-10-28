@@ -31,6 +31,28 @@ from app.services import config_service
 
 router = APIRouter()
 
+
+def _parse_attachment_ids(raw_ids) -> list[int]:
+    """附件 id 严格解析：只收 JSON 整数与纯数字字符串（ASCII），bool/float/其它一律 ValueError。
+
+    int() 宽松强转不可用：true 会悄悄变 1、3.5 被截成 3，协议错误被伪装成「附件不存在」。
+    去重保序（先出现的保留位置）。
+    """
+    out: list[int] = []
+    for i in raw_ids:
+        if isinstance(i, bool):
+            raise ValueError(f"非法附件 id: {i!r}")
+        if isinstance(i, int):
+            v = i
+        elif isinstance(i, str) and i.isascii() and i.isdigit():
+            v = int(i)
+        else:
+            raise ValueError(f"非法附件 id: {i!r}")
+        if v not in out:
+            out.append(v)
+    return out
+
+
 @router.websocket("/ws/chat/{session_id}")
 async def ws_chat(ws: WebSocket, session_id: int):
     # WS 认证收口（Ticket 009 / spec §3 故事12）：/ws scope 不走 HTTP guard 中间件，
@@ -111,7 +133,7 @@ async def ws_chat(ws: WebSocket, session_id: int):
                     await reject("附件参数非法", cid, running=session_id in hub.running)
                     continue
                 try:
-                    attachment_ids = list(dict.fromkeys(int(i) for i in raw_ids))
+                    attachment_ids = _parse_attachment_ids(raw_ids)
                 except (TypeError, ValueError):
                     await reject("附件参数非法", cid, running=session_id in hub.running)
                     continue
@@ -157,18 +179,31 @@ async def ws_chat(ws: WebSocket, session_id: int):
                 cfg_now = None
                 model_cfg = None
                 if attachment_ids:
+                    # 预校验含多个 await（load_bindable/config/resolve_model），期间若还不占
+                    # 运行位，第二条 user_message（另一连接）会看到「未在跑」再开一个 run
+                    # （双跑竞态）。故先预留运行位：任何拒绝/异常路径都要摘掉，成功路径不摘，
+                    # 由 run_task 首行（幂等 add）接管。
+                    hub.running.add(session_id)
                     try:
-                        await attachment_service.load_bindable(
-                            app.state.session_factory, session_id, attachment_ids)
-                    except attachment_service.AttachmentError as e:
-                        await reject(str(e), cid, running=False)
-                        continue
-                    cfg_now = await config_getter()
-                    model_cfg = await resolve_model(app.state.session_factory, session_id, cfg_now)
-                    if not model_cfg.get("supports_vision"):
-                        await reject("当前模型不支持图片输入，请切换支持视觉的模型",
-                                     cid, running=False)
-                        continue
+                        try:
+                            await attachment_service.load_bindable(
+                                app.state.session_factory, session_id, attachment_ids)
+                        except attachment_service.AttachmentError as e:
+                            hub.running.discard(session_id)
+                            await reject(str(e), cid, running=False)
+                            continue
+                        cfg_now = await config_getter()
+                        model_cfg = await resolve_model(
+                            app.state.session_factory, session_id, cfg_now)
+                        if not model_cfg.get("supports_vision"):
+                            hub.running.discard(session_id)
+                            await reject("当前模型不支持图片输入，请切换支持视觉的模型",
+                                         cid, running=False)
+                            continue
+                    except Exception:
+                        # 意外异常（含上面 reject 自身失败）：摘掉预留位再抛，不留幽灵 running
+                        hub.running.discard(session_id)
+                        raise
 
                 async def send(event: dict):
                     # AgentRunner.send 是单参签名；经 hub 会话槽晚绑定转发，

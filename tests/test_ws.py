@@ -357,7 +357,8 @@ def test_ws_busy_is_non_terminal(client):
         ws.send_json({"type": "user_message", "content": "第 21 句"})
         assert _reject_event(ws)["type"] == "busy"
         # busy 不是终态：ask 仍挂起，应答后这一轮照常收尾
-        # （预置的 20 条占位插话会在边界被一并注入 → 先来 20 帧 steering_done，读够再找 message_done）
+        # （预置的 20 条占位插话无字无图，drain 时被整体跳过 → 0 帧 steering_done，
+        #   下一帧确定性的 message_done 直接从事件流里读即可）
         ws.send_json({"type": "ask_submit", "answers": [{"answer": "随便"}]})
         for _ in range(60):
             if ws.receive_json()["type"] == "message_done":
@@ -695,3 +696,30 @@ def test_ws_image_steering_rejected_when_run_model_lacks_vision(client, monkeypa
             if ws.receive_json()["type"] == "status":
                 break
     assert not client.app.state.hub.pending.get(client.zc_sid)
+
+
+def test_ws_image_steering_gate_uses_run_model_not_latest_default(client, monkeypatch, tmp_path):
+    """能力门按**本 run 启动时**解析的模型判定，不是收到插话那一刻的默认模型。
+
+    运行开始后才把默认模型换成视觉模型：本 run 的 run_vision 仍为 false，
+    带图插话必须按本 run 能力拒绝；若实现改回「收信时临时解析默认模型」，
+    这里会放行入队（随后读不到 busy → 断言失败）。
+    """
+    monkeypatch.setenv("ZEROCODE_DATA_DIR", str(tmp_path / "data"))
+    att_row = _upload(client, client.zc_sid)
+    client.app.state.llm_factory = lambda cfg: ScriptedLLM([done(None, [_ask_tool_call()]), done("ok")])
+    with client.websocket_connect(f"/ws/chat/{client.zc_sid}") as ws:
+        ws.send_json({"type": "user_message", "content": "先挂着"})
+        for _ in range(6):
+            if ws.receive_json()["type"] == "ask_user":
+                break
+        _vision_model(client)  # 运行开始后才切到视觉默认模型：本 run 的能力位应仍是 false
+        ws.send_json({"type": "user_message", "content": "",
+                      "attachment_ids": [att_row["id"]], "client_msg_id": "c-stale"})
+        ev = _reject_event(ws)
+        assert ev["type"] == "busy" and ev["client_msg_id"] == "c-stale"
+        assert ev["running"] is True
+        ws.send_json({"type": "cancel"})
+        for _ in range(5):
+            if ws.receive_json()["type"] == "status":
+                break
