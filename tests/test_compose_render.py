@@ -567,19 +567,58 @@ def test_dev_compose_non_fastapi_stacks_inject_npm_only(monkeypatch, stack):
     assert _named_volume_refs(doc) == set(doc["volumes"])
 
 
-def test_prod_compose_ignores_mirror_env(monkeypatch):
-    """诚实缺口钉住：prod 栈靠 `build: ../backend` 出镜像，pip/npm 跑在**构建容器**里，
-    compose 的 environment 段对 build 阶段无效——所以这里一律不注入。
-
-    设了变量也必须与 golden 逐字节一致：将来若要覆盖 prod 构建期，走的是 build args 而非
-    environment，届时这条断言会红着提醒一并重生 golden，而不是留下两份静默不一致的产物。
-    """
+def test_prod_compose_injects_build_args_from_env(monkeypatch):
+    """ADR-0025：prod 的 pip/npm 跑在**构建容器**里，compose 的 environment 段对它无效，
+    所以镜像源走 `build.args` 注入。设了变量就必须落到 args 上，否则服务器上 prod 构建照旧
+    连官方源等到超时（这条是 600s build 超时的根因收口）。"""
     monkeypatch.setenv(PYPI_ENV, "https://mirrors.aliyun.com/pypi/simple")
     monkeypatch.setenv(NPM_ENV, "https://registry.npmmirror.com")
+    y = compose.render_prod_compose(META)
+    doc = yaml.safe_load(y)
+    assert doc["services"]["backend"]["build"] == {
+        "context": "../backend", "args": {"PIP_INDEX_URL": "https://mirrors.aliyun.com/pypi/simple"}}
+    assert doc["services"]["frontend"]["build"] == {
+        "context": "../frontend", "args": {"NPM_CONFIG_REGISTRY": "https://registry.npmmirror.com"}}
+    assert "__" not in y
+
+
+def test_prod_compose_without_mirror_env_keeps_golden_bytes():
+    """零注入半边：两个变量都没设时 `build:` 保持标量形态、产物与 golden 逐字节一致
+    （autouse fixture 已清空宿主变量，这里不 setenv 就是「未设」）。"""
     golden = Path(__file__).parent / "golden" / "prod-compose.fastapi.yml"
-    assert compose.render_prod_compose(META) == golden.read_text(encoding="utf-8")
-    y = compose.render_prod_compose(META_SB)
-    assert "PIP_INDEX_URL" not in y and "NPM_CONFIG_REGISTRY" not in y
+    y = compose.render_prod_compose(META)
+    assert y == golden.read_text(encoding="utf-8")
+    assert "args:" not in y
+
+
+def test_prod_compose_springboot_backend_has_no_pip_arg(monkeypatch):
+    """SB 后端是 maven：pip 源对它没有消费方，两个变量都设也只给 frontend 注 npm。
+    这条同时钉住「Maven 仓库镜像仍是缺口」——顺手给 SB backend 加 PIP_INDEX_URL 会红。"""
+    monkeypatch.setenv(PYPI_ENV, "https://mirrors.aliyun.com/pypi/simple")
+    monkeypatch.setenv(NPM_ENV, "https://registry.npmmirror.com")
+    doc = yaml.safe_load(compose.render_prod_compose(META_SB))
+    assert doc["services"]["backend"]["build"] == "../backend"
+    assert doc["services"]["frontend"]["build"]["args"] == {
+        "NPM_CONFIG_REGISTRY": "https://registry.npmmirror.com"}
+
+
+def test_prod_compose_npm_only_leaves_backend_build_scalar(monkeypatch):
+    """只给 npm：backend 的 build 不得凭空长出 args 段（反向断言——漏判 npm 一侧会红）。"""
+    monkeypatch.setenv(NPM_ENV, "https://registry.npmmirror.com")
+    y = compose.render_prod_compose(META)
+    assert "PIP_INDEX_URL" not in y
+    doc = yaml.safe_load(y)
+    assert doc["services"]["backend"]["build"] == "../backend"
+    assert doc["services"]["frontend"]["build"]["args"]["NPM_CONFIG_REGISTRY"]
+
+
+@pytest.mark.parametrize("value", ["mirrors.aliyun.com/pypi/simple", "not a url", "ftp://x"])
+def test_prod_compose_rejects_malformed_mirror_env(monkeypatch, value):
+    """prod 与 dev 同一条校验：畸形值整栈失败，静默丢等于让这次发布继续装不到依赖。"""
+    for name in (PYPI_ENV, NPM_ENV):
+        monkeypatch.setenv(name, value)
+    with pytest.raises(DeployError, match="ZEROCODE_"):
+        compose.render_prod_compose(META)
 
 
 @pytest.mark.parametrize("value", [

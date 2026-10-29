@@ -60,7 +60,8 @@ STACK_SECRETS = {"vue3-springboot": ("JWT_SECRET", "REDIS_PASSWORD")}
 _MARKER_RE = re.compile(r"__[A-Z][A-Z0-9_]*__")   # 只认渲染器自己的标记形态，不误伤 yaml 合法内容
 
 # 依赖镜像源：从打包时烘进平台容器的环境变量读，零注入承诺——没设就不写对应行，compose 字节不变。
-# prod 栈不注入：prod 是 `build: ../backend`，pip/npm install 在镜像构建期跑，compose environment 对它无效。
+# dev 栈走 environment（pip/npm 在运行期装）；prod 栈的 pip/npm 跑在**构建容器**里，environment 对它
+# 无效，所以走 build.args（ADR-0025，见 _prod_build_block）。两条通道都只认同一份打包参数。
 _MIRROR_URL_RE = re.compile(r"https?://[^\s]+")
 
 
@@ -89,6 +90,21 @@ def _npm_env_block() -> str:
     """
     v = _mirror_env("ZEROCODE_NPM_REGISTRY")
     return f"\n    environment:\n      NPM_CONFIG_REGISTRY: {v}" if v else ""
+
+def _prod_build_block(context: str, arg_name: str, url: str | None) -> str:
+    """prod 栈一个 build 标记的渲染值：没镜像源时逐字回退到 `build: ../<context>` 标量形态。
+
+    返回值不带行尾换行——模板里标记独占一行，行尾由模板自己提供，这样未注入分支与旧模板字节相同
+    （ADR-0017「注入块不得独占一行」的约束在这里换了形态：块永不空，所以标记可以独占一行）。
+    消费方是应用自己的 Dockerfile（`ARG` + `ENV`）；没声明 ARG 的应用只会收到 BuildKit 的一条
+    「build-arg not consumed」警告，不影响构建。
+    """
+    if not url:
+        return f"    build: ../{context}"
+    return (f"    build:\n"
+            f"      context: ../{context}\n"
+            f"      args:\n"
+            f"        {arg_name}: {url}")
 
 _DEV_COMPOSE = """name: zc-__SLUG__-dev
 networks:
@@ -228,7 +244,7 @@ services:
 __MIGRATE_PROD__
   backend:
     image: zc-__SLUG__-backend:prod-${PROD_VERSION}
-    build: ../backend
+__BUILD_BACKEND__
     environment:
       DATABASE_URL: postgresql+asyncpg://${PROD_USER}:${PROD_PASSWORD}@zerocode-pg16:5432/${PROD_DB}
       APP_PORT: "8000"
@@ -239,7 +255,7 @@ __MIGRATE_PROD__
         condition: service_completed_successfully
   frontend:
     image: zc-__SLUG__-frontend:prod-${PROD_VERSION}
-    build: ../frontend
+__BUILD_FRONTEND__
     networks: [default]
     ports:
       - "__PROD_PORT__:80"
@@ -298,7 +314,7 @@ __MIGRATE_PROD__
         condition: service_started
   frontend:
     image: zc-__SLUG__-frontend:prod-${PROD_VERSION}
-    build: ../frontend
+__BUILD_FRONTEND__
     networks: [default]
     ports:
       - "__PROD_PORT__:80"
@@ -359,8 +375,14 @@ def render_prod_compose(meta: dict) -> str:
     else:
         raise DeployError(f"栈发布未支持: {stack}", status=400)
     sources = tpl + "".join(fragments)              # 本次渲染用到的全部标记面
+    # build.args 只给真有消费方的构建上下文：fastapi 后端是 pip、两栈前端是 npm；
+    # 大型栈后端是 maven，仓库镜像不在这两个参数范围内（_PROD_COMPOSE_SB 的 backend 因此没有标记）。
     y = (tpl
          .replace("__MIGRATE_PROD__", _MIGRATE_PROD)
+         .replace("__BUILD_BACKEND__", _prod_build_block(
+             "backend", "PIP_INDEX_URL", _mirror_env("ZEROCODE_PYPI_MIRROR")))
+         .replace("__BUILD_FRONTEND__", _prod_build_block(
+             "frontend", "NPM_CONFIG_REGISTRY", _mirror_env("ZEROCODE_NPM_REGISTRY")))
          .replace("__PROD_PORT__", str(meta["ports"]["prod"]))
          .replace("__UPLOADS_VOL__", UPLOADS_VOLUME)
          .replace("__UPLOADS_VOL_NAME__", UPLOADS_VOLUME)

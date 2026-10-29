@@ -48,6 +48,8 @@ dev 栈里那一次 `npm install` / `pip install`，而「点预览装依赖」�
   `pip install` / `npm install` 跑在构建容器里，而 compose 的 `environment:` 对 `build:` 无效。现状用
   一条「设了变量也必须与 golden 文件逐字节一致」的测试钉住，免得后来人以为 prod 也跟着走镜像源。大型栈
   （vue3-springboot）后端的 Maven 仓库镜像同理不在三个参数范围内，它的 dev 侧只注入 npm。
+  **本条的 prod 半边已被 ADR-0025 推翻**（境内服务器上 prod 构建等满 600s 超时）：改走 `build.args`，
+  不再依赖 `environment:`。Maven 半边仍然成立。
 - 「不给 = 逐字不变」有实现代价：注入块要么返回空串、要么返回自带换行的整块，模板里的占位标记**不得
   独占一行**。变异验证实测过——把空替换从 `""` 改成 `"\n"`，golden 逐字节比对与两条「空值视同未设」的
   用例同时变红。

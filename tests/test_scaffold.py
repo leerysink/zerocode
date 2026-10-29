@@ -2,6 +2,7 @@
 import json
 import re
 from pathlib import Path
+import pytest
 from app.deploy import scaffold
 
 TEMPLATE = Path(__file__).resolve().parents[1] / "app" / "templates" / "vue3-fastapi"
@@ -115,6 +116,35 @@ def test_template_nginx_prod_proxy(tmp_path):
     assert "proxy_pass http://backend:8000" in ng and "try_files" in ng
     dk = (tmp_path / "frontend" / "Dockerfile").read_text(encoding="utf-8")
     assert "COPY nginx.conf /etc/nginx/conf.d/default.conf" in dk
+
+
+# prod 构建期的 build args 要有消费方：模板 Dockerfile 必须声明同名 ARG，且默认值是官方源
+# （没配镜像源的部署构建行为不变，见 ADR-0025）
+_MIRROR_ARGS = {
+    "vue3-fastapi": (("backend", "PIP_INDEX_URL", "https://pypi.org/simple"),
+                     ("frontend", "NPM_CONFIG_REGISTRY", "https://registry.npmjs.org")),
+    # 大型栈后端是 maven，仓库镜像不在这两个参数范围内 → 只有前端有 npm 消费方
+    "vue3-springboot": (("frontend", "NPM_CONFIG_REGISTRY", "https://registry.npmjs.org"),),
+}
+
+
+@pytest.mark.parametrize("stack,wires", sorted(_MIRROR_ARGS.items()))
+def test_template_dockerfiles_declare_mirror_args_with_official_defaults(stack, wires):
+    root = Path(__file__).resolve().parents[1] / "app" / "templates" / stack
+    for part, arg, official in wires:
+        dk = (root / part / "Dockerfile").read_text(encoding="utf-8")
+        assert f"ARG {arg}={official}" in dk, f"{stack}/{part} 缺 ARG {arg}"
+        assert f"ENV {arg}=${{{arg}}}" in dk, f"{stack}/{part} 缺 ENV {arg}"
+        # ARG/ENV 必须早于真正装依赖的那条 RUN（比对注释里的 "npm" 字样没有意义，只认 RUN 行）
+        install = "pip install" if part == "backend" else "npm "
+        runs = [i for i, ln in enumerate(dk.splitlines())
+                if ln.strip().upper().startswith("RUN") and install in ln]
+        assert runs, f"{stack}/{part} 没有 {install} 那条 RUN"
+        assert max(i for i, ln in enumerate(dk.splitlines()) if arg in ln) < runs[0], \
+            f"{stack}/{part}: ARG 必须早于安装那一行"
+    for part in [p for p in ("backend", "frontend") if p not in {w[0] for w in wires}]:
+        dk = (root / part / "Dockerfile").read_text(encoding="utf-8")
+        assert "PIP_INDEX_URL" not in dk, f"{stack}/{part} 长出了没人读的 pip 源"
 
 
 def test_render_copies_binary_file_byte_identical(tmp_path):

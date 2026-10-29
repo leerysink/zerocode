@@ -38,17 +38,22 @@ class Seams:
     不新增打桩框架。
     """
 
-    def __init__(self, monkeypatch, up_code=0, down_code=0, preflight_exc=None):
+    def __init__(self, monkeypatch, up_code=0, down_code=0, preflight_exc=None,
+                 up_log="compose up boom", ps_out=""):
         self.calls, self.events = [], []
         self.up_code = up_code
         self.down_code = down_code
+        self.up_log = up_log
+        self.ps_out = ps_out
 
         async def docker(*a, **k):
             self.calls.append(("docker",) + a)
             if a[0] == "compose" and "up" in a:
-                return self.up_code, "compose up boom"
+                return self.up_code, self.up_log
             if a[0] == "compose" and "down" in a:
                 return self.down_code, "compose down boom"
+            if a[0] == "ps":                       # ports.port_holder 的点名查询
+                return 0, self.ps_out
             return 0, "ok"
 
         async def preflight():
@@ -276,6 +281,20 @@ async def test_start_up_failure_sets_error(monkeypatch, sf, seed):
     assert seams.statuses == ["starting", "error"]
     assert seams.events[-1]["type"] == "dev_log" and "启动失败" in seams.events[-1]["line"]
     assert await _status_prod(sf, aid) == "error"
+
+
+async def test_start_prod_names_the_container_holding_the_port(monkeypatch, sf, seed):
+    """prod 起栈撞端口同样要点名占用者：删应用留下的 prod 栈占的是偶数端口，dev 侧修不到它。"""
+    wid, aid = await seed()
+    app = _app(aid)                                             # prod_port=8998
+    seams = Seams(monkeypatch, up_code=1, ps_out="zc-gone-prod-frontend-1\n",
+                  up_log="Error response from daemon: driver failed programming external "
+                         "connectivity on endpoint zcdemo-prod-frontend-1: Bind for 0.0.0.0:8998 "
+                         "failed: port is already allocated")
+    _cred_and_ensure(monkeypatch, seams)
+    with pytest.raises(DeployError) as ei:
+        await prod.prod_start(sf, app, notify=seams.notify)
+    assert "8998" in str(ei.value) and "zc-gone-prod-frontend-1" in str(ei.value)
 
 
 async def test_reconcile_marks_publishing_and_matches_docker(monkeypatch, sf, seed):
@@ -1291,6 +1310,96 @@ async def test_publish_wires_legacy_dockerfile_and_idempotent(monkeypatch, sf, s
     before = (custom / "Dockerfile").read_text(encoding="utf-8")
     assert prod._wire_dockerfile_proxy(custom / "Dockerfile") is False
     assert (custom / "Dockerfile").read_text(encoding="utf-8") == before
+
+
+# ---- ADR-0025：prod 构建期依赖镜像源的存量接线 ----
+
+_FASTAPI_BACKEND = ("FROM python:3.12-slim\nWORKDIR /srv\nCOPY requirements.txt .\n"
+                    "RUN pip install --no-cache-dir -r requirements.txt\n")
+_SB_BACKEND = ("# syntax=docker/dockerfile:1\nFROM maven:3.9-eclipse-temurin-17 AS build\n"
+               "WORKDIR /build\nRUN mvn -B package\n")
+
+
+def test_wire_dockerfile_mirror_inserts_after_the_consuming_stage(tmp_path):
+    """接线必须落在跑 pip 的那个 stage 之后（多 stage 文件插错 stage 等于没插）。"""
+    f = tmp_path / "Dockerfile"
+    f.write_text(_FASTAPI_BACKEND, encoding="utf-8")
+    assert prod._wire_dockerfile_mirror(f, "FROM PYTHON", "pip install",
+                                        "PIP_INDEX_URL", "https://pypi.org/simple") is True
+    lines = f.read_text(encoding="utf-8").splitlines()
+    assert lines[1] == "ARG PIP_INDEX_URL=https://pypi.org/simple"
+    assert lines[2] == "ENV PIP_INDEX_URL=${PIP_INDEX_URL}"
+    assert lines.index("RUN pip install --no-cache-dir -r requirements.txt") > 2
+
+
+def test_wire_dockerfile_mirror_is_idempotent_and_shape_conservative(tmp_path):
+    """三条放过：已接线（幂等）、形状不认识（非 python 基座）、没有 pip 消费方。"""
+    wired = tmp_path / "wired"
+    wired.mkdir()
+    f = wired / "Dockerfile"
+    f.write_text(_FASTAPI_BACKEND, encoding="utf-8")
+    assert prod._wire_dockerfile_mirror(f, "FROM PYTHON", "pip install",
+                                        "PIP_INDEX_URL", "https://pypi.org/simple") is True
+    once = f.read_text(encoding="utf-8")
+    assert prod._wire_dockerfile_mirror(f, "FROM PYTHON", "pip install",
+                                        "PIP_INDEX_URL", "https://pypi.org/simple") is False
+    assert f.read_text(encoding="utf-8") == once
+
+    maven = tmp_path / "maven"
+    maven.mkdir()
+    (maven / "Dockerfile").write_text(_SB_BACKEND, encoding="utf-8")
+    before = (maven / "Dockerfile").read_text(encoding="utf-8")
+    assert prod._wire_dockerfile_mirror(maven / "Dockerfile", "FROM PYTHON", "pip install",
+                                        "PIP_INDEX_URL", "https://pypi.org/simple") is False
+    assert (maven / "Dockerfile").read_text(encoding="utf-8") == before
+
+    nopip = tmp_path / "nopip"
+    nopip.mkdir()
+    (nopip / "Dockerfile").write_text("FROM python:3.12-slim\nCMD [\"sh\"]\n", encoding="utf-8")
+    assert prod._wire_dockerfile_mirror(nopip / "Dockerfile", "FROM PYTHON", "pip install",
+                                        "PIP_INDEX_URL", "https://pypi.org/simple") is False
+    assert not (tmp_path / "missing" / "Dockerfile").exists()
+    assert prod._wire_dockerfile_mirror(tmp_path / "missing" / "Dockerfile", "FROM PYTHON",
+                                        "pip install", "PIP_INDEX_URL", "https://pypi.org/simple") is False
+
+
+def test_ensure_prod_build_mirror_wires_both_stages_and_skips_maven(tmp_path):
+    """按栈无关的形状判定出手：fastapi 工程补 backend+frontend，SB 工程只补 frontend。"""
+    fa = tmp_path / "fa"
+    (fa / "backend").mkdir(parents=True)
+    (fa / "frontend").mkdir(parents=True)
+    (fa / "backend" / "Dockerfile").write_text(_FASTAPI_BACKEND, encoding="utf-8")
+    (fa / "frontend" / "Dockerfile").write_text(
+        "FROM node:20-alpine AS build\nWORKDIR /src\nRUN npm install\n", encoding="utf-8")
+    assert prod.ensure_prod_build_mirror(fa) is True
+    assert "ARG PIP_INDEX_URL=https://pypi.org/simple" in (fa / "backend" / "Dockerfile").read_text(encoding="utf-8")
+    fe = (fa / "frontend" / "Dockerfile").read_text(encoding="utf-8")
+    assert "ARG NPM_CONFIG_REGISTRY=https://registry.npmjs.org" in fe
+    assert "PIP_INDEX_URL" not in fe
+    assert prod.ensure_prod_build_mirror(fa) is False        # 幂等：第二轮零改动
+
+    sb = tmp_path / "sb"
+    (sb / "backend").mkdir(parents=True)
+    (sb / "frontend").mkdir(parents=True)
+    (sb / "backend" / "Dockerfile").write_text(_SB_BACKEND, encoding="utf-8")
+    (sb / "frontend" / "Dockerfile").write_text(
+        "FROM node:20-alpine AS build\nWORKDIR /src\nRUN npm ci\n", encoding="utf-8")
+    assert prod.ensure_prod_build_mirror(sb) is True
+    assert "PIP_INDEX_URL" not in (sb / "backend" / "Dockerfile").read_text(encoding="utf-8")
+    assert "NPM_CONFIG_REGISTRY" in (sb / "frontend" / "Dockerfile").read_text(encoding="utf-8")
+
+
+async def test_publish_wires_build_mirror_and_reports_it(monkeypatch, sf, seed, pub_root):
+    """存量应用在 preflight 就被补上接线，并播报一条补齐事件（与生产反代补齐同构）。"""
+    (pub_root / "backend").mkdir()
+    (pub_root / "backend" / "Dockerfile").write_text(_FASTAPI_BACKEND, encoding="utf-8")
+    wid, aid = await seed(slug="zcpub", prod_port=8982, dev_port=8983)
+    seams = PubSeams(monkeypatch, pub_root)
+
+    await prod.publish(sf, _pub_app(aid), notify=seams.notify, force=True)
+
+    assert "ARG PIP_INDEX_URL=" in (pub_root / "backend" / "Dockerfile").read_text(encoding="utf-8")
+    assert any("镜像源接线" in ln for ln in seams.logs)
 
 
 async def test_publish_survives_readme_and_cleanup_tail_failures(monkeypatch, sf, seed, pub_root):

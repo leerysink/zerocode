@@ -1320,6 +1320,7 @@ bash apply-init.sh                                 # 新表自动建上，既有
 | 应用栈起不来、报路径不存在 | 部署根与容器内路径不一致（ADR-0013）：核对本目录是否就在 `{deploy_root}` |
 | 发布后新表/新列没出现 | 忘了跑 `bash apply-init.sh`——镜像里没有 changelog，backend 不会自己补 schema |
 | 拉镜像超时 | 服务器访问不了 Docker Hub：配 registry mirror 后 `docker compose up -d --build` 重试 |
+| 发布报 `docker compose -f …prod-compose.yml… 超时（600s）`、记账停在 build 步 | 应用的 prod 镜像要在**构建期**装依赖（`pip install` / `npm install`），境内机直连官方源会等到超时——dev 预览正常不代表发布能过，两条通道不同。重打包时给 `--pypi-mirror` 与 `--npm-registry`，平台会把同一份源经 `build.args` 注进每个应用的 prod 构建（ADR-0025）；`deploy.build_timeout` 调大只是把 10 分钟换成 30 分钟，不是修法 |
 | 控制台里应用地址点进去全 404 | 逐项核对：① 网关起了吗（`docker compose -f gateway/docker-compose.yml ps`）；② 平台 `.env` 与 `gateway/.env` 的域名是否一致；③ 应用 prod 是否 `running`（进没进 `gateway/routes/routes.json`）；④ 浏览器是否信任了自签 CA |
 | 网关容器起不来 / 反复重启 | `docker compose -f gateway/docker-compose.yml logs gateway`：多为 `gateway/certs/gateway.crt|key` 缺失，或 80/443 被占用 |
 | 发布成功但域名仍是 404 | 检查 `{deploy_root}/gateway/routes/routes.json` 里有没有该 slug；没有就看 backend 日志里 `gateway routes.json 刷新失败` 一行（该失败只告警、不阻断发布） |

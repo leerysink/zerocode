@@ -254,8 +254,10 @@ build-output 里的单一 SQL 交付物：由 `changelog/V*.sql` 按日期顺序
 registry（这两项收**完整 http(s) 地址**）。默认全部留空——不给时交付物逐字节不变。apt 只作用于镜像
 构建期，因此**不进容器 env**；PyPI / npm 以同名变量贯通三段（打包参数 → compose 的 `${VAR:-打包值}`
 → 平台转注进应用 dev 栈），运维在服务器 `.env` 里改一次即长期生效。给不给运行期覆盖位的判据是「有没有
-运行期消费方」：部署根是反例（三处同源，所以钉死）。prod 栈不注入——compose 的 `environment:` 对
-`build:` 无效（ADR-0017）。
+运行期消费方」：部署根是反例（三处同源，所以钉死）。prod 栈的 `pip install` / `npm install` 跑在构建
+容器里，`environment:` 对它无效，因此 prod 走 **build args**（`build.args` + 应用 Dockerfile 的
+`ARG`/`ENV`，默认值是官方源）——同一份打包参数喂两条通道（ADR-0017 / ADR-0025）。Maven 仓库镜像
+仍是缺口：大型栈后端的 prod 构建没有换源位。
 
 ## 聊天附件（chat attachment）
 

@@ -18,6 +18,7 @@ from app.deploy.compose import ensure_deploy_files
 from app.deploy.errors import DeployError
 from app.deploy.engine import (preflight_docker, _app_root, _compose_meta, _notify,
                                LOG_PREFIX)
+from app.deploy.ports import explain_start_failure
 from app.deploy.provision import read_cred, provision_env
 from app.deploy.settings import deploy_cfg, health_timeout, build_timeout, preview_probe_host, preview_url
 from app.deploy.sqlrun import run_sqlchange
@@ -129,7 +130,7 @@ async def prod_start(sf, app: dict, notify=None) -> dict:
         await _step(app_id, notify, f"→ docker compose up -d 启动 prod 栈（版本 {cur}）")
         code, log = await _docker(*_prod_compose_args(root), "up", "-d", cwd=str(root))
         if code != 0:
-            raise DeployError(f"正式栈启动失败:\n{log[-800:]}")
+            raise DeployError(f"正式栈启动失败: {await explain_start_failure(log, _docker)}")
         timeout = health_timeout(await deploy_cfg(sf), app.get("stack", ""))
         ok, checks = await wait_prod_health(root, _prod_port(app), timeout, app.get("stack", ""))
         if not ok:
@@ -292,6 +293,52 @@ async def _ensure_prod_proxy_conf(root: Path, stack: str = "vue3-fastapi") -> bo
     return patched
 
 
+# prod 构建期的依赖镜像源接线（ADR-0025 存量半边）：(目录, 认得的基座前缀, 安装指令线索,
+# build arg 名, 官方默认源)。线索全小写，比对时对整行 lower()。
+_MIRROR_WIRES = (
+    ("backend", "FROM PYTHON", "pip install", "PIP_INDEX_URL", "https://pypi.org/simple"),
+    ("frontend", "FROM NODE", "npm ", "NPM_CONFIG_REGISTRY", "https://registry.npmjs.org"),
+)
+
+
+def _wire_dockerfile_mirror(dockerfile: Path, from_prefix: str, install_hint: str,
+                            arg: str, default: str) -> bool:
+    """存量应用的 Dockerfile 补 `ARG` + `ENV` 两行，让 prod 构建期的 build args 有消费方（幂等）。
+
+    与 `_wire_dockerfile_proxy` 同一条保守纪律，只认平台模板形状：指定基座 + 真有那条安装指令。
+    三种情形原样放过且不报错——文件不在（栈没这个构件）、已带该 ARG（应用自己接过，不重复也不覆盖）、
+    形状不认识（如大型栈后端的 maven 基座：pip 源对它没有消费方）。
+    插在基座 FROM 行之后而不是文件末尾：多 stage 文件里只有跑安装的那个 stage 需要它。
+    """
+    if not dockerfile.is_file():
+        return False
+    lines = dockerfile.read_text(encoding="utf-8").splitlines()
+    if any(arg in ln for ln in lines):
+        return False
+    if not any(install_hint in ln.lower() for ln in lines):
+        return False
+    for i, ln in enumerate(lines):
+        if ln.strip().upper().startswith(from_prefix):
+            lines[i + 1:i + 1] = [f"ARG {arg}={default}", f"ENV {arg}=${{{arg}}}"]
+            dockerfile.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="")
+            return True
+    return False
+
+
+def ensure_prod_build_mirror(root: Path) -> bool:
+    """按形状给存量应用的 backend/frontend Dockerfile 补镜像源接线，任一发生即 True。
+
+    与镜像源本身是否配置无关：模板里的 ARG 默认值就是官方源，所以没配镜像源的部署补了也零行为
+    变化，等运维哪天设上变量，存量应用不必再等一次回填。
+    """
+    patched = False
+    for rel, prefix, hint, arg, default in _MIRROR_WIRES:
+        # 不用 any(生成器表达式)：短路会把后半边的接线跳过，两个 stage 都得补
+        if _wire_dockerfile_mirror(root / rel / "Dockerfile", prefix, hint, arg, default):
+            patched = True
+    return patched
+
+
 def _wire_dockerfile_proxy(dockerfile: Path) -> bool:
     """M1 存量 frontend/Dockerfile 缺 `COPY nginx.conf`：在 nginx 基座 FROM 行后补一行（幂等）。
 
@@ -361,6 +408,8 @@ async def publish(sf, app: dict, notify=None, *, force: bool = False,
             raise DeployError("app.json 缺失，无法发布")
         if await _ensure_prod_proxy_conf(root, app.get("stack") or "vue3-fastapi"):
             await _step(app_id, notify, "✓ 已为存量应用补齐 frontend 生产反代（nginx.conf / Dockerfile COPY 接线）")
+        if ensure_prod_build_mirror(root):
+            await _step(app_id, notify, "✓ 已为存量应用补齐 prod 构建期依赖镜像源接线（Dockerfile ARG/ENV）")
         # 1.x dev/prod 结构等价校验（P1 止血；并入 preflight，不改步序）：
         #     dev 实际结构必须等于 fold(sqlchange 文件)，否则视为漂移，硬阻断发布。
         _skip_verify = str((await deploy_cfg(sf)).get("deploy.skip_schema_parity", "")).lower() in ("1", "true", "yes")
@@ -429,7 +478,7 @@ async def publish(sf, app: dict, notify=None, *, force: bool = False,
         code, log = await _docker("compose", "-f", compose_file, "up", "-d", cwd=str(root),
                                   on_line=blog)
         if code != 0:
-            raise DeployError(f"切换新版本失败:\n{log[-800:]}")
+            raise DeployError(f"切换新版本失败: {await explain_start_failure(log, _docker)}")
         await _step_ev(app_id, notify, rst, "deploy", "ok")
         # 6 health：失败自动回退旧 tag（04 §4.3 / S-04-2）——程序回退，数据库永不回滚
         await _step_ev(app_id, notify, rst, "health", "running")
@@ -579,7 +628,7 @@ async def rollback(sf, app: dict, version: str, notify=None) -> dict:
         ensure_deploy_files(root, app, {"dev": cred_dev, "prod": cred}, version=version)
         code, log = await _docker(*_prod_compose_args(root), "up", "-d", cwd=str(root))
         if code != 0:
-            raise DeployError(f"回滚起栈失败:\n{log[-800:]}")
+            raise DeployError(f"回滚起栈失败: {await explain_start_failure(log, _docker)}")
         timeout = health_timeout(await deploy_cfg(sf), app.get("stack", ""))
         ok, checks = await wait_prod_health(root, _prod_port(app), timeout, app.get("stack", ""))
         async with sf() as s:
