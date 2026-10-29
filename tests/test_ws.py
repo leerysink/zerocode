@@ -725,6 +725,12 @@ def test_ws_image_steering_gate_uses_run_model_not_latest_default(client, monkey
                 break
 
 
+# 四个预览默认值键（`app_config` 的键名）：ws.py 的 setdefault 与下面两条用例共用同一份名单，
+# 默认值的**数值**只在 `preview_tools` 的 DEFAULT_* 常量里有一份字面量
+_PREVIEW_CONFIG_KEYS = ("agent.preview_wait_seconds", "agent.preview_log_lines",
+                        "agent.preview_max_restarts", "agent.preview_confirm_running")
+
+
 def test_ws_injects_deploy_hub_and_task_table(client, monkeypatch):
     """接线身份断言：runner 拿到的必须是 app.state 上那**同一个** hub 与任务表。
 
@@ -733,7 +739,22 @@ def test_ws_injects_deploy_hub_and_task_table(client, monkeypatch):
     所以这里钉的是身份（is），不是「非 None」。
     """
     import app.api.ws as ws_module
+    import app.agent.preview_tools as pt
     captured = {}
+
+    # 四个预览默认值必须由 ws.py 的 setdefault 补出来，不能让共享开发库 zerocode 里
+    # 管理员在设置页写过的值替它们说话（`app_config` 不在 conftest 的 TRUNCATE 名单里，
+    # 读库的断言会因环境而红）。桩包一层真实现、再 pop 掉这四个键：断言打的正是
+    # 「库里没存这个键时 setdefault 补了什么」这条路径本身。
+    real_get_all = ws_module.config_service.get_all
+
+    async def defaults_stripped(session, owner_user_id=None):
+        cfg = await real_get_all(session, owner_user_id=owner_user_id)
+        for key in _PREVIEW_CONFIG_KEYS:
+            cfg.pop(key, None)
+        return cfg
+
+    monkeypatch.setattr(ws_module.config_service, "get_all", defaults_stripped)
 
     class Spy:
         def __init__(self, sf, llm, config_provider, send, ask, confirm, pop_pending=None,
@@ -762,12 +783,15 @@ def test_ws_injects_deploy_hub_and_task_table(client, monkeypatch):
 
     assert captured["hub"] is client.app.state.deploy_hub
     assert captured["tasks"] is client.app.state.dev_tasks
-    for key, default in (("agent.preview_wait_seconds", 240), ("agent.preview_log_lines", 80),
-                         ("agent.preview_max_restarts", 3), ("agent.preview_confirm_running", True)):
-        assert captured["cfg"][key] == default
-    # 字面量 True 而非真值：`cfg.get(key) or True` 在这行仍是 True，所以这条开关关不掉的 bug
-    # 要靠 setdefault 的实现本身守住（库里存了 false 就以库为准）
-    assert captured["cfg"]["agent.preview_confirm_running"] is True
+    # 断言引用 `preview_tools` 的常量而不是字面量：默认值只该有一份字面量，
+    # ws.py 的 setdefault 与 build_preview_prompt 的 system 文案都必须读同一个来源（改常量时
+    # 若 ws.py 还留着旧数字，模型先被骗）
+    assert captured["cfg"]["agent.preview_wait_seconds"] == pt.DEFAULT_WAIT_SECONDS
+    assert captured["cfg"]["agent.preview_log_lines"] == pt.DEFAULT_LOG_LINES
+    assert captured["cfg"]["agent.preview_max_restarts"] == pt.DEFAULT_MAX_RESTARTS
+    assert captured["cfg"]["agent.preview_confirm_running"] is pt.DEFAULT_CONFIRM_RUNNING
+    # 用 `is`：`cfg.get(key) or DEFAULT_CONFIRM_RUNNING` 在 `==` 下照样通过，而「吃掉库里的 false」
+    # 正是真值判断造成的——那条 bug 的铁证是下面「库里 false 能关掉确认」的用例
 
 
 def test_ws_confirm_switch_can_be_turned_off_from_config(client, monkeypatch):
@@ -777,11 +801,16 @@ def test_ws_confirm_switch_can_be_turned_off_from_config(client, monkeypatch):
     模块属性，打桩它的 get_all 就够了；包一层真实现，免得 llm.* 缺失让 resolve_model 先炸。
     """
     import app.api.ws as ws_module
+    import app.agent.preview_tools as pt
     real_get_all = ws_module.config_service.get_all
     captured = {}
 
     async def fake_get_all(session, owner_user_id=None):
         cfg = await real_get_all(session, owner_user_id=owner_user_id)
+        # 先把四个键从库里抹掉：这条用例要证的是「库里存 false → 以库为准」，
+        # 而其余三个默认值必须来自 ws.py 的 setdefault，不能来自共享开发库里管理员写过的值
+        for key in _PREVIEW_CONFIG_KEYS:
+            cfg.pop(key, None)
         cfg["agent.preview_confirm_running"] = False      # 等价于管理员在库里把开关拧到 off
         return cfg
 
@@ -812,4 +841,4 @@ def test_ws_confirm_switch_can_be_turned_off_from_config(client, monkeypatch):
         assert seen, "runner 的 run 没跑起来（接线断在更前面）"
 
     assert captured["cfg"]["agent.preview_confirm_running"] is False
-    assert captured["cfg"]["agent.preview_wait_seconds"] == 240      # 其余键仍取代码默认值
+    assert captured["cfg"]["agent.preview_wait_seconds"] == pt.DEFAULT_WAIT_SECONDS  # 其余键取代码默认值

@@ -26,6 +26,8 @@ from sqlalchemy import text as _sql
 from app.agent.llm import OpenAICompatLLM
 from app.agent.loop import AgentRunner
 from app.agent.model_resolver import resolve_model
+from app.agent.preview_tools import (DEFAULT_CONFIRM_RUNNING, DEFAULT_LOG_LINES,
+                                     DEFAULT_MAX_RESTARTS, DEFAULT_WAIT_SECONDS)
 from app.services import attachment_service
 from app.services import compaction_service
 from app.services import config_service
@@ -113,12 +115,15 @@ async def ws_chat(ws: WebSocket, session_id: int):
                 {"i": session_id})).scalar()
             cfg = await config_service.get_all(s, owner_user_id=uid)
         # 预览工具的平台级默认值（规格 2026-10-29 §5.9）：与 agent.max_tool_rounds 同一读法——
-        # 默认值写在代码里，库里存了就以库为准。preview_confirm_running 默认 True 走**字面量**，
-        # 不能写成 `cfg.get(key) or default`：库里的 JSON false 会被 `or` 吃掉，等于这个开关关不掉
-        cfg.setdefault("agent.preview_wait_seconds", 240)
-        cfg.setdefault("agent.preview_log_lines", 80)
-        cfg.setdefault("agent.preview_max_restarts", 3)
-        cfg.setdefault("agent.preview_confirm_running", True)
+        # 库里存了就以库为准，没存才补代码默认值。默认值只有 `preview_tools` 的 DEFAULT_* 一份字面量：
+        # `build_preview_prompt` 会把 DEFAULT_WAIT_SECONDS 写进 system 文案，这里再抄一遍数字的话，
+        # 改常量时真正生效的仍是 ws 这份 setdefault，而模型读到的是旧数字（先被骗的是模型）
+        cfg.setdefault("agent.preview_wait_seconds", DEFAULT_WAIT_SECONDS)
+        cfg.setdefault("agent.preview_log_lines", DEFAULT_LOG_LINES)
+        cfg.setdefault("agent.preview_max_restarts", DEFAULT_MAX_RESTARTS)
+        # 用 setdefault 而不是 `cfg.get(key) or DEFAULT_CONFIRM_RUNNING`：后者会把库里 JSON 的
+        # false 当成「没有值」吃掉，等于这个「中断运行中的预览要先确认」的开关永远关不掉
+        cfg.setdefault("agent.preview_confirm_running", DEFAULT_CONFIRM_RUNNING)
         return cfg
 
     def llm_factory(cfg, model_cfg=None):
