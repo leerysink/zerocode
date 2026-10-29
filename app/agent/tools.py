@@ -1,7 +1,9 @@
-import dataclasses, difflib, json, os
+import asyncio, dataclasses, difflib, json, os
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 from sqlalchemy import text
+
+from app.agent.llm import PREVIEW_TOOL_NAMES
 
 MAX_READ_BYTES = 200 * 1024
 BINARY_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".pdf", ".zip", ".gz", ".exe", ".dll", ".so", ".bin", ".db", ".sqlite", ".mp3", ".mp4"}
@@ -70,6 +72,14 @@ class ToolContext:
     session_factory: Any
     send: Callable[[dict], Awaitable[None]]
     skills_root: Path | None = None  # 该用户技能母本根（受控读面）；None = 无技能读面，存量调用不受影响
+    # ---- 预览工具（规格 docs/specs/2026-10-29-agent-preview-tools.md §5）----
+    # 全部带默认值：非应用工作区与既有构造点（loop 之外的测试）一律不受影响。
+    app: dict | None = None          # run 开始时解析出的应用行；None = 预览工具不挂载
+    cfg: dict = dataclasses.field(default_factory=dict)          # 本轮配置快照（agent.preview_* 阈值）
+    cancel: asyncio.Event | None = None                          # 本轮取消信号：等待循环据此尽快返回
+    deploy_hub: Any = None           # DeployHub：订阅 dev_log/dev_status 转成聊天进度
+    deploy_tasks: dict = dataclasses.field(default_factory=dict)  # app.state.dev_tasks（与 REST 共用同一张表）
+    run_state: dict = dataclasses.field(default_factory=dict)     # 单次 run 的计数（preview_restarts），不落库
 
 def _unified_diff(path: str, before: str, after: str) -> str:
     return "".join(difflib.unified_diff(
@@ -109,7 +119,13 @@ def _memory_target_id(args: dict):
         raise ToolError("memory_write 的 update / delete 必须给出记忆 id（create 返回的字符串 id）")
     return raw
 
-async def execute_tool(ctx: ToolContext, name: str, args: dict) -> dict:
+async def execute_tool(ctx: ToolContext, name: str, args: dict, *, confirmed: bool = False) -> dict:
+    if name in PREVIEW_TOOL_NAMES:
+        # 惰性 import：preview_tools 只读 ctx 的字段、刻意不 import 本模块（否则成环）；
+        # 预览工具的失败一律是**正常结果**（{"ok": False, "error": ...}），不抛 ToolError——
+        # 模型需要读到「Docker 没开」「已有部署任务」这类可行动的原因并向用户解释。
+        from app.agent.preview_tools import run_preview_tool
+        return await run_preview_tool(ctx, name, args, confirmed=confirmed)
     if name == "list_dir":
         d = resolve_in_workspace(ctx.root, args.get("path"))
         if not d.is_dir():

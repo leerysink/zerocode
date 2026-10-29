@@ -1029,3 +1029,48 @@ async def test_preview_prompt_stack_specific_lines():
     assert "刷新即可" in pt.build_preview_prompt("static")
     assert "刷新即可" in pt.build_preview_prompt("vue3-node")
     assert "</preview>" in pt.build_preview_prompt("unknown-stack")   # 未知栈仍有基线指引
+
+# ---------- execute_tool 分派与 ToolContext 契约 ----------
+
+async def test_execute_tool_routes_the_three_preview_names(monkeypatch, tmp_path):
+    """分派是惰性的：preview_tools 不 import tools（会成环），tools 在分支里 import 它。"""
+    from app.agent import preview_tools as pt
+    from app.agent.tools import ToolContext, execute_tool
+    calls = []
+
+    async def fake(ctx, name, args, *, confirmed=False):
+        calls.append((name, args, confirmed))
+        return {"ok": True, "name": name}
+
+    monkeypatch.setattr(pt, "run_preview_tool", fake)
+    ctx = ToolContext(root=tmp_path, session_id=1, session_factory=None,
+                      send=lambda ev: asyncio.sleep(0))
+    for name in ("preview_status", "preview_logs", "preview_restart"):
+        assert await execute_tool(ctx, name, {"x": 1}, confirmed=True) == {"ok": True, "name": name}
+    assert calls == [("preview_status", {"x": 1}, True), ("preview_logs", {"x": 1}, True),
+                     ("preview_restart", {"x": 1}, True)]
+
+
+async def test_preview_context_fields_default_safely_and_are_not_shared(tmp_path):
+    from app.agent.tools import ToolContext
+    ctx = ToolContext(root=tmp_path, session_id=1, session_factory=None, send=None)
+    assert ctx.app is None and ctx.cfg == {} and ctx.cancel is None
+    assert ctx.deploy_hub is None and ctx.deploy_tasks == {} and ctx.run_state == {}
+    other = ToolContext(root=tmp_path, session_id=2, session_factory=None, send=None)
+    other.run_state["preview_restarts"] = 1
+    other.deploy_tasks[9] = "x"
+    assert ctx.run_state == {} and ctx.deploy_tasks == {}    # dataclass 可变默认值的经典坑
+
+
+async def test_no_command_execution_tool_exists(tmp_path):
+    """红线：动作面只有三个预览工具，没有任何 shell/命令入口（规格 §12）。"""
+    from app.agent.llm import PREVIEW_TOOL_NAMES, TOOLS
+    from app.agent.tools import ToolContext, ToolError, execute_tool
+    names = {t["function"]["name"] for t in TOOLS} | set(PREVIEW_TOOL_NAMES)
+    assert names == {"list_dir", "read_file", "write_file", "edit_file", "ask_user",
+                     "todo_write", "memory_write",
+                     "preview_status", "preview_logs", "preview_restart"}
+    ctx = ToolContext(root=tmp_path, session_id=1, session_factory=None, send=None)
+    for forbidden in ("run_shell", "exec", "terminal", "run_command", "preview_stop"):
+        with pytest.raises(ToolError):
+            await execute_tool(ctx, forbidden, {})
