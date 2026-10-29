@@ -47,6 +47,13 @@ function isPreviewTool(m) {
   return PREVIEW_TOOL_NAMES.includes(toolNameOf(m))
 }
 
+// 一次调用在实时流里是两条 message（tool_call 行 + tool_result 行）：
+// 只有「已出结果」或「它就是最后一条（仍在进行）」才渲染预览卡，
+// 否则结果到达后那张进行中的卡会永久停在「正在重启预览…」，而刷新后又只剩一张
+function isPreviewCard(m, i) {
+  return isPreviewTool(m) && !!(m.result || m.tool_result || i === props.messages.length - 1)
+}
+
 // 进度只给「消息流最后一条、还没有结果」的那张卡：历史卡片复活进度条会让人以为又在重启
 function liveProgress(m, i) {
   if (m.result || m.tool_result) return null
@@ -123,11 +130,12 @@ onMounted(scrollToBottom)
         <div v-else-if="m.role === 'notice'" class="zc-msg is-notice">
           <span class="zc-notice-text">{{ m.content }}</span>
         </div>
-        <!-- tool：todo_write 渲染任务卡；preview_* 渲染预览卡；其余落回通用折叠块。
+        <!-- tool：todo_write 渲染任务卡；preview_* 渲染预览卡（还要过 isPreviewCard 的闸——实时流里
+             call 行与 result 行是两条 message，只给「有结果」或「仍在进行」的那条画卡）；其余落回通用折叠块。
              实时消息字段为 name/args/result，历史消息为 tool_name/tool_result，两者都认。 -->
         <div v-else-if="m.role === 'tool'" class="zc-msg is-tool">
           <TodoCard v-if="m.name === 'todo_write' && m.args && m.args.todos" :todos="m.args.todos" />
-          <PreviewCard v-else-if="isPreviewTool(m)" :msg="m" :progress="liveProgress(m, i)" />
+          <PreviewCard v-else-if="isPreviewCard(m, i)" :msg="m" :progress="liveProgress(m, i)" />
           <ToolCallBlock v-else :msg="m" />
         </div>
         <!-- error：红色气泡 + 尾部重试（重发最后一条 user 消息） -->

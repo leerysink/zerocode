@@ -244,7 +244,11 @@ describe('chat store 图片发送（票 001/003/006）', () => {
     setActivePinia(createPinia())
     const s = useChatStore()
     s.connect = vi.fn()
+    // tool_progress 是临时事件：切会话/重开时不得把它带过去。openSession 的清理点里
+    // 只有这一条此前没有断言（删掉 `this.toolProgress = null` 会全绿），所以在这里钉住
+    s.toolProgress = { name: 'preview_restart', line: 'x' }
     await s.openSession(5, 2)
+    expect(s.toolProgress).toBe(null)
     expect(s.effectiveModel.model).toBe('deepseek-chat')
     expect(s.visionSupported).toBe(false)
     expect(s.messages[0]).toMatchObject({ role: 'user', content: '看图', queued: true, attachments: [att] })

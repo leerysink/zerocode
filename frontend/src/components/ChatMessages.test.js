@@ -99,6 +99,21 @@ describe('预览工具在消息流里的渲染', () => {
     expect(w.find('.zc-preview').exists()).toBe(false)
   })
 
+  it('实时流里一次调用只画一张预览卡（call 行不再长驻「进行中」）', () => {
+    // 后端 loop.py 把 tool_call 与 tool_result 分两次下发 → store 里是两条 message。
+    // 闸门放过「有结果」与「最后一条（仍在进行）」，所以这里只有 result 行画卡；
+    // 去掉闸门会变成两张：call 行永久的「正在重启预览…／等待平台步骤…」+ 刷新后只剩一张
+    const w = mountMessages([
+      { role: 'tool', name: 'preview_restart', args: { wait_seconds: 240 } },
+      { role: 'tool', name: 'preview_restart',
+        result: { ok: true, status: 'running', healthy: true, url: 'http://10.0.0.5:8213' } },
+    ])
+    expect(w.findAll('.zc-preview').length).toBe(1)
+    expect(w.text()).not.toContain('正在重启预览')
+    expect(w.text()).not.toContain('等待平台步骤')
+    expect(w.text()).toContain('预览已就绪')
+  })
+
   it('进行中的预览卡拿得到进度，且有结果后不再拿', () => {
     setActivePinia(createPinia())
     const store = useChatStore()
@@ -155,13 +170,17 @@ describe('预览工具在消息流里的渲染', () => {
     expect(w.text()).not.toContain('起栈中')
   })
 
-  it('非最后一条的预览卡不挂进度（历史卡不复活）', () => {
+  it('非最后一条、又没结果的 call 行不画预览卡（历史卡不复活进度）', () => {
+    // I-1 的闸门让这一行落回通用折叠块——它与其它工具的 call 行同形，不再有「长驻进行中」的卡。
+    // 有结果的行即便不是最后一条仍然画卡（终态要看得见），那条由上面的「有结果后不再挂进度」守着；
+    // 于是 liveProgress 里的「最后一条」判断退化为纯防御：路由层已经保证不会画出不可能的形状
     const w = mountWithProgress(
       [{ role: 'tool', name: 'preview_restart', args: {} },
        { role: 'assistant', content: '已经起好了' }],
       { name: 'preview_restart', line: '[zerocode] → 起栈中' },
     )
-    expect(w.text()).toContain('正在重启预览')
+    expect(w.findAll('.zc-preview').length).toBe(0)
+    expect(w.text()).not.toContain('正在重启预览')
     expect(w.text()).not.toContain('起栈中')
   })
 
