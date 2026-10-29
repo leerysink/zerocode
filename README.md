@@ -173,10 +173,30 @@ tests/       后端测试，与 app/ 分层对应
 
 ---
 
+## 仓库与镜像
+
+| 位置 | 地址 | 角色 |
+| --- | --- | --- |
+| Gitee | <https://gitee.com/leerys/zerocode.git> | **主仓**，日常提交、分支与 Issue 都在这里 |
+| GitHub | <https://github.com/leerysink/zerocode> | 完整历史镜像 |
+
+两边分支一一对应，只有一处命名差异：主仓的默认分支 `master` 对应 GitHub 的 `main`（GitHub 建仓时的默认分支名习惯），`feature/*` 分支同名。
+
+GitHub 侧请只当作镜像读，**不要直接在 GitHub 上提交**——一旦它多出主仓没有的提交，主仓的 `master` 就不再能快进推上去，得先手工把那段提交回收进主仓才能继续同步。日常同步用显式 refspec：
+
+```bash
+git remote add github git@github.com:leerysink/zerocode.git   # 只需一次
+git push github master:refs/heads/main                        # 每次主仓更新后
+```
+
+镜像只反映**已提交**的内容，本机未提交的改动不会跟过去。
+
+---
+
 <div align="center">
 
 **ZeroCode —— 让每个有想法的人，都能把软件做出来。**
 
-在线体验 <http://159.75.185.70:8100/>（`tsadmin` / `tsadmin`） · 仓库 <https://gitee.com/leerys/zerocode.git>
+在线体验 <http://159.75.185.70:8100/>（`tsadmin` / `tsadmin`） · 主仓 <https://gitee.com/leerys/zerocode.git> · GitHub 镜像 <https://github.com/leerysink/zerocode>
 
 </div>
