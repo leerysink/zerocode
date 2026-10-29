@@ -401,3 +401,306 @@ async def test_skill_injection_is_user_scoped(test_engine, tmp_path):
     c = await _system_content(test_engine, sf, sid)
     assert "Alice技能" in c
     assert "Bob技能" not in c
+
+
+# ---- 预览工具接线（规格 docs/specs/2026-10-29-agent-preview-tools.md §5.1 / §5.6 / §8.1）----
+
+from app.deploy.hub import DeployHub
+
+
+async def mk_app_session(test_engine, tmp_path, *, stack="vue3-fastapi", status="stopped",
+                         slug="pvloop", dev_port=8271, prod_port=8270):
+    """workspace + app_project + chat_session 三行一起建，返回 (sid, app_id, sf)。
+
+    owner 一律留 NULL：与 test_agent_loop.py 既有会话同形（WS 所有权校验不在本文件的靶心上），
+    `resolve_session_app` 传 owner=None 时不加过滤，正好命中。
+    """
+    sf = make_session_factory(test_engine)
+    async with sf() as s:
+        wid = (await s.execute(sql(
+            "INSERT INTO workspace (name, root_path) VALUES ('pv', :p) RETURNING id"),
+            {"p": str(tmp_path)})).scalar()
+        aid = (await s.execute(sql(
+            "INSERT INTO app_project (workspace_id, name, slug, scale, stack, prod_port, dev_port) "
+            "VALUES (:w, '预览应用', :sl, 'small', :st, :pp, :dp) RETURNING id"),
+            {"w": wid, "sl": slug, "st": stack, "pp": prod_port, "dp": dev_port})).scalar()
+        sid = (await s.execute(sql(
+            "INSERT INTO chat_session (workspace_id) VALUES (:w) RETURNING id"),
+            {"w": wid})).scalar()
+        if status != "stopped":
+            await s.execute(sql("UPDATE app_project SET status_dev=:st WHERE id=:i"),
+                            {"st": status, "i": aid})
+        await s.commit()
+    return sid, aid, sf
+
+
+def preview_cfg(**over):
+    async def _p():
+        base = {"agent.write_confirm": False, "agent.ask_timeout_seconds": 0,
+                "agent.max_tool_rounds": 10, "agent.history_window": 40}
+        base.update(over)
+        return base
+    return _p
+
+
+def mk_runner(sf, llm, rec, *, confirm=None, hub=None, tasks=None, cfg=None):
+    """带预览接线的 runner：hub/tasks 缺省 None（= 不接线），cfg 缺省平台默认那几键。
+
+    默认 confirm 用 `asyncio.sleep(0, True)` 而不是裸 `lambda: True`：`AgentRunner.confirm`
+    按契约是 awaitable（WS 侧传的是 `hub.confirm`），preview_restart 的确认分支会 `await` 它，
+    同步替身会在那里抛 TypeError 并被 run() 吞成 error 事件（工具结果就再也拿不到了）。
+    """
+    return AgentRunner(sf, llm, cfg or preview_cfg(), rec,
+                       lambda *a, **k: asyncio.sleep(0, None),
+                       confirm or (lambda *a, **k: asyncio.sleep(0, True)),
+                       deploy_hub=hub, dev_tasks=tasks)
+
+
+def tool_names(llm, round_index=0):
+    return [t["function"]["name"] for t in llm.received_tools[round_index]]
+
+
+@pytest.mark.asyncio
+async def test_preview_tools_mounted_only_for_app_workspace(test_engine, tmp_path):
+    sid, aid, sf = await mk_app_session(test_engine, tmp_path)
+    llm = ScriptedLLM([[delta("好"), *done("好了")]])
+    await mk_runner(sf, llm, Recorder()).run(sid, "起个预览", asyncio.Event())
+    assert tool_names(llm)[-3:] == ["preview_status", "preview_logs", "preview_restart"]
+    assert "<preview>" in llm.received[0][0]["content"]
+    assert "vue3-fastapi" in llm.received[0][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_no_preview_tools_without_app_row(test_engine, tmp_path):
+    """US-01：非应用工作区里模型根本看不到这三个工具（不是置灰，是不存在）。"""
+    sid = await mk_session(test_engine, tmp_path)
+    sf = make_session_factory(test_engine)
+    llm = ScriptedLLM([[delta("好"), *done("好了")]])
+    await mk_runner(sf, llm, Recorder()).run(sid, "起个预览", asyncio.Event())
+    names = tool_names(llm)
+    assert not any(n.startswith("preview_") for n in names)
+    assert "<preview>" not in llm.received[0][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_duplicate_workspace_binding_fails_closed_with_note(test_engine, tmp_path):
+    """US-01/§5.1：一个工作区绑了两个应用 → 不挂载工具，但 system 里给模型一句能转述的原因。"""
+    sid, aid, sf = await mk_app_session(test_engine, tmp_path)
+    async with sf() as s:
+        wid = (await s.execute(sql("SELECT workspace_id FROM app_project WHERE id=:i"),
+                               {"i": aid})).scalar()
+        await s.execute(sql(
+            "INSERT INTO app_project (workspace_id, name, slug, scale, stack, prod_port, dev_port) "
+            "VALUES (:w, '重复应用', 'pvloop2', 'small', 'vue3-fastapi', 8273, 8272)"), {"w": wid})
+        await s.commit()
+    llm = ScriptedLLM([[delta("好"), *done("好了")]])
+    await mk_runner(sf, llm, Recorder()).run(sid, "起个预览", asyncio.Event())
+    assert not any(n.startswith("preview_") for n in tool_names(llm))
+    assert "绑定了多个应用" in llm.received[0][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_preview_prompt_follows_the_stack(test_engine, tmp_path):
+    sid, aid, sf = await mk_app_session(test_engine, tmp_path, stack="vue3-springboot",
+                                        slug="pvloopj", dev_port=8275, prod_port=8274)
+    llm = ScriptedLLM([[delta("好"), *done("好了")]])
+    await mk_runner(sf, llm, Recorder()).run(sid, "改个后端", asyncio.Event())
+    c = llm.received[0][0]["content"]
+    assert "必须 preview_restart" in c and "uvicorn" not in c     # 按栈差异化，不串味
+    assert c.rstrip().endswith("</preview>")                      # 块在 system 尾部（契约/技能之后）
+
+
+@pytest.fixture
+def pv_seams(monkeypatch):
+    """预览重启链路的 Docker 侧替身：预检放行、探针 200、起栈像真引擎那样把终态写进库。"""
+    from app.deploy import engine as eng
+
+    async def preflight_ok():
+        return None
+
+    async def probe_ok(app, timeout=2):
+        return True, ""
+
+    async def start_ok(sf_, app, notify=None):
+        await eng._set_status(sf_, app["id"], "running")
+        if notify:
+            notify(app["id"], {"app_id": app["id"], "type": "dev_log",
+                               "line": "[zerocode] ✓ 预览已就绪"})
+        return {"status": "running"}
+
+    monkeypatch.setattr(eng, "preflight_docker", preflight_ok)
+    monkeypatch.setattr(eng, "probe_dev", probe_ok)
+    monkeypatch.setattr(eng, "start_dev", start_ok)
+    monkeypatch.setattr(eng, "restart_dev", start_ok)
+    return eng
+
+
+@pytest.mark.asyncio
+async def test_running_restart_asks_and_rejection_changes_nothing(test_engine, tmp_path, pv_seams):
+    """US-21：running 时先确认；拒绝则一次启停都不发生，模型收到「用户拒绝重启预览」。"""
+    sid, aid, sf = await mk_app_session(test_engine, tmp_path, status="running", slug="pvconf",
+                                        dev_port=8277, prod_port=8276)
+    rec, tasks = Recorder(), {}
+
+    async def reject(session_id, payload):
+        assert payload["tool"] == "preview_restart" and "预览应用" in payload["summary"]
+        return False
+
+    turns = [done(None, [tool_call("c1", "preview_restart")]), done("好，那不重启")]
+    await mk_runner(sf, ScriptedLLM(turns), rec, confirm=reject, hub=DeployHub(),
+                    tasks=tasks).run(sid, "重启一下", asyncio.Event())
+    tr = next(e for e in rec.events if e["type"] == "tool_result")
+    assert tr["result"]["ok"] is False and "用户拒绝重启预览" in tr["result"]["error"]
+    cr = next(e for e in rec.events if e["type"] == "confirm_request")
+    assert cr["tool"] == "preview_restart" and "正在运行" in cr["summary"]
+    assert tasks == {}                                     # 拒绝后没有任务被登记
+
+
+@pytest.mark.asyncio
+async def test_confirmed_restart_uses_the_shared_task_table(test_engine, tmp_path, pv_seams):
+    """US-24：Agent 起的栈登记在 `app.state.dev_tasks` 里——与用户手点「启动预览」同一张表。"""
+    sid, aid, sf = await mk_app_session(test_engine, tmp_path, status="running", slug="pvok",
+                                        dev_port=8279, prod_port=8278)
+    rec, tasks = Recorder(), {}
+    turns = [done(None, [tool_call("c1", "preview_restart", wait_seconds=5)]), done("已重启")]
+    await mk_runner(sf, ScriptedLLM(turns), rec, hub=DeployHub(), tasks=tasks).run(
+        sid, "重启", asyncio.Event())
+    tr = next(e for e in rec.events if e["type"] == "tool_result")
+    assert tr["result"]["ok"] is True and tr["result"]["status"] == "running"
+    assert tr["result"]["restarts_left"] == 2
+    assert aid in tasks and tasks[aid].done()
+
+
+@pytest.mark.asyncio
+async def test_confirm_switch_off_never_opens_a_dialog(test_engine, tmp_path, pv_seams):
+    sid, aid, sf = await mk_app_session(test_engine, tmp_path, status="running", slug="pvnc",
+                                        dev_port=8281, prod_port=8280)
+    rec, asked = Recorder(), []
+
+    async def never(session_id, payload):
+        asked.append(payload)
+        return True
+
+    turns = [done(None, [tool_call("c1", "preview_restart", wait_seconds=5)]), done("好")]
+    await mk_runner(sf, ScriptedLLM(turns), rec, confirm=never, hub=DeployHub(), tasks={},
+                    cfg=preview_cfg(**{"agent.preview_confirm_running": False})).run(
+        sid, "重启", asyncio.Event())
+    tr = next(e for e in rec.events if e["type"] == "tool_result")
+    assert tr["result"]["ok"] is True and asked == []
+    assert not any(e["type"] == "confirm_request" for e in rec.events)
+
+
+@pytest.mark.asyncio
+async def test_exhausted_cap_never_opens_a_dialog(test_engine, tmp_path, pv_seams):
+    """§5.6/§5.7：上限是**单次 run** 的——同一轮里连着两次重启，第二次既不弹确认也不起任务。
+
+    先问一次确认、再告诉他「次数用尽」是纯打扰，所以 `need_confirm` 里也带了次数判据。
+    """
+    sid, aid, sf = await mk_app_session(test_engine, tmp_path, status="running", slug="pvcap",
+                                        dev_port=8289, prod_port=8288)
+    rec, asked = Recorder(), []
+
+    async def always(session_id, payload):
+        asked.append(payload)
+        return True
+
+    turns = [done(None, [tool_call("c1", "preview_restart", wait_seconds=5)]),
+             done(None, [tool_call("c2", "preview_restart", wait_seconds=5)]),
+             done("好")]
+    await mk_runner(sf, ScriptedLLM(turns), rec, confirm=always, hub=DeployHub(), tasks={},
+                    cfg=preview_cfg(**{"agent.preview_max_restarts": 1})).run(
+        sid, "重启", asyncio.Event())
+    results = [e["result"] for e in rec.events if e["type"] == "tool_result"]
+    assert results[0]["ok"] is True and results[0]["restarts_left"] == 0
+    assert results[1]["ok"] is False and "已启动/重启预览 1 次" in results[1]["error"]
+    assert len(asked) == 1
+    assert len([e for e in rec.events if e["type"] == "confirm_request"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_stopped_start_never_opens_a_dialog(test_engine, tmp_path, pv_seams):
+    """US-21 的另一半：冷启动不中断任何人，不该弹确认。"""
+    sid, aid, sf = await mk_app_session(test_engine, tmp_path, slug="pvcold",
+                                        dev_port=8283, prod_port=8282)
+    rec = Recorder()
+    turns = [done(None, [tool_call("c1", "preview_restart", wait_seconds=5)]), done("好了")]
+    await mk_runner(sf, ScriptedLLM(turns), rec, hub=DeployHub(), tasks={}).run(
+        sid, "起预览", asyncio.Event())
+    assert not any(e["type"] == "confirm_request" for e in rec.events)
+    tr = next(e for e in rec.events if e["type"] == "tool_result")
+    assert tr["result"]["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_tool_progress_arrives_before_tool_result(test_engine, tmp_path, pv_seams):
+    """US-17/§8.1：进度是临时事件，但必须早于同一工具的结果到达，前端才画得出「正在重启」。"""
+    sid, aid, sf = await mk_app_session(test_engine, tmp_path, slug="pvprog",
+                                        dev_port=8285, prod_port=8284)
+    rec = Recorder()
+    turns = [done(None, [tool_call("c1", "preview_restart", wait_seconds=5)]), done("好了")]
+    await mk_runner(sf, ScriptedLLM(turns), rec, hub=DeployHub(), tasks={}).run(
+        sid, "起预览", asyncio.Event())
+    types = [e["type"] for e in rec.events]
+    assert "tool_progress" in types
+    assert types.index("tool_progress") < types.index("tool_result")
+    prog = next(e for e in rec.events if e["type"] == "tool_progress")
+    assert prog["name"] == "preview_restart" and prog["line"].startswith("[zerocode]")
+
+
+@pytest.mark.asyncio
+async def test_tool_context_carries_preview_wiring(test_engine, tmp_path, pv_seams, monkeypatch):
+    """ctx 注入是接线正确性的唯一靶心：应用行、配置、取消信号、hub、任务表都要到位。"""
+    from app.agent import preview_tools as pt
+    sid, aid, sf = await mk_app_session(test_engine, tmp_path, slug="pvctx",
+                                        dev_port=8287, prod_port=8286)
+    captured, hub, tasks = {}, DeployHub(), {}
+
+    async def fake(ctx, name, args, *, confirmed=False):
+        captured.update({"app_id": ctx.app["id"], "cfg": dict(ctx.cfg), "cancel": ctx.cancel,
+                         "hub": ctx.deploy_hub, "tasks": ctx.deploy_tasks,
+                         "run_state": ctx.run_state, "confirmed": confirmed, "name": name})
+        return {"ok": True}
+
+    monkeypatch.setattr(pt, "run_preview_tool", fake)
+    cancel = asyncio.Event()
+    turns = [done(None, [tool_call("c1", "preview_status")]), done("好")]
+    runner = mk_runner(sf, ScriptedLLM(turns), Recorder(), hub=hub, tasks=tasks,
+                       cfg=preview_cfg(**{"agent.preview_wait_seconds": 30}))
+    await runner.run(sid, "看看状态", cancel)
+    assert captured["app_id"] == aid and captured["name"] == "preview_status"
+    assert captured["hub"] is hub and captured["tasks"] is tasks and captured["cancel"] is cancel
+    assert captured["cfg"]["agent.preview_wait_seconds"] == 30
+    assert captured["run_state"] == {} and captured["confirmed"] is False
+
+
+@pytest.mark.asyncio
+async def test_pending_deploy_task_never_opens_a_dialog(test_engine, tmp_path, pv_seams):
+    """§5.6 的另一半「别白问一次」：任务表里有未完成任务时不发确认。
+
+    这种时候 handler 只会回并发提示（没起新栈），先让用户点一次确认再告诉他做不了是纯打扰。
+    这条同时钉住 `need_confirm` 读的是**共享**任务表：REST 那边（用户手点「启动预览」）起的
+    在途任务，Agent 这条链路也看得见——看不见就会双栈。
+    """
+    sid, aid, sf = await mk_app_session(test_engine, tmp_path, status="running", slug="pvbusy",
+                                        dev_port=8291, prod_port=8290)
+    rec, asked, tasks = Recorder(), [], {}
+    blocker = asyncio.ensure_future(asyncio.Event().wait())   # 永不完成：模拟在途的 REST 部署任务
+    tasks[aid] = blocker
+    try:
+        async def approve(session_id, payload):
+            asked.append(payload)
+            return True
+
+        turns = [done(None, [tool_call("c1", "preview_restart", wait_seconds=5)]), done("稍后再试")]
+        await mk_runner(sf, ScriptedLLM(turns), rec, confirm=approve, hub=DeployHub(),
+                        tasks=tasks).run(sid, "重启", asyncio.Event())
+        assert asked == []
+        assert not any(e["type"] == "confirm_request" for e in rec.events)
+        tr = next(e for e in rec.events if e["type"] == "tool_result")
+        assert tr["result"]["ok"] is False and "部署任务进行中" in tr["result"]["error"]
+    finally:
+        blocker.cancel()
+        try:
+            await blocker
+        except asyncio.CancelledError:
+            pass

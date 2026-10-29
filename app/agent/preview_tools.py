@@ -148,6 +148,27 @@ def confirm_required(ctx) -> bool:
                      DEFAULT_CONFIRM_RUNNING)
 
 
+def confirm_summary(app: dict) -> str:
+    """确认卡的人话摘要：说清「哪个应用、正在运行、重启会中断什么」，不给模型看参数 JSON。"""
+    name = app.get("name") or app.get("slug") or f"应用 #{app.get('id')}"
+    return f"应用「{name}」的 dev 预览正在运行，重启会中断正在进行的调试。确定重启？"
+
+
+def need_confirm(ctx, app: dict | None) -> bool:
+    """这次 preview_restart 要不要先问用户（§5.6）。
+
+    四个条件缺一不可，其中两个纯粹是「别白问一次」：已有部署任务时 handler 会直接回并发提示，
+    次数用尽时会直接回上限提示——先让用户点一次确认、再告诉他做不了，是纯打扰。
+    """
+    if not app or (app.get("status_dev") or "stopped") != "running":
+        return False
+    if not confirm_required(ctx):
+        return False
+    if pending_task(ctx, app["id"]) is not None:
+        return False
+    return _restarts_left(ctx) != 0
+
+
 def _max_restarts(cfg: dict | None) -> int:
     """单次 run 的启动/重启上限；`<=0` 表示不限（与超时参数 `<=0` 不限制的约定一致）。"""
     try:

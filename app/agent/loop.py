@@ -1,11 +1,15 @@
 """Agent 循环：流式对话 + 工具调度 + ask_user 挂起恢复 + 写入确认 + 取消。
 
-事件协议（send 下发）：token/tool_call/tool_result/file_change/message_done/error，
-另有 confirm_request（写入确认请求）、status（终态回执）、compaction_done（自动压缩完成）
-与 session_title（首条消息自动命名后的新标题，前端就地刷新侧栏）。
+事件协议（send 下发）：token/tool_call/tool_result/tool_progress/file_change/message_done/error，
+另有 confirm_request（写入或重启预览的确认请求）、status（终态回执）、compaction_done（自动压缩完成）
+与 session_title（首条消息自动命名后的新标题，前端就地刷新侧栏）。tool_progress 由预览工具经
+同一个 send 下发，临时、不落库。
 """
 import asyncio, datetime, inspect, itertools, json
+import logging
 from pathlib import Path
+from app.agent.preview_tools import (build_preview_prompt, confirm_summary, fetch_app,
+                                     need_confirm, resolve_session_app)
 from app.agent.prompts import build_system_prompt
 from app.agent.tools import ToolContext, ToolError, execute_tool
 from app.agent.mentions import expand_mentions
@@ -15,6 +19,8 @@ from app.services import memory_service as _mem
 from app.services.message_service import add_message
 from app.services.session_title_service import ensure_session_title
 from sqlalchemy import text
+
+logger = logging.getLogger(__name__)
 
 def _normalize_questions(args: dict) -> list[dict]:
     """新协议 questions 优先；兼容旧单题参数（question/options 字符串）。"""
@@ -28,7 +34,8 @@ def _normalize_questions(args: dict) -> list[dict]:
     raise ToolError("缺少 question(s)")
 
 class AgentRunner:
-    def __init__(self, session_factory, llm, config_provider, send, ask, confirm, pop_pending=None):
+    def __init__(self, session_factory, llm, config_provider, send, ask, confirm, pop_pending=None,
+                 deploy_hub=None, dev_tasks=None):
         self.sf = session_factory
         self.llm = llm
         self.get_config = config_provider
@@ -39,6 +46,10 @@ class AgentRunner:
         # 项为 {content, attachment_ids, client_msg_id}（兼容裸字符串）；
         # 缺省 None = 不支持插话（旧调用方与单测保持原签名可用）
         self.pop_pending = pop_pending
+        # 预览工具（规格 2026-10-29 §5.2）：DeployHub 与 REST 共用的部署任务表。
+        # 缺省 None = 不接线（既有调用方与单测保持原签名可用），此时工具仍可只读工作。
+        self.deploy_hub = deploy_hub
+        self.dev_tasks = dev_tasks if dev_tasks is not None else {}
         # 本轮历史已内联的图片原始字节合计（_history 构建时写入）：插话带图与历史共用
         # 同一份 MAX_INLINE_BYTES 预算，否则一次运行的内联总量可以越过上限
         self._inline_used = 0
@@ -79,6 +90,28 @@ class AgentRunner:
             return None
         from app.skills.library import skills_root
         return skills_root(uid)
+
+    async def _workspace_of(self, session_id: int) -> tuple[int | None, int | None]:
+        """会话所属工作区与其归属账号：预览工具的身份解析只认这两个值（模型给不出第三个）。"""
+        async with self.sf() as s:
+            row = (await s.execute(text(
+                "SELECT cs.workspace_id, w.owner_user_id FROM chat_session cs "
+                "JOIN workspace w ON w.id = cs.workspace_id WHERE cs.id = :i"),
+                {"i": session_id})).first()
+        return (row[0], row[1]) if row else (None, None)
+
+    async def _resolve_app(self, session_id: int) -> tuple[dict | None, str]:
+        """run 开始时解析一次应用身份，返回 `(app, note)`。
+
+        解析不到不是错误（普通工作区就没有应用）；解析出错也只记 warning——预览是增量能力，
+        不该让整轮对话失败。note 非空时是一句要注入 system 的说明（工作区绑定了多个应用：
+        fail closed，但要让模型能向用户解释为什么用不了）。
+        """
+        wid, uid = await self._workspace_of(session_id)
+        app, note = await resolve_session_app(self.sf, wid, owner_user_id=uid)
+        if note:
+            logger.warning("会话 %s 的预览工具未挂载：%s", session_id, note)
+        return app, note
 
     async def run(self, session_id: int, user_text: str, cancel: asyncio.Event,
                   attachment_ids: list[int] | None = None) -> str:
@@ -206,7 +239,7 @@ class AgentRunner:
         return llm
 
     async def _build_messages(self, session_id: int, root: Path, cfg: dict, send,
-                              user_text: str = "") -> list[dict]:
+                              user_text: str = "", preview: str | None = None) -> list[dict]:
         """自动压缩（阈值+最小新增双条件，thr=0 关闭）→ 摘要注入 system 尾部 → 水位后窗口消息。"""
         summary, wm = await _comp.latest(self.sf, session_id)
         rows = await _comp.rows_after(self.sf, session_id, wm)
@@ -222,7 +255,8 @@ class AgentRunner:
         from app.deploy.contract import build_app_contract
         skills = await self._enabled_skills_of(session_id)
         system_text = build_system_prompt(str(root), datetime.date.today().isoformat(),
-                                          app_contract=build_app_contract(root), skills=skills)
+                                          app_contract=build_app_contract(root), skills=skills,
+                                          preview=preview)
         if summary:
             system_text += f"\n\n<context_summary>\n{summary}\n</context_summary>"
         # 当前任务清单回灌：todo_write 调用会被历史窗口截掉，模型跨运行就"看不见"清单，
@@ -322,6 +356,11 @@ class AgentRunner:
                      attachment_ids: list[int] | None = None):
         cfg = await self.get_config()
         root = await self._root_of(session_id)
+        # 预览工具（规格 2026-10-29 §5.1）：应用身份只在服务端解析，工具列表随之挂载。
+        # 非应用工作区一个 preview_* 都不给模型看——不给它一个「调了才发现不能用」的假工具。
+        app, preview_note = await self._resolve_app(session_id)
+        preview_prompt = preview_note or (build_preview_prompt(app["stack"]) if app else None)
+        tools = _TOOLS + PREVIEW_TOOLS if app else _TOOLS
         # 先消费上一次 run 停止/收尾前没来得及注入的插话，再落本次新问题：
         # 保证 DB seq 与对话顺序一致（插话发生在先，新问题在后）
         await self._drain_steering(session_id, root, [])
@@ -336,9 +375,12 @@ class AgentRunner:
             [a["filename"] for a in row.get("attachments") or []])
         if titled:
             await self.send({"type": "session_title", "title": titled})
-        messages = await self._build_messages(session_id, root, cfg, self.send, user_text)
+        messages = await self._build_messages(session_id, root, cfg, self.send, user_text,
+                                              preview=preview_prompt)
         ctx = ToolContext(root=root, session_id=session_id, session_factory=self.sf, send=self.send,
-                          skills_root=await self._skills_root_of(session_id))
+                          skills_root=await self._skills_root_of(session_id),
+                          app=app, cfg=cfg, cancel=cancel, deploy_hub=self.deploy_hub,
+                          deploy_tasks=self.dev_tasks, run_state={})
         max_rounds = int(cfg.get("agent.max_tool_rounds", 30))
         # <=0 = 不限工具轮数（与超时参数 <=0 不限制的约定一致），不再 range(0) 零轮即错
         rounds = itertools.count() if max_rounds <= 0 else range(max_rounds)
@@ -349,7 +391,7 @@ class AgentRunner:
             await self._drain_steering(session_id, root, messages)
             llm = await self._llm_for(cfg)
             final = None
-            async for ev in llm.chat_stream(messages, _TOOLS):
+            async for ev in llm.chat_stream(messages, tools):
                 if cancel.is_set():
                     raise _Cancelled()
                 if ev["type"] == "reasoning_delta":
@@ -424,13 +466,28 @@ class AgentRunner:
             if ans is None:
                 return {"cancelled": True}
             return {"answers": ans.get("answers", [])}
+        confirmed = False
         if name in ("write_file", "edit_file") and cfg.get("agent.write_confirm"):
             await self.send({"type": "confirm_request", "tool": name, "args": args})
             ok = await self.confirm(session_id, {"tool": name, "args": args})
             if not ok:
                 return {"ok": False, "error": "用户拒绝该修改"}
+        elif name == "preview_restart":
+            # 中断运行中的预览要用户点头（§5.6）。AgentRunner 仍是 confirm_request 的唯一发出方；
+            # 事件多带一个 summary，前端据此把「写入确认」换成「重启预览」的人话文案。
+            # 判据读的是**此刻**的库状态：确认期间状态可能已经变了，handler 侧还有一道兜底。
+            target = await fetch_app(ctx)
+            if need_confirm(ctx, target):
+                summary = confirm_summary(target)
+                await self.send({"type": "confirm_request", "tool": name, "args": args,
+                                 "summary": summary})
+                approved = await self.confirm(session_id, {"tool": name, "args": args,
+                                                           "summary": summary})
+                if not approved:
+                    return {"ok": False, "error": "用户拒绝重启预览"}
+                confirmed = True
         try:
-            return await execute_tool(ctx, name, args)
+            return await execute_tool(ctx, name, args, confirmed=confirmed)
         except ToolError as e:
             return {"ok": False, "error": str(e)}
         except Exception as e:  # pragma: no cover
@@ -439,4 +496,4 @@ class AgentRunner:
 class _Cancelled(Exception):
     pass
 
-from app.agent.llm import TOOLS as _TOOLS
+from app.agent.llm import PREVIEW_TOOLS, TOOLS as _TOOLS

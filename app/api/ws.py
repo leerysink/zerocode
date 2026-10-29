@@ -1,10 +1,11 @@
 """WS 聊天端点 /ws/chat/{session_id}。
 
 上行：user_message / ask_submit / confirm / cancel / compact；
-下行：token / tool_call / tool_result / ask_user / confirm_request /
+下行：token / tool_call / tool_result / tool_progress / ask_user / confirm_request /
 message_done / error / status / file_change / compacting / compaction_done / busy /
-steering_done（由 runner 与 hub 经 emit 下发）。error 与 status 是**本轮终态**；busy 是
-执行中被拒的非终态提示（不得据此复位前端执行态，否则「停止」按钮消失 → 发不出也停不掉的死循环）。
+steering_done（由 runner 与 hub 经 emit 下发）。tool_progress 是预览工具的**临时**进度，
+不落库、刷新即消失；error 与 status 是本轮终态；busy 是执行中被拒的非终态提示
+（不得据此复位前端执行态，否则「停止」按钮消失 → 发不出也停不掉的死循环）。
 
 执行中再发 user_message = 插话（steering）：进 hub.pending 队列（对象项：content +
 attachment_ids + client_msg_id），由 runner 在下一个工具边界落库绑定附件并回
@@ -110,7 +111,15 @@ async def ws_chat(ws: WebSocket, session_id: int):
                 "SELECT w.owner_user_id FROM chat_session cs "
                 "JOIN workspace w ON w.id = cs.workspace_id WHERE cs.id=:i"),
                 {"i": session_id})).scalar()
-            return await config_service.get_all(s, owner_user_id=uid)
+            cfg = await config_service.get_all(s, owner_user_id=uid)
+        # 预览工具的平台级默认值（规格 2026-10-29 §5.9）：与 agent.max_tool_rounds 同一读法——
+        # 默认值写在代码里，库里存了就以库为准。preview_confirm_running 默认 True 走**字面量**，
+        # 不能用 `cfg.get(key, default)`：库里的 JSON false 会被 `or` 吃掉，等于关不掉确认。
+        cfg.setdefault("agent.preview_wait_seconds", 240)
+        cfg.setdefault("agent.preview_log_lines", 80)
+        cfg.setdefault("agent.preview_max_restarts", 3)
+        cfg.setdefault("agent.preview_confirm_running", True)
+        return cfg
 
     def llm_factory(cfg, model_cfg=None):
         if hasattr(app.state, "llm_factory"):
@@ -244,7 +253,9 @@ async def ws_chat(ws: WebSocket, session_id: int):
                         llm = llm_factory(cfg_now_, model_cfg_)
                         runner = AgentRunner(app.state.session_factory, llm,
                                              config_getter, send, hub.ask, hub.confirm,
-                                             hub.pop_pending)
+                                             hub.pop_pending,
+                                             deploy_hub=app.state.deploy_hub,
+                                             dev_tasks=app.state.dev_tasks)
                         await runner.run(session_id, user_text_, cancel,
                                          attachment_ids=attachment_ids_)
                     finally:

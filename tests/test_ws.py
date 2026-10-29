@@ -723,3 +723,48 @@ def test_ws_image_steering_gate_uses_run_model_not_latest_default(client, monkey
         for _ in range(5):
             if ws.receive_json()["type"] == "status":
                 break
+
+
+def test_ws_injects_deploy_hub_and_task_table(client, monkeypatch):
+    """接线身份断言：runner 拿到的必须是 app.state 上那**同一个** hub 与任务表。
+
+    漏接线的后果是静默的——ToolContext.deploy_tasks 的默认值是每实例私有空 dict，于是
+    「同一应用至多一个部署任务」的守卫看不见 REST 起的任务，双栈保护形同虚设，且无用例会红。
+    所以这里钉的是身份（is），不是「非 None」。
+    """
+    import app.api.ws as ws_module
+    captured = {}
+
+    class Spy:
+        def __init__(self, sf, llm, config_provider, send, ask, confirm, pop_pending=None,
+                     deploy_hub=None, dev_tasks=None):
+            self.get_cfg = config_provider
+            self.send = send
+            captured.update(hub=deploy_hub, tasks=dev_tasks)
+
+        async def run(self, session_id, user_text, cancel, attachment_ids=None):
+            # 配置在 runner 的调用点上取（与真实 run 同一次 await）：config_getter 是绑定了
+            # session_id 的异步闭包，只能在应用的事件循环里 await
+            captured["cfg"] = await self.get_cfg()
+            await self.send({"type": "status", "status": "idle"})   # 给本用例一个可读到的收尾帧
+            return "idle"
+
+    monkeypatch.setattr(ws_module, "AgentRunner", Spy)
+    client.app.state.llm_factory = lambda cfg: ScriptedLLM([])
+    with client.websocket_connect(f"/ws/chat/{client.zc_sid}") as ws:
+        ws.send_json({"type": "user_message", "content": "接线检查"})
+        seen = False
+        for _ in range(4):
+            if ws.receive_json()["type"] == "status":
+                seen = True
+                break
+        assert seen, "runner 的 run 没跑起来（接线断在更前面）"
+
+    assert captured["hub"] is client.app.state.deploy_hub
+    assert captured["tasks"] is client.app.state.dev_tasks
+    for key, default in (("agent.preview_wait_seconds", 240), ("agent.preview_log_lines", 80),
+                         ("agent.preview_max_restarts", 3), ("agent.preview_confirm_running", True)):
+        assert captured["cfg"][key] == default
+    # 字面量 True 而非真值：`cfg.get(key) or True` 在这行仍是 True，所以这条开关关不掉的 bug
+    # 要靠 setdefault 的实现本身守住（库里存了 false 就以库为准）
+    assert captured["cfg"]["agent.preview_confirm_running"] is True
