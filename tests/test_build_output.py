@@ -24,6 +24,13 @@ from scripts import build_output as bo      # noqa: E402
 STAMP = "2026-10-16T00:00:00Z"
 ROOT = "/opt/zerocode"
 
+# 假仓库里的部署脚本桩：打包器只负责原样搬运，不解释内容；真文件的自检见
+# test_repo_deploy_script_busy_is_a_real_predicate。
+DEPLOY_SH_STUB = r"""#!/usr/bin/env bash
+set -euo pipefail
+busy() { ss -ltnH 2>/dev/null | awk '{print $4}' | grep -qE ":$1\$"; }
+"""
+
 CHANGELOG_INIT = """-- V20260101_01_init.sql
 CREATE TABLE IF NOT EXISTS workspace (
     id BIGSERIAL PRIMARY KEY,
@@ -128,6 +135,8 @@ def fake_repo(tmp_path) -> Path:
     (tmp_path / "app" / "__pycache__").mkdir()
     (tmp_path / "app" / "__pycache__" / "main.cpython-312.pyc").write_bytes(b"\x00")
     (tmp_path / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "deploy.sh").write_text(DEPLOY_SH_STUB, encoding="utf-8")
 
     dist = tmp_path / "frontend" / "dist"
     dist.mkdir(parents=True)
@@ -159,7 +168,7 @@ def test_build_produces_every_artifact(fake_repo):
     s = _build(fake_repo)
     out = s["out"]
     for rel in ("init.sql", "docker-compose.yml", ".env.example", ".dockerignore",
-                "apply-init.sh", "README-deploy.md",
+                "apply-init.sh", "deploy.sh", "README-deploy.md",
                 "backend/Dockerfile", "backend/requirements.txt", "backend/app/main.py",
                 "frontend/dist/index.html",
                 "gateway/docker-compose.yml", "gateway/nginx.conf", "gateway/lua/router.lua",
@@ -192,10 +201,49 @@ def test_rebuild_wipes_previous_output(fake_repo):
 def test_generated_text_files_use_lf(fake_repo):
     """边界：CRLF 会让 apply-init.sh 在 bash 下直接报错，SQL 里也不该有 \\r。"""
     out = _build(fake_repo)["out"]
-    for rel in ("init.sql", "docker-compose.yml", "apply-init.sh", "README-deploy.md",
-                ".env.example", "backend/Dockerfile"):
+    for rel in ("init.sql", "docker-compose.yml", "apply-init.sh", "deploy.sh",
+                "README-deploy.md", ".env.example", "backend/Dockerfile"):
         raw = (out / rel).read_bytes()
         assert b"\r\n" not in raw, f"{rel} 含 CRLF 行尾"
+
+
+def test_deploy_script_ships_verbatim_from_repo(fake_repo):
+    """deploy.sh 的源住在仓库里，包只是搬运工：重打包不再冲掉服务器端排障改动。"""
+    (fake_repo / "scripts" / "deploy.sh").write_text("#!/usr/bin/env bash\necho 现场改的\n",
+                                                     encoding="utf-8")
+    out = _build(fake_repo)["out"]
+    assert (out / "deploy.sh").read_text(encoding="utf-8").endswith("echo 现场改的\n")
+
+
+def test_deploy_script_strips_crlf(fake_repo):
+    """边界：源文件被编辑器存成 CRLF 也不能带进包——脚本自己在服务器上有条 CRLF 自检。"""
+    (fake_repo / "scripts" / "deploy.sh").write_bytes(b"#!/usr/bin/env bash\r\necho hi\r\n")
+    out = _build(fake_repo)["out"]
+    assert b"\r" not in (out / "deploy.sh").read_bytes()
+
+
+def test_missing_deploy_script_blocks_packaging(fake_repo):
+    """缺文件不出包：与网关配置同一套闸门，宁可不打也不发一个没有部署脚本的包。"""
+    (fake_repo / "scripts" / "deploy.sh").unlink()
+    with pytest.raises(bo.BuildError, match="部署脚本"):
+        _build(fake_repo)
+
+
+def test_repo_deploy_script_busy_is_a_real_predicate():
+    """回归钉：busy() 末尾挂 `|| true` 会让它恒返回 0，端口预检于是恒报「已被占」，
+    真占用者永远查不到（2026-10-29 在演示机上撞过一次）。"""
+    text = (bo.REPO_ROOT / "scripts" / "deploy.sh").read_text(encoding="utf-8")
+    line = next((l for l in text.splitlines() if l.strip().startswith("busy() {")), None)
+    assert line is not None, "scripts/deploy.sh 里找不到 busy() 判定函数"
+    assert "|| true" not in line, f"busy() 又挂上 || true 了：{line}"
+
+
+def test_repo_gateway_upstream_keeps_desktop_default():
+    """仓库版本服务本机 Docker Desktop，默认值必须留在 host.docker.internal；
+    出包版本才换成 172.17.0.1（见 test_gateway_defaults_baked_into_gateway_compose）。
+    两边搞反时：本机网关全 502，或服务器上重新踩一遍 DNS 解析不了的老坑。"""
+    text = (bo.REPO_ROOT / "gateway" / "docker-compose.yml").read_text(encoding="utf-8")
+    assert "UPSTREAM_HOST: ${ZEROCODE_GATEWAY_UPSTREAM:-host.docker.internal}" in text
 
 
 # ---------------------------------------------------------------- init.sql 合成
@@ -732,8 +780,9 @@ def test_compose_pins_pg_name_vector_image_and_docker_sock(fake_repo):
     assert "container_name: zerocode-pg16" in compose
     assert "image: pgvector/pgvector:pg16" in compose
     assert "/var/run/docker.sock:/var/run/docker.sock" in compose
-    assert "docker-compose-plugin" in (_build(fake_repo)["out"] / "backend" / "Dockerfile"
-                                       ).read_text(encoding="utf-8")
+    # buildx 缺失时 compose 退回 classic builder，SpringBoot 模板的 RUN --mount=type=cache 直接构建失败
+    dk = (_build(fake_repo)["out"] / "backend" / "Dockerfile").read_text(encoding="utf-8")
+    assert "docker-compose-plugin" in dk and "docker-buildx-plugin" in dk
 
 
 def test_compose_creates_zcnet_by_name(fake_repo):
@@ -1548,14 +1597,6 @@ def test_gateway_defaults_baked_into_gateway_compose(fake_repo):
     assert f"{GATEWAY_ENV}=leerysink.com" in example
     assert "ZEROCODE_GATEWAY_UPSTREAM=172.17.0.1" in example
     assert "gateway/ 下" in example or "同目录的 .env" in example
-
-
-def test_repo_gateway_upstream_keeps_desktop_default():
-    """仓库版本服务本机 Docker Desktop，默认值必须留在 host.docker.internal；
-    出包版本才换成 172.17.0.1（见 test_gateway_defaults_baked_into_gateway_compose）。
-    两边搞反时：本机网关全 502，或服务器上重新踩一遍 DNS 解析不了的老坑。"""
-    text = (bo.REPO_ROOT / "gateway" / "docker-compose.yml").read_text(encoding="utf-8")
-    assert "UPSTREAM_HOST: ${ZEROCODE_GATEWAY_UPSTREAM:-host.docker.internal}" in text
 
 
 def test_gateway_compose_shape_drift_fails_closed(fake_repo):

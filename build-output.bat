@@ -18,9 +18,9 @@ REM  running batch file, which splits echo text into bogus commands.
 REM  Human-facing Chinese output comes from the Python script instead.
 REM
 REM  Usage: build-output.bat [args forwarded to scripts\build_output.py]
-REM    build-output.bat                        presets test1 + sqlc002, root /opt/zerocode
+REM    build-output.bat                        platform only, no preset apps
 REM    build-output.bat --slugs test1          preset a single app
-REM    build-output.bat --slugs ""             platform only, no preset apps
+REM    build-output.bat --slugs test1,sqlc002  ship test1 and sqlc002 as presets
 REM    build-output.bat --deploy-root /srv/zc  different server deploy root
 REM    build-output.bat --skip-frontend        reuse existing dist, skip npm run build
 REM    build-output.bat --allow-stale-dist     accept a dist older than src

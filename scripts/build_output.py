@@ -30,7 +30,9 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-DEFAULT_SLUGS = ("test1", "sqlc002")
+# 默认只打平台，不带预置应用：apps/ 下绝大多数目录是开发期试出来的残留，打进演示包既没意义
+# 又拖慢出包。要预置就显式点名：build-output.bat --slugs test1,sqlc002
+DEFAULT_SLUGS = ()
 DEFAULT_DEPLOY_ROOT = "/opt/zerocode"
 DEFAULT_OUT_NAME = "build-output"
 
@@ -1006,7 +1008,7 @@ networks:
 
 
 def backend_dockerfile(deploy_root: str, mirrors: Mirrors = DEFAULT_MIRRORS) -> str:
-    """平台后端镜像：python:3.12-slim + docker CLI/compose plugin（ADR-0013）。
+    """平台后端镜像：python:3.12-slim + docker CLI/compose/buildx plugin（ADR-0013）。
 
     WORKDIR 必须等于部署根：settings.py 的 REPO_ROOT 由本文件自身位置推出，在镜像里就是
     WORKDIR，于是 `deploy.apps_root` 留空时的兜底恰好就是同路径挂载点，新建应用直接落到
@@ -1025,7 +1027,9 @@ def backend_dockerfile(deploy_root: str, mirrors: Mirrors = DEFAULT_MIRRORS) -> 
                    else "https://download.docker.com/linux/debian")
     return f"""# zerocode 平台后端镜像 —— 由 scripts/build_output.py 生成，勿手改
 FROM python:3.12-slim
-{apt_block}# docker CLI + compose plugin：平台在容器内通过挂进来的 docker.sock 起应用 dev/prod 栈（ADR-0013）
+{apt_block}# docker CLI + compose/buildx plugin：平台在容器内通过挂进来的 docker.sock 起应用 dev/prod 栈（ADR-0013）。
+# buildx 不能省：compose 找不到 buildx 插件会退回 classic builder，而 classic 不支持 RUN --mount=type=cache，
+# SpringBoot 模板的后端 Dockerfile 正是靠 cache mount 复用 m2 依赖，缺它直接构建失败。
 RUN apt-get update \\
  && apt-get install -y --no-install-recommends ca-certificates curl gnupg \\
  && install -m 0755 -d /etc/apt/keyrings \\
@@ -1035,7 +1039,7 @@ RUN apt-get update \\
 {docker_repo} $(. /etc/os-release && echo $VERSION_CODENAME) stable" \\
       > /etc/apt/sources.list.d/docker.list \\
  && apt-get update \\
- && apt-get install -y --no-install-recommends docker-ce-cli docker-compose-plugin \\
+ && apt-get install -y --no-install-recommends docker-ce-cli docker-compose-plugin docker-buildx-plugin \\
  && rm -rf /var/lib/apt/lists/*
 
 # 与 compose 的同路径挂载点逐字相同；换部署根请重跑打包（它是构建期烘死的）
@@ -1141,8 +1145,9 @@ def readme_md(presets, deploy_root: str, generated_at: str, dist_stamp: str,
 预置应用：{slug_list}　网关域名：`{gateway_domain}`
 
 > 本目录整体是**生成物**（由仓库根的 `build-output.bat` 产出），不要手改其中任何文件——
-> 下次打包会整目录重建。要改就改仓库里的 `changelog/`、`app/`、`frontend/`、`gateway/`
-> 或打包脚本。`gateway/certs/`（TLS 私钥）与 `gateway/routes/routes.json`（运行期路由）是
+> 下次打包会整目录重建。要改就改仓库里的 `changelog/`、`app/`、`frontend/`、`gateway/`、
+> `scripts/deploy.sh`（服务器端部署脚本的源，包里的只是拷贝）或打包脚本。
+> `gateway/certs/`（TLS 私钥）与 `gateway/routes/routes.json`（运行期路由）是
 > 服务器现场产物，不在包内。
 
 ## 1. 前置条件
@@ -1279,7 +1284,8 @@ rsync -a --delete build-output/frontend/ {deploy_root}/frontend/
 
 # ② 顶层文件：只覆盖、不删（{deploy_root}/.env 是服务器现场填的，绝不能删）
 rsync -a build-output/init.sql build-output/docker-compose.yml build-output/.dockerignore \\
-         build-output/.env.example build-output/apply-init.sh build-output/README-deploy.md \\
+         build-output/.env.example build-output/apply-init.sh build-output/deploy.sh \\
+         build-output/README-deploy.md \\
          {deploy_root}/
 
 # ③ 网关配置：certs/（私钥）、routes/（运行期路由表）与 .env（现场域名覆盖）必须排除，
@@ -1362,7 +1368,7 @@ bash apply-init.sh                                 # 新表自动建上，既有
 | 应用域名 502 Bad Gateway | 先看 `docker compose -f gateway/docker-compose.yml logs gateway`：出现 `host.docker.internal could not be resolved` 就是上游地址在 Linux 上解析不了（nginx 不读 `/etc/hosts`），把 `gateway/.env` 的 `ZEROCODE_GATEWAY_UPSTREAM` 设成宿主 docker0 网关（默认 `172.17.0.1`）后重建网关；若日志是 `connection refused`，核对应用 prod 栈与 `routes.json` 的端口是否一致 |
 | 网关容器起不来 / 反复重启 | `docker compose -f gateway/docker-compose.yml logs gateway`：多为 `gateway/certs/gateway.crt|key` 缺失，或 80/443 被占用 |
 | 发布成功但域名仍是 404 | 检查 `{deploy_root}/gateway/routes/routes.json` 里有没有该 slug；没有就看 backend 日志里 `gateway routes.json 刷新失败` 一行（该失败只告警、不阻断发布） |
-| 端口被占用 | 改 `.env` 的 `PLATFORM_PORT`；应用端口在控制台改不了，需重打包；网关的 80/443 被占只能腾端口 |
+| 端口被占用 | `deploy.sh --takeover` 会 stop 掉占端口的旧容器（控制台端口与网关的 80/443 都算；宿主进程仍要你手工 kill，脚本不代劳）。不建议改 `PLATFORM_PORT`：它是对外的控制台地址，还要与云安全组放行的端口一致；应用端口在控制台改不了，需重打包 |
 
 > 打包期的端口检测只管两件事：预置应用之间不得互撞 `prod_port`/`dev_port`（它们是 UNIQUE 列），
 > 且同一个应用的 prod 与 dev 不得相同。它**不**探测服务器上已占用的端口，也不管预置应用与
@@ -1506,6 +1512,19 @@ def copy_gateway(repo_root: Path, dst: Path, gateway_domain: str) -> int:
     _write(dst / "routes" / ".gitkeep", "")
     _write(dst / ".env.example", gateway_env_example(gateway_domain))
     return _count_files(dst)
+
+
+def copy_deploy_script(repo_root: Path, dst: Path) -> None:
+    """把仓库里的服务器端一键部署脚本原样搬进包根。
+
+    它与 apply-init.sh 相反：那个是生成物，这个是交付物的**源**——要在服务器上手改排障，
+    所以住在仓库里（`scripts/deploy.sh`），包只是搬运工。缺文件不出包，理由同网关配置。
+    `\r` 一律剥掉：脚本自带一条 CRLF 自检，带着 \r 出包等于把失败推迟到服务器上才炸。
+    """
+    src = repo_root / "scripts" / "deploy.sh"
+    if not src.is_file():
+        raise BuildError(f"缺部署脚本 {src}：deploy.sh 已纳入交付包，缺文件不出包")
+    _write(dst, src.read_text(encoding="utf-8").replace("\r\n", "\n"))
 
 
 def check_frontend_dist(repo_root: Path, allow_stale: bool = False) -> tuple[Path, str]:
@@ -1698,6 +1717,7 @@ def _assemble(repo_root: Path, staging: Path, presets, root: str,
     _write(staging / ".dockerignore", dockerignore())
     _write(staging / ".env.example", env_example(root, gateway_domain, mirrors))
     _write(staging / "apply-init.sh", apply_init_sh())
+    copy_deploy_script(repo_root, staging / "deploy.sh")
     _write(staging / "README-deploy.md",
            readme_md(presets, root, stamp, dist_stamp, gateway_domain, mirrors))
 
@@ -1748,7 +1768,8 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="生成 build-output 演示部署包（ADR-0013 / ADR-0014）")
     ap.add_argument("--out", default=None, help="输出目录（默认 仓库根/build-output）")
     ap.add_argument("--slugs", default=",".join(DEFAULT_SLUGS),
-                    help=f"预置应用 slug，逗号分隔；传空串表示只打平台（默认 {','.join(DEFAULT_SLUGS)}）")
+                    help=f"预置应用 slug，逗号分隔；空串表示只打平台"
+                         f"（默认 {'、'.join(DEFAULT_SLUGS) or '只打平台，不带预置应用'}）")
     ap.add_argument("--deploy-root", default=DEFAULT_DEPLOY_ROOT,
                     help=f"服务器部署根，须为 Linux 绝对路径（默认 {DEFAULT_DEPLOY_ROOT}）")
     ap.add_argument("--allow-stale-dist", action="store_true",
