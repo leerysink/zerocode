@@ -27,8 +27,8 @@ import ChatAppActions from './ChatAppActions.vue'
 import { useChatStore } from '../stores/chat'
 
 const APPS = [
-  { id: 11, workspace_id: 101, slug: 'win', stack: 'vue3-fastapi', dev_port: 8211, status_dev: 'running', preview_url: 'http://localhost:8211/' },
-  { id: 12, workspace_id: 102, slug: 'test1', stack: 'vue3-fastapi', dev_port: 8213, status_dev: 'stopped', preview_url: 'http://localhost:8213/' },
+  { id: 11, workspace_id: 101, slug: 'win', stack: 'vue3-fastapi', dev_port: 8211, status_dev: 'running', preview_url: 'http://localhost:8211/', prod_port: 8210, status_prod: 'running', prod_url: 'https://win.example.test' },
+  { id: 12, workspace_id: 102, slug: 'test1', stack: 'vue3-fastapi', dev_port: 8213, status_dev: 'stopped', preview_url: 'http://localhost:8213/', prod_port: 8212, status_prod: 'stopped', prod_url: 'https://test1.example.test' },
 ]
 
 // 下拉：antd 的 overlay 是懒渲染的，桩把触发区与浮层都渲出来，菜单项才可点
@@ -209,7 +209,7 @@ it('预览未运行时「打开预览」禁用', async () => {
   expect(w.find('.zc-act-open').attributes('disabled')).toBeDefined()
 })
 
-// dev_port 缺位时后端刻意回空串（app_service.py::_with_preview_url），拼不出地址也不能开 about:blank。
+// dev_port 缺位时后端刻意回空串（app_service.py::_with_public_urls），拼不出地址也不能开 about:blank。
 // 两个来源都要空：listApps 那一份和轮询那一份，任一有值都不该判死。
 it('preview_url 为空串时「打开预览」与「复制预览地址」都不可用', async () => {
   const noUrl = [{ ...APPS[0], preview_url: '' }]
@@ -230,6 +230,60 @@ it('window.open 被拦截返回 null 时给出可操作提示', async () => {
   await flushPromises()
   await w.find('.zc-act-open').trigger('click')
   expect(message.warning).toHaveBeenCalled()
+})
+
+// ---- 「打开生产」：与「打开预览」同款图标，闸门读 status_prod ----
+
+it('正式环境 running 时点「打开生产」用后端返回的 prod_url 开新标签', async () => {
+  const spy = openSpy()
+  useChatStore().currentWorkspaceId = 101 // status_prod: running
+  const w = mountActions()
+  await flushPromises()
+  await w.find('.zc-act-prod').trigger('click')
+  expect(spy).toHaveBeenCalledWith('https://win.example.test', 'zerocode-prod-11')
+})
+
+// 停着时同样不代为启动：网关对未 routes.json 登记的 slug 给 404 提示页，
+// 开出去的是一片「应用不存在」而不是白屏——用户更容易怀疑代码或发布出了问题。
+// 两个来源都要压住：轮询那一份优先于 listApps，只改列表等于没改。
+it('正式环境未启动时「打开生产」禁用，且不影响可点的「打开预览」', async () => {
+  const stopped = [{ ...APPS[0], status_prod: 'stopped' }]
+  listApps.mockResolvedValue({ data: stopped })
+  getApp.mockImplementation((id) => Promise.resolve({ data: stopped.find((a) => a.id === id) }))
+  useChatStore().currentWorkspaceId = 101
+  const w = mountActions()
+  await flushPromises()
+  expect(w.find('.zc-act-prod').attributes('disabled')).toBeDefined()
+  expect(w.find('.zc-act-open').attributes('disabled')).toBeUndefined()
+})
+
+// 静态栈等 SSL 关且端口缺位的应用，后端刻意回空串（nics.py::app_url）；
+// 域名口径只在后端一处，前端不许按 slug 自拼一个 https://{slug}.域名 出来。
+it('prod_url 为空串时「打开生产」不可用', async () => {
+  const noUrl = [{ ...APPS[0], prod_url: '' }]
+  listApps.mockResolvedValue({ data: noUrl })
+  getApp.mockImplementation((id) => Promise.resolve({ data: noUrl.find((a) => a.id === id) }))
+  useChatStore().currentWorkspaceId = 101
+  const w = mountActions()
+  await flushPromises()
+  expect(w.find('.zc-act-prod').attributes('disabled')).toBeDefined()
+})
+
+// 在应用列表里启动正式、或本页发布完成后，聊天页的灰态必须自己解开——
+// 闸门停在 listApps 那一刻的旧值等于按钮在撒谎。
+it('轮询到 status_prod 转 running 后「打开生产」从禁用变为可点', async () => {
+  const stopped = [{ ...APPS[0], status_prod: 'stopped' }]
+  listApps.mockResolvedValue({ data: stopped })
+  getApp.mockImplementation((id) => Promise.resolve({ data: stopped.find((a) => a.id === id) }))
+  useChatStore().currentWorkspaceId = 101
+  const w = mountActions()
+  await flushPromises()
+  expect(w.find('.zc-act-prod').attributes('disabled')).toBeDefined()
+
+  getApp.mockResolvedValue({ data: { ...APPS[0], status_prod: 'running' } })
+  await vi.advanceTimersByTimeAsync(5000)
+  await flushPromises()
+  expect(w.find('.zc-act-prod').attributes('disabled')).toBeUndefined()
 })
 
 // ---- 票 004：更多菜单与只读壳子 ----

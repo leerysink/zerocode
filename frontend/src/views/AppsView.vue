@@ -19,6 +19,7 @@ import PublishHistory from '../components/PublishHistory.vue'
 import MetricsModal from '../components/MetricsModal.vue'
 import PublishModal from '../components/PublishModal.vue'
 import { SMALL_STACKS, slugFromName, validateForm } from '../utils/appForm'
+import { copyText } from '../utils/clipboard'
 import DeployLogPanel from '../components/DeployLogPanel.vue'
 import BackButton from '../components/BackButton.vue'
 import { openWorkspaceFilesPage, resolveOpenFolderMode } from '../utils/openFolder'
@@ -36,6 +37,8 @@ const hist = reactive({ open: false, app: null })
 const mon = reactive({ open: false, app: null })
 const rel = reactive({ open: false, app: null, title: '', summary: '' })
 const urlsCache = reactive({})
+// 复制失败时的就地兜底：{ key, url }，key 是失败发生的那一处（`card:<id>` / 'preview'）
+const copyFail = reactive({ key: '', url: '' })
 const rename = reactive({ open: false, app: null, name: '' })
 const del = reactive({ open: false, app: null })
 const openingFolder = ref(false)
@@ -165,18 +168,20 @@ async function resetDev(a) {
     },
   })
 }
-async function copyUrl(url) {
+async function copyUrl(url, key = '') {
   // navigator.clipboard 只在安全上下文（https 或 localhost）存在：用 IP + http 访问控制台时它是
-  // undefined，直接 .writeText 抛 TypeError。同文件的 copyPreviewUrl、DeployLogPanel 的 copyAll
-  // 都包了 catch，只有这个函数没有——而它是卡片「正式地址」与预览抽屉「复制地址」的共用出口，
-  // 结果是点了什么都没发生，连「复制失败」也不说。
-  try {
-    if (!navigator.clipboard) throw new Error('clipboard unavailable outside a secure context')
-    await navigator.clipboard.writeText(url)
+  // undefined。utils/clipboard.js 里依次降级到 execCommand('copy')，两条路都不通才算失败。
+  if (await copyText(url)) {
+    copyFail.key = ''
+    copyFail.url = ''
     message.success('已复制')
-  } catch {
-    message.error('复制失败，请手动选择地址')
+    return
   }
+  // 失败时把地址就地摊开：卡片上的「正式地址」从来不是一个可见文本（只有一个复制动作），
+  // 光说「请手动选择地址」等于把用户支到一个不存在的地方。key 让兜底只出现在失败的那一处。
+  copyFail.key = key
+  copyFail.url = url || ''
+  message.error('复制失败，请手动选择地址')
 }
 // 查看日志：独立抽屉，栈没起也能打开（上一次启动失败在哪一步，只有这里看得到）
 function openLogs(a) {
@@ -228,15 +233,6 @@ async function openAppFolder(a) {
     message.info('无法直接打开文件夹，已改用内置文件管理器')
   } finally {
     openingFolder.value = false
-  }
-}
-
-async function copyPreviewUrl(a) {
-  try {
-    await navigator.clipboard.writeText(a.preview_url)
-    message.success('预览地址已复制')
-  } catch (e) {
-    message.error('复制失败，请手动选择地址')
   }
 }
 
@@ -321,7 +317,7 @@ async function copyProdUrl(a) {
     message.warning('正式地址暂时取不到，请稍后重试')
     return
   }
-  await copyUrl(url)
+  await copyUrl(url, `card:${a.id}`)
 }
 
 // ---------- M3-a 商店：发布到商店（只认真实在服的 prod 版本，闸门在后端） ----------
@@ -379,7 +375,7 @@ async function doRelease() {
                 <div v-if="canReleaseToStore(a)" class="zc-app-menu-item zc-menu-release" @click.stop="openRelease(a)"><shop-outlined /> 发布到商店</div>
                 <div class="zc-app-menu-item zc-menu-rename" @click.stop="openRename(a)"><edit-outlined /> 重命名</div>
                 <div class="zc-app-menu-item zc-menu-folder" @click.stop="openAppFolder(a)"><folder-open-outlined /> 打开工程目录</div>
-                <div class="zc-app-menu-item zc-menu-copy" @click.stop="copyPreviewUrl(a)"><copy-outlined /> 复制预览地址</div>
+                <div class="zc-app-menu-item zc-menu-copy" @click.stop="copyUrl(a.preview_url, `card:${a.id}`)"><copy-outlined /> 复制预览地址</div>
                 <div class="zc-app-menu-item zc-menu-logs" @click.stop="openLogs(a)"><profile-outlined /> 查看日志</div>
                 <a class="zc-app-menu-item zc-menu-db" :href="`/apps/${a.id}/db`" target="_blank" @click.stop>
                   <database-outlined /> DB 操作
@@ -403,6 +399,8 @@ async function doRelease() {
             <copy-outlined /> 正式地址
           </a>
         </p>
+        <!-- 复制失败才出现的兜底行：user-select: all 让单击即整段选中，键盘 Ctrl+C 就能拿走 -->
+        <p v-if="copyFail.key === `card:${a.id}`" class="zc-line zc-copy-manual">{{ copyFail.url }}</p>
         <!-- 操作仍在一行，但按环境切成两段：测试环境（dev，直改直跑的预览实例）| 生产环境（prod，已发布版本）。
              中间一条竖线 + 各段环境标签，避免同名动作被误读成跨环境操作。 -->
         <div class="zc-acts">
@@ -490,11 +488,12 @@ async function doRelease() {
       <a-space style="margin-bottom: 12px">
         <a-tag :color="preview.status === 'running' ? 'green' : 'default'">{{ statusText(preview.status) }}</a-tag>
         <a-button size="middle" @click="preview.app && refreshPreview(preview.app)"><reload-outlined /> 刷新</a-button>
-        <a-button size="middle" v-if="preview.url" @click="copyUrl(preview.url)">
+        <a-button size="middle" v-if="preview.url" @click="copyUrl(preview.url, 'preview')">
           <copy-outlined /> 复制地址
         </a-button>
         <a-button size="middle" v-if="preview.url" target="_blank" :href="preview.url">新窗口打开</a-button>
       </a-space>
+      <p v-if="copyFail.key === 'preview'" class="zc-line zc-copy-manual">{{ copyFail.url }}</p>
       <iframe v-if="preview.status === 'running' && preview.url"
               :key="preview.nonce" :src="preview.url"
               style="width: 100%; height: calc(100vh - 160px); border: 1px solid #e5e7eb; border-radius: 4px" />
@@ -565,6 +564,9 @@ async function doRelease() {
 .zc-card-tag { flex-shrink: 0; margin-inline-start: 8px; font-weight: 400; }
 .zc-line { margin: 0 0 6px; color: var(--zc-text); font-size: 13px; }
 .zc-line.sub { color: var(--zc-text-sub); }
+/* 复制失败后的兜底地址：单击即整段选中（user-select: all），等宽 + 折行保证长域名可读 */
+.zc-copy-manual { user-select: all; cursor: text; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+                  word-break: break-all; background: rgba(91, 122, 157, 0.08); border-radius: 4px; padding: 2px 6px; }
 /* 一行内的环境分段：两段各自 flex 贴标签 + 按钮，中间竖线分隔；窄屏折行兜底。
    按钮走 small（与其他卡片区一致）以保证两组 + 两个标签能舒坦地平在一行。 */
 .zc-acts { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }

@@ -89,6 +89,17 @@ async function mountView() {
   return wrapper
 }
 
+// execCommand 是浏览器 API，happy-dom 没实现，只能桩。桩里读真实 DOM：断言的是「复制那一刻页面上
+// 那个临时节点承载的文本」，也就是降级路径真的把地址搬进了可被选中的节点，而不是桩自己记的参数。
+function stubExecCommand(copiedText, impl = () => true) {
+  const spy = vi.fn(() => {
+    expect(document.querySelector('textarea')?.value).toBe(copiedText)
+    return impl()
+  })
+  Object.defineProperty(document, 'execCommand', { value: spy, configurable: true })
+  return spy
+}
+
 beforeEach(() => {
   vi.clearAllMocks()
   mocks.cfg.form.openFolderMode = 'auto'
@@ -97,6 +108,8 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.unstubAllGlobals()
+  delete document.execCommand
+  document.body.innerHTML = ''
 })
 
 describe('AppsView 发布接线', () => {
@@ -203,6 +216,37 @@ describe('AppsView 预览地址', () => {
     await wrapper.findAll('.zc-menu-copy')[0].trigger('click')
     await flushPromises()
     expect(writeText).toHaveBeenCalledWith('http://10.0.1.25:8301')
+  })
+
+  it('边界：http + IP 访问时「复制预览地址」也走降级（与正式地址同一个出口）', async () => {
+    Object.defineProperty(window.navigator, 'clipboard',
+      { value: undefined, configurable: true })
+    const exec = stubExecCommand('http://10.0.1.25:8301')
+    const wrapper = await mountView()
+
+    await wrapper.findAll('.zc-menu-copy')[0].trigger('click')
+    await flushPromises()
+
+    expect(exec).toHaveBeenCalledWith('copy')
+    expect(mocks.antd.message.success).toHaveBeenCalledWith('已复制')
+  })
+
+  it('边界：预览抽屉里复制失败 → 地址摊在抽屉里，不跑到卡片上', async () => {
+    Object.defineProperty(window.navigator, 'clipboard',
+      { value: undefined, configurable: true })
+    stubExecCommand('http://10.0.1.25:8301', () => false)
+    mocks.api.devStatus.mockResolvedValue({ data: { status_dev: 'running', url: 'http://10.0.1.25:8301' } })
+    const wrapper = await mountView()
+    await wrapper.findAll('.zc-menu-preview')[0].trigger('click')
+    await flushPromises()
+
+    const drawer = wrapper.find('.stub-drawer')
+    const copyBtn = drawer.findAll('.stub-a-button').find((b) => b.text().includes('复制地址'))
+    await copyBtn.trigger('click')
+    await flushPromises()
+
+    expect(drawer.find('.zc-copy-manual').text()).toBe('http://10.0.1.25:8301')
+    expect(wrapper.findAll('.stub-card')[0].find('.zc-copy-manual').exists()).toBe(false)
   })
 
   it('卡片「打开」链接指向 preview_url，而不是 localhost 拼端口', async () => {
@@ -477,31 +521,68 @@ describe('AppsView 正式地址', () => {
     expect(mocks.antd.message.warning).toHaveBeenCalled()
   })
 
-  it('边界：http + IP 访问控制台时 navigator.clipboard 不存在 → 报错而非静默无反应', async () => {
+  it('边界：http + IP 访问控制台（navigator.clipboard 不存在）→ 降级 execCommand 仍能复制', async () => {
     // 非安全上下文（http://159.75.185.70:8100）里 navigator.clipboard 是 undefined，
-    // 直接 .writeText 抛 TypeError。copyUrl 原本没有 catch，结果是点了什么都没发生。
+    // 早先直接 .writeText 抛 TypeError、点了没反应；补 catch 后变成恒失败的「复制失败」。
+    // 现在这条路要真的能复制成功（utils/clipboard.js 的降级）。
     Object.defineProperty(window.navigator, 'clipboard',
       { value: undefined, configurable: true })
+    const exec = stubExecCommand('https://aaa.example.test')
     mocks.api.appUrls.mockResolvedValue({ data: { domain: 'https://aaa.example.test' } })
     const wrapper = await mountView()
 
     await prodLink(wrapper).trigger('click')
     await flushPromises()
 
-    expect(mocks.antd.message.error).toHaveBeenCalledWith('复制失败，请手动选择地址')
-    expect(mocks.antd.message.success).not.toHaveBeenCalled()
+    expect(exec).toHaveBeenCalledWith('copy')
+    expect(mocks.antd.message.success).toHaveBeenCalledWith('已复制')
+    expect(mocks.antd.message.error).not.toHaveBeenCalled()
   })
 
-  it('边界：剪贴板写入被拒（权限/窗口失焦）→ 不谎报已复制', async () => {
+  it('边界：剪贴板写入被拒（权限/窗口失焦）→ 降级成功后不谎报失败', async () => {
     writeText.mockRejectedValue(new Error('NotAllowedError'))
+    const exec = stubExecCommand('https://aaa.example.test')
     mocks.api.appUrls.mockResolvedValue({ data: { domain: 'https://aaa.example.test' } })
     const wrapper = await mountView()
 
     await prodLink(wrapper).trigger('click')
     await flushPromises()
 
+    expect(exec).toHaveBeenCalledWith('copy')
+    expect(mocks.antd.message.success).toHaveBeenCalledWith('已复制')
+  })
+
+  it('边界：两条路都不通 → 报错，并把完整地址就地显示成可选中文本', async () => {
+    // 卡片上「正式地址」从头到尾没渲染过完整 URL（只有一个复制动作），所以 toast 里那句
+    // 「请手动选择地址」在页面上根本没有对应物。兜底行就是把那个用户本来要拿到的东西摊开。
+    Object.defineProperty(window.navigator, 'clipboard',
+      { value: undefined, configurable: true })
+    stubExecCommand('https://aaa.example.test', () => false)
+    mocks.api.appUrls.mockResolvedValue({ data: { domain: 'https://aaa.example.test' } })
+    const wrapper = await mountView()
+
+    expect(wrapper.find('.zc-copy-manual').exists()).toBe(false)
+    await prodLink(wrapper).trigger('click')
+    await flushPromises()
+
     expect(mocks.antd.message.error).toHaveBeenCalledWith('复制失败，请手动选择地址')
     expect(mocks.antd.message.success).not.toHaveBeenCalled()
+    expect(wrapper.find('.zc-copy-manual').text()).toBe('https://aaa.example.test')
+  })
+
+  it('边界：兜底行只出现在失败的那张卡片上', async () => {
+    Object.defineProperty(window.navigator, 'clipboard',
+      { value: undefined, configurable: true })
+    stubExecCommand('https://aaa.example.test', () => false)
+    mocks.api.appUrls.mockResolvedValue({ data: { domain: 'https://aaa.example.test' } })
+    const wrapper = await mountView()
+
+    await prodLink(wrapper, 0).trigger('click')
+    await flushPromises()
+
+    const cards = wrapper.findAll('.stub-card')
+    expect(cards[0].find('.zc-copy-manual').exists()).toBe(true)
+    expect(cards[1].find('.zc-copy-manual').exists()).toBe(false)
   })
 
   it('取不到地址时不缓存空结果：下一次点击会重新问后端（可重试）', async () => {

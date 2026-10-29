@@ -11,6 +11,7 @@ from sqlalchemy.exc import IntegrityError
 from app.deploy import provision, scaffold
 from app.deploy import gateway_routes
 from app.deploy.errors import DeployError
+from app.deploy.nics import app_url
 from app.deploy.ports import allocate_pair
 from app.deploy.settings import REPO_ROOT, deploy_cfg, preview_url, resolve_apps_root
 from app.deploy.slugs import validate_slug
@@ -27,7 +28,6 @@ NAME_MAX = 100    # workspace.name / app_project.name 同为 VARCHAR(100)
 # index.html 的 <title>），单引号安全（SQL 字面量路径由 scaffold 做 '→'' 转义），故只拒写坏产物的那几个。
 # % 也不拒（「50% 折扣」是正常业务名）：模板侧保证名字只作格式化实参出现，不进格式串（见 BaseApplication 横幅）。
 NAME_UNSAFE = re.compile(r"[<>\"\\&\x00-\x1f\x7f]")
-STOPPABLE = ("running", "starting")   # 删除前需要收口的 dev 状态：这两态 Docker 里可能有真容器
 
 
 def check_name(name: str) -> str:
@@ -214,13 +214,16 @@ async def _rollback(session_factory, root_path: Path, slug: str, app_id: int | N
     shutil.rmtree(root_path, ignore_errors=True)
 
 
-def _with_preview_url(row: dict) -> dict:
-    """回表补 `preview_url`：预览链接由后端按部署基址生成，前端不再硬拼 localhost。
+def _with_public_urls(row: dict) -> dict:
+    """回表补两个对外地址：`preview_url`（dev 栈）与 `prod_url`（正式发布地址）。
 
     硬拼出来的地址在远程部署下指向的是访问者自己的机器，端口倒是没错——错的是宿主。
+    prod 侧同理，而且它的域名/端口口径只在 `nics.app_url` 一处投影（ADR-0016），这里只是
+    把那一份结果顺带进列表与详情，前端不再自拼、也不必为渲染一个按钮多点一次接口。
     """
     port = row.get("dev_port")
     row["preview_url"] = preview_url(port) if port else ""
+    row["prod_url"] = app_url(row)
     return row
 
 
@@ -252,7 +255,7 @@ async def list_apps(session_factory, *, owner_user_id: int | None = None) -> lis
     for r in rows:
         d = to_dict(r)
         d["store"] = by_app.get(int(d["id"]))
-        out.append(_with_preview_url(d))
+        out.append(_with_public_urls(d))
     return out
 
 
@@ -280,7 +283,7 @@ async def get_app(session_factory, app_id: int, *, owner_user_id: int | None = N
             {"i": app_id})).mappings().first()
     d = to_dict(row)
     d["store"] = to_dict(link) if link else None
-    return _with_preview_url(d)
+    return _with_public_urls(d)
 
 
 async def rename_app(session_factory, app_id: int, name: str, *,
@@ -321,7 +324,9 @@ async def delete_app(session_factory, app_id: int) -> dict:
     M1 裁定：只删记录，**不删磁盘工程目录、不 drop 数据库**（01 FR1-07 的全删链含删容器/镜像/
     删库勾选项，留给 M2）。删的是 workspace 行——app_project 的 FK 与 chat_session 都是
     ON DELETE CASCADE，一次删除即清掉应用 + 会话 + 消息 + 文件变更，不留孤儿；
-    prod_port/dev_port 的 UNIQUE 行随之消失，端口对即被释放（规格 05）。
+    prod_port/dev_port 的 UNIQUE 行随之消失，端口对即被释放（规格 05）——**前提是调用方已把该应用的
+    dev/prod 栈收口**（`engine.down_app_stacks`）：端口在库里释放而容器还在跑，等于把同一个端口埋给
+    下一个应用，它起栈时只会拿到 daemon 的 port is already allocated。
     """
     async with session_factory() as s:
         row = (await s.execute(text(

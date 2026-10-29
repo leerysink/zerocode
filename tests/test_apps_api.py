@@ -105,6 +105,32 @@ async def test_list_preview_url_defaults_to_localhost(client, monkeypatch):
     assert row["preview_url"] == f"http://localhost:{row['dev_port']}"
 
 
+async def test_list_and_detail_carry_prod_url(client, monkeypatch):
+    """正式地址与预览地址同批回表（聊天页「打开生产」）。
+
+    为什么不复用 `GET /apps/{id}/urls` 让前端点击时再拉：`window.open` 落在 await 之后就出了
+    用户手势窗口，会被弹窗拦截器静默吞掉。地址口径本身仍只在 `nics.app_url` 一处投影（ADR-0016），
+    这里只是把那一份带进行里，不另立第二套拼法。
+    """
+    from app.deploy import nics
+    monkeypatch.delenv("ZEROCODE_SSL_ENABLE", raising=False)
+    assert (await client.post("/api/apps", json=BODY)).status_code == 201
+    row = await _row_by_slug(client, SLUG)
+    assert row["prod_url"] == f"https://{SLUG}.{nics.GATEWAY_DOMAIN}"
+    detail = (await client.get(f"/api/apps/{row['id']}")).json()
+    assert detail["prod_url"] == row["prod_url"]
+
+
+async def test_prod_url_uses_host_and_prod_port_when_ssl_off(client, monkeypatch):
+    """SSL 关（域名未备案期的活路）：正式地址退到 `http://{基址}:{prod_port}`，与预览各用各的端口。"""
+    monkeypatch.setenv("ZEROCODE_SSL_ENABLE", "false")
+    monkeypatch.setenv("ZEROCODE_PREVIEW_HOST", "10.0.1.25")
+    assert (await client.post("/api/apps", json=BODY)).status_code == 201
+    row = await _row_by_slug(client, SLUG)
+    assert row["prod_url"] == f"http://10.0.1.25:{row['prod_port']}"
+    assert row["prod_url"] != row["preview_url"]
+
+
 async def test_create_conflict_and_bad_request(client):
     body = {"name": "x", "slug": SLUG, "scale": "small", "stack": "vue3-fastapi"}
     assert (await client.post("/api/apps", json=body)).status_code == 201

@@ -4,8 +4,8 @@
 // 「未绑工作区 / 无应用 / 非本人应用」三种情形，前端不重复实现权限判定（ADR-0020）。
 import { computed, h, onMounted, reactive, ref, watch } from 'vue'
 import {
-  CopyOutlined, DashboardOutlined, DatabaseOutlined, HistoryOutlined, MenuUnfoldOutlined,
-  CloudUploadOutlined, ProfileOutlined, RedoOutlined, SelectOutlined, SyncOutlined,
+  CloudServerOutlined, CloudUploadOutlined, CopyOutlined, DashboardOutlined, DatabaseOutlined,
+  HistoryOutlined, MenuUnfoldOutlined, ProfileOutlined, RedoOutlined, SelectOutlined, SyncOutlined,
 } from '@ant-design/icons-vue'
 import { message, Modal } from 'ant-design-vue'
 import { devReset, devRestart, devStart, listApps } from '../api'
@@ -31,9 +31,15 @@ const submitting = ref(false)
 const devBusy = computed(() => submitting.value || isDevBusy(devStatus.value))
 
 // 地址只从接口字段来，绝不按 dev_port 自拼：部署基址是配置项，硬拼在容器化与远端访问下直接失效（ADR-0021）。
-// dev_port 缺位时后端刻意回空串（app_service.py::_with_preview_url），此时开出去的是 about:blank，比不开更糟。
+// dev_port 缺位时后端刻意回空串（app_service.py::_with_public_urls），此时开出去的是 about:blank，比不开更糟。
 const previewUrl = computed(() => polled.url.value || app.value?.preview_url || '')
 const canOpenPreview = computed(() => devStatus.value === 'running' && !!previewUrl.value)
+
+// 正式地址同样只从接口字段来（prod_url 由后端 nics.app_url 单点投影，ADR-0016）：
+// SSL 开时是网关域名、关时是 host:prod_port，前端两种口径都不该自己拼。
+const prodStatus = computed(() => polled.statusProd.value ?? app.value?.status_prod ?? null)
+const prodUrl = computed(() => polled.prodUrl.value || app.value?.prod_url || '')
+const canOpenProd = computed(() => prodStatus.value === 'running' && !!prodUrl.value)
 
 // 四个查看壳子互斥：同时至多一个开着。用单一 active 源 + 可写 computed，
 // 互斥由构造保证，不需要「开这个就关其余」的遍历；v-model:open 直绑布尔也是
@@ -74,12 +80,19 @@ function startRollback(version) {
   openShell('publish')
 }
 
-function openPreview() {
-  if (!canOpenPreview.value) return
-  // 命名窗口让同一应用重复点击复用标签而不是堆一排（对齐 openFolder.js 的 zerocode-files-<id>）
-  const win = window.open(previewUrl.value, `zerocode-preview-${app.value.id}`)
+// 命名窗口让同一应用重复点击复用标签而不是堆一排（对齐 openFolder.js 的 zerocode-files-<id>）
+function openTab(url, prefix) {
+  const win = window.open(url, `${prefix}-${app.value.id}`)
   // 被弹窗拦截或 transient activation 过期时返回 null；静默失败等于按钮坏了
   if (!win) message.warning('新标签被拦截了，请允许本站弹出窗口后重试')
+}
+
+function openPreview() {
+  if (canOpenPreview.value) openTab(previewUrl.value, 'zerocode-preview')
+}
+
+function openProd() {
+  if (canOpenProd.value) openTab(prodUrl.value, 'zerocode-prod')
 }
 
 // 失败提示里挂一个可点的「查看日志」：排查启动失败时用户下一步几乎必然是看日志，
@@ -173,6 +186,11 @@ async function copyPreviewUrl() {
     <a-tooltip :title="canOpenPreview ? '打开预览' : '预览未启动'">
       <a-button size="small" class="zc-act-open" :disabled="!canOpenPreview" @click="openPreview">
         <template #icon><select-outlined /></template>
+      </a-button>
+    </a-tooltip>
+    <a-tooltip :title="canOpenProd ? '打开生产' : '正式环境未启动'">
+      <a-button size="small" class="zc-act-prod" :disabled="!canOpenProd" @click="openProd">
+        <template #icon><cloud-server-outlined /></template>
       </a-button>
     </a-tooltip>
     <a-dropdown>

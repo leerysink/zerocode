@@ -12,6 +12,10 @@ export const STARTING_TIMEOUT_MS = 90000
 export function useDevStatus(appIdRef, options = {}) {
   const status = ref(null)
   const url = ref('')
+  // prod 状态顺带跟着同一次 getApp 走：「打开生产」的置灰闸门必须反映真实运行态，
+  // 停在 listApps 那一刻的旧值等于按钮在撒谎（本页不订阅 deploy WS，轮询是唯一通道）
+  const statusProd = ref(null)
+  const prodUrl = ref('')
   let timer = null
   let startingSince = null
   let reported = null
@@ -37,6 +41,9 @@ export function useDevStatus(appIdRef, options = {}) {
       const { data } = await getApp(id)
       status.value = data.status_dev
       url.value = data.preview_url || ''
+      statusProd.value = data.status_prod ?? null
+      // prod_url 只在应用行里，轮询这一份也要带回去，否则别处启动正式后按钮永远灰着
+      prodUrl.value = data.prod_url || ''
     } catch {
       // 轮询失败静默：状态未知时按钮沿用上一次读数，不许把错误弹到用户脸上打断聊天
       return
@@ -84,6 +91,8 @@ export function useDevStatus(appIdRef, options = {}) {
       if (timer) clearTimeout(timer)
       status.value = null
       url.value = ''
+      statusProd.value = null
+      prodUrl.value = ''
       rearm()
       loop()
     },
@@ -96,5 +105,5 @@ export function useDevStatus(appIdRef, options = {}) {
     document.removeEventListener('visibilitychange', onVisibility)
   })
 
-  return { status, url, rearm }
+  return { status, url, statusProd, prodUrl, rearm }
 }
