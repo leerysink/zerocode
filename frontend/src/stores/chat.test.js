@@ -18,6 +18,7 @@ function mk() {
   return {
     messages: [], streamingContent: '', streamingThinking: '', todoList: [],
     compacting: false, pendingAsk: null, currentSessionId: 1,
+    toolProgress: null, pendingConfirm: null,
     pendingEcho: '', pendingEchoId: '', pendingOutbox: {}, rejectedDraft: '',
     rejectedAttachments: [], running: false, visionSupported: false,
   }
@@ -248,5 +249,74 @@ describe('chat store 图片发送（票 001/003/006）', () => {
     expect(s.visionSupported).toBe(false)
     expect(s.messages[0]).toMatchObject({ role: 'user', content: '看图', queued: true, attachments: [att] })
     expect(s.messages[0].client_msg_id).toBe('c1')
+  })
+})
+
+// 预览工具（规格 2026-10-29-agent-preview-tools §8）：进度是临时事件，只活在 store 里
+describe('tool_progress 与确认卡 summary', () => {
+  it('tool_progress 写入 store.toolProgress，不进消息流', () => {
+    const s = mk()
+    applyEvent(s, { type: 'tool_progress', name: 'preview_restart', line: '[zerocode] → 迁移中' })
+    expect(s.toolProgress).toEqual({ name: 'preview_restart', line: '[zerocode] → 迁移中' })
+    expect(s.messages.length).toBe(0)          // 临时事件不落消息流（刷新即消失）
+  })
+
+  it('同名 tool_result 到达时清空进度', () => {
+    const s = mk()
+    applyEvent(s, { type: 'tool_call', name: 'preview_restart', args: {} })
+    applyEvent(s, { type: 'tool_progress', name: 'preview_restart', line: 'x' })
+    applyEvent(s, { type: 'tool_result', name: 'preview_restart', result: { ok: true } })
+    expect(s.toolProgress).toBe(null)
+    expect(s.messages.length).toBe(2)
+  })
+
+  it('别的工具的结果不误清当前进度', () => {
+    const s = mk()
+    applyEvent(s, { type: 'tool_progress', name: 'preview_restart', line: 'x' })
+    applyEvent(s, { type: 'tool_result', name: 'read_file', result: { ok: true } })
+    expect(s.toolProgress.line).toBe('x')
+  })
+
+  it('message_done / status 终态 / error 都清空进度', () => {
+    for (const ev of [{ type: 'message_done', content: '好了' },
+                      { type: 'status', status: 'idle' },
+                      { type: 'error', message: '炸了' }]) {
+      const s = mk()
+      applyEvent(s, { type: 'tool_progress', name: 'preview_restart', line: 'x' })
+      applyEvent(s, ev)
+      expect(s.toolProgress).toBe(null)
+    }
+  })
+
+  it('status(running) 是重连快照，不清进度也不复位执行态', () => {
+    const s = mk()
+    applyEvent(s, { type: 'tool_progress', name: 'preview_restart', line: 'x' })
+    applyEvent(s, { type: 'status', status: 'running' })
+    expect(s.toolProgress.line).toBe('x')
+  })
+
+  it('confirm_request 无 summary 时对象形状一字不变', () => {
+    const s = mk()
+    applyEvent(s, { type: 'confirm_request', tool: 'write_file', args: { path: 'a.txt' } })
+    expect(s.pendingConfirm).toEqual({ tool: 'write_file', args: { path: 'a.txt' } })
+  })
+
+  it('confirm_request 带 summary 时保存', () => {
+    const s = mk()
+    applyEvent(s, {
+      type: 'confirm_request', tool: 'preview_restart', args: { wait_seconds: 240 },
+      summary: '应用「演示应用」的 dev 预览正在运行，重启会中断正在进行的调试。确定重启？',
+    })
+    expect(s.pendingConfirm.summary).toContain('正在运行')
+    expect(s.pendingConfirm.tool).toBe('preview_restart')
+  })
+
+  it('cancel 顺手清掉进度', () => {
+    setActivePinia(createPinia())
+    const s = useChatStore()
+    s._ws = { readyState: 1, send: vi.fn() }
+    applyEvent(s, { type: 'tool_progress', name: 'preview_restart', line: 'x' })
+    s.cancel()
+    expect(s.toolProgress).toBe(null)
   })
 })

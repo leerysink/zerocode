@@ -4,6 +4,7 @@
 // token / reasoning_delta / tool_call / tool_result / ask_user(多问题) / confirm_request / message_done
 // / error / status / file_change / todo_sync / compacting / compaction_done / notice(压缩 skip 终态)
 // / busy(执行中被拒的非终态提示) / steering_done(插话已在工具边界被模型看见)
+// / tool_progress(预览工具的临时进度，不落库不进气泡，收到结果/终态即清)
 // / session_title(首条消息自动命名，就地更新侧栏标题)；
 // 终态 = error / status(idle|error)，busy、status(running) 与 steering_done 都不是。
 import { defineStore } from 'pinia'
@@ -28,17 +29,27 @@ export function applyEvent(store, ev) {
       break
     case 'tool_result':
       store.messages.push({ role: 'tool', name: ev.name, result: ev.result })
+      // 进度只属于「正在跑的那个工具」：同名结果到达即收口，别的工具的结果不误清
+      if (!store.toolProgress || store.toolProgress.name === ev.name) store.toolProgress = null
+      break
+    case 'tool_progress': // 预览工具的临时进度（不落库，刷新即消失；最终结论看 tool_result）
+      store.toolProgress = { name: ev.name, line: ev.line }
       break
     case 'ask_user': // 多问题新协议：questions 逐题渲染（AskPanel 消费）
       store.pendingAsk = { questions: ev.questions || [] }
       break
     case 'confirm_request':
-      store.pendingConfirm = { tool: ev.tool, args: ev.args }
+      // summary 是可选的人话摘要（预览重启用）：没有它时对象形状必须一字不变，
+      // 既有写入确认的断言与渲染都不受影响
+      store.pendingConfirm = ev.summary
+        ? { tool: ev.tool, args: ev.args, summary: ev.summary }
+        : { tool: ev.tool, args: ev.args }
       break
     case 'message_done': // 整段回复固化（附带思考留痕）
       store.messages.push({ role: 'assistant', content: ev.content, reasoning: store.streamingThinking || undefined })
       store.streamingContent = ''
       store.streamingThinking = ''
+      store.toolProgress = null // 本轮收口：临时进度不得活到下一条消息
       break
     case 'reasoning_delta': // 思考流式增量（有才发）
       store.streamingThinking += ev.content
@@ -133,11 +144,12 @@ export function applyEvent(store, ev) {
       store.pendingEcho = ''
       store.pendingOutbox = {}
       store.pendingEchoId = ''
+      store.toolProgress = null
       break
     case 'status': // 终态回执（idle/error）复位执行态；status=running 是重连补发的非终态快照
       if (ev.status === 'running') {
         store.running = true // 后端仍在跑（刷新/重连/另开标签页）：把「停止」按钮立回来
-        break
+        break // 快照不改进度：那一行还得继续显示
       }
       store.running = false
       store.streamingThinking = ''
@@ -145,6 +157,7 @@ export function applyEvent(store, ev) {
       store.pendingEcho = ''
       store.pendingOutbox = {}
       store.pendingEchoId = ''
+      store.toolProgress = null
       break
     case 'file_change': // 挂到最近一条 tool 消息，供 diff 渲染（Task 13 最小扩展：补存 path/action 供文件名显示）
       for (let i = store.messages.length - 1; i >= 0; i--) {
@@ -170,6 +183,7 @@ export const useChatStore = defineStore('chat', {
     wsStatus: 'disconnected',
     pendingAsk: null,
     pendingConfirm: null,
+    toolProgress: null, // 预览工具的临时进度 {name, line}：不落库、不进消息流，终态即清
     running: false,
     todoList: [],
     streamingThinking: '',
@@ -234,6 +248,7 @@ export const useChatStore = defineStore('chat', {
       this.streamingContent = ''
       this.pendingAsk = null
       this.pendingConfirm = null
+      this.toolProgress = null // 临时进度不跨会话：切会话/重开时一并抹掉
       // 执行态一律以服务端为准，不在这里猜：DB 的 status='running' 在进程崩溃后会滞留
       // 最多 10 分钟（watchdog 周期），拿它立 running=true 会造出「假在跑、又停不掉」的新死结。
       // connect 之后后端若真在跑，会补发一帧 status(running) 把执行态与「停止」按钮立回来。
@@ -351,6 +366,7 @@ export const useChatStore = defineStore('chat', {
       this._uplink({ type: 'cancel' })
       this.pendingAsk = null
       this.pendingConfirm = null
+      this.toolProgress = null // 用户点了「停止」：那行进度当场作废，不等后端回执
       // 后端 hub.cancel 会一并丢弃未注入的插话（不落库）：本地同步摘掉那些「排队中」气泡，
       // 文本与附件按原顺序退回输入框，别让用户以为说出去了
       const stranded = this.messages.filter((m) => m.role === 'user' && m.queued)
