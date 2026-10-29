@@ -439,3 +439,367 @@ async def test_unexpected_exception_text_is_redacted_and_capped(sf, monkeypatch)
     r = await pt.run_preview_tool(Ctx({"id": 1}, sf=sf), "preview_status", {})
     assert r["ok"] is False and "supersecret" not in r["error"]
     assert "<redacted:" in r["error"] and len(r["error"]) <= 200
+
+
+# ---------- preview_restart：策略表（§5.5） ----------
+
+@pytest.fixture
+async def no_docker(monkeypatch):
+    """Docker 预检与探针一律替身：本段验接线，真起栈由 test_engine.py 与手工矩阵负责。"""
+    from app.deploy import engine as eng
+
+    async def ok():
+        return None
+
+    async def probe(app, timeout=2):
+        return True, ""
+
+    monkeypatch.setattr(eng, "preflight_docker", ok)
+    monkeypatch.setattr(eng, "probe_dev", probe)
+
+
+@pytest.fixture
+async def stopped_app(sf, tmp_path):
+    return await _mk_app(sf, await _mk_workspace(sf, str(tmp_path / "rs")), "pvstart")
+
+
+@pytest.fixture
+async def running_app(sf, tmp_path):
+    aid = await _mk_app(sf, await _mk_workspace(sf, str(tmp_path / "rr")), "pvrestart",
+                        dev_port=8263, prod_port=8262)
+    async with sf() as s:
+        await s.execute(text("UPDATE app_project SET status_dev='running' WHERE id=:i"), {"i": aid})
+        await s.commit()
+    return aid
+
+
+async def _engine_action_catcher(monkeypatch, action_name: str):
+    """把 engine.<action> 换成「立刻完成」的替身，返回它收到的调用记录。
+
+    替身像真引擎一样把终态写进 `status_dev`：工具的 `status` 读的是库，不是替身的返回值——
+    不写库的替身会让断言变成「替身自说自话」。
+    """
+    from app.deploy import engine as eng
+    seen = []
+
+    async def fake(sf_, app, notify=None):
+        seen.append({"slug": app["slug"], "notify": notify})
+        await eng._set_status(sf_, app["id"], "running")
+        return {"status": "running"}
+
+    monkeypatch.setattr(eng, action_name, fake)
+    return seen
+
+
+async def test_stopped_preview_calls_start_dev_without_confirm(stopped_app, sf, monkeypatch, no_docker):
+    from app.agent import preview_tools as pt
+    started = await _engine_action_catcher(monkeypatch, "start_dev")
+    restart = await _engine_action_catcher(monkeypatch, "restart_dev")
+    ctx = Ctx({"id": stopped_app}, sf=sf, cfg={"agent.preview_confirm_running": True})
+    r = await pt.run_preview_tool(ctx, "preview_restart", {"wait_seconds": 5})
+    assert r["ok"] is True and r["status"] == "running" and r["healthy"] is True
+    assert len(started) == 1 and restart == []               # stopped → 启动，不先 down（与应用页一致）
+    assert ctx.run_state["preview_restarts"] == 1 and r["restarts_left"] == 2
+
+
+async def test_running_preview_refuses_unconfirmed_restart(running_app, sf, monkeypatch, no_docker):
+    """竞态兜底（§5.6）：确认期间预览变成 running，也不执行未确认的中断。"""
+    from app.agent import preview_tools as pt
+    started = await _engine_action_catcher(monkeypatch, "restart_dev")
+    ctx = Ctx({"id": running_app}, sf=sf, cfg={"agent.preview_confirm_running": True})
+    r = await pt.run_preview_tool(ctx, "preview_restart", {})
+    assert r["ok"] is False and "请重试并在确认框中选择确认" in r["error"]
+    assert started == [] and ctx.deploy_tasks == {}
+
+
+async def test_running_preview_restarts_when_user_confirmed(running_app, sf, monkeypatch, no_docker):
+    from app.agent import preview_tools as pt
+    restarted = await _engine_action_catcher(monkeypatch, "restart_dev")
+    ctx = Ctx({"id": running_app}, sf=sf, cfg={"agent.preview_confirm_running": True})
+    r = await pt.run_preview_tool(ctx, "preview_restart", {}, confirmed=True)
+    assert r["ok"] is True and len(restarted) == 1
+    assert restarted[0]["notify"] == ctx.deploy_hub.publish  # 进度接到同一个 DeployHub（US-24）
+
+
+async def test_confirm_switch_off_skips_the_confirm_gate(running_app, sf, monkeypatch, no_docker):
+    from app.agent import preview_tools as pt
+    restarted = await _engine_action_catcher(monkeypatch, "restart_dev")
+    ctx = Ctx({"id": running_app}, sf=sf, cfg={"agent.preview_confirm_running": False})
+    r = await pt.run_preview_tool(ctx, "preview_restart", {})
+    assert r["ok"] is True and len(restarted) == 1
+
+
+async def test_existing_starting_task_is_observed_not_respawned(stopped_app, sf, monkeypatch, no_docker):
+    """US-16：用户刚点过启动，工具等同一个任务，绝不双起一个栈。"""
+    from app.agent import preview_tools as pt
+    from app.deploy import engine as eng
+    started = await _engine_action_catcher(monkeypatch, "start_dev")
+    async with sf() as s:
+        await s.execute(text("UPDATE app_project SET status_dev='starting' WHERE id=:i"),
+                        {"i": stopped_app})
+        await s.commit()
+    gate = asyncio.Event()
+
+    async def user_task():
+        await gate.wait()
+        return {"status": "running"}
+
+    task = asyncio.create_task(user_task())
+    ctx = Ctx({"id": stopped_app}, sf=sf, tasks={stopped_app: task})
+    r = await pt.run_preview_tool(ctx, "preview_restart", {"wait_seconds": 1})
+    assert started == [] and r["ok"] is False and r["status"] == "starting"
+    assert ctx.run_state.get("preview_restarts") is None     # 观察现有任务不计次数
+    gate.set()
+    await task
+
+
+async def test_other_deploy_task_is_refused_without_spawning(stopped_app, sf, monkeypatch, no_docker):
+    """库里状态不是 starting/stopping 却有任务在跑（多半是发布）：拒绝并发，不排队、不双跑。"""
+    from app.agent import preview_tools as pt
+    started = await _engine_action_catcher(monkeypatch, "start_dev")
+    gate = asyncio.Event()
+    task = asyncio.create_task(gate.wait())
+    ctx = Ctx({"id": stopped_app}, sf=sf, tasks={stopped_app: task})
+    r = await pt.run_preview_tool(ctx, "preview_restart", {})
+    assert r["ok"] is False and "部署任务进行中" in r["error"] and started == []
+    assert ctx.deploy_tasks[stopped_app] is task             # 没有覆盖别人的任务
+    gate.set()
+    await task
+
+
+async def test_wait_timeout_returns_starting_and_leaves_task_running(stopped_app, sf, monkeypatch):
+    """US-18：等待有界，超时是正常结果——后台任务继续跑完，模型改用 preview_status 观察。"""
+    from app.agent import preview_tools as pt
+    from app.deploy import engine as eng
+    gate = asyncio.Event()
+
+    async def slow(sf_, app, notify=None):
+        await eng._set_status(sf_, app["id"], "starting")     # 真引擎一进 start_dev 就落 starting
+        await gate.wait()
+
+    monkeypatch.setattr(eng, "preflight_docker", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(eng, "start_dev", slow)
+    ctx = Ctx({"id": stopped_app}, sf=sf)
+    r = await pt.run_preview_tool(ctx, "preview_restart", {"wait_seconds": 1})
+    assert r["ok"] is False and r["status"] == "starting"
+    assert "不要连续重启" in r["hint"] and "preview_status" in r["hint"]
+    assert ctx.deploy_tasks[stopped_app] and not ctx.deploy_tasks[stopped_app].done()
+    gate.set()
+    await ctx.deploy_tasks[stopped_app]
+
+
+async def test_chat_cancel_stops_waiting_only(stopped_app, sf, monkeypatch):
+    """US-19：点「停止」后工具在一个轮询周期内返回，部署任务不被取消。"""
+    from app.agent import preview_tools as pt
+    from app.deploy import engine as eng
+    gate = asyncio.Event()
+
+    async def slow(sf_, app, notify=None):
+        await eng._set_status(sf_, app["id"], "starting")
+        await gate.wait()
+
+    monkeypatch.setattr(eng, "preflight_docker", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(eng, "start_dev", slow)
+    cancel = asyncio.Event()
+    ctx = Ctx({"id": stopped_app}, sf=sf, cancel=cancel)
+    task = asyncio.create_task(pt.run_preview_tool(ctx, "preview_restart", {"wait_seconds": 60}))
+    await asyncio.sleep(0.8)
+    cancel.set()
+    r = await asyncio.wait_for(task, 2)
+    assert r["ok"] is True and r["cancelled"] is True and "用户已停止本轮" in r["hint"]
+    assert r["status"] == "starting"
+    assert not ctx.deploy_tasks[stopped_app].done()          # 预览仍在后台继续启动
+    gate.set()
+    await ctx.deploy_tasks[stopped_app]
+
+
+async def test_task_failure_is_shaped_with_status_and_logs(stopped_app, sf, monkeypatch):
+    """US-20：DeployError 原文带出 + 状态 + 最近日志，模型不必再猜。
+
+    状态由「引擎」自己写库（真 start_dev 就是这么收口的），工具侧每次终态都重新读一遍应用行，
+    所以断言的是「读到什么回什么」，不是替身硬写的字面量。
+    """
+    from app.agent import preview_tools as pt
+    from app.deploy import engine as eng
+    from app.deploy.errors import DeployError
+
+    async def preflight_ok():
+        return None
+
+    async def boom(sf_, app, notify=None):
+        notify(app["id"], {"app_id": app["id"], "type": "dev_log",
+                           "line": "[zerocode] ✗ 迁移失败，dev 栈不启动"})
+        await eng._set_status(sf_, app["id"], "error")
+        raise DeployError("dev 迁移失败（sqlrunner 退出码 1），详情见迁移日志")
+
+    monkeypatch.setattr(eng, "preflight_docker", preflight_ok)
+    monkeypatch.setattr(eng, "start_dev", boom)
+    ctx = Ctx({"id": stopped_app}, sf=sf)
+    r = await pt.run_preview_tool(ctx, "preview_restart", {"wait_seconds": 5})
+    assert r["ok"] is False and r["status"] == "error"
+    assert "sqlrunner 退出码 1" in r["error"]
+    assert any("迁移失败" in line for line in r["logs"])
+
+
+async def test_non_deploy_error_gets_a_prefix(stopped_app, sf, monkeypatch):
+    from app.agent import preview_tools as pt
+    from app.deploy import engine as eng
+
+    async def preflight_ok():
+        return None
+
+    async def crash(sf_, app, notify=None):
+        raise ValueError("unexpected")
+
+    monkeypatch.setattr(eng, "preflight_docker", preflight_ok)
+    monkeypatch.setattr(eng, "start_dev", crash)
+    r = await pt.run_preview_tool(Ctx({"id": stopped_app}, sf=sf), "preview_restart",
+                                  {"wait_seconds": 5})
+    assert r["ok"] is False and r["error"] == "预览任务异常: unexpected"
+
+
+async def test_confirm_window_status_change_falls_back_to_start(running_app, sf, monkeypatch, no_docker):
+    """§5.5：确认期间预览从 running 变成 stopped → 确认通过后按启动执行，不再问第二次。"""
+    from app.agent import preview_tools as pt
+    from app.deploy import engine as eng
+    started = await _engine_action_catcher(monkeypatch, "start_dev")
+    restarted = await _engine_action_catcher(monkeypatch, "restart_dev")
+    async with sf() as s:
+        await s.execute(text("UPDATE app_project SET status_dev='stopped' WHERE id=:i"),
+                        {"i": running_app})
+        await s.commit()
+    ctx = Ctx({"id": running_app}, sf=sf, cfg={"agent.preview_confirm_running": True})
+    r = await pt.run_preview_tool(ctx, "preview_restart", {"wait_seconds": 5}, confirmed=True)
+    assert r["ok"] is True and len(started) == 1 and restarted == []
+
+
+async def test_restart_cap_refuses_without_asking_the_user(stopped_app, sf, monkeypatch):
+    """US-22：到限直接返回并带上次数；观察现有任务不占用额度。"""
+    from app.agent import preview_tools as pt
+    from app.deploy import engine as eng
+    seen = []
+
+    async def preflight_ok():
+        return None
+
+    async def quick(sf_, app, notify=None):
+        seen.append(1)
+        return {"status": "running"}
+
+    monkeypatch.setattr(eng, "preflight_docker", preflight_ok)
+    monkeypatch.setattr(eng, "start_dev", quick)
+    ctx = Ctx({"id": stopped_app}, sf=sf, cfg={"agent.preview_max_restarts": 2})
+    ctx.run_state["preview_restarts"] = 2
+    r = await pt.run_preview_tool(ctx, "preview_restart", {})
+    assert r["ok"] is False and "已启动/重启预览 2 次" in r["error"] and r["restarts_left"] == 0
+    assert seen == []
+
+
+async def test_restart_cap_zero_means_unlimited(stopped_app, sf, monkeypatch, no_docker):
+    from app.agent import preview_tools as pt
+    from app.deploy import engine as eng
+
+    async def quick(sf_, app, notify=None):
+        await eng._set_status(sf_, app["id"], "running")
+        return {"status": "running"}
+
+    monkeypatch.setattr(eng, "start_dev", quick)
+    ctx = Ctx({"id": stopped_app}, sf=sf, cfg={"agent.preview_max_restarts": 0})
+    ctx.run_state["preview_restarts"] = 9
+    r = await pt.run_preview_tool(ctx, "preview_restart", {"wait_seconds": 5})
+    assert r["ok"] is True and r["restarts_left"] == -1      # -1 = 不限
+
+
+async def test_docker_preflight_failure_registers_no_task(stopped_app, sf, monkeypatch):
+    """US-23：预检失败给出中文引导（与 REST 的 503 同源），且不登记后台任务。"""
+    from app.agent import preview_tools as pt
+    from app.deploy import engine as eng
+    from app.deploy.errors import DeployError
+
+    async def down():
+        raise DeployError("Docker 未启动或不可用：请打开 Docker Desktop（设置页「部署环境」可一键启动）",
+                          status=503)
+
+    monkeypatch.setattr(eng, "preflight_docker", down)
+    ctx = Ctx({"id": stopped_app}, sf=sf)
+    r = await pt.run_preview_tool(ctx, "preview_restart", {})
+    assert r["ok"] is False and "Docker" in r["error"]
+    assert ctx.deploy_tasks == {}
+
+
+async def test_progress_forwards_only_step_lines_and_status_changes(
+        stopped_app, sf, monkeypatch, no_docker):
+    """US-17：pip/npm 的成百上千行容器输出不进聊天进度（那属于 preview_logs）。"""
+    from app.agent import preview_tools as pt
+    from app.deploy import engine as eng
+
+    async def with_steps(sf_, app, notify=None):
+        notify(app["id"], {"app_id": app["id"], "type": "dev_log",
+                           "line": "[zerocode] → 执行 sqlchange 迁移（dev 库 pv_dev）"})
+        notify(app["id"], {"app_id": app["id"], "type": "dev_log", "line": "Collecting fastapi==0.115"})
+        notify(app["id"], {"app_id": app["id"], "type": "dev_status", "status": "starting"})
+        await eng._set_status(sf_, app["id"], "running")
+        notify(app["id"], {"app_id": app["id"], "type": "dev_log", "line": "[zerocode] ✓ 预览已就绪"})
+        return {"status": "running"}
+
+    monkeypatch.setattr(eng, "start_dev", with_steps)
+    ctx = Ctx({"id": stopped_app}, sf=sf)
+    r = await pt.run_preview_tool(ctx, "preview_restart", {"wait_seconds": 5})
+    lines = [ev["line"] for ev in ctx.sent if ev["type"] == "tool_progress"]
+    assert all(ev["name"] == "preview_restart" for ev in ctx.sent)
+    assert any("执行 sqlchange 迁移" in l for l in lines)
+    assert any("预览状态：starting" in l for l in lines)
+    assert not any("Collecting" in l for l in lines)          # 容器输出不转发
+    assert r["ok"] is True
+    assert any("预览已就绪" in l for l in r["logs"])          # 全量步骤行仍进结果的 logs
+
+
+async def test_successful_restart_carries_probe_and_url(stopped_app, sf, monkeypatch):
+    from app.agent import preview_tools as pt
+    from app.deploy import engine as eng
+
+    async def preflight_ok():
+        return None
+
+    async def quick(sf_, app, notify=None):
+        return {"status": "running"}
+
+    async def unreachable(app, timeout=2):
+        return False, "ConnectError: [Errno 111] Connection refused"
+
+    async def quick(sf_, app, notify=None):
+        await eng._set_status(sf_, app["id"], "running")
+        return {"status": "running"}
+
+    monkeypatch.setattr(eng, "preflight_docker", preflight_ok)
+    monkeypatch.setattr(eng, "start_dev", quick)
+    monkeypatch.setattr(eng, "probe_dev", unreachable)
+    r = await pt.run_preview_tool(Ctx({"id": stopped_app}, sf=sf), "preview_restart",
+                                  {"wait_seconds": 5})
+    assert r["ok"] is True                                    # 探针失败不把动作翻成失败
+    assert r["healthy"] is False and "ConnectError" in r["probe"]
+    assert r["status"] == "running" and r["url"].endswith(":8241")
+    assert r["app"]["slug"] == "pvstart"
+
+
+# ---------- <preview> 指引（§9）：工具挂载时才注入，按栈补一句热更新语义 ----------
+
+async def test_preview_prompt_carries_the_verify_dont_restart_rules():
+    from app.agent import preview_tools as pt
+    p = pt.build_preview_prompt("vue3-fastapi")
+    assert p.startswith("\n\n<preview>") and p.endswith("</preview>")
+    assert "preview_status" in p and "preview_logs" in p and "preview_restart" in p
+    assert "healthy 只表示 HTTP 可达" in p          # 不许把「能访问」说成「功能正确」
+    assert "不要连续重启" in p
+    assert "你没有这些工具" in p                     # 明确动作面边界
+    assert "3 次" not in p                          # 次数上限是可配的，提示词不写死数字
+
+
+async def test_preview_prompt_stack_specific_lines():
+    from app.agent import preview_tools as pt
+    assert "uvicorn --reload" in pt.build_preview_prompt("vue3-fastapi")
+    spring = pt.build_preview_prompt("vue3-springboot")
+    assert "必须 preview_restart" in spring and "uvicorn" not in spring
+    assert "刷新即可" in pt.build_preview_prompt("static")
+    assert "刷新即可" in pt.build_preview_prompt("vue3-node")
+    assert "</preview>" in pt.build_preview_prompt("unknown-stack")   # 未知栈仍有基线指引
