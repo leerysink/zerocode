@@ -438,6 +438,24 @@ async def test_prod_status_reads_db_and_compose_text(monkeypatch, sf, seed):
     assert seen and seen[0][0] == "compose" and "ps" in seen[0]
 
 
+async def test_prod_status_shows_direct_url_when_ssl_disabled(monkeypatch, sf, seed):
+    """SSL 开关关掉后，状态接口（控制台地址、发布记录、README 块同源）回 IP 直连地址。"""
+    wid, aid = await seed(status_prod="running")
+
+    async def app_root(sf, app):
+        return Path("D:/__zc_prod_test__")
+
+    async def docker(*a, **k):
+        return 0, '{"State":"running"}'
+
+    monkeypatch.setattr(prod, "_app_root", app_root)
+    monkeypatch.setattr(prod, "_docker", docker)
+    monkeypatch.setenv(nics.SSL_ENABLE_ENV, "false")
+    monkeypatch.setenv("ZEROCODE_PREVIEW_HOST", "10.0.0.8")
+    res = await prod.prod_status(sf, _app(aid, prod_port=8214))
+    assert res["domain"] == "http://10.0.0.8:8214"
+
+
 async def test_prod_restart_stops_then_starts(monkeypatch, sf, seed):
     wid, aid = await seed(status_prod="running")
     app = _app(aid)

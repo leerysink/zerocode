@@ -63,6 +63,11 @@ PREVIEW_PROBE_HOST_ENV = "ZEROCODE_PREVIEW_PROBE_HOST"
 PREVIEW_HOST_ENV = "ZEROCODE_PREVIEW_HOST"
 PREVIEW_PROBE_HOST_BAKED = "host.docker.internal"
 PREVIEW_HOST_BAKED = "localhost"
+# SSL 开关（消费方 app/deploy/nics.py）：true=应用地址走网关通配域名；显式 false/0/no/off
+# 时改投影成 http://<PREVIEW_HOST>:<prod 端口>，用于域名未备案、443 被拦期间。
+# 它只改地址展示，不停网关、不碰证书——开着网关不用没有任何代价。
+SSL_ENABLE_ENV = "ZEROCODE_SSL_ENABLE"
+SSL_ENABLE_BAKED = "true"
 
 # 预置应用复制时的剔除名单：deploy/ 是凭据禁区（compose.py 的 STACK_SECRETS 就落在那里），
 # 其余都是可再生的依赖/产物目录——带上它们只会让包体膨胀几十倍且把本机路径带过去。
@@ -814,7 +819,7 @@ def _compose_override(key: str, value: str) -> str:
 def _backend_overlay_env(gateway_domain: str, mirrors: Mirrors) -> str:
     """backend 的 environment 段要追加的行（自带 6 空格缩进，可直接插在上一行之后）。
 
-    只列**有运行期消费方**的三项：网关域名由 app/deploy/nics.py 在容器里读，PyPI / npm 由
+    只列**有运行期消费方**的项：网关域名与 SSL 开关由 app/deploy/nics.py 在容器里读，PyPI / npm 由
     app/deploy/compose.py 转注进应用的 dev 栈（于是服务器上改一次 `.env` 就同时管住平台自己
     与它起出来的每一个应用）。apt 不进这里：它只作用于镜像构建期，容器里没人读它。
     """
@@ -826,6 +831,9 @@ def _backend_overlay_env(gateway_domain: str, mirrors: Mirrors) -> str:
         # 展示值是用户浏览器里的那个主机（服务器部署时填 IP 或域名，否则复制到的地址打不开）。
         "      " + _compose_override(PREVIEW_PROBE_HOST_ENV, PREVIEW_PROBE_HOST_BAKED),
         "      " + _compose_override(PREVIEW_HOST_ENV, PREVIEW_HOST_BAKED),
+        # SSL 开关只影响地址投影（控制台/发布记录/应用 README），网关不必停机：
+        # 域名没备案时把它设成 false，应用就改以 http://<展示宿主>:<prod 端口> 露出来。
+        "      " + _compose_override(SSL_ENABLE_ENV, SSL_ENABLE_BAKED),
     ]
     if mirrors.pypi:
         lines.append("      " + _compose_override(PYPI_MIRROR_ENV, mirrors.pypi))
@@ -890,6 +898,12 @@ def _env_example_overlay(gateway_domain: str, mirrors: Mirrors) -> str:
         "# 请填服务器的 IP 或域名**，否则控制台里的「打开/复制预览地址」指向访问者自己的机器。",
         f"{PREVIEW_PROBE_HOST_ENV}={PREVIEW_PROBE_HOST_BAKED}",
         f"{PREVIEW_HOST_ENV}={PREVIEW_HOST_BAKED}",
+        "",
+        "# 应用访问地址形态：true（默认）= 网关通配域名 https://<应用slug>.<域名>；",
+        "# 显式 false/0/no/off = 改用 IP 直连 http://<上面的预览展示地址>:<prod 端口>。",
+        "# 域名未备案、443 被拦截时设为 false，网关不必停机——控制台、发布记录与",
+        "# 应用 README 里的应用地址会一起切换。",
+        f"{SSL_ENABLE_ENV}={SSL_ENABLE_BAKED}",
     ]
     if mirrors.pypi:
         lines += ["", "# 应用预览环境（dev 栈）装 Python 依赖用的镜像源，打包时烘的是默认值。",
@@ -1219,6 +1233,12 @@ docker compose -f gateway/docker-compose.yml ps
 
 网关或证书没就位之前，控制台里应用地址看着正常、点进去全 404。
 
+域名暂时不能对外提供时（例如境内服务器上域名还没备案、443 的 TLS 握手被中间设备重置），
+**不必拆网关**：把部署根 `.env` 的 `ZEROCODE_SSL_ENABLE` 设成 `false` 再 `docker compose up -d`，
+控制台、发布记录与应用 README 里的地址就改成 `http://<ZEROCODE_PREVIEW_HOST>:<prod 端口>`
+直连（宿主防火墙要放行应用端口段，默认 8210-8399）。它只改地址投影，网关照常跑；
+备案或证书就绪后改回 `true` 即恢复域名地址。dev 预览地址本来就是 IP 直连，不受这个开关影响。
+
 **第一个注册的账号自动成为创始人**，并接管所有预置应用（它们的 `owner_user_id` 在 init.sql 里
 刻意留 NULL）。演示就注册 `tsadmin` / `tsadmin`。
 
@@ -1338,6 +1358,7 @@ bash apply-init.sh                                 # 新表自动建上，既有
 | 拉镜像超时 | 服务器访问不了 Docker Hub：配 registry mirror 后 `docker compose up -d --build` 重试 |
 | 发布报 `docker compose -f …prod-compose.yml… 超时（600s）`、记账停在 build 步 | 应用的 prod 镜像要在**构建期**装依赖（`pip install` / `npm install`），境内机直连官方源会等到超时——dev 预览正常不代表发布能过，两条通道不同。重打包时给 `--pypi-mirror` 与 `--npm-registry`，平台会把同一份源经 `build.args` 注进每个应用的 prod 构建（ADR-0025）；`deploy.build_timeout` 调大只是把 10 分钟换成 30 分钟，不是修法 |
 | 控制台里应用地址点进去全 404 | 逐项核对：① 网关起了吗（`docker compose -f gateway/docker-compose.yml ps`）；② 平台 `.env` 与 `gateway/.env` 的域名是否一致；③ 应用 prod 是否 `running`（进没进 `gateway/routes/routes.json`）；④ 浏览器是否信任了自签 CA |
+| 域名打不开（未备案 / 443 被拦），想先走 IP | 把部署根 `.env` 的 `ZEROCODE_SSL_ENABLE` 设成 `false` 并 `docker compose up -d`：控制台、发布记录、应用 README 的应用地址一起改成 `http://<ZEROCODE_PREVIEW_HOST>:<prod 端口>`，网关不用停；宿主防火墙要放行应用端口段（默认 8210-8399）。备案或证书就绪后改回 `true` |
 | 应用域名 502 Bad Gateway | 先看 `docker compose -f gateway/docker-compose.yml logs gateway`：出现 `host.docker.internal could not be resolved` 就是上游地址在 Linux 上解析不了（nginx 不读 `/etc/hosts`），把 `gateway/.env` 的 `ZEROCODE_GATEWAY_UPSTREAM` 设成宿主 docker0 网关（默认 `172.17.0.1`）后重建网关；若日志是 `connection refused`，核对应用 prod 栈与 `routes.json` 的端口是否一致 |
 | 网关容器起不来 / 反复重启 | `docker compose -f gateway/docker-compose.yml logs gateway`：多为 `gateway/certs/gateway.crt|key` 缺失，或 80/443 被占用 |
 | 发布成功但域名仍是 404 | 检查 `{deploy_root}/gateway/routes/routes.json` 里有没有该 slug；没有就看 backend 日志里 `gateway routes.json 刷新失败` 一行（该失败只告警、不阻断发布） |

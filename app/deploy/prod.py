@@ -555,7 +555,7 @@ async def publish(sf, app: dict, notify=None, *, force: bool = False,
             urls = await nics.app_urls(sf, app)
             url = urls["domain"]
         except Exception as ue:  # noqa: BLE001
-            url = f"https://{slug}.{nics.GATEWAY_DOMAIN}"
+            url = nics.app_url(app)      # 兜底也要跟 SSL 开关同形，不能写死 https://
             await _step(app_id, notify, f"✗ 发布 URL 汇总失败（不影响发布结果，排查稍后看 prod/status）：{ue}",
                         level=logging.WARNING)
         try:
@@ -646,7 +646,7 @@ async def rollback(sf, app: dict, version: str, notify=None) -> dict:
             urls = await nics.app_urls(sf, app)
             rurl = urls["domain"]
         except Exception as ue:  # noqa: BLE001  I-1 同款收尾窗：记账已收口，URL 汇总挂只降级
-            rurl = f"https://{slug}.{nics.GATEWAY_DOMAIN}"
+            rurl = nics.app_url(app)     # 兜底也要跟 SSL 开关同形，不能写死 https://
         await _notify(notify, app_id, {"type": "publish_done", "ok": ok, "version": version,
                                        "url": rurl,
                                        "error": "" if ok else f"体检未通过 {checks}"})

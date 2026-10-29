@@ -15,6 +15,11 @@ MARK_START, MARK_END = "<!-- zc:publish -->", "<!-- /zc:publish -->"
 # 证书要重签成对应域名；nginx.conf 的 server_name（catch-all）与证书文件名都与域名无关，不用改。
 # 默认 zerocode.com，可用 env 覆盖便于测试/多环境。
 GATEWAY_DOMAIN = os.environ.get("ZEROCODE_GATEWAY_DOMAIN", "zerocode.com")
+# SSL 开关（CONTEXT「SSL 开关」）：部署根 .env 的全局地址投影开关，缺省开。
+# 只有显式 false/0/no/off 才关；其余取值（含拼错）一律按 true——开关只有两态，不造第三个灰区。
+# 关态用于域名未备案、443 被拦期间：网关照常运行，只是控制台不再展示它的域名地址。
+SSL_ENABLE_ENV = "ZEROCODE_SSL_ENABLE"
+_SSL_OFF = frozenset({"false", "0", "no", "off"})
 # Docker 默认 bridge 网段：候选里出现它多半不是用户要的局域网地址，只标注不剔除。
 # 模块级常量：lan_candidates 每次调用都重建 /12 网络是白花的开销（T4 审查移交）。
 _DOCKER_NET = ipaddress.ip_network("172.16.0.0/12")
@@ -59,15 +64,38 @@ async def default_nic(sf) -> str:
     from app.deploy.settings import deploy_cfg
     return (await deploy_cfg(sf)).get("deploy.default_nic", "") or ""
 
-async def app_urls(sf, app: dict) -> dict:
-    """prod 访问地址：统一交中央网关的通配域名 https://{slug}.zerocode.com。
+def ssl_enabled() -> bool:
+    """应用访问地址走网关 HTTPS 还是 IP 直连（判定规则见 SSL_ENABLE_ENV 注释）。"""
+    return os.environ.get(SSL_ENABLE_ENV, "").strip().lower() not in _SSL_OFF
 
-    域名是 slug 的稳定投影，不绑端口；真正可访问的前提是应用 prod 处于 running（进 routes.json），
-    否则网关给 404 提示页。localhost/lan 直连不再是平台对外呈现的生产地址（内网排障仍可用端口直连），
-    故这里只回 domain 一项。slug 缺位（异常数据）回空串，不谎拼 https://.zerocode.com。
+
+def _app_port(app: dict):
+    """prod 端口：兼容 get_app 的扁平列与 engine._compose_meta 归一后的 ports 字典。"""
+    ports = app.get("ports")
+    if isinstance(ports, dict) and ports.get("prod") is not None:
+        return ports["prod"]
+    return app.get("prod_port")
+
+
+def app_url(app: dict) -> str:
+    """单个应用的访问地址投影（同步纯函数，地址的唯一事实来源）。
+
+    SSL 开 → https://{slug}.{域名}：域名是 slug 的稳定投影，不绑端口；真正可访问的前提是
+    prod 处于 running（进 routes.json），否则网关给 404 提示页。
+    SSL 关 → http://{ZEROCODE_PREVIEW_HOST}:{prod_port}：域名未备案、443 被拦期间的活路，
+    宿主与预览地址共用同一个变量，不另立第二个 host。端口缺位回空串，不谎拼 http://host:None。
     """
+    if not ssl_enabled():
+        from app.deploy.settings import preview_base_host
+        port = _app_port(app)
+        return f"http://{preview_base_host()}:{port}" if port else ""
     slug = (app.get("slug") or "").strip()
-    return {"domain": f"https://{slug}.{GATEWAY_DOMAIN}" if slug else ""}
+    return f"https://{slug}.{GATEWAY_DOMAIN}" if slug else ""
+
+
+async def app_urls(sf, app: dict) -> dict:
+    """API 形状（`GET /apps/{id}/urls` 只回 domain 一项）：内容见 app_url。"""
+    return {"domain": app_url(app)}
 
 def _dominant_eol(text_: str) -> str:
     """首行探测文件主导行尾：第一个 LF 若被 CR 前导即 CRLF 文件（空文件/裸 LF 回落 "\\n"）。

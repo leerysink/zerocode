@@ -28,6 +28,24 @@ openssl 脚本（仓库内 make-cert）生成的本地 CA + `*.zerocode.com` 证
 落在 `gateway/certs/`（gitignore 排除，不入库）。浏览器需手动信任该 CA。
 上服务器时重跑脚本、换真 DNS 解析即可。
 
+## SSL 开关（ZEROCODE_SSL_ENABLE）
+
+部署根 `.env` 的全局开关，决定应用访问地址**投影成哪种形态**。缺省 `true`：
+地址是网关通配域名 `https://{slug}.{GATEWAY_DOMAIN}`；显式写成 `false`/`0`/`no`/`off`
+（不区分大小写）时改用「IP 直连地址」——用于域名未备案、443 被拦期间应用仍可访问。
+它只改**地址投影**（控制台展示、发布记录、应用 README 发布块）：网关容器、证书、
+routes.json、80→443 跳转全部照旧运行，平台不启停网关（ADR-0018 不变）；反过来，
+应用 prod 是否运行也与它无关。dev 预览地址本就是 `http://{host}:{dev_port}`，不受影响。
+其余取值或缺失一律按 `true`，与 `fs.open_folder_mode` 的三态判定风格一致——不新增灰区。
+
+## IP 直连地址（direct URL）
+
+SSL 开关为 false 时的应用访问地址：`http://{ZEROCODE_PREVIEW_HOST}:{prod_port}`。
+宿主来源**复用**预览地址的 `ZEROCODE_PREVIEW_HOST`（打包默认 `localhost`，
+服务器 `.env` 填 IP 或域名），不新增第二个 host 变量——否则会出现
+「预览一个宿主、直连另一个宿主」的分叉。它只描述**已发布的 prod 栈**，
+端口即 prod 端口；不改变发布、健康探针、routes.json 导出等任何环节。
+
 ## miss（路由未命中）
 
 请求的 slug 不在 routes.json 中（应用未发布/已停/已删）→ 网关返回 404 提示页，

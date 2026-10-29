@@ -769,6 +769,20 @@ def test_platform_backend_can_reach_host_published_app_ports(fake_repo):
     assert "ZEROCODE_PREVIEW_PROBE_HOST" in readme and "ZEROCODE_PREVIEW_HOST" in readme
 
 
+def test_ssl_switch_exposed_for_server_env(fake_repo):
+    """SSL 开关要能在服务器 .env 里改得到：compose 给运行期覆盖位，.env.example 给裸值示例。
+
+    关掉它的效果由 tests/test_nics.py 钉（地址投影成 IP 直连）；这里只钉交付物的接线面——
+    变量名三段一致（nics 读取 / compose 插值 / .env 示例），README 里也能搜到。
+    """
+    out = _build(fake_repo)["out"]
+    backend = yaml.safe_load((out / "docker-compose.yml").read_text(encoding="utf-8"))["services"]["backend"]
+    assert backend["environment"]["ZEROCODE_SSL_ENABLE"] == "${ZEROCODE_SSL_ENABLE:-true}"
+    example = (out / ".env.example").read_text(encoding="utf-8")
+    assert "\nZEROCODE_SSL_ENABLE=true" in example
+    assert "ZEROCODE_SSL_ENABLE" in (out / "README-deploy.md").read_text(encoding="utf-8")
+
+
 def test_dockerignore_keeps_apps_out_of_build_context(fake_repo):
     """边界：apps/ 若进了构建上下文，每次 build 都要把两个应用源码传给 daemon。"""
     ignore = (_build(fake_repo)["out"] / ".dockerignore").read_text(encoding="utf-8")

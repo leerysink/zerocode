@@ -54,15 +54,65 @@ def test_update_readme_keeps_line_endings(tmp_path):
     run("lf", "# 应用\n\n正文\n", "\n")
 
 
-async def test_app_urls_domain():
+async def test_app_urls_domain(monkeypatch):
     """prod 访问地址统一为网关域名 https://{slug}.zerocode.com（通配证书只覆盖一级 slug）。
 
     slug 缺位/空白回空 domain——不谎拼 https://.zerocode.com（网关解不到、徒增误导）。
     app_urls 不碰库（纯 slug 投影），sf 传 None 即可。
     """
+    monkeypatch.delenv(nics.SSL_ENABLE_ENV, raising=False)   # 缺省即开，不受跑测试的机器 env 影响
     assert await nics.app_urls(None, {"slug": "demoapp"}) == {"domain": f"https://demoapp.{nics.GATEWAY_DOMAIN}"}
     assert await nics.app_urls(None, {"slug": "  spaced  "}) == {"domain": f"https://spaced.{nics.GATEWAY_DOMAIN}"}
     assert await nics.app_urls(None, {}) == {"domain": ""}
+
+
+def test_ssl_enabled_only_explicit_falsy_disables(monkeypatch):
+    """SSL 开关只有两态：显式 false/0/no/off 才关，缺省与其余取值（含拼错）一律按开。
+
+    判定域放宽到「非关闭词即开」是刻意的：运维把 true 写成 ture 时应当退回默认的 HTTPS，
+    而不是悄悄切到 IP 直连——后者看起来「生效了」，实际是把用户赶去了另一套地址。
+    """
+    monkeypatch.delenv(nics.SSL_ENABLE_ENV, raising=False)
+    assert nics.ssl_enabled() is True
+    for off in ("false", "FALSE", "0", "no", "off", " off "):
+        monkeypatch.setenv(nics.SSL_ENABLE_ENV, off)
+        assert nics.ssl_enabled() is False, off
+    for on in ("true", "TRUE", "1", "yes", "on", "ture", ""):
+        monkeypatch.setenv(nics.SSL_ENABLE_ENV, on)
+        assert nics.ssl_enabled() is True, on
+
+
+async def test_app_urls_direct_url_when_ssl_disabled(monkeypatch):
+    """关掉 SSL 后地址投影为 http://{ZEROCODE_PREVIEW_HOST}:{prod_port}（域名未备案、443 被拦期间的活路）。
+
+    端口缺位回空串，不谎拼 http://host:None；宿主观测点与预览地址共用 ZEROCODE_PREVIEW_HOST，
+    不另立第二个 host 变量。ports 字典形态来自 engine._compose_meta 的归一结果。
+    """
+    monkeypatch.setenv(nics.SSL_ENABLE_ENV, "false")
+    monkeypatch.setenv("ZEROCODE_PREVIEW_HOST", "10.0.0.8")
+    assert await nics.app_urls(None, {"slug": "demoapp", "prod_port": 8210}) == \
+        {"domain": "http://10.0.0.8:8210"}
+    assert await nics.app_urls(None, {"slug": "demoapp", "ports": {"prod": 8212}}) == \
+        {"domain": "http://10.0.0.8:8212"}
+    assert await nics.app_urls(None, {"slug": "demoapp"}) == {"domain": ""}
+
+
+async def test_app_urls_direct_host_defaults_to_localhost(monkeypatch):
+    """展示宿主缺省沿用 settings.preview_base_host 的 localhost（与预览地址同一口径）。"""
+    monkeypatch.setenv(nics.SSL_ENABLE_ENV, "0")
+    monkeypatch.delenv("ZEROCODE_PREVIEW_HOST", raising=False)
+    assert await nics.app_urls(None, {"slug": "demoapp", "prod_port": 8210}) == \
+        {"domain": "http://localhost:8210"}
+
+
+def test_app_url_is_single_projection_shared_with_publish_fallback(monkeypatch):
+    """发布收尾的 URL 兜底也走 app_url：开关翻转时「记录里的地址」与「兜底地址」不能形态不一。"""
+    monkeypatch.setenv(nics.SSL_ENABLE_ENV, "false")
+    monkeypatch.setenv("ZEROCODE_PREVIEW_HOST", "srv.local")
+    assert nics.app_url({"slug": "x", "ports": {"prod": 8214}}) == "http://srv.local:8214"
+    monkeypatch.setenv(nics.SSL_ENABLE_ENV, "true")
+    assert nics.app_url({"slug": "x", "prod_port": 8214}) == f"https://x.{nics.GATEWAY_DOMAIN}"
+    assert nics.app_url({}) == ""
 
 
 def test_urls_and_nics_routes_registered():
