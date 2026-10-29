@@ -1,7 +1,7 @@
 <script setup>
 // 中栏对话流：无会话空态（大标题+副标题）/ 消息渲染（user 右侧浅蓝气泡、assistant Markdown 高亮、
-// tool 折叠块、error 红气泡+重试）/ 流式气泡（streamingContent 非空才渲染）/ 消息流底部
-// 插入写入确认卡（pendingConfirm）与提问卡（pendingAsk）。
+// tool 折叠块与预览卡、error 红气泡+重试）/ 流式气泡（streamingContent 非空才渲染）/ 消息流底部
+// 插入确认卡（pendingConfirm：写入确认／重启预览）与提问卡（pendingAsk）。
 // 滚动策略：新消息/新卡片强制滚底；流式增量仅在用户已贴底时跟随，不打断上翻阅读。
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useChatStore } from '../stores/chat'
@@ -10,6 +10,7 @@ import ToolCallBlock from './ToolCallBlock.vue'
 import AskUserCard from './AskUserCard.vue'
 import ThinkingBlock from './ThinkingBlock.vue'
 import TodoCard from './TodoCard.vue'
+import PreviewCard from './PreviewCard.vue'
 
 const props = defineProps({
   messages: { type: Array, default: () => [] },
@@ -32,6 +33,34 @@ const confirmSummary = computed(() => {
   const text = JSON.stringify(args, null, 2)
   return text.length > 600 ? `${text.slice(0, 600)}\n…（已截断）` : text
 })
+
+// 预览工具（规格 2026-10-29-agent-preview-tools §8）：三个工具共用 PreviewCard。
+// 名单与后端 llm.PREVIEW_TOOL_NAMES 同名同序；这里刻意不 import 后端常量（前端拿不到），
+// 增删预览工具时两处一起改——名字对不上的后果是卡片落回通用折叠块，不会静默出错。
+const PREVIEW_TOOL_NAMES = ['preview_status', 'preview_logs', 'preview_restart']
+
+function toolNameOf(m) {
+  return m.name ?? m.tool_name ?? ''
+}
+
+function isPreviewTool(m) {
+  return PREVIEW_TOOL_NAMES.includes(toolNameOf(m))
+}
+
+// 进度只给「消息流最后一条、还没有结果」的那张卡：历史卡片复活进度条会让人以为又在重启
+function liveProgress(m, i) {
+  if (m.result || m.tool_result) return null
+  if (i !== props.messages.length - 1) return null
+  const p = store.toolProgress
+  return p && p.name === toolNameOf(m) ? p : null
+}
+
+// 确认卡按工具换口径：写入确认（args 摘要）／重启预览（后端给的人话 summary）
+const isRestartConfirm = computed(() => props.pendingConfirm?.tool === 'preview_restart')
+const confirmTitle = computed(() => (isRestartConfirm.value ? '重启预览' : '写入确认'))
+const confirmOkText = computed(() => (isRestartConfirm.value ? '确认重启' : '确认写入'))
+const confirmNoText = computed(() => (isRestartConfirm.value ? '取消' : '拒绝'))
+const confirmSummaryText = computed(() => props.pendingConfirm?.summary || '')
 
 // 自动滚底
 const scrollRef = ref(null)
@@ -94,10 +123,11 @@ onMounted(scrollToBottom)
         <div v-else-if="m.role === 'notice'" class="zc-msg is-notice">
           <span class="zc-notice-text">{{ m.content }}</span>
         </div>
-        <!-- tool：todo_write 调用处渲染任务卡（实时 tool_call 消息才有 args.todos；
-             tool_result 与历史消息无 args，落回折叠工具块，避免同一调用渲染两张卡） -->
+        <!-- tool：todo_write 渲染任务卡；preview_* 渲染预览卡；其余落回通用折叠块。
+             实时消息字段为 name/args/result，历史消息为 tool_name/tool_result，两者都认。 -->
         <div v-else-if="m.role === 'tool'" class="zc-msg is-tool">
           <TodoCard v-if="m.name === 'todo_write' && m.args && m.args.todos" :todos="m.args.todos" />
+          <PreviewCard v-else-if="isPreviewTool(m)" :msg="m" :progress="liveProgress(m, i)" />
           <ToolCallBlock v-else :msg="m" />
         </div>
         <!-- error：红色气泡 + 尾部重试（重发最后一条 user 消息） -->
@@ -119,16 +149,17 @@ onMounted(scrollToBottom)
         <MarkdownView class="zc-md is-streaming" :content="streaming" />
       </div>
 
-      <!-- 写入确认卡：pendingConfirm 时插入消息流 -->
+      <!-- 确认卡：写入确认（args 摘要）／重启预览（人话 summary），pendingConfirm 时插入消息流 -->
       <div v-if="pendingConfirm" class="zc-msg is-confirm">
         <div class="zc-confirm">
           <div class="zc-confirm-head">
-            写入确认<span class="zc-confirm-tool">{{ pendingConfirm.tool }}</span>
+            {{ confirmTitle }}<span class="zc-confirm-tool">{{ pendingConfirm.tool }}</span>
           </div>
-          <pre class="zc-confirm-args">{{ confirmSummary }}</pre>
+          <p v-if="confirmSummaryText" class="zc-confirm-summary">{{ confirmSummaryText }}</p>
+          <pre v-else class="zc-confirm-args">{{ confirmSummary }}</pre>
           <div class="zc-confirm-actions">
-            <a-button type="primary" @click="store.confirm(true)">确认写入</a-button>
-            <a-button @click="store.confirm(false)">拒绝</a-button>
+            <a-button type="primary" @click="store.confirm(true)">{{ confirmOkText }}</a-button>
+            <a-button @click="store.confirm(false)">{{ confirmNoText }}</a-button>
           </div>
         </div>
       </div>
@@ -307,6 +338,14 @@ onMounted(scrollToBottom)
   white-space: pre-wrap;
   word-break: break-all;
   color: var(--zc-text);
+}
+.zc-confirm-summary {
+  margin: 10px 0;
+  font-size: 13px;
+  line-height: 1.7;
+  color: var(--zc-text);
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 .zc-confirm-actions {
   display: flex;
