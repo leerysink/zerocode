@@ -1,5 +1,8 @@
 # tests/test_deploy_basics.py
+import re
 import socket
+from pathlib import Path
+
 import pytest
 from sqlalchemy import text
 from app.deploy.errors import DeployError
@@ -148,3 +151,96 @@ async def test_allocate_pair_exhausted(test_engine):
 def test_port_free_local_tcp_free_port():
     s = socket.socket(); s.bind(("127.0.0.1", 0)); free = s.getsockname()[1]; s.close()
     assert ports.port_free(free) is True
+
+
+async def test_allocate_pair_probes_the_configured_probe_host(test_engine, monkeypatch):
+    """默认探针连的是 preview_probe_host()，不是写死的 127.0.0.1。
+
+    平台容器化部署时 127.0.0.1 是容器自己的 loopback，宿主上已发布的应用端口一律「探起来空闲」，
+    分配于是只看库内登记 —— 库里已无行、容器还活着的那些端口就这样被重复分出去。
+    """
+    from app.db import make_session_factory
+    seen: list[tuple[int, str]] = []
+
+    def record(port, host="127.0.0.1", timeout=0.2):
+        seen.append((port, host))
+        return True
+
+    monkeypatch.setattr(ports, "port_free", record)
+    monkeypatch.setenv("ZEROCODE_PREVIEW_PROBE_HOST", "172.17.0.1")
+    async with make_session_factory(test_engine)() as s:
+        await ports.allocate_pair(s)
+    assert seen, "allocate_pair 没调用任何端口探测"
+    assert {host for _, host in seen} == {"172.17.0.1"}
+
+
+# 线上 daemon 原文（演示服 2026-10-28，dev 栈起不来时 compose 吐出的那一整行）
+_BIND_CONFLICT_LOG = (
+    "Error response from daemon: driver failed programming external connectivity on "
+    "endpoint zc-finance-dev-frontend-1 (8e8cd85384b731ca9546cce8b493b68efbfc6eb612c5703e"
+    "373305b731bd4699): Bind for 0.0.0.0:8213 failed: port is already allocated")
+
+
+def test_parse_bind_conflict_reads_the_host_port_that_failed_to_bind():
+    assert ports.parse_bind_conflict(_BIND_CONFLICT_LOG) == 8213
+    assert ports.parse_bind_conflict("Bind for [::]:8214 failed: port is already allocated") == 8214
+    assert ports.parse_bind_conflict("Error response from daemon: No such image: x") is None
+    assert ports.parse_bind_conflict("") is None
+
+
+async def test_port_holder_names_the_container_publishing_the_port():
+    """占用者点名走 `docker ps --filter publish=<port>`：查得到给名字，查不到给空串。"""
+    calls = []
+
+    async def run(*args, **kwargs):
+        calls.append(args)
+        return 0, "zc-test1-dev-frontend-1\n"
+
+    assert await ports.port_holder(8213, run) == "zc-test1-dev-frontend-1"
+    assert "publish=8213" in calls[0], f"查询没按端口过滤，点名会张冠李戴: {calls[0]}"
+
+
+async def test_port_holder_returns_empty_when_nothing_publishes_the_port():
+    async def free(*args, **kwargs):
+        return 0, ""
+
+    async def broken(*args, **kwargs):
+        return 1, "Cannot connect to the Docker daemon"
+
+    assert await ports.port_holder(8213, free) == ""
+    assert await ports.port_holder(8213, broken) == ""
+
+
+def test_frontend_publish_gate_matches_backend_whitelist():
+    """发布闸门不漂移：真源是后端 PUBLISHABLE_STACKS，前端那份只是镜像。
+
+    M2 时期后端已放开 vue3-springboot、前端仍写死 fastapi，大型应用的「发布」因此置灰了一个
+    迭代，而且漂移是静默的——禁用按钮不带原因，用户只会当成后端坏了。商店入口同一道闸门。
+
+    镜像住在 utils/publishableStacks.js：应用列表与聊天页操作条是同一个闸门的两个入口，
+    两边都必须 import 这一份——谁自己写死一份，谁就在下一次放栈时静默漂移。
+    """
+    from app.deploy.compose import PUBLISHABLE_STACKS
+    fe = Path(__file__).resolve().parents[1] / "frontend" / "src"
+    mirror = fe / "utils" / "publishableStacks.js"
+    src = mirror.read_text(encoding="utf-8")
+
+    decl = re.search(r"export const PUBLISHABLE_STACKS\s*=\s*\[([^\]]*)\]", src)
+    assert decl, f"{mirror.name} 里找不到 PUBLISHABLE_STACKS 常量——闸门又退回写死在各处了"
+    front = frozenset(re.findall(r"['\"]([^'\"]+)['\"]", decl.group(1)))
+    assert front == frozenset(PUBLISHABLE_STACKS), \
+        f"前端栈白名单 {sorted(front)} 与后端 {sorted(PUBLISHABLE_STACKS)} 不一致"
+
+    gate = re.search(r"export const canPublish = \(app\) =>(.*)", src)
+    assert gate, "找不到 canPublish 的判定式，闸门形态变了，请同步本测试"
+    assert "PUBLISHABLE_STACKS" in gate.group(1), \
+        "canPublish 没走统一栈常量，会在后端放开新栈时再次漂移"
+
+    for rel in ("views/AppsView.vue", "components/ChatAppActions.vue"):
+        assert "utils/publishableStacks" in (fe / rel).read_text(encoding="utf-8"), \
+            f"{rel} 没读共享名单，闸门分叉了"
+
+    apps_view = (fe / "views" / "AppsView.vue").read_text(encoding="utf-8")
+    store_gate = re.search(r"const canReleaseToStore = \(a\) =>(.*)", apps_view)
+    assert store_gate, "找不到 canReleaseToStore 的判定式，商店闸门形态变了，请同步本测试"
+    assert "canPublish(a)" in store_gate.group(1), "商店入口没走同一道栈闸门"
