@@ -255,6 +255,23 @@ async def test_format_log_lines_caps_each_line_and_total():
     assert len(lines) <= 300 and truncated is True
     assert sum(len(l) for l in lines) <= 4000
     assert lines[-1].startswith("10:00:01 [backend] line-399")    # 丢的是最旧的行
+
+
+async def test_format_log_lines_skipped_blank_body_is_not_truncation():
+    """空正文行被跳过不算截断：容器打空行时 compose 给的是 `backend-1 |`，
+    parse_compose_logs 会无条件 append，把它算成截断会让 truncated 恒真、沦为噪声。"""
+    from app.agent import preview_tools as pt
+    lines, truncated, _ = pt.format_log_lines([_row(""), _row("真实内容")])
+    assert lines[-1].endswith("真实内容") and truncated is False
+
+
+async def test_format_log_lines_marks_truncated_when_rows_exceed_limit():
+    from app.agent import preview_tools as pt
+    rows = [_row(f"l{i}") for i in range(5)]
+    lines, truncated, _ = pt.format_log_lines(rows, limit_lines=3)
+    assert len(lines) == 3 and truncated is True
+
+
 # ---------- preview_status（§5.4） ----------
 
 async def test_status_stopped_does_not_probe(sf, tmp_path, monkeypatch):
@@ -390,7 +407,35 @@ async def test_logs_are_read_only(sf, tmp_path, monkeypatch):
     assert st == "stopped" and ctx.deploy_tasks == {}
 
 
+async def test_logs_note_is_redacted_before_reaching_the_model(sf, tmp_path, monkeypatch):
+    """note 是容器/子进程异常原文的透传口：凭据不能顺着它进模型上下文。"""
+    from app.agent import preview_tools as pt
+    wid = await _mk_workspace(sf, str(tmp_path / "n1"))
+    aid = await _mk_app(sf, wid, "pvnote", dev_port=8265, prod_port=8264)
+
+    async def fake_collect(session_factory, app, h, *, tail=200, since_seq=0, container_timeout=60):
+        return {"lines": [], "note": "容器日志暂不可用：postgresql://u:supersecret@db:5432/app",
+                "status_dev": "error", "url": "", "last_seq": 0}
+
+    monkeypatch.setattr(pt, "collect_dev_logs", fake_collect)
+    r = await pt.run_preview_tool(Ctx({"id": aid}, sf=sf), "preview_logs", {})
+    assert "supersecret" not in r["note"] and "<redacted:" in r["note"]
+
+
 async def test_unknown_preview_tool_is_a_normal_result(sf):
     from app.agent import preview_tools as pt
     r = await pt.run_preview_tool(Ctx(None, sf=sf), "preview_nope", {})
     assert r == {"ok": False, "error": "未知预览工具: preview_nope"}
+
+
+async def test_unexpected_exception_text_is_redacted_and_capped(sf, monkeypatch):
+    """宽 except 的兜底文案同样要过闸：第三方异常把凭据拼进 message 时不能原样送给模型。"""
+    from app.agent import preview_tools as pt
+
+    async def boom(ctx, args):
+        raise RuntimeError("连接失败 postgresql://u:supersecret@db:5432/app " + "x" * 400)
+
+    monkeypatch.setattr(pt, "_status", boom)
+    r = await pt.run_preview_tool(Ctx({"id": 1}, sf=sf), "preview_status", {})
+    assert r["ok"] is False and "supersecret" not in r["error"]
+    assert "<redacted:" in r["error"] and len(r["error"]) <= 200

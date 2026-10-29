@@ -155,12 +155,26 @@ def format_log_lines(rows, *, limit_lines: int = LOG_LINES_MAX, limit_chars: int
         if len(body) > limit_line_chars:
             body = body[:limit_line_chars] + "…（已截断）"
         out.append(f"{_clock(row.get('ts'))} [{_source_of(row)}] {body}")
-    truncated = len(rows) > len(kept) or len(kept) > len(out)
+    # truncated 只对「真的扣下了内容」负责：行数被 limit_lines 切掉、或总量超预算从最旧开始丢。
+    # 空正文行被跳过不算——容器打空行时 compose 的行形态是 `backend-1 |`，
+    # parse_compose_logs 会无条件 append，把跳过空行也算截断会让这个信号恒真、沦为噪声。
+    truncated = len(rows) > len(kept)
     total = sum(len(line) for line in out)
     while out and total > limit_chars:
         total -= len(out.pop(0))
         truncated = True
     return out, truncated, redacted
+
+
+def _safe_text(raw, limit: int = 200) -> str:
+    """任何要送进模型上下文的自由文本都过这一道：剥 ANSI、遮凭据、限长。
+
+    规格 §6 的红线字面只管步骤行与容器输出，但 note / 异常原文 / 探针判定串同样会进模型，
+    而 loop 的 `redact_tool_result` 只净化落库与推送那一份——当轮回注模型用的是原文。
+    200 字与 `engine.container_logs` 的既有口径同形。
+    """
+    text_, _ = redact_sensitive(engine.strip_ansi(str(raw or "")))
+    return text_[:limit]
 
 
 def _status_hint(status: str, deploy_task: bool) -> str:
@@ -189,7 +203,7 @@ async def _status(ctx, args: dict) -> dict:
     healthy, probe = await engine.probe_dev(app, timeout=2)
     hint = "" if healthy else ("端口探测未通过：healthy 只代表 HTTP 可达，"
                                "编译错误与 traceback 要看 preview_logs")
-    return {**base, "healthy": healthy, "probe": probe, "hint": hint}
+    return {**base, "healthy": healthy, "probe": _safe_text(probe), "hint": hint}
 
 
 async def _logs(ctx, args: dict) -> dict:
@@ -203,7 +217,7 @@ async def _logs(ctx, args: dict) -> dict:
     lines, truncated, redacted = format_log_lines(collected["lines"])
     return {"ok": True, "status": app.get("status_dev") or "stopped",
             "url": app.get("preview_url") or "", "lines": lines, "truncated": truncated,
-            "note": collected.get("note") or "", "redacted": redacted}
+            "note": _safe_text(collected.get("note")), "redacted": redacted}
 
 
 async def run_preview_tool(ctx, name: str, args: dict, *, confirmed: bool = False) -> dict:
@@ -221,4 +235,4 @@ async def run_preview_tool(ctx, name: str, args: dict, *, confirmed: bool = Fals
         return {"ok": False, "error": f"未知预览工具: {name}"}
     except Exception as e:
         logger.exception("预览工具 %s 执行异常", name)
-        return {"ok": False, "error": f"预览工具执行异常: {e}"}
+        return {"ok": False, "error": _safe_text(f"预览工具执行异常: {e}")}
