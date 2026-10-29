@@ -234,7 +234,7 @@ async def test_dev_logs_endpoint_merges_both_sources(client, dev_app, monkeypatc
 
     captured = {}
 
-    async def fake_container(sf, app, tail=200):
+    async def fake_container(sf, app, tail=200, timeout=60):
         captured["slug"] = app["slug"]
         captured["tail"] = tail
         return [{"source": "container", "service": "backend", "ts": "2026-09-20T14:27:58+00:00",
@@ -257,7 +257,7 @@ async def test_dev_logs_url_follows_preview_base_host(client, dev_app, monkeypat
     """日志面板顶部的「预览地址」也读后端，基址一换就要跟着换（否则远程部署复制到的还是 localhost）。"""
     monkeypatch.setenv("ZEROCODE_PREVIEW_HOST", "10.0.1.25")
 
-    async def fake_container(sf, app, tail=200):
+    async def fake_container(sf, app, tail=200, timeout=60):
         return [], ""
 
     monkeypatch.setattr(eng_mod, "container_logs", fake_container)
@@ -270,7 +270,7 @@ async def test_dev_logs_endpoint_fail_soft_when_docker_missing(client, dev_app, 
     hub = client.app.state.deploy_hub
     hub.publish(dev_app, {"app_id": dev_app, "type": "dev_log", "line": "[zerocode] ✗ 启动预览失败"})
 
-    async def unavailable(sf, app, tail=200):
+    async def unavailable(sf, app, tail=200, timeout=60):
         return [], "容器日志暂不可用：Docker 未启动或不可用"
 
     monkeypatch.setattr(eng_mod, "container_logs", unavailable)
@@ -287,7 +287,7 @@ async def test_dev_logs_endpoint_clamps_tail_and_filters_since(client, dev_app, 
         hub.publish(dev_app, {"app_id": dev_app, "type": "dev_log", "line": f"l{i}"})
     seen = {}
 
-    async def fake_container(sf, app, tail=200):
+    async def fake_container(sf, app, tail=200, timeout=60):
         seen["tail"] = tail
         return [], ""
 

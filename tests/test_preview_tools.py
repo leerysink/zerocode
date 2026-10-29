@@ -116,3 +116,281 @@ async def test_base_tools_unchanged_by_preview_feature():
     from app.agent.llm import TOOLS
     assert [t["function"]["name"] for t in TOOLS] == [
         "list_dir", "read_file", "write_file", "edit_file", "ask_user", "todo_write", "memory_write"]
+# ---------- ctx 替身：preview_tools 只读字段，不 import ToolContext ----------
+
+class Ctx:
+    def __init__(self, app=None, *, sf=None, cfg=None, hub=None, tasks=None, cancel=None):
+        from app.deploy.hub import DeployHub
+        self.app = app
+        self.session_factory = sf
+        self.cfg = cfg or {}
+        self.deploy_hub = hub if hub is not None else DeployHub()   # 真 hub：订阅/环形缓冲都走生产代码
+        self.deploy_tasks = tasks if tasks is not None else {}
+        self.cancel = cancel or asyncio.Event()
+        self.run_state = {}
+        self.session_id = 1
+        self.sent = []
+
+    async def send(self, ev):
+        self.sent.append(ev)
+
+
+# ---------- resolve_session_app（§5.1 fail closed） ----------
+
+async def test_resolve_session_app_hit_and_miss(sf, tmp_path):
+    from app.agent import preview_tools as pt
+    wid = await _mk_workspace(sf, str(tmp_path / "r1"))
+    aid = await _mk_app(sf, wid, "pvres")
+    app, note = await pt.resolve_session_app(sf, wid)
+    assert app["id"] == aid and note == ""
+    plain = await _mk_workspace(sf, str(tmp_path / "r2"))
+    assert await pt.resolve_session_app(sf, plain) == (None, "")
+    assert await pt.resolve_session_app(sf, None) == (None, "")
+
+
+async def test_resolve_session_app_duplicate_fails_closed_with_note(sf, tmp_path):
+    """重复绑定：不挂载工具，但要给模型一句能转述给用户的原因（不能静默）。"""
+    from app.agent import preview_tools as pt
+    wid = await _mk_workspace(sf, str(tmp_path / "r3"))
+    await _mk_app(sf, wid, "pvdupA", dev_port=8247, prod_port=8246)
+    await _mk_app(sf, wid, "pvdupB", dev_port=8249, prod_port=8248)
+    app, note = await pt.resolve_session_app(sf, wid)
+    assert app is None and "多个应用" in note
+
+
+async def test_resolve_session_app_survives_db_error(sf, monkeypatch):
+    """解析出错按非应用工作区处理：记 warning，绝不让整轮对话失败。"""
+    from app.agent import preview_tools as pt
+
+    async def boom(*a, **k):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(pt.app_service, "get_app_by_workspace", boom)
+    assert await pt.resolve_session_app(sf, 1) == (None, "")
+
+
+async def test_resolve_session_app_splits_404_from_409(sf, monkeypatch):
+    """404（探测到行之后应用被删）必须与 409（绑定了多个应用）分岔。
+
+    `get_app_by_workspace` 是「只查 id、再委托 get_app 取行」，两查之间应用可能被另一个标签页删掉；
+    把这条也说成「绑定了多个应用」，用户删掉应用后会看到一句莫名其妙的解释。
+    """
+    from app.agent import preview_tools as pt
+
+    async def gone(*a, **k):
+        raise DeployError("应用不存在", status=404)
+
+    monkeypatch.setattr(pt.app_service, "get_app_by_workspace", gone)
+    assert await pt.resolve_session_app(sf, 1) == (None, "")
+
+
+async def test_fetch_app_returns_none_after_app_deleted(sf, tmp_path):
+    """运行中应用被删（另一个标签页）：工具拿到 None，据此回「已被删除」而不是 500。"""
+    from app.agent import preview_tools as pt
+    wid = await _mk_workspace(sf, str(tmp_path / "r4"))
+    aid = await _mk_app(sf, wid, "pvgone")
+    ctx = Ctx({"id": aid}, sf=sf)
+    assert (await pt.fetch_app(ctx))["slug"] == "pvgone"
+    async with sf() as s:
+        await s.execute(text("DELETE FROM app_project WHERE id=:i"), {"i": aid})
+        await s.commit()
+    assert await pt.fetch_app(ctx) is None
+    assert await pt.fetch_app(Ctx(None, sf=sf)) is None
+
+
+# ---------- 等待/行数夹取（§5.9） ----------
+
+async def test_wait_seconds_clamped_and_config_driven():
+    from app.agent import preview_tools as pt
+    assert pt.wait_seconds_of({}, {}) == 240
+    assert pt.wait_seconds_of({"agent.preview_wait_seconds": 30}, {}) == 30
+    assert pt.wait_seconds_of({}, {"wait_seconds": 5000}) == 900
+    assert pt.wait_seconds_of({}, {"wait_seconds": -5}) == 0
+    assert pt.wait_seconds_of({}, {"wait_seconds": "abc"}) == 240
+    assert pt.wait_seconds_of({"agent.preview_wait_seconds": 0}, {}) == 0     # <=0 = 等到任务结束
+
+
+async def test_tail_clamped_between_10_and_300():
+    from app.agent import preview_tools as pt
+    assert pt.tail_of({}, {}) == 80
+    assert pt.tail_of({"agent.preview_log_lines": 120}, {}) == 120
+    assert pt.tail_of({}, {"tail": 1}) == 10
+    assert pt.tail_of({}, {"tail": 9999}) == 300
+    assert pt.tail_of({}, {"tail": None}) == 80
+
+
+# ---------- 日志整形（§6 日志出口收口） ----------
+
+def _row(line, *, source="container", service="backend", ts="2026-10-29T10:00:01+08:00"):
+    return {"source": source, "service": service, "ts": ts, "line": line}
+
+
+async def test_format_log_lines_labels_time_and_source():
+    from app.agent import preview_tools as pt
+    lines, truncated, redacted = pt.format_log_lines([
+        _row("Uvicorn running", ts="2026-10-29T10:00:01+08:00"),
+        _row("✓ 迁移完成", source="platform", service="平台"),
+    ])
+    assert lines[0].startswith("10:00:01 [backend] Uvicorn running")
+    assert lines[1].endswith("[平台] ✓ 迁移完成")
+    assert truncated is False and redacted == 0
+
+
+async def test_format_log_lines_redacts_credentials_and_strips_ansi():
+    from app.agent import preview_tools as pt
+    lines, _, redacted = pt.format_log_lines([
+        _row("\x1b[33mDATABASE_URL=postgresql://u:supersecret@db:5432/app\x1b[39m"),
+    ])
+    assert "\x1b" not in lines[0]
+    assert "supersecret" not in lines[0] and "<redacted:" in lines[0]
+    assert redacted >= 1
+
+
+async def test_format_log_lines_caps_each_line_and_total():
+    from app.agent import preview_tools as pt
+    lines, truncated, _ = pt.format_log_lines([_row("x" * 900)])
+    assert len(lines[0]) < 600 and "已截断" in lines[0]
+    many = [_row(f"line-{i} " + "y" * 200) for i in range(400)]
+    lines, truncated, _ = pt.format_log_lines(many, limit_lines=300, limit_chars=4000)
+    assert len(lines) <= 300 and truncated is True
+    assert sum(len(l) for l in lines) <= 4000
+    assert lines[-1].startswith("10:00:01 [backend] line-399")    # 丢的是最旧的行
+# ---------- preview_status（§5.4） ----------
+
+async def test_status_stopped_does_not_probe(sf, tmp_path, monkeypatch):
+    from app.agent import preview_tools as pt
+    from app.deploy import engine as eng
+    wid = await _mk_workspace(sf, str(tmp_path / "s1"))
+    aid = await _mk_app(sf, wid, "pvst")
+    hits = []
+
+    async def fake_probe(app, timeout=2):
+        hits.append(app["id"])
+        return True, ""
+
+    monkeypatch.setattr(eng, "probe_dev", fake_probe)
+    r = await pt.run_preview_tool(Ctx({"id": aid}, sf=sf), "preview_status", {})
+    assert r["ok"] is True and r["status"] == "stopped"
+    assert r["healthy"] is False and r["probe"] == "" and "未运行" in r["hint"]
+    assert r["url"].endswith(":8241") and r["app"] == {"slug": "pvst", "stack": "vue3-fastapi"}
+    assert r["deploy_task"] is False and hits == []          # 非 running 不探针
+
+
+async def test_status_running_healthy_and_unhealthy(sf, tmp_path, monkeypatch):
+    from app.agent import preview_tools as pt
+    from app.deploy import engine as eng
+    wid = await _mk_workspace(sf, str(tmp_path / "s2"))
+    aid = await _mk_app(sf, wid, "pvrun", dev_port=8251, prod_port=8250)
+    async with sf() as s:
+        await s.execute(text("UPDATE app_project SET status_dev='running' WHERE id=:i"), {"i": aid})
+        await s.commit()
+
+    async def ok_probe(app, timeout=2):
+        return True, ""
+
+    monkeypatch.setattr(eng, "probe_dev", ok_probe)
+    r = await pt.run_preview_tool(Ctx({"id": aid}, sf=sf), "preview_status", {})
+    assert r["healthy"] is True and r["probe"] == "" and r["hint"] == ""
+
+    async def bad_probe(app, timeout=2):
+        return False, "/ → 403"
+
+    monkeypatch.setattr(eng, "probe_dev", bad_probe)
+    r2 = await pt.run_preview_tool(Ctx({"id": aid}, sf=sf), "preview_status", {})
+    assert r2["ok"] is True and r2["healthy"] is False        # 应用报错仍是 ok=true（§4.2 语义）
+    assert r2["probe"] == "/ → 403" and "preview_logs" in r2["hint"]
+
+
+async def test_status_reports_pending_deploy_task(sf, tmp_path, monkeypatch):
+    from app.agent import preview_tools as pt
+    from app.deploy import engine as eng
+    wid = await _mk_workspace(sf, str(tmp_path / "s3"))
+    aid = await _mk_app(sf, wid, "pvtask", dev_port=8253, prod_port=8252)
+    monkeypatch.setattr(eng, "probe_dev", lambda app, timeout=2: asyncio.sleep(0, (True, "")))
+    gate = asyncio.Event()
+    task = asyncio.create_task(gate.wait())
+    ctx = Ctx({"id": aid}, sf=sf, tasks={aid: task})
+    r = await pt.run_preview_tool(ctx, "preview_status", {})
+    assert r["deploy_task"] is True and "正在启动" in r["hint"]
+    gate.set()
+    await task
+
+
+async def test_status_after_app_deleted_is_a_normal_result(sf, tmp_path):
+    from app.agent import preview_tools as pt
+    wid = await _mk_workspace(sf, str(tmp_path / "s4"))
+    aid = await _mk_app(sf, wid, "pvdel", dev_port=8255, prod_port=8254)
+    async with sf() as s:
+        await s.execute(text("DELETE FROM app_project WHERE id=:i"), {"i": aid})
+        await s.commit()
+    r = await pt.run_preview_tool(Ctx({"id": aid}, sf=sf), "preview_status", {})
+    assert r["ok"] is False and "已被删除" in r["error"]
+
+
+# ---------- preview_logs（§4.2 / US-10…US-14） ----------
+
+async def test_logs_merges_platform_and_container_lines(sf, tmp_path, monkeypatch):
+    from app.agent import preview_tools as pt
+    from app.deploy.hub import DeployHub
+    wid = await _mk_workspace(sf, str(tmp_path / "l1"))
+    aid = await _mk_app(sf, wid, "pvlog", dev_port=8257, prod_port=8256)
+    hub = DeployHub()
+    hub.publish(aid, {"app_id": aid, "type": "dev_log", "line": "[zerocode] ✓ 预览已就绪"})
+    captured = {}
+
+    async def fake_collect(session_factory, app, h, *, tail=200, since_seq=0, container_timeout=60):
+        captured.update({"tail": tail, "timeout": container_timeout})
+        return {"lines": [{"source": "container", "service": "backend",
+                           "ts": "2026-10-29T10:00:02+08:00", "line": "Uvicorn running"},
+                          {"source": "platform", "service": "平台",
+                           "ts": "2026-10-29T10:00:03+08:00", "line": "[zerocode] ✓ 预览已就绪"}],
+                "note": "", "status_dev": "running", "url": "http://x", "last_seq": 1}
+
+    monkeypatch.setattr(pt, "collect_dev_logs", fake_collect)
+    ctx = Ctx({"id": aid}, sf=sf, hub=hub, cfg={"agent.preview_log_lines": 42})
+    r = await pt.run_preview_tool(ctx, "preview_logs", {})
+    assert captured == {"tail": 42, "timeout": 15}         # 工具侧 15s，不吊死整轮对话
+    assert r["ok"] is True and r["status"] == "stopped"     # 状态取库里的，不取收集器回声
+    assert r["lines"][0].endswith("[backend] Uvicorn running")
+    assert r["truncated"] is False and r["note"] == "" and r["redacted"] == 0
+
+
+async def test_logs_clamps_tail_and_keeps_note(sf, tmp_path, monkeypatch):
+    from app.agent import preview_tools as pt
+    wid = await _mk_workspace(sf, str(tmp_path / "l2"))
+    aid = await _mk_app(sf, wid, "pvlog2", dev_port=8259, prod_port=8258)
+    seen = {}
+
+    async def fake_collect(session_factory, app, h, *, tail=200, since_seq=0, container_timeout=60):
+        seen["tail"] = tail
+        return {"lines": [], "note": "容器日志暂不可用：Docker 未启动", "status_dev": "error",
+                "url": "", "last_seq": 0}
+
+    monkeypatch.setattr(pt, "collect_dev_logs", fake_collect)
+    r = await pt.run_preview_tool(Ctx({"id": aid}, sf=sf), "preview_logs", {"tail": 99999})
+    assert seen["tail"] == 300 and r["note"] == "容器日志暂不可用：Docker 未启动"
+    assert r["lines"] == [] and r["ok"] is True
+
+
+async def test_logs_are_read_only(sf, tmp_path, monkeypatch):
+    """US-14：读日志不改状态、不产生部署任务。"""
+    from app.agent import preview_tools as pt
+    wid = await _mk_workspace(sf, str(tmp_path / "l3"))
+    aid = await _mk_app(sf, wid, "pvlog3", dev_port=8261, prod_port=8260)
+
+    async def fake_collect(session_factory, app, h, *, tail=200, since_seq=0, container_timeout=60):
+        return {"lines": [], "note": "", "status_dev": "stopped", "url": "", "last_seq": 0}
+
+    monkeypatch.setattr(pt, "collect_dev_logs", fake_collect)
+    ctx = Ctx({"id": aid}, sf=sf)
+    await pt.run_preview_tool(ctx, "preview_logs", {})
+    async with sf() as s:
+        st = (await s.execute(text("SELECT status_dev FROM app_project WHERE id=:i"),
+                              {"i": aid})).scalar()
+    assert st == "stopped" and ctx.deploy_tasks == {}
+
+
+async def test_unknown_preview_tool_is_a_normal_result(sf):
+    from app.agent import preview_tools as pt
+    r = await pt.run_preview_tool(Ctx(None, sf=sf), "preview_nope", {})
+    assert r == {"ok": False, "error": "未知预览工具: preview_nope"}
