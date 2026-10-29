@@ -62,6 +62,7 @@ async def test_get_app_by_workspace_hits_single_row(sf, tmp_path):
     assert app["id"] == aid and app["slug"] == "pvone"
     assert app["preview_url"].endswith(":8241")       # 与 get_app 同形状，地址只来自后端
     assert app["status_dev"] == "stopped"
+    assert set(app) == set(await app_service.get_app(sf, aid))   # 可互换使用是规格的硬要求
 
 
 async def test_get_app_by_workspace_returns_none_without_app(sf, tmp_path):
