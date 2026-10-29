@@ -286,6 +286,44 @@ async def get_app(session_factory, app_id: int, *, owner_user_id: int | None = N
     return _with_public_urls(d)
 
 
+async def get_app_by_workspace(session_factory, workspace_id: int, *,
+                               owner_user_id: int | None = None) -> dict | None:
+    """按工作区反查唯一应用行（Agent 预览工具的身份来源，规格 2026-10-29 §5.1）。
+
+    与 `get_app` 同形状（含 preview_url / store），差别只在入口：调用方手上只有
+    `chat_session.workspace_id`，而预览工具的 schema 里刻意没有 app 参数——模型无从指定别的应用。
+
+    - 0 行 → None：不是应用工作区，预览工具不挂载；
+    - 多行 → 抛 409：`app_project.workspace_id` 没有 UNIQUE 约束，历史上可能手工插入重复行，
+      这时不猜、也不挂载工具（fail closed），由调用方记 warning 并向模型说明原因；
+    - `owner_user_id` 过滤与 `list_apps` 同一条判据：会话已过 WS 所有权校验，这里是第二道闸。
+    """
+    async with session_factory() as s:
+        sql = ("SELECT id, workspace_id, name, slug, scale, stack, prod_port, dev_port, "
+               "status_dev, status_prod, current_version, origin, created_at, updated_at "
+               "FROM app_project WHERE workspace_id = :w")
+        params: dict = {"w": workspace_id}
+        if owner_user_id is not None:
+            sql += " AND owner_user_id = :u"
+            params["u"] = owner_user_id
+        rows = (await s.execute(text(sql + " ORDER BY id LIMIT 2"), params)).mappings().all()
+    if not rows:
+        return None
+    if len(rows) > 1:
+        raise DeployError("当前工作区绑定了多个应用，无法确定预览目标", status=409)
+    app_id = rows[0]["id"]
+    async with session_factory() as s:
+        link = (await s.execute(text(
+            "SELECT l.app_id, l.release_id, l.channel, l.detach_reason, l.applied_fingerprint, "
+            "l.last_upgraded_at, r.version AS release_version, r.slug AS release_slug, "
+            "r.title AS release_title FROM app_instance_link l "
+            "JOIN app_release r ON r.id = l.release_id WHERE l.app_id = :i"),
+            {"i": app_id})).mappings().first()
+    d = to_dict(rows[0])
+    d["store"] = to_dict(link) if link else None
+    return _with_public_urls(d)
+
+
 async def rename_app(session_factory, app_id: int, name: str, *,
                      owner_user_id: int | None = None) -> dict:
     """应用改名：app_project.name 与 workspace.name 同事务更新，slug/端口/目录不动。
