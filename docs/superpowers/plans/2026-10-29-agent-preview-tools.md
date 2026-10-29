@@ -303,6 +303,7 @@ git commit -m "refactor(deploy): 抽取部署任务注册表供 REST 与 Agent �
 async def test_collect_dev_logs_returns_endpoint_shape(sf, dev_app, monkeypatch):
     from app.deploy import logs as logs_mod
     from app.deploy.hub import DeployHub
+    from app.services import app_service
 
     hub = DeployHub()
     hub.publish(dev_app, {"app_id": dev_app, "type": "dev_log", "line": "[zerocode] ✓ 预览已就绪"})
@@ -313,7 +314,9 @@ async def test_collect_dev_logs_returns_endpoint_shape(sf, dev_app, monkeypatch)
                  "epoch": _epoch("2026-09-20T14:27:58+00:00"), "line": "Uvicorn running"}], ""
 
     monkeypatch.setattr(logs_mod.engine, "container_logs", fake_container)
-    body = await logs_mod.collect_dev_logs(sf, {"id": dev_app, "slug": SLUG}, hub, tail=5)
+    # 传真实应用行（不是手搓 dict）：status_dev / preview_url 是收集器从行上读的，
+    # 两个出口读的是同一份后端投影——手搓字典会让这两条断言无值可读
+    body = await logs_mod.collect_dev_logs(sf, await app_service.get_app(sf, dev_app), hub, tail=5)
     assert [l["source"] for l in body["lines"]] == ["container", "platform"]
     assert body["note"] == "" and body["status_dev"] == "stopped"
     assert body["url"] == f"http://localhost:{body['url'].rsplit(':', 1)[1]}"
