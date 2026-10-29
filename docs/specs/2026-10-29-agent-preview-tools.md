@@ -406,8 +406,9 @@ ctx 的字段，所有错误都作为结果返回；`tools.py` 在分派分支�
 | `result.ok=false` 且有 `error` | 红色「预览操作失败」+ 错误原文 + 可折叠日志 |
 | `preview_status` / `preview_logs` 的 `ok=true` | 紧凑状态行或日志块（日志默认折叠，点击展开） |
 
-- 地址链接用 `<a target="_blank" rel="noopener">`，只在 `status=running` 且 `url` 非空时出现；
-  不在前端拼 `localhost` / 端口。
+- 地址链接用 `<a target="_blank" rel="noopener">`，只在 `status=running`、`healthy=true` 且 `url` 非空时出现
+  （探针说不可达还给一个「打开预览」，等于把故障藏起来让用户自己撞 403）；`preview_logs` 的结果不带
+  `healthy` 字段，因此日志卡永不给链接。不在前端拼 `localhost` / 端口。
 - 日志块用等宽字体、最大高度 240px、可滚动；显示 `note` 与「已遮断 N 处凭据」（`redacted > 0` 时）。
 - `restarts_left <= 1` 时显示「本次任务还可重启 N 次」，给用户一个预警。
 
