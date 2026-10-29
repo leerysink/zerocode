@@ -648,9 +648,10 @@ git commit -m "feat(deploy): 抽出 dev 探针路径与单轮 probe_dev，容器
 **Interfaces:**
 - Produces: `get_app_by_workspace(session_factory, workspace_id: int, *, owner_user_id: int | None = None) -> dict | None`
   - 0 行 → `None`
-  - 1 行 → 与 `get_app` 同形状（含 `preview_url` / `store`）
+  - 1 行 → 与 `get_app` 同形状（含 `preview_url` / `prod_url` / `store`）
   - 多行 → 抛 `DeployError("当前工作区绑定了多个应用，无法确定预览目标", status=409)`
-- Consumes: `to_dict` / `_with_public_urls`（同模块既有；它同时补 `preview_url` 与 `prod_url`）
+  - 行在两查之间被删 → `get_app` 的 `DeployError(status=404)` 原样上抛（调用方必须与 409 分岔）
+- Consumes: 同模块既有的 `get_app`（委托取整行；列清单与 store 子查询只此一份）
 
 - [ ] **Step 1: 先写失败测试**
 
@@ -741,45 +742,48 @@ Expected: FAIL —— `AttributeError: module 'app.services.app_service' has no 
 
 - [ ] **Step 3: 写实现**
 
-在 `app/services/app_service.py` 的 `get_app` 之后插入：
+在 `app/services/app_service.py` 的 `get_app` 之后插入（**只查 id、再委托 `get_app` 取整行**：
+两处各自维护一份列清单与 store 子查询早晚漂移，而规格要求两者可互换使用，漂移的后果是下游拿到
+静默的 None。刻意不抽公共助手去改 `get_app` 本体——它是 REST 详情/改名/删除/dev 端点/商店
+多路共用的热点，§14 已裁定不为预览工具改它）：
 
 ```python
 async def get_app_by_workspace(session_factory, workspace_id: int, *,
                                owner_user_id: int | None = None) -> dict | None:
     """按工作区反查唯一应用行（Agent 预览工具的身份来源，规格 2026-10-29 §5.1）。
 
-    与 `get_app` 同形状（含 preview_url / store），差别只在入口：调用方手上只有
-    `chat_session.workspace_id`，而预览工具的 schema 里刻意没有 app 参数——模型无从指定别的应用。
+    与 `get_app` 同形状——因为它就是**委托** `get_app` 取的行：两处各自维护一份列清单与
+    store 子查询早晚漂移，而漂移的后果是下游拿到静默的 None（规格要求两者可互换使用）。
 
     - 0 行 → None：不是应用工作区，预览工具不挂载；
     - 多行 → 抛 409：`app_project.workspace_id` 没有 UNIQUE 约束，历史上可能手工插入重复行，
       这时不猜、也不挂载工具（fail closed），由调用方记 warning 并向模型说明原因；
-    - `owner_user_id` 过滤与 `list_apps` 同一条判据：会话已过 WS 所有权校验，这里是第二道闸。
+    - 行在两查之间被删 → `get_app` 的 404 原样上抛：调用方要把它与 409 的「多个应用」
+      分开处理（前者是「应用不可用」，后者是「无法确定预览目标」）；
+    - `owner_user_id` 过滤与 `list_apps` 同一条判据：会话已过 WS 所有权校验，这里是第二道闸；
+      存量 NULL 归属的应用在应用列表里同样不可见，不制造新的不一致。
     """
     async with session_factory() as s:
-        sql = ("SELECT id, workspace_id, name, slug, scale, stack, prod_port, dev_port, "
-               "status_dev, status_prod, current_version, origin, created_at, updated_at "
-               "FROM app_project WHERE workspace_id = :w")
+        sql = "SELECT id FROM app_project WHERE workspace_id = :w"
         params: dict = {"w": workspace_id}
         if owner_user_id is not None:
             sql += " AND owner_user_id = :u"
             params["u"] = owner_user_id
-        rows = (await s.execute(text(sql + " ORDER BY id LIMIT 2"), params)).mappings().all()
-    if not rows:
+        ids = [r[0] for r in (await s.execute(text(sql + " ORDER BY id LIMIT 2"), params)).all()]
+    if not ids:
         return None
-    if len(rows) > 1:
+    if len(ids) > 1:
         raise DeployError("当前工作区绑定了多个应用，无法确定预览目标", status=409)
-    app_id = rows[0]["id"]
-    async with session_factory() as s:
-        link = (await s.execute(text(
-            "SELECT l.app_id, l.release_id, l.channel, l.detach_reason, l.applied_fingerprint, "
-            "l.last_upgraded_at, r.version AS release_version, r.slug AS release_slug, "
-            "r.title AS release_title FROM app_instance_link l "
-            "JOIN app_release r ON r.id = l.release_id WHERE l.app_id = :i"),
-            {"i": app_id})).mappings().first()
-    d = to_dict(rows[0])
-    d["store"] = to_dict(link) if link else None
-    return _with_public_urls(d)
+    return await get_app(session_factory, ids[0])
+```
+
+（委托时刻意**不传** `owner_user_id`：归属过滤已经在第一条查询里做过，再传一次只是多一处
+可能不一致的判据。）
+
+`test_get_app_by_workspace_hits_single_row` 里补一条断言，把「可互换」钉成可证伪的：
+
+```python
+    assert set(app) == set(await app_service.get_app(sf, aid))   # 可互换使用是规格的硬要求
 ```
 
 - [ ] **Step 4: 跑测试确认通过**
@@ -1013,6 +1017,21 @@ async def test_resolve_session_app_survives_db_error(sf, monkeypatch):
         raise RuntimeError("db down")
 
     monkeypatch.setattr(pt.app_service, "get_app_by_workspace", boom)
+    assert await pt.resolve_session_app(sf, 1) == (None, "")
+
+
+async def test_resolve_session_app_splits_404_from_409(sf, monkeypatch):
+    """404（探测到行之后应用被删）必须与 409（绑定了多个应用）分岔。
+
+    `get_app_by_workspace` 是「只查 id、再委托 get_app 取行」，两查之间应用可能被另一个标签页删掉；
+    把这条也说成「绑定了多个应用」，用户删掉应用后会看到一句莫名其妙的解释。
+    """
+    from app.agent import preview_tools as pt
+
+    async def gone(*a, **k):
+        raise DeployError("应用不存在", status=404)
+
+    monkeypatch.setattr(pt.app_service, "get_app_by_workspace", gone)
     assert await pt.resolve_session_app(sf, 1) == (None, "")
 
 
@@ -1304,8 +1323,14 @@ async def resolve_session_app(session_factory, workspace_id, *,
         app = await app_service.get_app_by_workspace(
             session_factory, workspace_id, owner_user_id=owner_user_id)
     except DeployError as e:
+        # 409 = 工作区绑定了多个应用（fail closed，但要给模型一句能转述给用户的原因）；
+        # 404 = 探测到行之后、委托回读之前应用被删（另一个标签页），那是「应用不可用」，
+        # 不是「绑定了多个应用」——把前者说成后者等于对用户撒谎
+        if e.status == 409:
+            logger.warning("预览工具未挂载：工作区 %s 绑定了多个应用", workspace_id)
+            return None, "当前工作区绑定了多个应用，无法使用预览工具"
         logger.warning("预览工具未挂载：工作区 %s 的应用解析被拒（%s）", workspace_id, e)
-        return None, "当前工作区绑定了多个应用，无法使用预览工具"
+        return None, ""
     except Exception:
         logger.warning("预览工具未挂载：工作区 %s 的应用解析失败", workspace_id, exc_info=True)
         return None, ""
