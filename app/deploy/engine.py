@@ -218,6 +218,34 @@ async def wait_dev_health(port: int, timeout: int, backend_path: str,
     return await _all_200(port, ("/", backend_path), timeout, host)
 
 
+def _dev_probe_paths(stack: str) -> tuple[str, ...]:
+    """dev 健康探针要打的路径：前端 `/` 必有，联合健康栈再加后端健康路径。
+
+    唯一真相：`start_dev` 的就绪等待与 `probe_dev` 的单轮探针都从这里取，
+    健康路径不许出现第二份（漂移的后果是「启动说好了、状态说没好」）。
+    """
+    if stack in JOINT_HEALTH_STACKS:
+        # deploy → services 就地取用是 prod.py 已有的惯例，提到模块顶会变成循环导入
+        from app.services.app_service import HEALTH_BY_STACK
+        backend = HEALTH_BY_STACK.get(stack) or ""
+        if backend:
+            return ("/", backend)
+    return ("/",)
+
+
+async def probe_dev(app: dict, timeout: int = 2) -> tuple[bool, str]:
+    """单轮预览探针：只回答「HTTP 可达吗」，不轮询到就绪、不写状态、不发事件。
+
+    与 `wait_*_health` 的分工：那两条是启动流程里等到就绪为止（最长 240/900s），
+    这条是给 `preview_status` 用的廉价体检——它可能被高频调用，不能起子进程也不能长等。
+    返回 `(是否可达, 最后一轮判定)`，判定串形态与 `_all_200` 一致（`"/ → 403"` / `ConnectError: …`）。
+    """
+    port = _dev_port(app)
+    if not port:
+        return False, "应用没有 dev 端口"
+    return await _all_200(port, _dev_probe_paths(app.get("stack") or ""), max(int(timeout), 1))
+
+
 async def start_dev(sf, app: dict, notify=None) -> dict:
     """启动 dev 预览栈：stopped→starting→running（进入 starting 之后任一失败 → error，异常原样上抛）。
 
@@ -268,10 +296,9 @@ async def start_dev(sf, app: dict, notify=None) -> dict:
         cfg = await deploy_cfg(sf)
         stack = app.get("stack") or ""
         timeout = health_timeout(cfg, stack)
-        # 健康路径不抄第三份：取 app_service.HEALTH_BY_STACK（也就是写进 app.json 的那个源）；
-        # deploy → services 就地取用是 prod.py 已有的惯例，提到模块顶会变成循环导入。
-        from app.services.app_service import HEALTH_BY_STACK
-        backend_path = (HEALTH_BY_STACK.get(stack) or "") if stack in JOINT_HEALTH_STACKS else ""
+        # 健康路径不抄第三份：与 probe_dev 共用 _dev_probe_paths（其内部取 HEALTH_BY_STACK）
+        paths = _dev_probe_paths(stack)
+        backend_path = paths[1] if len(paths) > 1 else ""
         probe = preview_probe_host()
         if backend_path:
             await _step(app_id, notify, f"→ 等待预览就绪（探测 http://{probe}:{port}/ 与后端 {backend_path}，"
@@ -409,6 +436,15 @@ _TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|[+-]\
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07")
 
 
+def strip_ansi(text: str) -> str:
+    """剥掉子进程自己发的 ANSI 转义序列（`--no-color` 只管 compose 自己的前缀着色）。
+
+    容器输出与平台步骤行都可能带（sqlrunner 的输出经 on_log 原样进环形缓冲），
+    面板是 `<pre>`、模型上下文是纯文本，留着就是 `[33m` 这类乱码。
+    """
+    return _ANSI_RE.sub("", text)
+
+
 def _split_ts(s: str) -> tuple[float | None, str, str]:
     """剥掉开头的 ISO 时间戳，返回 (epoch, ISO, 剩余文本)；不是时间戳开头则 (None, "", 原文)。
 
@@ -447,7 +483,7 @@ def parse_compose_logs(out: str, tail: int = 200) -> list[dict]:
     """
     rows: list[dict] = []
     for raw in out.splitlines():
-        raw = _ANSI_RE.sub("", raw)                        # 子进程自己的转义序列，面板不认
+        raw = strip_ansi(raw)                             # 子进程自己的转义序列，面板不认
         if not raw.strip():
             continue
         left, sep, right = raw.partition(" | ")
@@ -474,17 +510,18 @@ def merge_logs(*groups: list[dict]) -> list[dict]:
     return [{k: v for k, v in r.items() if k != "epoch"} for r in flat]
 
 
-async def container_logs(sf, app: dict, tail: int = 200) -> tuple[list[dict], str]:
+async def container_logs(sf, app: dict, tail: int = 200, timeout: int = 60) -> tuple[list[dict], str]:
     """dev 栈的容器输出（含应用自己打的启动 banner）。
 
     看日志是**排障入口**，它自己不许 500：Docker 没开 / 命令失败 / 非零退出一律降级成
     `([], 中文提示)`，让平台侧的步骤行照样返回——那正是「应用起不来时唯一看得见的东西」。
+    `timeout` 默认 60s（REST 面板）；Agent 的 preview_logs 传 15s，避免一次日志读取卡住整轮对话。
     """
     try:
         root = await _app_root(sf, app)
         code, out = await docker("compose", "-f", str(root / "deploy" / "dev-compose.yml"),
                                  "logs", "--no-color", "--timestamps", "--tail", str(int(tail)),
-                                 cwd=str(root), timeout=60)
+                                 cwd=str(root), timeout=timeout)
     except Exception as e:        # DeployError（含 504 超时）与 FileNotFoundError（CLI 没装）都要收口
         logger.warning("读取 dev 容器日志失败: %s", e)
         return [], f"容器日志暂不可用：{str(e).splitlines()[0][:200]}"

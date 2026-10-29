@@ -963,3 +963,70 @@ async def test_start_dev_large_stack_failure_names_both_probes(sf, make_app, sea
         await engine.start_dev(sf, app)
     msg = str(ei.value)
     assert "未就绪" in msg and "/api/health" in msg
+
+
+# ---------- 预览工具侧的引擎收口（规格 2026-10-29-agent-preview-tools §5.4） ----------
+
+async def test_dev_probe_paths_is_the_single_truth_for_health_routes():
+    """健康路径只有一份真相：start_dev 与 probe_dev 都从这里取，不许各写一遍。
+
+    本文件模块顶有 `pytestmark = asyncio`，纯逻辑用例也写成 async（写成 def 会多一条 PytestWarning）。
+    """
+    assert engine._dev_probe_paths("vue3-springboot") == ("/", "/api/health")
+    assert engine._dev_probe_paths("vue3-fastapi") == ("/",)     # 小栈刻意不探后端（见 JOINT_HEALTH_STACKS 注释）
+    assert engine._dev_probe_paths("static") == ("/",)
+    assert engine._dev_probe_paths("") == ("/",)
+
+
+async def test_probe_dev_reports_reachable_and_verdict(monkeypatch):
+    FakeClient, seen = _client_returning(lambda url: 200)
+    monkeypatch.setattr(engine.httpx, "AsyncClient", FakeClient)
+    ok, verdict = await engine.probe_dev({"id": 1, "stack": "vue3-fastapi", "dev_port": 8231})
+    assert ok is True and verdict == ""
+    assert seen == ["http://127.0.0.1:8231/"]
+
+
+async def test_probe_dev_verdict_carries_non_200(monkeypatch):
+    FakeClient, _ = _client_returning(lambda url: 403)
+    monkeypatch.setattr(engine.httpx, "AsyncClient", FakeClient)
+    ok, verdict = await engine.probe_dev({"id": 1, "stack": "vue3-fastapi", "dev_port": 8231}, timeout=1)
+    assert ok is False and "403" in verdict
+
+
+async def test_probe_dev_probes_both_paths_for_large_stack(monkeypatch):
+    FakeClient, seen = _client_returning(lambda url: 200)
+    monkeypatch.setattr(engine.httpx, "AsyncClient", FakeClient)
+    ok, _ = await engine.probe_dev({"id": 1, "stack": "vue3-springboot", "dev_port": 8233})
+    assert ok is True
+    assert any(u.endswith("8233/") for u in seen) and any(u.endswith("/api/health") for u in seen)
+
+
+async def test_probe_dev_without_dev_port_does_not_hit_network(monkeypatch):
+    """没有 dev 端口的应用不该发出任何 HTTP 请求（也不该抛），只回一句能转述给用户的说明。"""
+    instantiated = []
+
+    class Boom:
+        def __init__(self, **kw):
+            instantiated.append(kw)
+
+    monkeypatch.setattr(engine.httpx, "AsyncClient", Boom)
+    ok, verdict = await engine.probe_dev({"id": 1, "stack": "vue3-fastapi", "dev_port": None})
+    assert ok is False and verdict == "应用没有 dev 端口"
+    assert instantiated == []
+
+
+async def test_strip_ansi_removes_subprocess_escape_sequences():
+    """公开函数：Task 6 的日志整形要对平台步骤行也剥一遍（容器输出那条已由 parse_compose_logs 处理）。"""
+    assert engine.strip_ansi("\x1b[33mVITE ready\x1b[39m") == "VITE ready"
+    assert engine.strip_ansi("plain") == "plain"
+
+
+async def test_container_logs_passes_timeout_through(monkeypatch, sf, make_app):
+    """工具侧传 15s：读日志不许把整轮对话吊死；REST 仍是 60s 默认。"""
+    app = await make_app("zcto", prod_port=8234, dev_port=8235)
+    runner = FakeRunner({"compose logs": (0, "2026-09-20T14:27:58Z backend | hi")})
+    monkeypatch.setattr(engine, "docker", runner)
+    rows, note = await engine.container_logs(sf, app, 10, timeout=15)
+    assert runner.calls[0]["timeout"] == 15 and note == "" and rows[0]["line"] == "hi"
+    await engine.container_logs(sf, app, 10)
+    assert runner.calls[1]["timeout"] == 60
