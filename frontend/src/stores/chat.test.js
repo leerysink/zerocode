@@ -299,6 +299,9 @@ describe('tool_progress 与确认卡 summary', () => {
     const s = mk()
     applyEvent(s, { type: 'confirm_request', tool: 'write_file', args: { path: 'a.txt' } })
     expect(s.pendingConfirm).toEqual({ tool: 'write_file', args: { path: 'a.txt' } })
+    // toEqual 会忽略值为 undefined 的键（实测：toEqual 放过 summary: undefined，toStrictEqual 才拦）：
+    // 只靠上面那条测不出「多一个空键」，补一条键清单，才真正守住「形状一字不变」
+    expect(Object.keys(s.pendingConfirm)).toEqual(['tool', 'args'])
   })
 
   it('confirm_request 带 summary 时保存', () => {
