@@ -46,6 +46,13 @@ DEFAULT_GATEWAY_DOMAIN = "zerocode.com"
 # app/deploy/compose.py 再把同一个值转注进应用 dev 栈——一次命名贯通三段。
 # apt 只作用于镜像构建期（Dockerfile 里换源），没有运行期消费方，故不进容器 env。
 GATEWAY_DOMAIN_ENV = "ZEROCODE_GATEWAY_DOMAIN"
+# 网关连应用 prod 宿主端口的上游地址。仓库里的 gateway/docker-compose.yml 默认
+# host.docker.internal（本机 Docker Desktop 的内嵌 DNS 认识它），但**出包目标恒为 Linux
+# 服务器**，那里这个别名只写在 /etc/hosts，而 nginx 的变量式 proxy_pass 只查 resolver、
+# 不读 hosts → 必然 NXDOMAIN，症状是所有应用域名 502。故打包时烘成 docker0 默认网关的
+# IP 字面量；宿主自定义过 docker0 时用 gateway/.env 覆盖。
+GATEWAY_UPSTREAM_ENV = "ZEROCODE_GATEWAY_UPSTREAM"
+GATEWAY_UPSTREAM_BAKED = "172.17.0.1"
 APT_MIRROR_ENV = "ZEROCODE_APT_MIRROR"
 PYPI_MIRROR_ENV = "ZEROCODE_PYPI_MIRROR"
 NPM_REGISTRY_ENV = "ZEROCODE_NPM_REGISTRY"
@@ -93,10 +100,11 @@ GATEWAY_EXCLUDE_FILES = frozenset({".env"})
 GATEWAY_REQUIRED = ("docker-compose.yml", "nginx.conf", "lua/router.lua", "404.html",
                     "make-cert.sh", "make-cert.ps1")
 
-# 网关 compose 里域名默认值的形态（与平台 compose 的 ${VAR:-打包值} 同一副面孔）。
-# 打包时把这个 fallback 换成实际域名，使「不建 gateway/.env 也能与平台指向同一个域名」；
-# 出现 0 次或多次都拒包——前者说明源文件改了形状、替换会静默不生效，后者说明判定域有歧义。
+# 网关 compose 里两个默认值的形态（与平台 compose 的 ${VAR:-打包值} 同一副面孔）：
+# 域名 fallback 换成实际域名，上游 fallback 换成 Linux 可用的 IP。
+# 各自出现 0 次或多次都拒包——前者说明源文件改了形状、替换会静默不生效，后者说明判定域有歧义。
 _GATEWAY_DOMAIN_TOKEN_RE = re.compile(r"\$\{" + GATEWAY_DOMAIN_ENV + r":-[^}]*\}")
+_GATEWAY_UPSTREAM_TOKEN_RE = re.compile(r"\$\{" + GATEWAY_UPSTREAM_ENV + r":-[^}]*\}")
 
 
 
@@ -1184,6 +1192,14 @@ docker compose -f gateway/docker-compose.yml up -d
 docker compose -f gateway/docker-compose.yml ps
 ```
 
+网关默认从 `{GATEWAY_UPSTREAM_BAKED}`（Linux 的 docker0 网关）连各应用的 prod 宿主端口，
+这是打包时烘进 `gateway/docker-compose.yml` 的默认值。**不要**指望 `extra_hosts` 里的
+`host.docker.internal`：nginx 的变量式 `proxy_pass` 只查 `resolver`（Docker 内嵌 DNS），
+不读 `/etc/hosts`，这个名字在 Linux 上解析不了——症状是所有应用域名 502、网关日志里
+`host.docker.internal could not be resolved (3: Host not found)`。宿主 docker0 不是
+`{GATEWAY_UPSTREAM_BAKED}` 时，在 `gateway/.env` 里设 `{GATEWAY_UPSTREAM_ENV}=<实际网关 IP>`
+再重建网关；本机 Docker Desktop 演示才用 `host.docker.internal`。
+
 80 上的请求会 301 到 https；两个端口都必须空闲。
 
 ### 网关域名与路由表
@@ -1322,6 +1338,7 @@ bash apply-init.sh                                 # 新表自动建上，既有
 | 拉镜像超时 | 服务器访问不了 Docker Hub：配 registry mirror 后 `docker compose up -d --build` 重试 |
 | 发布报 `docker compose -f …prod-compose.yml… 超时（600s）`、记账停在 build 步 | 应用的 prod 镜像要在**构建期**装依赖（`pip install` / `npm install`），境内机直连官方源会等到超时——dev 预览正常不代表发布能过，两条通道不同。重打包时给 `--pypi-mirror` 与 `--npm-registry`，平台会把同一份源经 `build.args` 注进每个应用的 prod 构建（ADR-0025）；`deploy.build_timeout` 调大只是把 10 分钟换成 30 分钟，不是修法 |
 | 控制台里应用地址点进去全 404 | 逐项核对：① 网关起了吗（`docker compose -f gateway/docker-compose.yml ps`）；② 平台 `.env` 与 `gateway/.env` 的域名是否一致；③ 应用 prod 是否 `running`（进没进 `gateway/routes/routes.json`）；④ 浏览器是否信任了自签 CA |
+| 应用域名 502 Bad Gateway | 先看 `docker compose -f gateway/docker-compose.yml logs gateway`：出现 `host.docker.internal could not be resolved` 就是上游地址在 Linux 上解析不了（nginx 不读 `/etc/hosts`），把 `gateway/.env` 的 `ZEROCODE_GATEWAY_UPSTREAM` 设成宿主 docker0 网关（默认 `172.17.0.1`）后重建网关；若日志是 `connection refused`，核对应用 prod 栈与 `routes.json` 的端口是否一致 |
 | 网关容器起不来 / 反复重启 | `docker compose -f gateway/docker-compose.yml logs gateway`：多为 `gateway/certs/gateway.crt|key` 缺失，或 80/443 被占用 |
 | 发布成功但域名仍是 404 | 检查 `{deploy_root}/gateway/routes/routes.json` 里有没有该 slug；没有就看 backend 日志里 `gateway routes.json 刷新失败` 一行（该失败只告警、不阻断发布） |
 | 端口被占用 | 改 `.env` 的 `PLATFORM_PORT`；应用端口在控制台改不了，需重打包；网关的 80/443 被占只能腾端口 |
@@ -1387,23 +1404,32 @@ def copy_backend(repo_root: Path, out_backend: Path, deploy_root: str,
     return _count_files(out_backend)
 
 
-def gateway_compose_text(text: str, gateway_domain: str) -> str:
-    """把网关 compose 里 `GATEWAY_DOMAIN` 的 fallback 换成打包域名（ADR-0018）。
-
-    网关是一个独立 compose 项目，它的 `.env` 在 `gateway/` 下而不是部署根。不烘默认值时，
-    自定义域名必须额外记得 `cp gateway/.env.example gateway/.env`，忘掉的表现是
-    「平台地址是 <自定义域名>、网关仍按 zerocode.com 判 Host」——控制台看着正常，点进去全 404。
-
-    判定域故意收得很窄（只认 `${ZEROCODE_GATEWAY_DOMAIN:-…}` 这一种写法），且必须恰好命中一次：
-    源文件将来若改成裸值或改写变量名，这里直接拒包，而不是产出一份域名没换的包。
-    """
-    new, hits = _GATEWAY_DOMAIN_TOKEN_RE.subn(
-        lambda _m: "${" + GATEWAY_DOMAIN_ENV + ":-" + gateway_domain + "}", text)
+def _bake_fallback(text: str, token_re: re.Pattern, env_name: str, value: str) -> str:
+    """把 compose 里 `${ENV:-任意默认值}` 的默认值换成打包值，命中数不是 1 就拒包。"""
+    new, hits = token_re.subn(lambda _m: "${" + env_name + ":-" + value + "}", text)
     if hits != 1:
         raise BuildError(
-            f"gateway/docker-compose.yml 里 `${{{GATEWAY_DOMAIN_ENV}:-…}}` 应恰好出现 1 次，"
-            f"实际 {hits} 次——打包器无法把网关域名烘成默认值。")
+            f"gateway/docker-compose.yml 里 `${{{env_name}:-…}}` 应恰好出现 1 次，"
+            f"实际 {hits} 次——打包器无法把它烘成默认值。")
     return new
+
+
+def gateway_compose_text(text: str, gateway_domain: str) -> str:
+    """把网关 compose 的两个 fallback 烘成打包值（ADR-0018）。
+
+    网关是一个独立 compose 项目，它的 `.env` 在 `gateway/` 下而不是部署根。不烘默认值时：
+    - 域名：自定义域名必须额外记得 `cp gateway/.env.example gateway/.env`，忘掉的表现是
+      「平台地址是 <自定义域名>、网关仍按 zerocode.com 判 Host」——控制台看着正常，点进去全 404；
+    - 上游：`host.docker.internal` 在 Linux 上只有 /etc/hosts 认识，nginx 的变量式
+      proxy_pass 只查 resolver，于是所有已路由应用 502。包里必须换成 IP 字面量
+      （docker0 默认网关）；仓库版本保留 host.docker.internal 供本机 Docker Desktop 演示。
+
+    判定域故意收得很窄（只认 `${ENV:-…}` 这一种写法），且必须各自恰好命中一次：
+    源文件将来若改成裸值或改写变量名，这里直接拒包，而不是产出一份默认值不对的包。
+    """
+    text = _bake_fallback(text, _GATEWAY_DOMAIN_TOKEN_RE, GATEWAY_DOMAIN_ENV, gateway_domain)
+    return _bake_fallback(text, _GATEWAY_UPSTREAM_TOKEN_RE, GATEWAY_UPSTREAM_ENV,
+                          GATEWAY_UPSTREAM_BAKED)
 
 
 def gateway_env_example(gateway_domain: str) -> str:
@@ -1412,6 +1438,7 @@ def gateway_env_example(gateway_domain: str) -> str:
     与平台 `.env.example` 相反，这里必须写明「本文件在 gateway/ 下」：gateway 是独立 compose
     项目，`docker compose -f gateway/docker-compose.yml up -d` 读的是 gateway/.env，不是部署根
     的 .env。两处域名不一致的症状正是 ADR-0016 记过的「地址正常、点进去全 404」。
+    上游那一段同理必须写明「Linux 用 IP、本机才用别名」，否则 502 会以「网关坏了」的面目出现。
     """
     return f"""# gateway 是独立的 compose 项目：本文件要复制成同目录的 .env 才会被读取
 # （不是部署根下的 .env）。打包时域名已烘进 docker-compose.yml 的默认值，
@@ -1419,9 +1446,13 @@ def gateway_env_example(gateway_domain: str) -> str:
 # 并同步修改部署根 .env 里的同名变量——两边不一致会让应用域名全部 404。
 {GATEWAY_DOMAIN_ENV}={gateway_domain}
 
-# 可选：网关从哪个宿主地址连应用 prod 端口（默认 host.docker.internal）。
-# 容器化部署不要改成 127.0.0.1：桥接容器里的回环是它自己，那里没有应用在监听。
-# ZEROCODE_GATEWAY_UPSTREAM=host.docker.internal
+# 网关从哪个宿主地址连应用 prod 端口。包里默认 {GATEWAY_UPSTREAM_BAKED}（Linux 的 docker0
+# 网关）：nginx 的变量式 proxy_pass 只查 Docker DNS、不读 /etc/hosts，而 extra_hosts 只写
+# hosts，所以 host.docker.internal 在 Linux 上会 NXDOMAIN——症状是所有应用域名 502，
+# 网关日志里「host.docker.internal could not be resolved」。
+# 宿主自定义过 docker0 时改成实际网关 IP；本机 Docker Desktop 演示才用 host.docker.internal。
+# 不要用 127.0.0.1：桥接容器里的回环是容器自己，那里没有应用在监听。
+{GATEWAY_UPSTREAM_ENV}={GATEWAY_UPSTREAM_BAKED}
 """
 
 

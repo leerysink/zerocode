@@ -14,8 +14,10 @@ services:
       - "443:443"
     environment:
       # 应用容器把 prod 端口发布在宿主上，所以网关要连的是宿主而不是自己的回环。
-      # host.docker.internal 配合下面的 extra_hosts: host-gateway 在 Linux 上同样成立
-      # （Docker 20.10+），本机与服务器用同一个值即可。
+      # host.docker.internal 只适用于本机 Docker Desktop（它的内嵌 DNS 认识这个名字）。
+      # Linux 上必须用 IP 字面量：nginx 的变量式 proxy_pass 只查 resolver、不读 /etc/hosts，
+      # 而 extra_hosts 只写 hosts，这个名字在 Linux 上必然 NXDOMAIN → 所有应用域名 502。
+      # 出包时打包器会把这里的默认值换成 172.17.0.1（docker0 网关），服务器无需额外配置。
       # 刻意不要改成 127.0.0.1：桥接容器里的 127.0.0.1 是容器自己，那里没任何东西
       # 监听 8212，结果是每个请求都 connection refused。
       UPSTREAM_HOST: ${ZEROCODE_GATEWAY_UPSTREAM:-host.docker.internal}

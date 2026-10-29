@@ -1522,15 +1522,26 @@ def test_gateway_private_key_and_live_routes_never_ship(fake_repo):
     assert leaked == [], f"服务器现场产物混进包：{leaked}"
 
 
-def test_gateway_domain_baked_into_gateway_compose(fake_repo):
-    """不建 gateway/.env 也要与平台指向同一域名：fallback 必须换成打包值。"""
+def test_gateway_defaults_baked_into_gateway_compose(fake_repo):
+    """不建 gateway/.env 也要与平台指向同一域名、并在 Linux 上连得到宿主端口。"""
     out = _build(fake_repo, gateway_domain="leerysink.com")["out"]
     env = _gateway_service(out)["environment"]
     assert env["GATEWAY_DOMAIN"] == "${" + GATEWAY_ENV + ":-leerysink.com}"
-    assert env["UPSTREAM_HOST"] == "${ZEROCODE_GATEWAY_UPSTREAM:-host.docker.internal}"
+    # 上游烘成 IP 字面量：Linux 上 nginx 只查 resolver、不读 /etc/hosts，
+    # host.docker.internal 会 NXDOMAIN → 所有应用域名 502（2026-10-29 演示机实测）。
+    assert env["UPSTREAM_HOST"] == "${ZEROCODE_GATEWAY_UPSTREAM:-172.17.0.1}"
     example = (out / "gateway" / ".env.example").read_text(encoding="utf-8")
     assert f"{GATEWAY_ENV}=leerysink.com" in example
+    assert "ZEROCODE_GATEWAY_UPSTREAM=172.17.0.1" in example
     assert "gateway/ 下" in example or "同目录的 .env" in example
+
+
+def test_repo_gateway_upstream_keeps_desktop_default():
+    """仓库版本服务本机 Docker Desktop，默认值必须留在 host.docker.internal；
+    出包版本才换成 172.17.0.1（见 test_gateway_defaults_baked_into_gateway_compose）。
+    两边搞反时：本机网关全 502，或服务器上重新踩一遍 DNS 解析不了的老坑。"""
+    text = (bo.REPO_ROOT / "gateway" / "docker-compose.yml").read_text(encoding="utf-8")
+    assert "UPSTREAM_HOST: ${ZEROCODE_GATEWAY_UPSTREAM:-host.docker.internal}" in text
 
 
 def test_gateway_compose_shape_drift_fails_closed(fake_repo):
