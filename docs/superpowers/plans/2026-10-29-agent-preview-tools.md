@@ -2858,7 +2858,7 @@ steering_done（由 runner 与 hub 经 emit 下发）。tool_progress 是预览�
             cfg = await config_service.get_all(s, owner_user_id=uid)
         # 预览工具的平台级默认值（规格 2026-10-29 §5.9）：与 agent.max_tool_rounds 同一读法——
         # 默认值写在代码里，库里存了就以库为准。preview_confirm_running 默认 True 走**字面量**，
-        # 不能用 `cfg.get(key, default)`：库里的 JSON false 会被 `or` 吃掉，等于关不掉确认。
+        # 不能写成 `cfg.get(key) or default`：库里的 JSON false 会被 `or` 吃掉，等于这个开关关不掉。
         cfg.setdefault("agent.preview_wait_seconds", 240)
         cfg.setdefault("agent.preview_log_lines", 80)
         cfg.setdefault("agent.preview_max_restarts", 3)
