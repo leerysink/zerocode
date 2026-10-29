@@ -5,6 +5,7 @@ Docker 侧一律替身：本文件验「工具怎么解析应用、怎么整形�
 真起栈由 tests/test_engine.py 与手工矩阵负责。
 """
 import asyncio
+import json
 import time
 
 import pytest
@@ -423,6 +424,31 @@ async def test_logs_note_is_redacted_before_reaching_the_model(sf, tmp_path, mon
     assert "supersecret" not in r["note"] and "<redacted:" in r["note"]
 
 
+async def test_credentials_are_gone_from_the_whole_preview_logs_result(sf, tmp_path, monkeypatch):
+    """§6 / US-13 的安全主张是**整条链路**的：直调层与 note 层各钉过一段，这条走完整出口。
+
+    容器行 → `collect_dev_logs`（替身，形状取仓库真行的形状）→ `format_log_lines` → 结果 dict →
+    `json.dumps`。断言打在**整个返回体**上而不是某一层，是因为漏闸的方式通常是「多了一条旁路字段」
+    （url / status / 以后新加的什么），逐层各守一段就守不住聚合后的那一份。
+    凭据形态取 `memory_service.SENSITIVE_RULES` 已命中的两种（连接串口令、`password=` 键值）。
+    """
+    from app.agent import preview_tools as pt
+    wid = await _mk_workspace(sf, str(tmp_path / "n2"))
+    aid = await _mk_app(sf, wid, "pvred", dev_port=8267, prod_port=8266)
+
+    async def fake_collect(session_factory, app, h, *, tail=200, since_seq=0, container_timeout=60):
+        return {"lines": [_row("bootstrap db postgresql://u:supersecret@db:5432/app"),
+                          _row("admin bootstrap password=hunter2 done")],
+                "note": "", "status_dev": "running", "url": "", "last_seq": 2}
+
+    monkeypatch.setattr(pt, "collect_dev_logs", fake_collect)
+    r = await pt.run_preview_tool(Ctx({"id": aid}, sf=sf), "preview_logs", {})
+    blob = json.dumps(r, ensure_ascii=False)        # 模型实际拿到的就是这份 JSON 字符串
+    assert "supersecret" not in blob and "hunter2" not in blob
+    assert "<redacted:" in blob
+    assert r["redacted"] >= 1
+
+
 async def test_unknown_preview_tool_is_a_normal_result(sf):
     from app.agent import preview_tools as pt
     r = await pt.run_preview_tool(Ctx(None, sf=sf), "preview_nope", {})
@@ -439,7 +465,11 @@ async def test_unexpected_exception_text_is_redacted_and_capped(sf, monkeypatch)
     monkeypatch.setattr(pt, "_status", boom)
     r = await pt.run_preview_tool(Ctx({"id": 1}, sf=sf), "preview_status", {})
     assert r["ok"] is False and "supersecret" not in r["error"]
-    assert "<redacted:" in r["error"] and len(r["error"]) <= 200
+    assert "<redacted:" in r["error"]
+    # 兜底文案保持 200 字闸（升到 500 的只有引擎异常原文），但超长按 §6 口径补标记：
+    # 被切的半句不留标记就读起来像完整原文，模型会以为异常信息本来就这么长
+    assert r["error"].endswith("…（已截断）")
+    assert len(r["error"]) <= 200 + len("…（已截断）")
 
 
 # ---------- preview_restart：策略表（§5.5） ----------
@@ -697,6 +727,59 @@ async def test_non_deploy_error_gets_a_prefix(stopped_app, sf, monkeypatch):
     r = await pt.run_preview_tool(Ctx({"id": stopped_app}, sf=sf), "preview_restart",
                                   {"wait_seconds": 5})
     assert r["ok"] is False and r["error"] == "预览任务异常: unexpected"
+
+
+async def test_engine_error_tail_survives_the_length_gate(stopped_app, sf, monkeypatch):
+    """US-20 承诺的「错误原文」不能被静默裁切：compose 原文挂在消息**尾部**，200 字闸切掉的正是它。
+
+    `start_dev` 的失败消息是 `"dev 栈启动失败: " + explain_start_failure(...)`，而后者明说
+    「原文一律附在后面」（`app/deploy/ports.py`，附最后 800 字 compose 输出）。所以引擎异常原文
+    这一类出口的上限取 `LOG_LINE_CHARS`(500)，note 与探针判定串仍是 200。
+    这条用例把可识别标记放在消息尾部：上限改回 200 时那个尾部标记整块消失，用例即红。
+    """
+    from app.agent import preview_tools as pt
+    from app.deploy import engine as eng
+    from app.deploy.errors import DeployError
+
+    message = "dev 栈启动失败: " + "compose 输出行 " * 30 + "PORT_ALREADY_ALLOCATED"
+    assert 200 < len(message) < pt.LOG_LINE_CHARS    # 落在旧闸与新闸之间
+
+    async def boom(sf_, app, notify=None):
+        await eng._set_status(sf_, app["id"], "error")   # 真引擎失败也这样收口，状态读的是库
+        raise DeployError(message)
+
+    monkeypatch.setattr(eng, "preflight_docker", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(eng, "start_dev", boom)
+    r = await pt.run_preview_tool(Ctx({"id": stopped_app}, sf=sf), "preview_restart",
+                                  {"wait_seconds": 5})
+    assert r["ok"] is False and r["status"] == "error"
+    assert r["error"].endswith("PORT_ALREADY_ALLOCATED")     # 尾部原文一字不少
+    assert "已截断" not in r["error"]                         # 500 字以内不该带裁切标记
+
+
+async def test_engine_error_over_the_cap_is_cut_with_a_marker(stopped_app, sf, monkeypatch):
+    """超上限当然要裁，但必须留标记：与同文件日志正文的「…（已截断）」同一口径。
+
+    不留标记时被切的半句读起来像完整原文，模型会以为 daemon 就说了这么多，不会再去 `preview_logs`
+    要剩下的部分——这正是「静默」比「裁切」更贵的地方。
+    """
+    from app.agent import preview_tools as pt
+    from app.deploy import engine as eng
+    from app.deploy.errors import DeployError
+
+    mark = "…（已截断）"
+    message = "dev 栈启动失败: " + "x" * 900 + " PORT_ALREADY_ALLOCATED"
+
+    async def boom(sf_, app, notify=None):
+        await eng._set_status(sf_, app["id"], "error")
+        raise DeployError(message)
+
+    monkeypatch.setattr(eng, "preflight_docker", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(eng, "start_dev", boom)
+    r = await pt.run_preview_tool(Ctx({"id": stopped_app}, sf=sf), "preview_restart",
+                                  {"wait_seconds": 5})
+    assert r["error"].endswith(mark)
+    assert len(r["error"]) == pt.LOG_LINE_CHARS + len(mark)
 
 
 async def test_confirm_window_status_change_falls_back_to_start(running_app, sf, monkeypatch, no_docker):

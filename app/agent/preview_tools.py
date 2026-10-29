@@ -35,7 +35,9 @@ DEFAULT_CONFIRM_RUNNING = True         # agent.preview_confirm_running（中断�
 TOOL_LOG_TIMEOUT = 15                  # 工具读容器日志的超时（REST 面板仍是 60）
 RESTART_LOG_LINES = 20                 # 失败/超时结果里附带的最近日志行数
 LOG_LINE_CHARS = 500                   # 单行上限：一条 traceback 不该吃掉整个上下文窗口
-LOG_TOTAL_BYTES = 16 * 1024            # 总量上限
+# 总量上限按**字符**预算，不是字节：模型的成本按 token/字符算，而规格 §6 写的「16KB」是同一个
+# 数量级的口径（中文行 UTF-8 下 1 字符≈3 字节，计量位选字符才不会因为语言把预算忽大忽小）
+LOG_TOTAL_CHARS = 16 * 1024
 PROGRESS_INTERVAL = 0.25               # 进度节流：同一时刻最多一条/250ms
 HEARTBEAT_INTERVAL = 30.0              # 长等待期间每 30s 补一句「仍在启动」
 POLL_INTERVAL = 0.5                    # 等待循环周期，也是取消检查的粒度
@@ -208,7 +210,7 @@ def _source_of(row: dict) -> str:
     return row.get("service") or "容器"
 
 
-def format_log_lines(rows, *, limit_lines: int = LOG_LINES_MAX, limit_chars: int = LOG_TOTAL_BYTES,
+def format_log_lines(rows, *, limit_lines: int = LOG_LINES_MAX, limit_chars: int = LOG_TOTAL_CHARS,
                      limit_line_chars: int = LOG_LINE_CHARS) -> tuple[list[str], bool, int]:
     """归并行 → 模型可读的短行 `时间 [来源] 正文`；返回 `(lines, truncated, redacted)`。
 
@@ -239,14 +241,20 @@ def format_log_lines(rows, *, limit_lines: int = LOG_LINES_MAX, limit_chars: int
 
 
 def _safe_text(raw, limit: int = 200) -> str:
-    """任何要送进模型上下文的自由文本都过这一道：剥 ANSI、遮凭据、限长。
+    """任何要送进模型上下文的自由文本都过这一道：剥 ANSI、遮凭据、限长（裁切留标记）。
 
     规格 §6 的红线字面只管步骤行与容器输出，但 note / 异常原文 / 探针判定串同样会进模型，
     而 loop 的 `redact_tool_result` 只净化落库与推送那一份——当轮回注模型用的是原文。
-    200 字与 `engine.container_logs` 的既有口径同形。
+    默认 200 字与 `engine.container_logs` 的既有口径同形（note 与探针判定串走它）；
+    **引擎异常原文改走 `LOG_LINE_CHARS`(500)**：`start_dev` 的失败消息尾部是
+    `explain_start_failure` 附上的 compose 原文，切到 200 吃掉的正好是「daemon 说了什么」那半，
+    而 US-20 承诺的是「返回错误原文与最近日志，模型不必再猜」。
+    超长按 `format_log_lines` 的同一口径补「…（已截断）」——被切的半句不该读起来像完整原文。
     """
     text_, _ = redact_sensitive(engine.strip_ansi(str(raw or "")))
-    return text_[:limit]
+    if len(text_) > limit:
+        return text_[:limit] + "…（已截断）"
+    return text_
 
 
 async def _emit(ctx, line: str) -> None:
@@ -255,7 +263,7 @@ async def _emit(ctx, line: str) -> None:
 
 async def _drain_progress(ctx, q, last_emit: float, seen: list[str],
                           *, flush: bool = False) -> tuple[float, list[str]]:
-    """把订阅队列里的事件塑成聊天进度：只转发平台步骤行与状态变化，并再过一遍遮断。
+    """把订阅队列里的事件塑成聊天进度：只转发平台步骤行与状态变化，并再过一遍遮断与单行限长。
 
     **不转发** pip/npm 的成百上千行容器输出（那属于 `preview_logs`），也不照单全收：
     250ms 内的多条只投递最新一条，进度是给中人看的读数，不是日志流。`seen` 始终累积全量，
@@ -280,7 +288,8 @@ async def _drain_progress(ctx, q, last_emit: float, seen: list[str],
             line = f"{STEP_PREFIX} 预览状态：{ev.get('status')}"
         else:
             continue
-        line, _ = redact_sensitive(engine.strip_ansi(line))
+        # 进度行会直接进超时/失败结果的 `logs`，所以它和日志正文同一个闸：ANSI + 凭据 + 单行长度
+        line = _safe_text(line, LOG_LINE_CHARS)
         if not seen or seen[-1] != line:
             seen.append(line)
             fresh.append(line)
@@ -337,9 +346,11 @@ async def _wait(ctx, app: dict, task, wait_seconds: int, q) -> dict:
                 "error": "预览任务已被取消", "logs": seen[-RESTART_LOG_LINES:], "restarts_left": left}
     exc = task.exception()
     if exc is not None:
-        # 两支都是引擎/第三方异常的原文，和 note 同类的自由文本出口：进模型上下文前先过遮断闸
-        error = _safe_text(str(exc)) if isinstance(exc, DeployError) \
-            else _safe_text(f"预览任务异常: {exc}")
+        # 两支都是引擎/第三方异常的原文，和 note 同类的自由文本出口：进模型上下文前先过遮断闸。
+        # 上限取 LOG_LINE_CHARS(500) 而不是默认的 200——start_dev 的失败消息尾部是
+        # explain_start_failure 附上的 compose 原文，US-20 要模型读到的是「daemon 说了什么」
+        error = _safe_text(str(exc), LOG_LINE_CHARS) if isinstance(exc, DeployError) \
+            else _safe_text(f"预览任务异常: {exc}", LOG_LINE_CHARS)
         return {"ok": False, "status": status, "url": url, "elapsed_s": elapsed,
                 "error": error, "logs": seen[-RESTART_LOG_LINES:], "restarts_left": left,
                 "hint": "先看 logs 定位失败原因，再决定是否重试"}
@@ -429,8 +440,10 @@ async def _restart(ctx, args: dict, *, confirmed: bool = False) -> dict:
             try:
                 await engine.preflight_docker()               # 失败不登记任务（与 REST 的 503 同文案）
             except DeployError as e:
+                # 预检失败的原文同样是「daemon 说了什么」：与任务异常同一上限，不用默认 200
                 return {"ok": False, "status": status, "url": url, "restarts_left": left,
-                        "error": _safe_text(str(e)), "hint": "未登记后台任务，Docker 就绪后重试"}
+                        "error": _safe_text(str(e), LOG_LINE_CHARS),
+                        "hint": "未登记后台任务，Docker 就绪后重试"}
             action = engine.restart_dev if status == "running" else engine.start_dev
             notify = hub.publish if hub is not None else None
             try:

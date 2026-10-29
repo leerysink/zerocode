@@ -234,8 +234,11 @@ def _dev_probe_paths(stack: str) -> tuple[str, ...]:
 
 
 async def probe_dev(app: dict, timeout: int = 2) -> tuple[bool, str]:
-    """单轮预览探针：只回答「HTTP 可达吗」，不轮询到就绪、不写状态、不发事件。
+    """短等预览探针：在 `timeout` 的 deadline 内轮询「HTTP 可达吗」，不等到就绪为止、不写状态、不发事件。
 
+    刻意不写「单轮」：委托的 `_all_200` 是 deadline 内轮询（一轮里逐路径发请求，deadline 只在一轮
+    结束后才检查），所以最坏是**每条路径各 `timeout` 秒**——`timeout=2` 的联合栈两条路径约 4s，
+    期间可能跑到第二轮。给 `preview_status` 算时延要按这个上界（4s 而不是 2s），按单轮估会算小一半。
     与 `wait_*_health` 的分工：那两条是启动流程里等到就绪为止（最长 240/900s），
     这条是给 `preview_status` 用的廉价体检——它可能被高频调用，不能起子进程也不能长等。
     返回 `(是否可达, 最后一轮判定)`，判定串形态与 `_all_200` 一致（`"/ → 403"` / `ConnectError: …`）。
