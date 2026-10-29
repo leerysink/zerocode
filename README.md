@@ -1,7 +1,5 @@
 <div align="center">
 
-![ZeroCode](docs/images/banner.png)
-
 # ZeroCode
 
 ### 像聊天一样，长出你的业务系统
