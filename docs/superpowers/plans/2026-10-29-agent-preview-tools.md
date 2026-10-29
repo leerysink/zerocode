@@ -21,7 +21,7 @@
 - 只做 dev：不发布、不回滚、不启停 prod、不读 prod 日志。没有 `preview_stop`，工具永不单独调用 `engine.stop_dev`。
 - `app.state.dev_tasks` 的值仍是**裸 `asyncio.Task`**（`tests/test_apps_dev_api.py` 直接 `await dev_tasks[app_id]`）。
 - 409 文案逐字保持「该应用有部署任务进行中，请稍候」；崩溃日志逐字保持「部署后台任务异常退出（app_id=%s）」。
-- 日志出口：单行 500 字、总量 16KB、最多 300 行，逐行过 `redact_sensitive`，ANSI 转义不出现。
+- 日志出口：单行 500 字、总量 16K 字符、最多 300 行，逐行过 `redact_sensitive`，ANSI 转义不出现。
 - `agent.*` 是平台级键（`config_service.USER_PREFIXES` 只有 `llm.` / `memory.`），本期不为它单开用户级配置。
 - 前端**不拼预览地址**：只用后端回的 `preview_url`；`PreviewCard.vue` 源码不得出现 `localhost` / `://${` / `dev_port` 的地址拼接形态。
 - 文档不写行号锚点；提交信息用中文 conventional style，不带 AI 协作者署名。
@@ -1299,7 +1299,7 @@ DEFAULT_MAX_RESTARTS = 3               # agent.preview_max_restarts（<=0 不限
 TOOL_LOG_TIMEOUT = 15                  # 工具读容器日志的超时（REST 面板仍是 60）
 RESTART_LOG_LINES = 20                 # 失败/超时结果里附带的最近日志行数
 LOG_LINE_CHARS = 500                   # 单行上限：一条 traceback 不该吃掉整个上下文窗口
-LOG_TOTAL_BYTES = 16 * 1024            # 总量上限
+LOG_TOTAL_CHARS = 16 * 1024            # 总量上限（按**字符**预算，不是字节）
 PROGRESS_INTERVAL = 0.25               # 进度节流：同一时刻最多一条/250ms
 HEARTBEAT_INTERVAL = 30.0              # 长等待期间每 30s 补一句「仍在启动」
 POLL_INTERVAL = 0.5                    # 等待循环周期，也是取消检查的粒度
@@ -1402,7 +1402,7 @@ def _source_of(row: dict) -> str:
     return row.get("service") or "容器"
 
 
-def format_log_lines(rows, *, limit_lines: int = LOG_LINES_MAX, limit_chars: int = LOG_TOTAL_BYTES,
+def format_log_lines(rows, *, limit_lines: int = LOG_LINES_MAX, limit_chars: int = LOG_TOTAL_CHARS,
                      limit_line_chars: int = LOG_LINE_CHARS) -> tuple[list[str], bool, int]:
     """归并行 → 模型可读的短行 `时间 [来源] 正文`；返回 `(lines, truncated, redacted)`。
 

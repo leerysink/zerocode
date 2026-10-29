@@ -1,6 +1,6 @@
 # Agent 预览验证工具（preview tools）规格说明
 
-**日期**：2026-10-29  **来源**：需求访谈（「Agent 执行终端命令」可行性 → 第一步）  **状态**：待实现
+**日期**：2026-10-29  **来源**：需求访谈（「Agent 执行终端命令」可行性 → 第一步）  **状态**：已实现（自动化验证通过，§10.4 手工矩阵待走）
 
 **相关文件**：[tools.py](../../app/agent/tools.py)、[loop.py](../../app/agent/loop.py)、[llm.py](../../app/agent/llm.py)、[prompts.py](../../app/agent/prompts.py)、[engine.py](../../app/deploy/engine.py)、[hub.py](../../app/deploy/hub.py)、[apps.py](../../app/api/apps.py)、[dev_logs.py](../../app/api/dev_logs.py)、[app_service.py](../../app/services/app_service.py)、[ws.py](../../app/api/ws.py)、[chat.js](../../frontend/src/stores/chat.js)、[ChatMessages.vue](../../frontend/src/components/ChatMessages.vue)
 
@@ -328,6 +328,9 @@ Agent 不应「每改一行就重启」：先 `preview_status`，`healthy=true` 
 
 全部是平台级键（`agent.*` 不在 `USER_PREFIXES` 里），普通用户改动会影响全平台，这是既有取舍。
 默认值写在代码里（与 `agent.max_tool_rounds` 同样的读取方式），**不新增数据库迁移**。
+默认值的唯一真相是 `app/agent/preview_tools.py` 的四个 `DEFAULT_*` 常量：`ws.py` 的 `config_getter`
+只用它们做 `setdefault` 注水（库里存了就以库为准），不再另写一份字面量——否则「改常量而生产不变」
+与「提示词里的数字与实际等待不一致」两类漂移都会悄悄长出来。
 
 | key | 默认 | 夹取 | 说明 |
 |---|---|---|---|
@@ -348,7 +351,10 @@ Agent 不应「每改一行就重启」：先 `preview_status`，`healthy=true` 
 - **工作区围栏不变**：预览工具不接收路径，不读 `deploy/**`，不读 `app.json`；`resolve_in_workspace` 的规则
   与写确认、改动账本对这些工具不需要开口子。
 - **日志出口收口**：平台步骤行与容器输出在返回模型之前逐行跑 `redact_sensitive`，已知凭据形态替换为
-  `<redacted:kind>`；单行 500 字、总量 16KB、最多 300 行，避免把整份启动日志灌进上下文。
+  `<redacted:kind>`；单行 500 字、总量 16K 字符（按**字符**预算，不是字节——模型的成本按 token/字符算；
+  中文行 UTF-8 下最坏约为 3 倍字节）、最多 300 行，避免把整份启动日志灌进上下文。
+  引擎异常原文与预检失败原文放宽到 500 字并在裁切处留标记（US-20 承诺的是「错误原文」，
+  `start_dev` 的失败消息带 compose 尾部原文，200 字正好切掉 daemon 说了什么那半）。
   残余风险：应用用自定义编码（base64、拼接）打印的口令无法被规则识别——日志只尾读，且只在排障时读。
 - **并发**：与 REST 共用 `app.state.dev_tasks`，同一应用至多一个部署任务；重复请求返回 409 语义的正常结果。
 - **次数上限**：单次 run 3 次，防止模型在失败循环里反复起栈、反复拉镜像。
