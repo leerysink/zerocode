@@ -476,7 +476,13 @@ class AgentRunner:
             # 中断运行中的预览要用户点头（§5.6）。AgentRunner 仍是 confirm_request 的唯一发出方；
             # 事件多带一个 summary，前端据此把「写入确认」换成「重启预览」的人话文案。
             # 判据读的是**此刻**的库状态：确认期间状态可能已经变了，handler 侧还有一道兜底。
-            target = await fetch_app(ctx)
+            try:
+                target = await fetch_app(ctx)
+            except Exception:
+                # 预览是增量能力：读不动应用行就按「没有应用」降级（need_confirm 为 False），
+                # 让 handler 自己重读兜底，绝不让一次 DB 抖动把整轮对话打成 error 终态
+                logger.warning("预览确认判定读应用行失败，按无需确认处理", exc_info=True)
+                target = None
             if need_confirm(ctx, target):
                 summary = confirm_summary(target)
                 await self.send({"type": "confirm_request", "tool": name, "args": args,

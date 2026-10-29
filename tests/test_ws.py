@@ -768,3 +768,48 @@ def test_ws_injects_deploy_hub_and_task_table(client, monkeypatch):
     # 字面量 True 而非真值：`cfg.get(key) or True` 在这行仍是 True，所以这条开关关不掉的 bug
     # 要靠 setdefault 的实现本身守住（库里存了 false 就以库为准）
     assert captured["cfg"]["agent.preview_confirm_running"] is True
+
+
+def test_ws_confirm_switch_can_be_turned_off_from_config(client, monkeypatch):
+    """库里的 false 必须能关掉重启确认：`is True` 的默认值断言抓不住 `cfg.get(key) or True`。
+
+    刻意不往共享开发库写平台级 agent.* 行（会漏给别的会话）——config_service 是 ws.py 的
+    模块属性，打桩它的 get_all 就够了；包一层真实现，免得 llm.* 缺失让 resolve_model 先炸。
+    """
+    import app.api.ws as ws_module
+    real_get_all = ws_module.config_service.get_all
+    captured = {}
+
+    async def fake_get_all(session, owner_user_id=None):
+        cfg = await real_get_all(session, owner_user_id=owner_user_id)
+        cfg["agent.preview_confirm_running"] = False      # 等价于管理员在库里把开关拧到 off
+        return cfg
+
+    monkeypatch.setattr(ws_module.config_service, "get_all", fake_get_all)
+
+    class Spy:
+        def __init__(self, sf, llm, config_provider, send, ask, confirm, pop_pending=None,
+                     deploy_hub=None, dev_tasks=None):
+            self.get_cfg = config_provider
+            self.send = send
+
+        async def run(self, session_id, user_text, cancel, attachment_ids=None):
+            # 与 test_ws_injects_deploy_hub_and_task_table 同理：config_getter 是绑定了
+            # session_id 的异步闭包，只能在应用的事件循环里 await
+            captured["cfg"] = await self.get_cfg()
+            await self.send({"type": "status", "status": "idle"})
+            return "idle"
+
+    monkeypatch.setattr(ws_module, "AgentRunner", Spy)
+    client.app.state.llm_factory = lambda cfg: ScriptedLLM([])
+    with client.websocket_connect(f"/ws/chat/{client.zc_sid}") as ws:
+        ws.send_json({"type": "user_message", "content": "关掉重启确认"})
+        seen = False
+        for _ in range(4):
+            if ws.receive_json()["type"] == "status":
+                seen = True
+                break
+        assert seen, "runner 的 run 没跑起来（接线断在更前面）"
+
+    assert captured["cfg"]["agent.preview_confirm_running"] is False
+    assert captured["cfg"]["agent.preview_wait_seconds"] == 240      # 其余键仍取代码默认值

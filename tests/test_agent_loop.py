@@ -704,3 +704,84 @@ async def test_pending_deploy_task_never_opens_a_dialog(test_engine, tmp_path, p
             await blocker
         except asyncio.CancelledError:
             pass
+
+
+@pytest.mark.asyncio
+async def test_starting_with_inflight_task_observes_instead_of_confirming(test_engine, tmp_path,
+                                                                          pv_seams):
+    """§5.6 四条腿里「已有未完成任务 → 不发确认」在 loop 层的看守：starting + 在途任务。
+
+    这条与 `test_pending_deploy_task_never_opens_a_dialog`（running + 在途任务）合起来覆盖
+    handler 会真的去观察的那一类在途状态：结果是等待/观察的产物（`hint` 讲「仍在启动」），
+    既不该有确认框，也不该有「请重试并在确认框中选择确认」这类确认相关文案。
+    说清看守范围：starting 本身也会被 `need_confirm` 的状态腿先挡下，单独那条 pending_task 腿由
+    running 那批用例守着——这条钉的是 loop 层「这整个组合不弹框、结果是观察产物」不被人重构掉
+    （把判据塌成「开关开 + 有应用」时，这条立刻变红）。
+    在途任务用 `finally` 里 cancel + 排空，不留「Task was destroyed but it is pending」噪声。
+    """
+    sid, aid, sf = await mk_app_session(test_engine, tmp_path, status="starting", slug="pvstart",
+                                        dev_port=8295, prod_port=8294)
+    rec, asked, tasks = Recorder(), [], {}
+    blocker = asyncio.ensure_future(asyncio.Event().wait())   # 永不完成：模拟在途的部署任务
+    tasks[aid] = blocker
+    try:
+        async def approve(session_id, payload):
+            asked.append(payload)
+            return True
+
+        # wait_seconds=1：观察循环到点自己收尾返回，不去真等一个永不完成的任务
+        turns = [done(None, [tool_call("c1", "preview_restart", wait_seconds=1)]), done("继续观察")]
+        await mk_runner(sf, ScriptedLLM(turns), rec, confirm=approve, hub=DeployHub(),
+                        tasks=tasks).run(sid, "重启", asyncio.Event())
+        assert asked == []
+        assert not any(e["type"] == "confirm_request" for e in rec.events)
+        tr = next(e for e in rec.events if e["type"] == "tool_result")
+        result = tr["result"]
+        assert result["ok"] is False and result["status"] == "starting"
+        assert "预览仍在启动" in result["hint"]
+        assert "确认" not in json.dumps(result, ensure_ascii=False)
+    finally:
+        blocker.cancel()
+        try:
+            await blocker
+        except asyncio.CancelledError:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_db_failure_reading_app_row_degrades_to_idle_turn(test_engine, tmp_path, pv_seams,
+                                                                monkeypatch):
+    """预览是增量能力：确认判定读应用行时炸了，只降级成「当作没读到」，不能把整轮打成 error。
+
+    `preview_tools.fetch_app` 只吞 `DeployError`，一次连接抖动或驱动异常会从 `_dispatch` 的确认分支
+    逃到 `run()` 的兜底 except，让整轮对话以 `{"type": "error"}` + status=error 收场。这条打桩点在
+    `app.agent.loop.fetch_app`（loop 是按名字 import 的）而非 `preview_tools` 那份，于是 handler
+    自己的重读仍是真实现——一条用例同时证明主路径没被 DB 异常打穿、且 handler 的确认兜底真接住了
+    （竞态文案原样回到模型上下文，不是「工具执行异常」）。
+    """
+    from app.agent import loop as loop_module
+
+    async def boom(ctx):
+        raise RuntimeError("connection already closed")      # 不是 DeployError：真会往外逃
+
+    sid, aid, sf = await mk_app_session(test_engine, tmp_path, status="running", slug="pvdberr",
+                                        dev_port=8293, prod_port=8292)
+    monkeypatch.setattr(loop_module, "fetch_app", boom)
+    rec, asked = Recorder(), []
+
+    async def approve(session_id, payload):
+        asked.append(payload)
+        return True
+
+    turns = [done(None, [tool_call("c1", "preview_restart", wait_seconds=5)]), done("那先观察")]
+    status = await mk_runner(sf, ScriptedLLM(turns), rec, confirm=approve, hub=DeployHub(),
+                             tasks={}).run(sid, "重启", asyncio.Event())
+    assert status == "idle"
+    assert not any(e["type"] == "error" for e in rec.events)
+    # 读不到应用行 → need_confirm 为 False → 一次确认都不该发（handler 侧的兜底负责拦下这次中断）
+    assert asked == [] and not any(e["type"] == "confirm_request" for e in rec.events)
+    tr = next(e for e in rec.events if e["type"] == "tool_result")
+    assert isinstance(tr["result"], dict)
+    assert tr["result"]["ok"] is False and tr["result"]["status"] == "running"
+    assert "预览已在运行，请重试并在确认框中选择确认" in tr["result"]["error"]
+    assert "工具执行异常" not in json.dumps(tr["result"], ensure_ascii=False)
