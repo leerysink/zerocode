@@ -243,6 +243,8 @@ async def _drain_progress(ctx, q, last_emit: float, seen: list[str],
     `flush=True` 只用在任务结束后的那一次收尾：节流的意义是「等待期间不把聊天刷成日志流」，
     而任务已经结束了，再把这一批里除最新一条之外的步骤行丢掉，用户看到的流程就断在半路
     （引擎常把「→ 迁移」「预览状态：starting」在同一瞬间连发，落在同一次排空里）。
+    收尾仍限 `RESTART_LOG_LINES` 条——与结果里 `logs` 的行数同口径，几十条 `[zerocode]` 行
+    攒在一次排空里时，结束瞬间不该把它们全灌进聊天。
     """
     if q is None:
         return last_emit, seen
@@ -263,7 +265,7 @@ async def _drain_progress(ctx, q, last_emit: float, seen: list[str],
             fresh.append(line)
     now = time.monotonic()
     if flush:
-        for line in fresh:
+        for line in fresh[-RESTART_LOG_LINES:]:   # 收尾也限长：病态的一大批行不该在结束瞬间灌进聊天
             await _emit(ctx, line)
         return now, seen
     if fresh and now - last_emit >= PROGRESS_INTERVAL:
@@ -372,7 +374,8 @@ async def _logs(ctx, args: dict) -> dict:
 async def _restart(ctx, args: dict, *, confirmed: bool = False) -> dict:
     """启动或重启 dev 预览（§5.5 策略表）：动作面只有引擎既有的 `start_dev` / `restart_dev`。
 
-    顺序是有意的，每一道都在打扰用户之前：次数上限 → 并发判定 → 确认兜底 → Docker 预检 → 登记任务。
+    顺序是有意的，每一道都在打扰用户之前：并发判定 → 次数上限 → 确认兜底 → Docker 预检 → 登记任务。
+    后两道只属于「没有任务」的分支：有任务时观察它，观察一次都没起栈，因而不受上限约束、也不发确认。
     `confirmed` 由 `AgentRunner._dispatch` 传入（它才是 `confirm_request` 的唯一发出方）；
     这里只做兜底：需要确认却没拿到确认时，宁可让模型重试一次，也不执行未确认的中断。
     """
@@ -383,18 +386,21 @@ async def _restart(ctx, args: dict, *, confirmed: bool = False) -> dict:
     status = app.get("status_dev") or "stopped"
     url = app.get("preview_url") or ""
     left = _restarts_left(ctx)
-    if left == 0:
-        return {"ok": False, "restarts_left": 0,
-                "error": f"本次任务已启动/重启预览 {_max_restarts(ctx.cfg)} 次，请先检查失败原因再继续"}
     task = pending_task(ctx, app_id)
     if task is not None:
-        # starting/stopping 期间有任务：观察它，不另起一个栈
+        # starting/stopping 期间有任务：观察它，不另起一个栈。
+        # 观察**不受次数上限约束**：上限管的是「模型又起了一次栈」，而观察一次都没起。
+        # 额度用尽时把观察也挡掉，模型就只剩 preview_status 一条路，容易改判成「再试一次」。
         if status not in ("starting", "stopping"):
             return {"ok": False, "status": status, "url": url, "restarts_left": left,
                     "error": "该应用有部署任务进行中（可能正在发布），请稍后再试"}
-    elif status == "running" and confirm_required(ctx) and not confirmed:
-        return {"ok": False, "status": status, "url": url, "restarts_left": left,
-                "error": "预览已在运行，请重试并在确认框中选择确认"}
+    else:
+        if left == 0:
+            return {"ok": False, "restarts_left": 0,
+                    "error": f"本次任务已启动/重启预览 {_max_restarts(ctx.cfg)} 次，请先检查失败原因再继续"}
+        if status == "running" and confirm_required(ctx) and not confirmed:
+            return {"ok": False, "status": status, "url": url, "restarts_left": left,
+                    "error": "预览已在运行，请重试并在确认框中选择确认"}
     hub = getattr(ctx, "deploy_hub", None)
     q = hub.subscribe(app_id) if hub is not None else None    # 先订阅再 spawn，避免漏掉最早的事件
     try:

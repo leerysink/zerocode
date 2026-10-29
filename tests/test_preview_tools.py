@@ -5,6 +5,7 @@ Docker 侧一律替身：本文件验「工具怎么解析应用、怎么整形�
 真起栈由 tests/test_engine.py 与手工矩阵负责。
 """
 import asyncio
+import time
 
 import pytest
 from sqlalchemy import text
@@ -553,6 +554,46 @@ async def test_existing_starting_task_is_observed_not_respawned(stopped_app, sf,
     await task
 
 
+async def test_restart_cap_still_observes_an_existing_task(stopped_app, sf, monkeypatch, no_docker):
+    """§5.5 / §5.7：额度用尽时照样观察现有的 starting 任务。
+
+    上限管的是「模型又起了一次栈」，而观察一次都没起栈——把闸排在并发判定之前（修复前），
+    这里会回「已启动/重启预览 1 次」而不是等同一个任务，模型只剩 preview_status 一条路，
+    容易改判成「再试一次」。
+    """
+    from app.agent import preview_tools as pt
+    from app.deploy import engine as eng
+    started = await _engine_action_catcher(monkeypatch, "start_dev")
+    preflight = []
+
+    async def counting_preflight():
+        preflight.append(1)
+
+    monkeypatch.setattr(eng, "preflight_docker", counting_preflight)
+    async with sf() as s:
+        await s.execute(text("UPDATE app_project SET status_dev='starting' WHERE id=:i"),
+                        {"i": stopped_app})
+        await s.commit()
+
+    async def user_task():
+        await eng._set_status(sf, stopped_app, "running")
+        return {"status": "running"}
+
+    task = asyncio.create_task(user_task())
+    ctx = Ctx({"id": stopped_app}, sf=sf, cfg={"agent.preview_max_restarts": 1},
+              tasks={stopped_app: task})
+    ctx.run_state["preview_restarts"] = 1          # 额度已用满（left == 0）
+    r = await pt.run_preview_tool(ctx, "preview_restart", {"wait_seconds": 5})
+    assert r["ok"] is True and r["status"] == "running"    # 返回的是等待结果，不是上限文案
+    assert "已启动/重启预览" not in r.get("error", "")
+    assert started == [] and preflight == []               # 不 spawn、不预检：不碰别人的栈
+    assert ctx.deploy_tasks[stopped_app] is task          # 等的就是那一个任务
+    assert ctx.run_state["preview_restarts"] == 1          # 观察不计次
+    assert r["restarts_left"] == 0                         # 额度如实报 0，只是不挡观察
+    assert ctx.deploy_hub.subs == {}                       # 观察这条出口也退了订
+    await task
+
+
 async def test_other_deploy_task_is_refused_without_spawning(stopped_app, sf, monkeypatch, no_docker):
     """库里状态不是 starting/stopping 却有任务在跑（多半是发布）：拒绝并发，不排队、不双跑。"""
     from app.agent import preview_tools as pt
@@ -761,9 +802,6 @@ async def test_successful_restart_carries_probe_and_url(stopped_app, sf, monkeyp
     async def preflight_ok():
         return None
 
-    async def quick(sf_, app, notify=None):
-        return {"status": "running"}
-
     async def unreachable(app, timeout=2):
         return False, "ConnectError: [Errno 111] Connection refused"
 
@@ -780,6 +818,194 @@ async def test_successful_restart_carries_probe_and_url(stopped_app, sf, monkeyp
     assert r["healthy"] is False and "ConnectError" in r["probe"]
     assert r["status"] == "running" and r["url"].endswith(":8241")
     assert r["app"]["slug"] == "pvstart"
+
+
+# ---------- 并发不变量：退订无泄漏 / 进度节流合并 ----------
+
+async def test_restart_unsubscribes_the_hub_on_every_exit_path(
+        stopped_app, running_app, sf, monkeypatch, no_docker):
+    """`_restart` 的每一条出口都退订，不在 `DeployHub.subs` 里留孤儿队列。
+
+    `Ctx.deploy_hub` 用的是**真** DeployHub，`unsubscribe` 会把空 list 从 `subs` 里 pop 掉，
+    所以 `subs == {}` 就是「一个队列都没漏」的判据——摘掉 finally 里的 unsubscribe 本用例即红。
+    覆盖出口：成功、等待超时、聊天取消、Docker 预检失败、spawn 抛 409、观察现有任务、
+    并发拒绝、确认竞态兜底、上限拒绝（后三道在订阅之前就 return，一并钉住「闸不许提前订阅」）。
+    """
+    from app.agent import preview_tools as pt
+    from app.deploy import engine as eng
+    from app.deploy import tasks as deploy_tasks
+    from app.deploy.errors import DeployError
+
+    def leak_free(label, ctx):
+        assert ctx.deploy_hub.subs == {}, f"{label}：DeployHub 订阅泄漏"
+
+    def use(action):
+        """启动/重启两个动作一起换替身：本用例只验出口路径，不管走的是哪一个（也不留真引擎）。"""
+        monkeypatch.setattr(eng, "start_dev", action)
+        monkeypatch.setattr(eng, "restart_dev", action)
+
+    def slow(status_written):
+        """替身引擎：落一个状态然后挂住，等用例自己放行。"""
+        gate = asyncio.Event()
+
+        async def action(sf_, app, notify=None):
+            await eng._set_status(sf_, app["id"], status_written)
+            await gate.wait()
+
+        return action, gate
+
+    async def success(sf_, app, notify=None):
+        notify(app["id"], {"app_id": app["id"], "type": "dev_log",
+                           "line": "[zerocode] ✓ 预览已就绪"})
+        await eng._set_status(sf_, app["id"], "running")
+        return {"status": "running"}
+
+    async def set_status(app_id, value):
+        """把 `status_dev` 摆回这一条出口的起点：九条路径共用同一个应用行，不摆回去会互相串味。"""
+        async with sf() as s:
+            await s.execute(text("UPDATE app_project SET status_dev=:st WHERE id=:i"),
+                            {"st": value, "i": app_id})
+            await s.commit()
+
+    use(success)
+    await set_status(stopped_app, "stopped")
+    ctx = Ctx({"id": stopped_app}, sf=sf)
+    r = await pt.run_preview_tool(ctx, "preview_restart", {"wait_seconds": 5})
+    assert r["ok"] is True
+    leak_free("成功", ctx)
+
+    action, gate = slow("starting")
+    use(action)
+    await set_status(stopped_app, "stopped")
+    ctx = Ctx({"id": stopped_app}, sf=sf)
+    r = await pt.run_preview_tool(ctx, "preview_restart", {"wait_seconds": 1})
+    assert r["ok"] is False and r["status"] == "starting"
+    leak_free("等待超时", ctx)
+    gate.set()
+    await ctx.deploy_tasks[stopped_app]
+
+    action, gate = slow("starting")
+    use(action)
+    await set_status(stopped_app, "stopped")
+    cancel = asyncio.Event()
+    cancel.set()                                        # 一进 _wait 就走取消出口
+    ctx = Ctx({"id": stopped_app}, sf=sf, cancel=cancel)
+    r = await pt.run_preview_tool(ctx, "preview_restart", {"wait_seconds": 60})
+    assert r["ok"] is True and r["cancelled"] is True
+    leak_free("聊天取消", ctx)
+    gate.set()
+    await ctx.deploy_tasks[stopped_app]
+
+    async def down():
+        raise DeployError("Docker 未启动或不可用", status=503)
+
+    await set_status(stopped_app, "stopped")
+    monkeypatch.setattr(eng, "preflight_docker", down)
+    ctx = Ctx({"id": stopped_app}, sf=sf)
+    r = await pt.run_preview_tool(ctx, "preview_restart", {"wait_seconds": 5})
+    assert r["ok"] is False and "Docker" in r["error"]
+    leak_free("Docker 预检失败", ctx)
+    assert ctx.deploy_tasks == {}
+
+    ctx = Ctx({"id": stopped_app}, sf=sf)
+    rivals = []
+
+    async def preflight_that_races():
+        # 真 409：预检与登记之间另一条通道（REST）抢先起了同一个应用的任务
+        rivals.append(deploy_tasks.spawn(ctx.deploy_tasks, stopped_app, lambda: asyncio.sleep(30)))
+
+    monkeypatch.setattr(eng, "preflight_docker", preflight_that_races)
+    r = await pt.run_preview_tool(ctx, "preview_restart", {"wait_seconds": 5})
+    assert r["ok"] is False and "部署任务进行中" in r["error"] and len(rivals) == 1
+    leak_free("spawn 抛 409", ctx)
+    rivals[0].cancel()
+    await asyncio.gather(*rivals, return_exceptions=True)
+    monkeypatch.setattr(eng, "preflight_docker", lambda: asyncio.sleep(0))
+
+    await set_status(stopped_app, "starting")
+    gate = asyncio.Event()
+    task = asyncio.create_task(gate.wait())             # 别人起的任务：工具只观察
+    ctx = Ctx({"id": stopped_app}, sf=sf, tasks={stopped_app: task})
+    r = await pt.run_preview_tool(ctx, "preview_restart", {"wait_seconds": 1})
+    assert r["ok"] is False and r["status"] == "starting" and ctx.deploy_tasks[stopped_app] is task
+    leak_free("观察现有任务", ctx)
+    gate.set()
+    await task
+
+    gate = asyncio.Event()
+    task = asyncio.create_task(gate.wait())
+    ctx = Ctx({"id": running_app}, sf=sf, tasks={running_app: task})
+    r = await pt.run_preview_tool(ctx, "preview_restart", {"wait_seconds": 5})
+    assert r["ok"] is False and "部署任务进行中" in r["error"]
+    leak_free("并发拒绝", ctx)
+    gate.set()
+    await task
+
+    ctx = Ctx({"id": running_app}, sf=sf, cfg={"agent.preview_confirm_running": True})
+    r = await pt.run_preview_tool(ctx, "preview_restart", {"wait_seconds": 5})
+    assert r["ok"] is False and "请重试并在确认框中选择确认" in r["error"]
+    leak_free("确认竞态兜底", ctx)
+
+    await set_status(stopped_app, "stopped")
+    ctx = Ctx({"id": stopped_app}, sf=sf, cfg={"agent.preview_max_restarts": 1})
+    ctx.run_state["preview_restarts"] = 1
+    r = await pt.run_preview_tool(ctx, "preview_restart", {"wait_seconds": 5})
+    assert r["ok"] is False and "已启动/重启预览 1 次" in r["error"]
+    leak_free("上限拒绝", ctx)
+    assert ctx.deploy_tasks == {}                         # 上限闸也不许起任务
+
+
+async def test_drain_progress_merges_within_the_window_and_flushes_only_at_the_end():
+    """等待期间的节流合并语义（活体证据进仓库）。
+
+    钉三件事：一次排空里多条步骤行**只投最新一条**、`seen` 仍累积全量（供超时/失败结果取用）、
+    窗口内再次排空**不重复投递**；再加 `flush=True` 的全量投递与它的条数上限。
+    把 250ms 节流改成「每行即投」，本用例即红。
+    """
+    from app.agent import preview_tools as pt
+
+    def step(i):
+        return {"type": "dev_log", "line": f"{pt.STEP_PREFIX} → 第 {i} 步"}
+
+    def line_of(i):
+        return f"{pt.STEP_PREFIX} → 第 {i} 步"
+
+    def q_of(events):
+        q = asyncio.Queue()
+        for ev in events:
+            q.put_nowait(ev)
+        return q
+
+    ctx = Ctx()
+    q = q_of([step(1), {"type": "dev_log", "line": "Collecting fastapi==0.115"},
+              step(2), {"type": "dev_status", "status": "starting"}])
+    seen: list[str] = []
+    last_emit, seen = await pt._drain_progress(ctx, q, 0.0, seen)
+    assert [ev["line"] for ev in ctx.sent] == [f"{pt.STEP_PREFIX} 预览状态：starting"]
+    assert seen == [line_of(1), line_of(2), f"{pt.STEP_PREFIX} 预览状态：starting"]
+
+    q.put_nowait(step(3))                                # 同一次等待的下一轮：窗口还没过
+    kept_emit, seen = await pt._drain_progress(ctx, q, last_emit, seen)
+    assert kept_emit == last_emit and len(ctx.sent) == 1  # 窗口内一条都不投、节流时刻不推进
+    assert seen[-1] == line_of(3)                        # 但 seen 照收
+
+    await asyncio.sleep(pt.PROGRESS_INTERVAL)            # 窗口过后恢复投递
+    q.put_nowait(step(4))
+    kept_emit, seen = await pt._drain_progress(ctx, q, kept_emit, seen)
+    assert len(ctx.sent) == 2 and ctx.sent[-1]["line"] == line_of(4)
+
+    ctx2 = Ctx()                                         # 收尾：窗口内也全量投递
+    _, seen_flush = await pt._drain_progress(ctx2, q_of([step(1), step(2), step(3)]),
+                                             time.monotonic(), [], flush=True)
+    assert [ev["line"] for ev in ctx2.sent] == [line_of(1), line_of(2), line_of(3)]
+    assert seen_flush == [line_of(1), line_of(2), line_of(3)]
+
+    ctx3 = Ctx()                                         # 收尾同样限长：不一次性灌满聊天
+    many = q_of([step(i) for i in range(pt.RESTART_LOG_LINES + 5)])
+    await pt._drain_progress(ctx3, many, 0.0, [], flush=True)
+    assert len(ctx3.sent) == pt.RESTART_LOG_LINES
+    assert ctx3.sent[0]["line"] == line_of(5)             # 丢的是最旧的
+    assert ctx3.sent[-1]["line"] == line_of(pt.RESTART_LOG_LINES + 4)
 
 
 # ---------- <preview> 指引（§9）：工具挂载时才注入，按栈补一句热更新语义 ----------
