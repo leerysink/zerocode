@@ -142,3 +142,17 @@ def test_prompt_builds_without_memory_config():
     # 规则 9 在基线文本里，不因缺配置而丢失
     assert "memory_write" in p
 
+
+# ---- 预览工具指引 <preview>（规格 2026-10-29-agent-preview-tools §9）----
+
+def test_preview_block_appended_after_app_contract():
+    p = build_system_prompt("/ws", "2026-10-29", app_contract="\n\n【应用契约】slug=aaa\n",
+                            preview="\n\n<preview>\n改完要验证\n</preview>")
+    assert "<preview>" in p and "改完要验证" in p
+    assert p.index("【应用契约】") < p.index("<preview>")     # 契约在前，预览指引在后
+
+
+def test_no_preview_block_by_default():
+    assert "<preview>" not in build_system_prompt("/ws", "2026-10-29")
+    assert "<preview>" not in build_system_prompt("/ws", "2026-10-29", app_contract="【应用契约】")
+

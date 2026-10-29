@@ -69,6 +69,33 @@ TOOLS = [
             "required": ["op"]}}},
 ]
 
+# 预览工具（规格 docs/specs/2026-10-29-agent-preview-tools.md）：只在会话工作区解析出应用时挂载。
+# 刻意没有 app_id / slug / path 参数——应用身份由服务端从 chat_session.workspace_id 反查，
+# 模型无从指向别的应用或别人的应用。描述保持一句话：这三条随每次请求发送，教程在 system prompt。
+PREVIEW_TOOLS = [
+    {"type": "function", "function": {
+        "name": "preview_status",
+        "description": "查看当前应用 dev 预览的状态与可用性（只读）",
+        "parameters": {"type": "object", "properties": {}, "required": []}}},
+    {"type": "function", "function": {
+        "name": "preview_logs",
+        "description": "读取当前应用 dev 预览的最近日志（平台步骤行 + 容器输出，只读）",
+        "parameters": {"type": "object", "properties": {
+            "tail": {"type": "integer", "description": "最近多少行，默认 80，最大 300"}},
+            "required": []}}},
+    {"type": "function", "function": {
+        "name": "preview_restart",
+        "description": ("启动或重启当前应用的 dev 预览，等待就绪后返回最终状态与日志。"
+                        "改了依赖清单/配置、或预览未运行时使用；纯代码改动通常会自动热更新，"
+                        "先看 preview_status/preview_logs"),
+        "parameters": {"type": "object", "properties": {
+            "wait_seconds": {"type": "integer",
+                             "description": "最多等待多少秒，默认 240；超时返回 starting，预览仍在后台继续"}},
+            "required": []}}},
+]
+
+PREVIEW_TOOL_NAMES = ("preview_status", "preview_logs", "preview_restart")
+
 def _reasoning_of(delta):
     """兼容取 reasoning_content：SDK 具名属性优先，其次 model_extra（未知字段兜底）。"""
     if delta is None:

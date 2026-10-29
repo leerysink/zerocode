@@ -87,3 +87,32 @@ async def test_get_app_by_workspace_fails_closed_on_duplicate(sf, tmp_path):
     with pytest.raises(DeployError) as ei:
         await app_service.get_app_by_workspace(sf, wid)
     assert ei.value.status == 409 and "多个应用" in str(ei.value)
+
+
+# ---------- 工具 schema（§4.1）：三个工具，且没有应用身份参数 ----------
+
+async def test_preview_tool_schemas_have_no_app_identity_params():
+    """红线：schema 里出现 app_id / slug / path 就等于把跨应用入口交给模型。"""
+    from app.agent.llm import PREVIEW_TOOLS, PREVIEW_TOOL_NAMES
+    assert [t["function"]["name"] for t in PREVIEW_TOOLS] == list(PREVIEW_TOOL_NAMES)
+    assert PREVIEW_TOOL_NAMES == ("preview_status", "preview_logs", "preview_restart")
+    for t in PREVIEW_TOOLS:
+        fn = t["function"]
+        assert t["type"] == "function" and fn["description"]
+        props = fn["parameters"]["properties"]
+        assert not ({"app_id", "slug", "path", "workspace_id"} & set(props))
+        assert fn["parameters"]["required"] == []
+
+
+async def test_preview_tool_params_are_only_tail_and_wait_seconds():
+    from app.agent.llm import PREVIEW_TOOLS
+    by_name = {t["function"]["name"]: t["function"]["parameters"]["properties"] for t in PREVIEW_TOOLS}
+    assert by_name["preview_status"] == {}
+    assert set(by_name["preview_logs"]) == {"tail"}
+    assert set(by_name["preview_restart"]) == {"wait_seconds"}
+
+
+async def test_base_tools_unchanged_by_preview_feature():
+    from app.agent.llm import TOOLS
+    assert [t["function"]["name"] for t in TOOLS] == [
+        "list_dir", "read_file", "write_file", "edit_file", "ask_user", "todo_write", "memory_write"]

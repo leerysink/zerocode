@@ -1,5 +1,5 @@
 def build_system_prompt(root: str, date: str, app_contract: str | None = None,
-                       skills: list[dict] | None = None) -> str:
+                       skills: list[dict] | None = None, preview: str | None = None) -> str:
     text = (
         f"你是 zerocode 编程助手，运行在本地 Web 应用中。今天是 {date}。\n"
         f"当前工作区根目录：{root}\n"
@@ -24,6 +24,8 @@ def build_system_prompt(root: str, date: str, app_contract: str | None = None,
         text += _render_available_skills(skills)
     if app_contract:
         text += app_contract
+    if preview:
+        text += preview
     return text
 
 
