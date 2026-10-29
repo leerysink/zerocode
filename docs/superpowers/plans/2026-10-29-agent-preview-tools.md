@@ -1536,7 +1536,7 @@ git commit -m "feat(agent): 预览工具只读内核（状态探针与日志整�
 - Consumes: `engine.start_dev` / `restart_dev` / `preflight_docker` / `probe_dev`（一律按模块属性在调用时取，monkeypatch 才拦得住）、`deploy_tasks.spawn`、`ctx.deploy_hub.subscribe/unsubscribe/publish`、`ctx.cancel`、`ctx.run_state`
 - Produces: `_restart(ctx, args, *, confirmed=False) -> dict`
 - Produces: `_cfg_bool(raw, default) -> bool`、`confirm_required(ctx) -> bool`、`_max_restarts(cfg) -> int`、`_restarts_used(ctx) -> int`、`_restarts_left(ctx) -> int`
-- Produces: `build_preview_prompt(stack: str, name: str = "") -> str`
+- Produces: `build_preview_prompt(stack: str) -> str`（单参：`<preview>` 块里没有应用名的位置，应用名属于 Task 9 的 `confirm_summary`）
 - Produces: `run_preview_tool` 的 `preview_restart` 分支
 
 - [ ] **Step 1: 先写失败测试（策略表与并发拒绝）**
@@ -2070,18 +2070,21 @@ async def _restart(ctx, args: dict, *, confirmed: bool = False) -> dict:
     status = app.get("status_dev") or "stopped"
     url = app.get("preview_url") or ""
     left = _restarts_left(ctx)
-    if left == 0:
-        return {"ok": False, "restarts_left": 0,
-                "error": f"本次任务已启动/重启预览 {_max_restarts(ctx.cfg)} 次，请先检查失败原因再继续"}
     task = pending_task(ctx, app_id)
     if task is not None:
-        # starting/stopping 期间有任务：观察它，不另起一个栈
+        # starting/stopping 期间有任务：观察它，不另起一个栈。
+        # 观察**不受次数上限约束**：上限管的是「模型又起了一次栈」，而观察一次都没起。
+        # 额度用尽时把观察也挡掉，模型就只剩 preview_status 一条路，容易改判成「再试一次」。
         if status not in ("starting", "stopping"):
             return {"ok": False, "status": status, "url": url, "restarts_left": left,
                     "error": "该应用有部署任务进行中（可能正在发布），请稍后再试"}
-    elif status == "running" and confirm_required(ctx) and not confirmed:
-        return {"ok": False, "status": status, "url": url, "restarts_left": left,
-                "error": "预览已在运行，请重试并在确认框中选择确认"}
+    else:
+        if left == 0:
+            return {"ok": False, "restarts_left": 0,
+                    "error": f"本次任务已启动/重启预览 {_max_restarts(ctx.cfg)} 次，请先检查失败原因再继续"}
+        if status == "running" and confirm_required(ctx) and not confirmed:
+            return {"ok": False, "status": status, "url": url, "restarts_left": left,
+                    "error": "预览已在运行，请重试并在确认框中选择确认"}
     hub = getattr(ctx, "deploy_hub", None)
     q = hub.subscribe(app_id) if hub is not None else None    # 先订阅再 spawn，避免漏掉最早的事件
     try:
