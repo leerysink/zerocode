@@ -150,51 +150,50 @@ async def test_delete_frees_the_port_pair_for_reuse(client):
     assert fresh["dev_port"] == app["dev_port"] and fresh["prod_port"] == app["prod_port"]
 
 
-async def test_delete_stops_running_dev_stack_before_removing_rows(client, monkeypatch):
-    """停栈前置：running 的应用要先走 stop_dev，否则 Docker 里留一只没人认领的容器。"""
+async def test_delete_releases_both_stacks_without_trusting_status(client, monkeypatch):
+    """删除必须把 dev 与 prod 两个 compose 项目各 down 一次，且**不看状态列**。
+
+    状态列是缓存不是事实：起栈半途失败会停在 error（容器还活着、端口还占着），prod 栈更从来不在
+    删除路径上收口。记录一删端口就在库里「释放」，下一个应用被分到同一端口后永远起不来——线上
+    演示服 8213 撞端口即此。down 按项目名走（不读 deploy/ 文件，`.env` 缺位也停得动）且幂等。
+    """
     app = await _create(client)
     async with client.app.state.session_factory() as s:
-        await s.execute(text("UPDATE app_project SET status_dev='running' WHERE id=:i"), {"i": app["id"]})
+        await s.execute(text("UPDATE app_project SET status_dev='error', status_prod='running' "
+                             "WHERE id=:i"), {"i": app["id"]})
         await s.commit()
     calls = []
+    stop_spy = []
 
-    async def fake_stop(sf, target, notify=None):
-        calls.append(target["id"])
+    async def fake_docker(*args, cwd=None, on_line=None, timeout=600):
+        calls.append(args)
+        return 0, ""
+
+    async def no_user_facing_stop(sf, target, notify=None):
+        stop_spy.append(target["id"])
         return {"status": "stopped"}
 
-    monkeypatch.setattr(engine, "stop_dev", fake_stop)
+    monkeypatch.setattr(engine, "docker", fake_docker)
+    monkeypatch.setattr(engine, "stop_dev", no_user_facing_stop)
     assert (await client.delete(f"/api/apps/{app['id']}")).status_code == 200
-    assert calls == [app["id"]]
+    projects = [a[a.index("-p") + 1] for a in calls if "-p" in a]
+    assert projects == [f"zc-{app['slug']}-dev", f"zc-{app['slug']}-prod"]
+    assert stop_spy == []                    # 删除走静默收口，不发 dev_status 事件、不写状态列
 
 
-async def test_delete_survives_stop_failure(client, monkeypatch):
-    """尽力而为：Docker 没开 / 停栈失败不能把应用永久钉在列表里（记录必须照样删掉）。"""
+async def test_delete_survives_stop_failure(client, monkeypatch, caplog):
+    """尽力而为：Docker 没开 / 停栈失败不能把应用永久钉在列表里（记录必须照样删掉，但要留痕）。"""
     app = await _create(client)
-    async with client.app.state.session_factory() as s:
-        await s.execute(text("UPDATE app_project SET status_dev='running' WHERE id=:i"), {"i": app["id"]})
-        await s.commit()
 
-    async def boom(sf, target, notify=None):
+    async def boom(*args, **kwargs):
         raise RuntimeError("docker 不可用")
 
-    monkeypatch.setattr(engine, "stop_dev", boom)
-    r = await client.delete(f"/api/apps/{app['id']}")
+    monkeypatch.setattr(engine, "docker", boom)
+    with caplog.at_level("WARNING", logger="app.api.apps"):
+        r = await client.delete(f"/api/apps/{app['id']}")
     assert r.status_code == 200, r.text
     assert (await client.get("/api/apps")).json() == []
-
-
-async def test_delete_skips_stop_when_already_stopped(client, monkeypatch):
-    """stopped 应用不再敲 docker：删除保持快路径。"""
-    app = await _create(client)
-    called = []
-
-    async def spy_stop(sf, target, notify=None):
-        called.append(target["id"])
-        return {"status": "stopped"}
-
-    monkeypatch.setattr(engine, "stop_dev", spy_stop)
-    assert (await client.delete(f"/api/apps/{app['id']}")).status_code == 200
-    assert called == []
+    assert "docker 不可用" in caplog.text                 # 没停净必须留下话，否则端口去哪了无从追查
 
 
 async def test_delete_refuses_while_publishing(client):

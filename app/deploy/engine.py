@@ -16,6 +16,7 @@ from app.deploy import compose as compose_mod
 from app.deploy.errors import DeployError
 # provision_env 按模块级名字引入（同 D-1）：惰性供给在单测里可被 monkeypatch 接管，
 # 否则用例会在共享测试实例上真建库建角色（副作用跨用例泄漏）。
+from app.deploy.ports import explain_start_failure
 from app.deploy.provision import provision_env, read_cred
 from app.deploy.settings import deploy_cfg, health_timeout, preview_probe_host, preview_url
 # 迁移入口按模块级名字引入（D-1）：引擎内以 bare name 调用，测试 monkeypatch engine.run_sqlchange 生效
@@ -153,8 +154,25 @@ async def _step(app_id, notify, message: str, *, since: float | None = None,
     await _notify(notify, app_id, {"type": "dev_log", "line": line})
 
 
-async def _all_200(port: int, paths: tuple, timeout: int, host: str | None = None) -> bool:
+def _probe_headers(port: int) -> dict:
+    """探针自己带 Host 头：连的是宿主的发布端口，报给应用的却是回环名。
+
+    Vite 5.4.12+/6 起对 Host 头做 DNS-rebinding 校验（`server.allowedHosts`）：裸 IP 与 `localhost`
+    无条件放行，其余主机名一律 403「Blocked request」。而容器化部署下探针连的正是
+    `host.docker.internal`（`settings.preview_probe_host`），于是**每一个**应用的 dev 预览都会等满
+    健康窗口，而浏览器用 IP 访问同一个端口是 200——线上实测过这一次。
+    刻意不在应用侧修：存量应用各有一份 AI 生成的 vite.config.js，改模板救不了它们，
+    而探针报什么 Host 本来就是平台的事。
+    """
+    return {"Host": f"localhost:{port}"}
+
+
+async def _all_200(port: int, paths: tuple, timeout: int, host: str | None = None) -> tuple[bool, str]:
     """轮询到超时为止：给定的一组路径全部 200 才算就绪（任一非 200 就连本轮一起不算过）。
+
+    返回 `(是否就绪, 最后一轮的判定)`，就绪时判定是空串。判定必须带出来：非 200 与拒连在旧实现里
+    都被 `except: pass` 吞成同一句「未就绪」，排障时 403 和「端口没起」长得一模一样，只能人进容器
+    手搓 curl 才分得开。
 
     按 deadline 计时而不是「轮数 × 1s」（与 prod.wait_prod_health 同形）：一轮本身要花时间
     （httpx 单请求 2s 超时），按轮数计会把「900s」拖成十几分钟。
@@ -163,27 +181,34 @@ async def _all_200(port: int, paths: tuple, timeout: int, host: str | None = Non
     平台自己跑在容器里时 127.0.0.1 那一侧永远没有监听。
     """
     target = host or preview_probe_host()
+    headers = _probe_headers(port)
+    last = "未探测"
     async with httpx.AsyncClient(timeout=2.0) as c:
         deadline = time.monotonic() + max(int(timeout), 1)
         while True:
             try:
-                codes = [(await c.get(f"http://{target}:{port}{p}")).status_code for p in paths]
-                if all(code == 200 for code in codes):
-                    return True
-            except Exception:
-                pass                      # 端口没起来时是连接拒绝，与非 200 同判：本轮没过
+                results = [(p, (await c.get(f"http://{target}:{port}{p}", headers=headers)).status_code)
+                           for p in paths]
+                bad = [f"{p} → {code}" for p, code in results if code != 200]
+                if not bad:
+                    return True, ""
+                last = "；".join(bad)
+            except Exception as e:
+                # 端口没起来时是连接拒绝，与非 200 同判：本轮没过
+                last = f"{type(e).__name__}: {e}"
             if time.monotonic() >= deadline:
-                return False
+                return False, last[:200]
             await asyncio.sleep(1)
 
 
-async def wait_frontend_health(port: int, timeout: int, host: str | None = None) -> bool:
+async def wait_frontend_health(port: int, timeout: int,
+                               host: str | None = None) -> tuple[bool, str]:
     """前端健康判定（规格 03 §4.3）：GET `<probe host>:<port>/` 拿到 200 即就绪。"""
     return await _all_200(port, ("/",), timeout, host)
 
 
 async def wait_dev_health(port: int, timeout: int, backend_path: str,
-                          host: str | None = None) -> bool:
+                          host: str | None = None) -> tuple[bool, str]:
     """dev 联合健康：前端 `/` 与经 dev proxy 打到后端的 `backend_path` 都要 200。
 
     大型栈后端在容器里 `mvn spring-boot:run`，前端先起、后端后起——只探前端会出现
@@ -238,7 +263,7 @@ async def start_dev(sf, app: dict, notify=None) -> dict:
             "compose", "-f", str(root / "deploy" / "dev-compose.yml"), "up", "-d",
             cwd=str(root), on_line=on_log)
         if code != 0:
-            raise DeployError(f"dev 栈启动失败:\n{log[-800:]}")
+            raise DeployError(f"dev 栈启动失败: {await explain_start_failure(log, docker)}")
         await _step(app_id, notify, "✓ 容器已启动", since=t0)
         cfg = await deploy_cfg(sf)
         stack = app.get("stack") or ""
@@ -252,16 +277,17 @@ async def start_dev(sf, app: dict, notify=None) -> dict:
             await _step(app_id, notify, f"→ 等待预览就绪（探测 http://{probe}:{port}/ 与后端 {backend_path}，"
                                         f"最长 {timeout}s）；"
                                         f"首次启动可能要数分钟（后端在装依赖与编译），请勿重复点「重启」")
-            ok = await wait_dev_health(port, timeout, backend_path)
+            ok, verdict = await wait_dev_health(port, timeout, backend_path)
             fail = (f"dev 预览在健康等待期内未就绪（探测 http://{probe}:{port}，需前端 / 与后端 "
                     f"{backend_path} 同时 200，后端可能仍在编译，详情看 dev 日志）")
         else:
             await _step(app_id, notify,
                         f"→ 等待前端就绪（探测 http://{probe}:{port}/，最长 {timeout}s）")
-            ok = await wait_frontend_health(port, timeout)
+            ok, verdict = await wait_frontend_health(port, timeout)
             fail = f"dev 前端在健康等待期内未就绪（探测 http://{probe}:{port}/）"
         if not ok:
-            raise DeployError(fail)
+            # 带上最后一轮的判定：403（应用答了但不应）与拒连（没人答）是两类完全不同的故障
+            raise DeployError(f"{fail}；最后一轮 {verdict}")
         await _set_status(sf, app_id, "running")
         await _step(app_id, notify,
                     f"✓ 预览已就绪 {preview_url(port)}，总耗时 {time.monotonic() - t0:.1f}s")
@@ -339,6 +365,26 @@ async def stop_dev(sf, app: dict, notify=None) -> dict:
     await _notify(notify, app_id, {"type": "dev_status", "status": "stopped"})
     await _step(app_id, notify, "✓ 预览已停止", since=t0)
     return {"status": "stopped"}
+
+
+async def down_app_stacks(slug: str) -> list[str]:
+    """按 compose 项目名 down 掉该应用的 dev 与 prod 栈，返回未停净的告警（自身不抛）。
+
+    与 stop_dev 的分工：那条是用户点「停止预览」（要发事件、写状态、先补 deploy/）；这条是删除应用的
+    收口——记录马上就没了对谁说状态都没意义，只要把容器和端口放掉。刻意不读 deploy/*.yml：模板里
+    密钥位带 `${VAR:?}`，那是 compose 的文件解析期闸门，`.env` 被清空时按文件 down 会 exit=1，
+    按项目名 down 不受影响。
+    """
+    warnings: list[str] = []
+    for env in ("dev", "prod"):
+        project = f"zc-{slug}-{env}"
+        try:
+            code, log = await docker("compose", "-p", project, "down", timeout=120)
+            if code != 0:
+                warnings.append(f"{project} 未停净: {log[-200:]}")
+        except Exception as e:
+            warnings.append(f"{project} 停止失败: {e}")
+    return warnings
 
 
 async def restart_dev(sf, app: dict, notify=None) -> dict:
@@ -456,8 +502,42 @@ async def get_status_dev(sf, app_id: int) -> str:
             "SELECT status_dev FROM app_project WHERE id = :i"), {"i": app_id})).scalar() or "stopped"
 
 
+# compose 项目名的唯一形状 `zc-<slug>-<env>`（slug 段不含连字符，反解无歧义），与 docker 的
+# compose 项目标签；标签值就是项目名，所以残留清扫不必认识容器叫什么。
+STACK_PROJECT_RE = re.compile(r"^zc-([a-z][a-z0-9]{1,39})-(dev|prod)$")
+COMPOSE_PROJECT_LABEL = "com.docker.compose.project"
+COMPOSE_PROJECT_FORMAT = '{{.Label "com.docker.compose.project"}}'
+
+
+async def sweep_deleted_stacks(known_slugs: set[str]) -> None:
+    """down 掉库里已无对应应用的平台栈：已删应用留下的残留还在占宿主端口，而端口在库里已经释放了。
+
+    只告警不抛：孤儿扫不到不影响平台起来，宁可漏扫也不要在 docker 失联时误停一切。
+    """
+    try:
+        code, out = await docker("ps", "--filter", f"label={COMPOSE_PROJECT_LABEL}",
+                                 "--format", COMPOSE_PROJECT_FORMAT, timeout=60)
+    except Exception:
+        logger.exception("清扫已删应用残留栈失败（docker ps 不可用），本轮跳过")
+        return
+    if code != 0:
+        logger.warning("清扫已删应用残留栈：docker ps 退出码 %s，本轮跳过: %s", code, out[-200:])
+        return
+    # `docker ps` 是每容器一行，一个三容器的栈会报三遍同一个项目名——按项目去重后再 down
+    for project in dict.fromkeys(line.strip() for line in (out or "").splitlines()):
+        m = STACK_PROJECT_RE.fullmatch(project)
+        if not m or m.group(1) in known_slugs:
+            continue                                    # 非平台命名 / 应用还在，都不碰
+        logger.warning("清扫已删应用残留栈: %s", project)
+        try:
+            await docker("compose", "-p", project, "down", timeout=120)
+        except Exception:
+            logger.exception("清扫已删应用残留栈失败: %s", project)
+
+
 async def cleanup_orphans(sf, notify=None) -> None:
-    """平台启动时：所有应用 dev 栈一律 down（崩溃残留清理），状态复位 stopped（规格 03 §5）。"""
+    """平台启动时：所有应用 dev 栈一律 down（崩溃残留清理），状态复位 stopped（规格 03 §5）；
+    再扫一遍 Docker，把库里已无应用的残留栈一并 down——按库清理管不到已删应用，端口就漏在它们身上。"""
     async with sf() as s:
         rows = (await s.execute(text("SELECT id, slug FROM app_project"))).fetchall()
     for app_id, slug in rows:
@@ -467,6 +547,7 @@ async def cleanup_orphans(sf, notify=None) -> None:
             logger.exception("清理孤儿 dev 栈失败: %s", slug)
         await _set_status(sf, app_id, "stopped")
         await _notify(notify, app_id, {"type": "dev_status", "status": "stopped"})
+    await sweep_deleted_stacks({slug for _, slug in rows})
 
 
 async def stop_all_dev_on_exit(sf, cfg: dict, notify=None) -> None:

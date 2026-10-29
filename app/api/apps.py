@@ -128,17 +128,17 @@ async def remove(request: Request, app_id: int):
     M1 裁定：磁盘工程目录与应用数据库**保留**，响应把保留位置回给前端写进确认文案（kept）。
     停栈按「尽力而为」处理——Docker 没开或 compose 失败都只记 warning，不把应用永久钉在列表里：
     记录删不掉才是用户真正没法自救的状态。发布中 / 有部署任务在跑则 409 拒删（规格 08 §5.4）。
+
+    停栈不看状态列、dev 与 prod 一起收（规格 05）：记录一删端口即在库里释放，容器还留着就是把
+    同一个端口原封不动地埋给下一个应用。
     """
     sf = request.app.state.session_factory
     try:
         app = await app_service.get_app(sf, app_id, owner_user_id=request.state.actor["id"])
         app_service.ensure_deletable(app)
         _reject_if_task_running(request, app_id)
-        if app["status_dev"] in app_service.STOPPABLE:
-            try:
-                await engine.stop_dev(sf, app, notify=request.app.state.deploy_hub.publish)
-            except Exception as e:
-                logger.warning("删除应用时停止 dev 栈失败（继续删记录）: app_id=%s %s", app_id, e)
+        for warning in await engine.down_app_stacks(app["slug"]):
+            logger.warning("删除应用时停栈未净（继续删记录）: app_id=%s %s", app_id, warning)
         snap = await app_service.delete_app(sf, app_id)
     except DeployError as e:
         raise _http(e)

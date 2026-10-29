@@ -156,6 +156,7 @@ class _Seams:
         self.preflight_error = None
         self.preflight_calls = 0
         self.health_ok = True
+        self.health_verdict = ""      # 探针替身带回的「最后一轮看到什么」，失败用例用它注入
         self.health_calls = []
         self.joint_calls = []        # B3 的 dev 联合探针（前端 + 后端），与只探前端的那条分开记
         # dev 凭据惰性供给（ADR-0015）：真 provision_env 会连实例建库建角色，单测里一律替身接管
@@ -189,11 +190,11 @@ class _Seams:
 
     async def _health(self, port, timeout):
         self.health_calls.append((port, timeout))
-        return self.health_ok
+        return self.health_ok, self.health_verdict
 
     async def _dev_health(self, port, timeout, backend_path):
         self.joint_calls.append((port, timeout, backend_path))
-        return self.health_ok
+        return self.health_ok, self.health_verdict
 
 
 @pytest.fixture
@@ -465,6 +466,24 @@ async def test_start_dev_compose_up_failure(sf, make_app, seams):
     assert await _db_status(sf, app["id"]) == "error"
 
 
+async def test_start_dev_names_the_container_holding_the_port(sf, make_app, seams):
+    """绑端口冲突要点名占用者并给出可执行命令：甩 daemon 原文，用户只会反复重试一个永远好不了的错。
+
+    端口在库里没登记（原属主已被删除）但容器还活着时，这是唯一的溯源路径。
+    """
+    app = await make_app("zcbind", prod_port=8284, dev_port=8285)
+    seams.docker.script["compose up"] = (
+        1, "Error response from daemon: driver failed programming external connectivity on "
+           "endpoint zcbind-dev-frontend-1: Bind for 0.0.0.0:8285 failed: port is already allocated")
+    seams.docker.script["ps"] = (0, "zc-gone-dev-frontend-1\n")
+    with pytest.raises(DeployError) as ei:
+        await engine.start_dev(sf, app)
+    msg = str(ei.value)
+    assert "8285" in msg and "zc-gone-dev-frontend-1" in msg
+    assert "docker rm -f zc-gone-dev-frontend-1" in msg
+    assert "already allocated" in msg                       # daemon 原文仍保留，不丢诊断线索
+
+
 async def test_start_dev_unhealthy_sets_error(sf, make_app, seams):
     """栈起了但前端健康探针超时未就绪 → error（状态机 running 之前的最后一道门）。"""
     app = await make_app("zcunhealthy", prod_port=8284, dev_port=8285)
@@ -478,6 +497,19 @@ async def test_start_dev_unhealthy_sets_error(sf, make_app, seams):
 
 
 # ---------- stop / restart / status ----------
+
+async def test_down_app_stacks_releases_both_projects_without_reading_deploy_files(seams):
+    """删除路径的收口：dev 与 prod 各 down 一次，按项目名走（不读 deploy/，`.env` 缺位也停得动），
+    未停净只回告警不抛——把应用永久钉在列表里，用户就真没法自救了。"""
+    assert await engine.down_app_stacks("zcdel") == []
+    assert [c["args"] for c in seams.docker.calls] == [
+        ("compose", "-p", "zc-zcdel-dev", "down"),
+        ("compose", "-p", "zc-zcdel-prod", "down")]
+
+    seams.docker.script["compose down"] = (1, "permission denied")
+    warnings = await engine.down_app_stacks("zcdel")
+    assert len(warnings) == 2 and all("permission denied" in w for w in warnings)
+
 
 async def test_stop_dev_downs_stack_and_resets_status(sf, make_app, seams):
     app = await make_app("zcstop", prod_port=8282, dev_port=8283)
@@ -618,6 +650,29 @@ async def test_cleanup_orphans_downs_every_project_and_resets_status(sf, make_ap
     assert _statuses(events) == ["stopped", "stopped"]
 
 
+async def test_cleanup_orphans_sweeps_stacks_whose_app_is_gone(sf, make_app, seams):
+    """库里已无 app_project 行的 zc-<slug>-{dev,prod} 是已删应用留下的残留，端口还占着 → 一并 down。
+
+    删除路径已收口（apps.remove → down_app_stacks），这一扫是为了收拾收口之前留下的现场：
+    线上演示服 8213 就是这么被一个不存在的应用占住的。现存应用的 prod 栈不在清扫范围——
+    平台重启不该把正式环境停掉（FR3-04）；非平台命名的项目一律不碰。
+    """
+    a = await make_app("zcor4", prod_port=8262, dev_port=8263)
+    seams.docker.script["ps"] = (0, "\n".join([
+        "zc-zcor4-prod", "zc-gone-dev", "zc-gone-prod", "notaplatformstack"]))
+    await engine.cleanup_orphans(sf)
+    projects = [c["args"][2] for c in seams.docker.calls if _cmd_key(c["args"]) == "compose down"]
+    assert projects == ["zc-zcor4-dev", "zc-gone-dev", "zc-gone-prod"]
+
+
+async def test_sweep_deleted_stacks_downs_each_orphan_project_once(sf, make_app, seams):
+    """`docker ps` 是每容器一行：一个残留栈有三个容器，不能 down 三遍。"""
+    seams.docker.script["ps"] = (0, "zc-gone-dev\nzc-gone-dev\nzc-gone-dev\n")
+    await engine.sweep_deleted_stacks(set())
+    assert [c["args"][2] for c in seams.docker.calls if _cmd_key(c["args"]) == "compose down"] \
+        == ["zc-gone-dev"]
+
+
 async def test_cleanup_orphans_survives_docker_failure(sf, make_app, seams, caplog):
     """单个栈清理失败不得中断整轮清扫（Docker 失联时平台仍要能起来），且异常要留日志。"""
     a = await make_app("zcor3", prod_port=8270, dev_port=8271)
@@ -685,8 +740,12 @@ async def test_docker_timeout_raises_504_and_preflight_passes():
 # ---------- Task B3：dev 联合健康探针 + 按栈超时 ----------
 
 def _client_returning(status_for):
-    """httpx.AsyncClient 替身：按 url 给固定状态码，并把访问过的 url 记下来（不真发网络请求）。"""
+    """httpx.AsyncClient 替身：按 url 给固定状态码，并把访问过的 url 记下来（不真发网络请求）。
+
+    请求头另存 `FakeClient.heads`（不进返回值元组，免得 12 处既有用例的 `FakeClient, seen = ...` 一起改形）。
+    """
     seen = []
+    heads = []
 
     class FakeClient:
         def __init__(self, **kw):
@@ -698,13 +757,15 @@ def _client_returning(status_for):
         async def __aexit__(self, *a):
             return False
 
-        async def get(self, url):
+        async def get(self, url, headers=None):
             seen.append(url)
+            heads.append(headers)
 
             class R:
                 status_code = status_for(url)
             return R()
 
+    FakeClient.heads = heads
     return FakeClient, seen
 
 
@@ -712,7 +773,8 @@ async def test_wait_dev_health_fails_when_backend_not_ready(monkeypatch):
     """大型栈：前端 200 但后端未就绪时必须等到超时，杜绝「预览已就绪、后端还在编译」的假绿。"""
     FakeClient, seen = _client_returning(lambda url: 502 if url.endswith("/api/health") else 200)
     monkeypatch.setattr(engine.httpx, "AsyncClient", FakeClient)
-    assert not await engine.wait_dev_health(8211, 2, "/api/health")
+    ok, _ = await engine.wait_dev_health(8211, 2, "/api/health")
+    assert not ok
     assert any(u.endswith("/api/health") for u in seen)          # 后端探针确实打过
     assert any(u.endswith("8211/") for u in seen)                # 前端也打过（不是只探后端）
 
@@ -720,7 +782,8 @@ async def test_wait_dev_health_fails_when_backend_not_ready(monkeypatch):
 async def test_wait_dev_health_passes_when_both_200(monkeypatch):
     FakeClient, seen = _client_returning(lambda url: 200)
     monkeypatch.setattr(engine.httpx, "AsyncClient", FakeClient)
-    assert await engine.wait_dev_health(8211, 2, "/api/health")
+    ok, _ = await engine.wait_dev_health(8211, 2, "/api/health")
+    assert ok
     assert len(seen) == 2                                        # 一轮内两个探针都过 → 立即返回，不白等
 
 
@@ -728,7 +791,8 @@ async def test_wait_frontend_health_still_only_probes_root(monkeypatch):
     """只探前端的那条没被顺手改成联合判定（存量小栈的行为一字不动，B3 只动大型栈）。"""
     FakeClient, seen = _client_returning(lambda url: 200)
     monkeypatch.setattr(engine.httpx, "AsyncClient", FakeClient)
-    assert await engine.wait_frontend_health(8211, 2)
+    ok, _ = await engine.wait_frontend_health(8211, 2)
+    assert ok
     assert seen == ["http://127.0.0.1:8211/"]
 
 
@@ -743,8 +807,77 @@ async def test_probe_host_env_moves_the_request_target(monkeypatch):
     FakeClient, seen = _client_returning(lambda url: 200)
     monkeypatch.setattr(engine.httpx, "AsyncClient", FakeClient)
     monkeypatch.setenv("ZEROCODE_PREVIEW_PROBE_HOST", "host.docker.internal")
-    assert await engine.wait_frontend_health(8213, 2)
+    ok, _ = await engine.wait_frontend_health(8213, 2)
+    assert ok
     assert seen == ["http://host.docker.internal:8213/"]
+
+
+async def test_probe_reports_a_loopback_host_header(monkeypatch):
+    """连接目标可以是 `host.docker.internal`，但 Host 头必须是 Vite 无条件放行的回环名。
+
+    Vite 5.4.12+/6 起对 Host 头做 DNS-rebinding 校验：只放行裸 IP 与 localhost，其余主机名要
+    `server.allowedHosts` 列过，否则 403「Blocked request」。探针报的是容器内解析出来的主机名，
+    于是**每个**应用的 dev 预览都等满健康窗口，而浏览器用 IP 访问同一个端口是 200（线上实测）。
+    改应用配置救不了存量应用（各有一份 AI 生成的 vite.config.js），改探针是一处修。
+    """
+    FakeClient, seen = _client_returning(lambda url: 200)
+    monkeypatch.setattr(engine.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setenv("ZEROCODE_PREVIEW_PROBE_HOST", "host.docker.internal")
+    ok, _ = await engine.wait_frontend_health(8213, 2)
+    assert ok
+    assert seen == ["http://host.docker.internal:8213/"]      # 连的还是宿主探针地址
+    assert FakeClient.heads == [{"Host": "localhost:8213"}]   # 报的却是回环名
+
+
+async def test_probe_verdict_carries_last_non_200_status(monkeypatch):
+    """等满窗口时必须把最后一轮的状态码带出来：403 与拒连在旧日志里长得一模一样。"""
+    FakeClient, _ = _client_returning(lambda url: 403)
+    monkeypatch.setattr(engine.httpx, "AsyncClient", FakeClient)
+    ok, verdict = await engine.wait_frontend_health(8211, 1)
+    assert not ok
+    assert "403" in verdict and "/" in verdict
+
+
+async def test_probe_verdict_carries_connection_error(monkeypatch):
+    """连不上（DNS 解不出 / 端口无监听）也要有名字，不能只剩一句「未就绪」。"""
+    seen = []
+
+    class BoomClient:
+        def __init__(self, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url, headers=None):
+            seen.append(url)
+            raise engine.httpx.ConnectError("[Errno 111] Connection refused")
+
+    monkeypatch.setattr(engine.httpx, "AsyncClient", BoomClient)
+    ok, verdict = await engine.wait_frontend_health(8211, 1)
+    assert not ok
+    assert "ConnectError" in verdict and "refused" in verdict
+
+
+async def test_probe_verdict_empty_when_ready(monkeypatch):
+    """就绪路径不留诊断串（成功日志里不该出现「最后一轮」字样）。"""
+    FakeClient, _ = _client_returning(lambda url: 200)
+    monkeypatch.setattr(engine.httpx, "AsyncClient", FakeClient)
+    ok, verdict = await engine.wait_dev_health(8211, 1, "/api/health")
+    assert ok and verdict == ""
+
+
+async def test_start_dev_failure_message_carries_probe_verdict(sf, make_app, seams):
+    """探针的最后一轮要拼进「启动预览失败」那句，用户在日志面板里直接看到 403/拒连是哪一个。"""
+    seams.health_ok = False
+    seams.health_verdict = "/ → 403"
+    app = await make_app("zcverd1", prod_port=8296, dev_port=8297)
+    with pytest.raises(DeployError) as ei:
+        await engine.start_dev(sf, app)
+    assert "未就绪" in str(ei.value) and "/ → 403" in str(ei.value)
 
 
 async def test_preview_url_without_config_keeps_localhost(monkeypatch):
