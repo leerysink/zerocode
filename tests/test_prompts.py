@@ -44,6 +44,65 @@ def test_contract_carries_sqlchange_append_only_discipline(tmp_path):
     assert "两步" in text_   # 破坏性变更两步走（新契约还没有这条纪律时安装闸门拦不住人）
 
 
+def _app_json_for_contract(tmp_path):
+    import json
+    (tmp_path / "app.json").write_text(json.dumps({
+        "schema": "zc-app/1", "name": "甲", "slug": "aaa", "stack": "vue3-fastapi",
+        "ports": {"dev": 8300, "prod": 8301},
+        "database": {"dev": {"name": "aaa_dev", "user": "aaa_dev"},
+                     "prod": {"name": "aaa_prod", "user": "aaa_prod"}},
+        "health": {"backend": "/api/health"}}), encoding="utf-8")
+
+
+def test_contract_carries_add_column_not_null_redline(tmp_path):
+    """生产事故回归：结构轨给已有数据的表补裸 NOT NULL 列不可重放，会把 dev 栈永久锁死在
+    fold 那一行（fold 不进 history，每次重启红在同一处）。契约必须自带这条红线与出路。"""
+    from app.deploy.contract import build_app_contract
+    _app_json_for_contract(tmp_path)
+    text_ = build_app_contract(tmp_path)
+    assert "补列红线" in text_
+    assert "contains null values" in text_     # 报错原文，让模型认得自己将撞什么
+    assert "gen_random_uuid()" in text_        # 唯一列的默认值出路（常量默认值会撞唯一索引）
+    assert "SET NOT NULL" in text_             # fold 先于数据轨的时序红线
+
+
+def test_schema_template_readmes_carry_add_column_not_null_redline():
+    """两栈的 schema/README.md 是应用工作区里的落地副本，红线必须同步在场（两份不得漂移）。"""
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1] / "app" / "templates"
+    for stack in ("vue3-fastapi", "vue3-springboot"):
+        md = (root / stack / "schema" / "README.md").read_text(encoding="utf-8")
+        assert "补列红线" in md, stack
+        assert "contains null values" in md, stack
+        assert "SET NOT NULL" in md, stack
+
+
+def test_contract_carries_unique_index_redline(tmp_path):
+    """生产事故回归：给已有数据的表加唯一索引，fold 先于数据轨执行，存量重复（常见为空串）
+    会让每次启动都红在建索引那一行。契约必须自带这条红线与两步走出路。"""
+    from app.deploy.contract import build_app_contract
+    _app_json_for_contract(tmp_path)
+    text_ = build_app_contract(tmp_path)
+    assert "唯一索引红线" in text_
+    assert "could not create unique index" in text_   # 报错原文，让模型认得自己将撞什么
+    assert "is duplicated" in text_
+    assert "空串" in text_ and "NULL" in text_        # () 是空串不是 NULL：多个 NULL 合法、多个空串不合法
+    assert "两步" in text_                             # 存量有重复时先清理、下一版再加索引
+
+
+def test_schema_template_readmes_carry_unique_index_redline():
+    """两栈的 schema/README.md 与契约同步携带唯一索引红线，不得漂移。"""
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1] / "app" / "templates"
+    for stack in ("vue3-fastapi", "vue3-springboot"):
+        md = (root / stack / "schema" / "README.md").read_text(encoding="utf-8")
+        assert "唯一索引红线" in md, stack
+        assert "could not create unique index" in md, stack
+        assert "is duplicated" in md, stack
+        assert "空串" in md and "NULL" in md, stack
+        assert "两步" in md, stack
+
+
 # ---- Ticket 009：基线 prompt 记忆时机规则 ----
 
 def test_prompt_carries_memory_timing_rule():
