@@ -304,3 +304,45 @@ async def test_dev_logs_endpoint_clamps_tail_and_filters_since(client, dev_app, 
 async def test_dev_logs_endpoint_404_for_unknown_app(client):
     r = await client.get("/api/apps/999999/dev/logs")
     assert r.status_code == 404
+
+
+# ---------- 共享收集器（app/deploy/logs.py）：REST 与 Agent 工具读同一份归并结果 ----------
+
+async def test_collect_dev_logs_returns_endpoint_shape(sf, dev_app, monkeypatch):
+    from app.deploy import logs as logs_mod
+    from app.deploy.hub import DeployHub
+    from app.services import app_service
+
+    hub = DeployHub()
+    hub.publish(dev_app, {"app_id": dev_app, "type": "dev_log", "line": "[zerocode] ✓ 预览已就绪"})
+
+    async def fake_container(session_factory, app, tail=200, timeout=60):
+        assert tail == 5
+        return [{"source": "container", "service": "backend", "ts": "2026-09-20T14:27:58+00:00",
+                 "epoch": _epoch("2026-09-20T14:27:58+00:00"), "line": "Uvicorn running"}], ""
+
+    monkeypatch.setattr(logs_mod.engine, "container_logs", fake_container)
+    # 传真实应用行：status_dev / preview_url 是收集器从行上读的，两个出口读的是同一份投影
+    body = await logs_mod.collect_dev_logs(sf, await app_service.get_app(sf, dev_app), hub, tail=5)
+    assert [l["source"] for l in body["lines"]] == ["container", "platform"]
+    assert body["note"] == "" and body["status_dev"] == "stopped"
+    assert body["url"] == f"http://localhost:{body['url'].rsplit(':', 1)[1]}"
+    assert body["last_seq"] == body["lines"][1]["seq"]
+
+
+async def test_collect_dev_logs_since_seq_and_empty_ring(sf, dev_app, monkeypatch):
+    from app.deploy import logs as logs_mod
+    from app.deploy.hub import DeployHub
+
+    hub = DeployHub()
+    for i in range(3):
+        hub.publish(dev_app, {"app_id": dev_app, "type": "dev_log", "line": f"l{i}"})
+
+    async def no_container(session_factory, app, tail=200, timeout=60):
+        return [], ""
+
+    monkeypatch.setattr(logs_mod.engine, "container_logs", no_container)
+    body = await logs_mod.collect_dev_logs(sf, {"id": dev_app, "slug": SLUG}, hub, since_seq=1)
+    assert [l["line"] for l in body["lines"]] == ["l1", "l2"]
+    empty = await logs_mod.collect_dev_logs(sf, {"id": dev_app, "slug": SLUG}, DeployHub())
+    assert empty["lines"] == [] and empty["last_seq"] == 0
