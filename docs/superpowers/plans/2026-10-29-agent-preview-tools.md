@@ -2203,6 +2203,11 @@ git add app/agent/preview_tools.py tests/test_preview_tools.py
 git commit -m "feat(agent): preview_restart 有界等待、进度转发与结果塑形"
 ```
 
+**落地偏差（以代码为准，本任务已交付）**：上面几个代码块是派发前的形状，实现与审查之后有三处变化——
+① `_wait` 的异常文本与 `_restart` 的预检失败文本都过 `_safe_text(...)`（自由文本进模型上下文前一律剥 ANSI + 遮凭据 + 限长，与 Task 6 修复轮同口径）；
+② `_drain_progress` 多一个 keyword-only 的 `flush: bool = False`，仅**任务完成后的收尾那一次**排空传 True，把该次攒下的步骤行按 `fresh[-RESTART_LOG_LINES:]` 全量投递（等待期间的 250ms 合并规则一行未动）；
+③ 闸序是「并发判定 → 次数上限 → 确认兜底 → Docker 预检 → 登记任务」，后两道只属于「没有任务」的分支——上限不得挡住「观察现有任务」（规格 §5.5 / §5.7）。
+
 ---
 
 ### Task 8: `ToolContext` 扩展与 `execute_tool` 分派
