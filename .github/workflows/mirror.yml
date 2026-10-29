@@ -1,0 +1,49 @@
+name: Mirror Gitee to GitHub
+
+# Gitee 是主仓，这里只做单向拉取：Gitee master -> GitHub main，其余分支同名对齐。
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: gitee-mirror
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Sync branches from Gitee
+        run: |
+          set -euo pipefail
+
+          git init -q mirror
+          cd mirror
+
+          git remote add gitee  https://gitee.com/leerys/zerocode.git
+          git remote add github https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git
+
+          git fetch -q --no-tags gitee '+refs/heads/*:refs/remotes/gitee/*'
+
+          # 主分支：不允许非快进，主仓之外在 GitHub 上产生的提交会让这一步失败而不是被覆盖掉
+          git push -q github refs/remotes/gitee/master:refs/heads/main
+          echo "master -> main 已同步"
+
+          # 其余分支同名对齐；单个分支被拒不中断，只发告警
+          for ref in $(git for-each-ref --format='%(refname)' refs/remotes/gitee); do
+            branch=${ref#refs/remotes/gitee/}
+            case "$branch" in
+              master|HEAD) continue ;;
+            esac
+            if git push -q github "$ref:refs/heads/$branch"; then
+              echo "$branch -> $branch 已同步"
+            else
+              echo "::warning::分支 $branch 无法快进推送到 GitHub，需要人工处理（主仓历史被改写，或 GitHub 侧有独立提交）"
+            fi
+          done
