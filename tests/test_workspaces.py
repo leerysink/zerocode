@@ -1,4 +1,32 @@
 import pytest
+from sqlalchemy import text
+
+from app.deploy import engine
+
+
+@pytest.mark.asyncio
+async def test_delete_workspace_releases_the_bound_app_stacks(client, monkeypatch, tmp_path):
+    """删工作区是应用记录消失的第二条路径（app_project 行靠 FK CASCADE 跟走），端口同样在库里被释放。
+
+    与 DELETE /api/apps 同源收口：库里没了行而容器还在跑，等于把同一个端口原封不动埋给下一个应用。
+    """
+    ws = (await client.post("/api/workspaces",
+                            json={"name": "demo", "root_path": str(tmp_path)})).json()
+    async with client.app.state.session_factory() as s:
+        await s.execute(text("INSERT INTO app_project (workspace_id, name, slug, scale, stack, "
+                             "prod_port, dev_port) VALUES (:w, 'zsws', 'zsws', 'small', 'static', "
+                             "8230, 8231)"), {"w": ws["id"]})
+        await s.commit()
+    calls = []
+
+    async def fake_docker(*args, **kwargs):
+        calls.append(args)
+        return 0, ""
+
+    monkeypatch.setattr(engine, "docker", fake_docker)
+    assert (await client.delete(f"/api/workspaces/{ws['id']}")).status_code == 200
+    assert [a[2] for a in calls if "-p" in a] == ["zc-zsws-dev", "zc-zsws-prod"]
+
 
 @pytest.mark.asyncio
 async def test_workspace_crud_and_browse(client, tmp_path):

@@ -1,15 +1,15 @@
 <script setup>
-// 右栏文件面板（Task 14）：可折叠 a-layout-sider（宽 300 / collapsedWidth 0）。
+// 右栏文件面板（Task 14 / 工作台 008）：可折叠 a-layout-sider（宽 300 / collapsedWidth 0）。
 // 「文件」tab：工作区文件树（GET /fs/tree → treeData）+ 顶部刷新按钮 + 打开文件夹按钮；
-//   点击文件 → 内容预览（pre）；后端对二进制/超 200KB 文件拒读（400），错误详情展示在预览区即「>200KB 提示」；
-//   「编辑」切 textarea + 保存（PUT /api/files/save），保存后刷新文件树（可能新增文件）。
+//   点击文件 → 只读内容预览（pre）；后端对二进制/超 200KB 文件拒读（400），错误详情展示在预览区即「>200KB 提示」；
+//   编辑收口到工作台：这里只给「在编辑器中打开」，新标签带 ?name=&file= 跳到工作台并定位该文件。
 // 「打开文件夹」按 fs.open_folder_mode 分流：默认直接新标签打开内置文件管理器整页（/workspaces/{id}/files）；
 //   显式选 auto 时同机访问才调后端本机文件管理器（POST /api/fs/open-folder），直开失败也降级到内置，见 utils/openFolder.js。
 // 「变更记录」tab：GET /api/sessions/{id}/file-changes（id 倒序），逐条 DiffBlock 显示 path+action+diff。
 import { computed, onMounted, ref, watch } from 'vue'
 import { message } from 'ant-design-vue'
 import { FolderOpenOutlined, ReloadOutlined } from '@ant-design/icons-vue'
-import { getFileChanges, openFolder, readFile, saveFile, tree } from '../api'
+import { getFileChanges, openFolder, readFile, tree } from '../api'
 import { useChatStore } from '../stores/chat'
 import { useConfigStore } from '../stores/config'
 import { openWorkspaceFilesPage, resolveOpenFolderMode } from '../utils/openFolder'
@@ -33,8 +33,6 @@ const selectedPath = ref('')
 const content = ref('')
 const previewError = ref('')
 const loading = ref(false)
-const editing = ref(false)
-const saving = ref(false)
 
 // 变更记录
 const changes = ref([])
@@ -72,7 +70,6 @@ async function onSelect(keys) {
   const path = keys[0]
   if (!path || nodeMap[path]?.type === 'dir') return
   selectedPath.value = keys[0]
-  editing.value = false
   previewError.value = ''
   content.value = ''
   loading.value = true
@@ -85,28 +82,13 @@ async function onSelect(keys) {
   }
 }
 
-function cancelEdit() {
-  editing.value = false
-  // 取消编辑：回退到磁盘内容（读取失败场景编辑入口本就不出现，此处 content 必为已加载内容）
-  loading.value = true
-  readFile(props.workspaceId, selectedPath.value)
-    .then(({ data }) => (content.value = data.content))
-    .catch((e) => (previewError.value = e?.response?.data?.detail || '读取失败'))
-    .finally(() => (loading.value = false))
+function warnBlocked() {
+  message.warning('新标签没能打开（可能被浏览器拦截），请允许本站弹出窗口后重试')
 }
 
-async function persist() {
-  saving.value = true
-  try {
-    await saveFile({ workspace_id: props.workspaceId, path: selectedPath.value, content: content.value })
-    message.success('已保存')
-    editing.value = false
-    await loadTree()
-  } catch (e) {
-    message.error(e?.response?.data?.detail || '保存失败')
-  } finally {
-    saving.value = false
-  }
+// 编辑收口到工作台：带 ?name=&file= 新标签打开并定位；没开成给可操作提示
+function openInEditor() {
+  if (!openWorkspaceFilesPage(props.workspaceId, workspaceName.value, selectedPath.value)) warnBlocked()
 }
 
 async function loadChanges() {
@@ -136,9 +118,7 @@ const workspaceName = computed(
 // 直开请求失败（容器里没有 explorer/xdg-open、目录被移走等）也算"打不开"：当场降级，不把用户卡在原地。
 // 整页走新标签：聊天页与右栏展开态都不被打断，地址还能收藏。
 function openFilesPage() {
-  if (!openWorkspaceFilesPage(props.workspaceId, workspaceName.value)) {
-    message.warning('新标签没能打开（可能被浏览器拦截），请允许本站弹出窗口后重试')
-  }
+  if (!openWorkspaceFilesPage(props.workspaceId, workspaceName.value)) warnBlocked()
 }
 
 async function openWorkspaceFolder() {
@@ -165,7 +145,6 @@ watch(() => props.workspaceId, () => {
   selectedPath.value = ''
   content.value = ''
   previewError.value = ''
-  editing.value = false
   loadTree()
 })
 
@@ -198,18 +177,16 @@ onMounted(loadTree)
         <div v-if="selectedPath" class="zc-fp-preview">
           <div class="zc-fp-preview-head">
             <span class="zc-fp-file" :title="selectedPath">{{ selectedPath }}</span>
-            <a-button v-if="!editing && !previewError" size="small" @click="editing = true">编辑</a-button>
+            <a-button
+              v-if="!previewError"
+              size="small"
+              class="zc-fp-open-editor"
+              @click="openInEditor"
+            >在编辑器中打开</a-button>
           </div>
           <a-spin v-if="loading" class="zc-fp-loading" />
           <template v-else>
             <a-alert v-if="previewError" type="warning" :message="previewError" show-icon />
-            <template v-else-if="editing">
-              <a-textarea v-model:value="content" :rows="12" class="zc-fp-editor" />
-              <div class="zc-fp-actions">
-                <a-button size="small" type="primary" :loading="saving" @click="persist">保存</a-button>
-                <a-button size="small" @click="cancelEdit">取消</a-button>
-              </div>
-            </template>
             <pre v-else class="zc-fp-content">{{ content }}</pre>
           </template>
         </div>
@@ -287,15 +264,6 @@ onMounted(loadTree)
   white-space: pre-wrap;
   word-break: break-all;
   color: var(--zc-text);
-}
-.zc-fp-editor {
-  font-family: ui-monospace, SFMono-Regular, Consolas, 'Courier New', monospace;
-  font-size: 12px;
-}
-.zc-fp-actions {
-  display: flex;
-  gap: 8px;
-  margin-top: 8px;
 }
 .zc-fp-changes {
   padding-bottom: 8px;

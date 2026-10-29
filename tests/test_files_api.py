@@ -74,6 +74,93 @@ async def test_save_preserves_line_endings(client, tmp_path):
     assert (tmp_path / "lf.txt").read_bytes() == b"one\ntwo\n"
 
 
+@pytest.mark.asyncio
+async def test_read_returns_mtime_ns(client, tmp_path):
+    (tmp_path / "a.txt").write_text("你好", encoding="utf-8")
+    ws = await _ws(client, tmp_path)
+
+    r = (await client.get("/api/files/read", params={"workspace_id": ws["id"], "path": "a.txt"})).json()
+
+    # 约 1.79e18 的纳秒戳超出 JS Number 的 2^53：必须按十进制字符串出 JSON，
+    # 否则浏览器读到的值与磁盘值不等，回传的 base_mtime_ns 每次都判冲突。
+    assert isinstance(r["mtime_ns"], str)
+    assert r["mtime_ns"] == str((tmp_path / "a.txt").stat().st_mtime_ns)
+    assert int(r["mtime_ns"]) > 0
+
+
+@pytest.mark.asyncio
+async def test_save_with_matching_base_updates_mtime(client, tmp_path):
+    f = tmp_path / "a.txt"
+    f.write_text("旧", encoding="utf-8")
+    ws = await _ws(client, tmp_path)
+    base = (await client.get("/api/files/read", params={"workspace_id": ws["id"], "path": "a.txt"})).json()["mtime_ns"]
+
+    r = await client.put("/api/files/save", json={"workspace_id": ws["id"], "path": "a.txt",
+                                                  "content": "新", "base_mtime_ns": base})
+
+    assert r.status_code == 200
+    assert f.read_text(encoding="utf-8") == "新"
+    assert r.json()["mtime_ns"] == str(f.stat().st_mtime_ns)
+
+
+@pytest.mark.asyncio
+async def test_js_rounded_numeric_base_is_rejected(client, tmp_path):
+    # 反向锁：客户端若把字符串 mtime 转回 Number，舍入后的整数不得被当作精确版本戳。
+    # 定 100ns 尾数（NTFS 粒度）让该值必落在 double 的 256ns 网格之外，舍入必然改变数值。
+    import os
+    f = tmp_path / "a.txt"
+    f.write_text("原始", encoding="utf-8")
+    os.utime(f, ns=(f.stat().st_atime_ns, 1_700_000_000_000_000_100))
+    ws = await _ws(client, tmp_path)
+    base = (await client.get("/api/files/read", params={"workspace_id": ws["id"], "path": "a.txt"})).json()["mtime_ns"]
+    rounded = int(float(base))
+    assert str(rounded) != base
+
+    r = await client.put("/api/files/save", json={"workspace_id": ws["id"], "path": "a.txt",
+                                                  "content": "新", "base_mtime_ns": rounded})
+
+    assert r.status_code == 409
+    assert f.read_text(encoding="utf-8") == "原始"
+
+
+@pytest.mark.asyncio
+async def test_save_conflict_leaves_disk_untouched(client, tmp_path):
+    import os
+    f = tmp_path / "a.txt"
+    f.write_text("原始", encoding="utf-8")
+    ws = await _ws(client, tmp_path)
+    base = (await client.get("/api/files/read", params={"workspace_id": ws["id"], "path": "a.txt"})).json()["mtime_ns"]
+    # 模拟聊天页 Agent 在用户编辑期间改了文件：显式挪 mtime，避免同毫秒写入的时间戳抖动
+    f.write_text("Agent 改的", encoding="utf-8")
+    os.utime(f, ns=(f.stat().st_atime_ns, int(base) + 1_000_000_000))
+
+    r = await client.put("/api/files/save", json={"workspace_id": ws["id"], "path": "a.txt",
+                                                  "content": "用户的旧草稿", "base_mtime_ns": base})
+
+    assert r.status_code == 409
+    body = r.json()
+    assert "其他改动" in body["detail"] and body["mtime_ns"] == str(f.stat().st_mtime_ns)
+    assert f.read_text(encoding="utf-8") == "Agent 改的"  # 冲突不得覆盖磁盘
+
+
+@pytest.mark.asyncio
+async def test_save_conflict_when_file_deleted(client, tmp_path):
+    f = tmp_path / "a.txt"
+    f.write_text("原始", encoding="utf-8")
+    ws = await _ws(client, tmp_path)
+    base = (await client.get("/api/files/read", params={"workspace_id": ws["id"], "path": "a.txt"})).json()["mtime_ns"]
+    f.unlink()
+
+    r = await client.put("/api/files/save", json={"workspace_id": ws["id"], "path": "a.txt",
+                                                  "content": "新", "base_mtime_ns": base})
+
+    assert r.status_code == 409
+    assert r.json()["detail"] == "文件已被删除或移动"
+    assert r.json()["mtime_ns"] is None
+    assert not f.exists()  # 带 base 的保存不悄悄重建已删文件
+
+
+
 # ---------- 工作区文件访问三件套：单层列目录 / 下载 / 调起系统文件管理器 ----------
 # 内置「类桌面」文件管理器的数据面：ls 只给单层（不递归、不拉全树），download 允许二进制，
 # open-folder 只在后端与浏览器同机时才有意义（判定在前端，见 utils/openFolder.js）。
@@ -136,6 +223,19 @@ async def test_download_allows_binary_and_sets_filename(client, tmp_path):
             "path": "nope.txt"})).status_code == 404  # 不存在
     assert (await client.get("/api/fs/download", params={"workspace_id": ws["id"],
             "path": ""})).status_code == 404  # 目录不可下载
+
+
+@pytest.mark.asyncio
+async def test_download_inline_omits_attachment_for_markdown_images(client, tmp_path):
+    (tmp_path / "img.png").write_bytes(b"\x89PNG\r\n\x1a\n\x00\x01")
+    ws = await _ws(client, tmp_path)
+
+    r = await client.get("/api/fs/download", params={"workspace_id": ws["id"], "path": "img.png",
+                                                     "inline": 1})
+
+    assert r.status_code == 200 and r.content.startswith(b"\x89PNG")
+    assert r.headers["content-type"].startswith("image/png")
+    assert "content-disposition" not in r.headers  # 浏览器按图片内联渲染，不触发下载
 
 
 @pytest.mark.asyncio

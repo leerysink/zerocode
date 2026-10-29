@@ -35,10 +35,21 @@ export function normalizeWorkspaceId(id) {
   return /^\d+$/.test(s) ? s : ''
 }
 
-// 内置文件管理器整页地址；id 不合法返回空串。
-export function workspaceFilesPath(id) {
+// name 与 file 都可选，按固定顺序拼 query；file 是工作区内相对路径，交给工作台开页签。
+function filesQuery(name, file) {
+  const parts = []
+  const label = String(name ?? '')
+  if (label) parts.push(`name=${encodeURIComponent(label)}`)
+  const rel = String(file ?? '')
+  if (rel) parts.push(`file=${encodeURIComponent(rel)}`)
+  return parts.length ? `?${parts.join('&')}` : ''
+}
+
+// 内置文件管理器（工作台）整页地址；id 不合法返回空串。
+// 带 file 时直接定位到该文件，给右栏「在编辑器中打开」与 Markdown 相对链接兜底用。
+export function workspaceFilesPath(id, file) {
   const ws = normalizeWorkspaceId(id)
-  return ws ? `/workspaces/${ws}/files` : ''
+  return ws ? `/workspaces/${ws}/files${filesQuery('', file)}` : ''
 }
 
 // 新标签打开整页。名字进 query 是让页面顶栏直接有名字，不必为标题再请求一次工作区；
@@ -46,11 +57,9 @@ export function workspaceFilesPath(id) {
 // 窗口名按工作区固定，同一个工作区反复点复用那一个标签，不会叠出一排。
 // 返回 false 表示没开成（地址不合法、不在浏览器里，或被弹窗拦截），由调用方去提示。
 // 写 globalThis.open 不写 window.open：浏览器里两者是同一个函数，而这模块本身是无 DOM 依赖的纯函数（单测跑在 node）。
-export function openWorkspaceFilesPage(id, name) {
+export function openWorkspaceFilesPage(id, name, file) {
   const ws = normalizeWorkspaceId(id)
   if (!ws) return false
-  const label = String(name ?? '')
-  const base = workspaceFilesPath(ws)
-  const url = label ? `${base}?name=${encodeURIComponent(label)}` : base
+  const url = `${workspaceFilesPath(ws)}${filesQuery(name, file)}`
   return Boolean(globalThis.open?.(url, `zerocode-files-${ws}`))
 }

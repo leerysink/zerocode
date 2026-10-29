@@ -1,9 +1,15 @@
-import os
+import logging, os
 from pathlib import Path
 from fastapi import APIRouter, Request, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
+
+from app.deploy import engine, gateway_routes
+from app.deploy.errors import DeployError
+from app.services import app_service
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api")
 
@@ -55,14 +61,34 @@ async def list_workspaces(request: Request):
 
 @router.delete("/workspaces/{ws_id}")
 async def delete_workspace(request: Request, ws_id: int):
+    """删工作区；绑定了应用的走与 DELETE /api/apps 同一套收口（ADR-0019）。
+
+    app_project 行靠 FK CASCADE 跟走，端口随记录在库里释放——容器不跟着停就是把同一个端口原封不动
+    埋给下一个应用。prod 栈一停网关路由必须同步摘，否则那个域名从「还在跑」变成 502；发布中的应用
+    照旧拒删（那条路径正在往这台栈上落版本），闸门与 apps 侧共用 `ensure_deletable`。
+    """
     uid = request.state.actor["id"]
-    async with request.app.state.session_factory() as s:
+    sf = request.app.state.session_factory
+    async with sf() as s:
+        # 带着 owner 一起查：他人的工作区必须查不到应用，否则下面 ensure_deletable 会把 404 变成
+        # 409「发布中拒删」——那等于告诉对方这个 id 后面真有个应用
+        row = (await s.execute(text(
+            "SELECT a.slug, a.status_prod FROM app_project a JOIN workspace w ON w.id = a.workspace_id "
+            "WHERE a.workspace_id = :i AND w.owner_user_id = :u"), {"i": ws_id, "u": uid})).mappings().first()
+        try:
+            app_service.ensure_deletable(dict(row) if row else {})
+        except DeployError as e:
+            raise HTTPException(e.status, str(e))
         r = await s.execute(text("DELETE FROM workspace WHERE id = :i AND owner_user_id = :u"),
                             {"i": ws_id, "u": uid})
         await s.commit()
         if r.rowcount == 0:
             # 不存在与他人的行同一 404，不给探测留差异
             raise HTTPException(404, "工作区不存在")
+    if row:
+        for warning in await engine.down_app_stacks(row["slug"]):
+            logger.warning("删除工作区时停栈未净（记录已删）: ws_id=%s %s", ws_id, warning)
+        await gateway_routes.refresh(sf)
     return {"ok": True}
 
 @router.post("/fs/browse")

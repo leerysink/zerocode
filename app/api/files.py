@@ -2,7 +2,7 @@ import subprocess
 import sys
 from pathlib import Path
 from fastapi import APIRouter, Request, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 from app.agent.tools import BINARY_EXTS, MAX_READ_BYTES, resolve_in_workspace
 
@@ -113,8 +113,12 @@ async def fs_ls(request: Request, workspace_id: int, path: str = ""):
 
 
 @router.get("/fs/download")
-async def fs_download(request: Request, workspace_id: int, path: str):
-    """单文件下载。与预览不同：这里不限二进制、不限 200KB——那两条限制只服务于文本查看。"""
+async def fs_download(request: Request, workspace_id: int, path: str, inline: bool = False):
+    """单文件下载。与预览不同：这里不限二进制、不限 200KB——那两条限制只服务于文本查看。
+
+    inline=1 是 Markdown 渲染视图的图片通道：不传 filename 就不产生
+    Content-Disposition: attachment，浏览器按 <img> 内联渲染而不是弹下载。
+    """
     root = await _root_of(request, workspace_id)
     from app.deploy.guard import is_secret_read
     if is_secret_read(root, path):
@@ -125,6 +129,8 @@ async def fs_download(request: Request, workspace_id: int, path: str):
         raise HTTPException(400, str(e))
     if not f.is_file():  # 目录与不存在统一 404，不给探测留差异
         raise HTTPException(404, "文件不存在")
+    if inline:
+        return FileResponse(f)
     return FileResponse(f, filename=f.name)
 
 
@@ -175,14 +181,20 @@ async def files_read(request: Request, workspace_id: int, path: str):
         raise HTTPException(400, str(e))
     if not f.is_file():
         raise HTTPException(404, "文件不存在")
-    if f.suffix.lower() in BINARY_EXTS or f.stat().st_size > MAX_READ_BYTES:
+    st = f.stat()
+    if f.suffix.lower() in BINARY_EXTS or st.st_size > MAX_READ_BYTES:
         raise HTTPException(400, "不支持读取的文件（二进制或超过200KB）")
-    return {"path": path, "content": f.read_text(encoding="utf-8", errors="replace")}
+    # mtime_ns 以十进制字符串出 JSON：纳秒戳约 1.79e18，超过 JS Number 的 2^53 安全整数范围，
+    # 走数字会被浏览器舍入（Windows 上约 256ns 一格），回传的 base_mtime_ns 永远对不上磁盘。
+    return {"path": path, "content": f.read_text(encoding="utf-8", errors="replace"),
+            "mtime_ns": str(st.st_mtime_ns)}
 
 class SaveIn(BaseModel):
     workspace_id: int
     path: str
     content: str
+    # 可选：工作台带上打开/上次保存时的版本戳做冲突检测；缺省保留旧的「无条件写」语义
+    base_mtime_ns: int | None = None
 
 @router.put("/files/save")
 async def files_save(request: Request, body: SaveIn):
@@ -194,7 +206,15 @@ async def files_save(request: Request, body: SaveIn):
     from app.deploy.guard import is_protected
     if is_protected(root, body.path):
         raise HTTPException(403, "app.json 与 deploy/ 由平台管理，请在应用页操作")
+    if body.base_mtime_ns is not None:
+        if not f.is_file():
+            return JSONResponse(status_code=409, content={
+                "detail": "文件已被删除或移动", "mtime_ns": None})
+        current = f.stat().st_mtime_ns
+        if current != body.base_mtime_ns:
+            return JSONResponse(status_code=409, content={
+                "detail": "文件已被其他改动，请重新加载后再保存", "mtime_ns": str(current)})
     f.parent.mkdir(parents=True, exist_ok=True)
     # newline='' 字节保真，避免 Windows 行尾翻转污染目标文件
     f.write_text(body.content, encoding="utf-8", newline="")
-    return {"ok": True}
+    return {"ok": True, "mtime_ns": str(f.stat().st_mtime_ns)}

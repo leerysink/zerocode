@@ -60,6 +60,13 @@ describe('workspaceFilesPath 内置文件管理器整页地址', () => {
       expect(workspaceFilesPath(id)).toBe('')
     }
   })
+
+  it('带 file 时指向该文件，斜杠编码后放进 query', () => {
+    expect(workspaceFilesPath(7, 'docs/guide.md')).toBe('/workspaces/7/files?file=docs%2Fguide.md')
+    expect(workspaceFilesPath(7, '')).toBe('/workspaces/7/files')
+    expect(workspaceFilesPath(7, null)).toBe('/workspaces/7/files')
+    expect(workspaceFilesPath('abc', 'a.md')).toBe('')
+  })
 })
 
 describe('openWorkspaceFilesPage 新标签打开整页', () => {
@@ -111,7 +118,23 @@ describe('openWorkspaceFilesPage 新标签打开整页', () => {
 
     for (const id of [undefined, null, '', 'abc']) {
       expect(openWorkspaceFilesPage(id)).toBe(false)
+      expect(openWorkspaceFilesPage(id, '名', 'a.md')).toBe(false)
     }
     expect(open).not.toHaveBeenCalled()
+  })
+
+  it('仅 file / name+file 两种组合：参数顺序固定，文件路径同样编码', () => {
+    const open = vi.fn(() => ({}))
+    vi.stubGlobal('open', open)
+
+    openWorkspaceFilesPage(7, '', 'docs/guide.md')
+    openWorkspaceFilesPage(7, '甲', 'docs/guide.md')
+    openWorkspaceFilesPage(7, null, '')
+
+    expect(open.mock.calls.map((c) => c[0])).toEqual([
+      '/workspaces/7/files?file=docs%2Fguide.md',
+      '/workspaces/7/files?name=%E7%94%B2&file=docs%2Fguide.md',
+      '/workspaces/7/files',
+    ])
   })
 })

@@ -21,7 +21,7 @@ vi.mock('ant-design-vue', () => ({
   message: { success: vi.fn(), error: vi.fn(), info: vi.fn(), warning: vi.fn() },
 }))
 
-import { tree, openFolder, listDir, getConfig } from '../api'
+import { tree, openFolder, listDir, getConfig, readFile, saveFile } from '../api'
 import { message } from 'ant-design-vue'
 import FilePanel from './FilePanel.vue'
 import { useChatStore } from '../stores/chat'
@@ -40,6 +40,13 @@ const ButtonStub = {
       this.$slots.default ? this.$slots.default() : [])
   },
 }
+const AlertStub = {
+  name: 'a-alert',
+  props: ['message'],
+  render() {
+    return h('div', { class: 'stub-a-alert' }, this.message)
+  },
+}
 const STUBS = {
   'a-layout-sider': slotDiv('a-layout-sider'),
   'a-tabs': slotDiv('a-tabs'),
@@ -48,7 +55,7 @@ const STUBS = {
   'a-spin': slotDiv('a-spin'),
   'a-empty': slotDiv('a-empty'),
   'a-tree': slotDiv('a-tree'),
-  'a-alert': slotDiv('a-alert'),
+  'a-alert': AlertStub,
   'a-textarea': slotDiv('a-textarea'),
   'a-modal': slotDiv('a-modal'),
   'a-table': slotDiv('a-table'),
@@ -58,11 +65,11 @@ const STUBS = {
 }
 
 // mode 走真实链路：ensureLoaded 从 /api/config 取值，故桩上 fs.open_folder_mode
-async function mountPanel(mode = 'auto') {
+async function mountPanel(mode = 'auto', nodes = []) {
   const pinia = createPinia()
   setActivePinia(pinia)
   getConfig.mockResolvedValue({ data: { 'fs.open_folder_mode': mode } })
-  tree.mockResolvedValue({ data: [] })
+  tree.mockResolvedValue({ data: nodes })
   listDir.mockResolvedValue({ data: { path: '', parent: null, entries: [] } })
   const wrapper = mount(FilePanel, {
     props: { workspaceId: 7 },
@@ -189,5 +196,82 @@ describe('FilePanel 打开文件夹入口', () => {
 
     expect(open.mock.calls[0][0]).toBe('/workspaces/7/files')
     expect(message.warning).not.toHaveBeenCalled()
+  })
+})
+
+describe('FilePanel 只读预览与在编辑器中打开', () => {
+  const NODES = [
+    { name: 'src', path: 'src', type: 'dir', children: [{ name: 'a.md', path: 'src/a.md', type: 'file' }] },
+    { name: 'broken.bin', path: 'broken.bin', type: 'file' },
+  ]
+
+  async function selectFile(wrapper, path) {
+    await wrapper.vm.onSelect([path])
+    await flushPromises()
+  }
+
+  it('选中可读文件只展示只读预览：没有编辑/保存/取消，也不调用 saveFile', async () => {
+    readFile.mockResolvedValue({ data: { content: '# 标题' } })
+    const wrapper = await mountPanel('auto', NODES)
+
+    await selectFile(wrapper, 'src/a.md')
+
+    expect(wrapper.find('.zc-fp-content').text()).toContain('# 标题')
+    expect(wrapper.find('.zc-fp-editor').exists()).toBe(false)
+    const labels = wrapper.findAll('button').map((b) => b.text().trim())
+    expect(labels).not.toContain('编辑')
+    expect(labels).not.toContain('保存')
+    expect(labels).not.toContain('取消')
+    expect(saveFile).not.toHaveBeenCalled()
+    expect(readFile).toHaveBeenCalledWith(7, 'src/a.md')
+  })
+
+  it('选中可读文件出现「在编辑器中打开」，新标签地址带 name 与 file 且都编码', async () => {
+    const open = stubOpen()
+    readFile.mockResolvedValue({ data: { content: 'x' } })
+    const wrapper = await mountPanel('auto', NODES)
+    useChatStore().workspaces = [{ id: 7, name: '订单 台账' }]
+
+    await selectFile(wrapper, 'src/a.md')
+    await wrapper.find('.zc-fp-open-editor').trigger('click')
+
+    expect(open).toHaveBeenCalledWith(
+      '/workspaces/7/files?name=%E8%AE%A2%E5%8D%95%20%E5%8F%B0%E8%B4%A6&file=src%2Fa.md',
+      'zerocode-files-7',
+    )
+    expect(message.warning).not.toHaveBeenCalled()
+  })
+
+  it('「在编辑器中打开」的新标签被拦截时给可操作提示，不静默失败', async () => {
+    stubOpen(null)
+    readFile.mockResolvedValue({ data: { content: 'x' } })
+    const wrapper = await mountPanel('auto', NODES)
+
+    await selectFile(wrapper, 'src/a.md')
+    await wrapper.find('.zc-fp-open-editor').trigger('click')
+
+    expect(message.warning).toHaveBeenCalled()
+  })
+
+  it('读取失败（二进制/超限）照旧展示 detail，且不出现「在编辑器中打开」', async () => {
+    readFile.mockRejectedValue({ response: { data: { detail: '不支持读取的文件（二进制或超过200KB）' } } })
+    const wrapper = await mountPanel('auto', NODES)
+
+    await selectFile(wrapper, 'broken.bin')
+
+    expect(wrapper.find('.stub-a-alert').text()).toContain('不支持读取的文件')
+    expect(wrapper.find('.zc-fp-open-editor').exists()).toBe(false)
+  })
+
+  it('切工作区清空预览与「在编辑器中打开」', async () => {
+    readFile.mockResolvedValue({ data: { content: '# 标题' } })
+    const wrapper = await mountPanel('auto', NODES)
+    await selectFile(wrapper, 'src/a.md')
+
+    await wrapper.setProps({ workspaceId: 8 })
+    await flushPromises()
+
+    expect(wrapper.find('.zc-fp-preview').exists()).toBe(false)
+    expect(wrapper.find('.zc-fp-open-editor').exists()).toBe(false)
   })
 })

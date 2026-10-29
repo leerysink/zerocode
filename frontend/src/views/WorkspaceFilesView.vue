@@ -2,12 +2,12 @@
 // 内置文件管理器整页（新标签打开 /workspaces/:id/files）。
 // 为什么是整页不是弹框：文件浏览是一件要长时间占用视线的事，压在聊天页上会让两边都只能用一半宽度；
 // 独立地址还能收藏、能后退、能开在第二个屏幕上对照着写代码。
-// 本页只管「地址 → 该不该挂文件管理器」这一件事：树与预览的行为都在 WorkspaceExplorer 里。
+// 本页只管「地址 → 该不该挂工作台」这一件事：树、页签与编辑行为都在 WorkspaceWorkbench 里。
 // id 全程按字符串透传（不转 Number）；非法地址一个目录请求都不发——后端按归属校验会给 404，
 // 但那要等请求回来才知道，这里先挡住，页面也不会挂出一个空壳。
 import { computed } from 'vue'
 import { useRoute } from 'vue-router'
-import WorkspaceExplorer from '../components/WorkspaceExplorer.vue'
+import WorkspaceWorkbench from '../components/WorkspaceWorkbench.vue'
 import { normalizeWorkspaceId } from '../utils/openFolder'
 
 const route = useRoute()
@@ -21,6 +21,12 @@ const workspaceName = computed(() => {
   return String(raw ?? '')
 })
 
+// 要揭示的文件同样可能被手改成多值（?file=a&file=b）：取第一个，交给工作台开页签
+const initialFile = computed(() => {
+  const raw = Array.isArray(route.query.file) ? route.query.file[0] : route.query.file
+  return String(raw ?? '')
+})
+
 const heading = computed(() => {
   const label = workspaceName.value || (workspaceId.value ? `#${workspaceId.value}` : '未知工作区')
   return `工作区文件 · ${label}`
@@ -31,7 +37,6 @@ const heading = computed(() => {
   <div class="zc-wsv">
     <div class="zc-wsv-head">
       <h2 :title="heading">{{ heading }}</h2>
-      <span class="zc-wsv-tip">只读浏览与下载，编辑请回聊天页的文件面板</span>
     </div>
 
     <a-alert
@@ -43,7 +48,11 @@ const heading = computed(() => {
       description="地址里的 /workspaces/后面的数字不是你的工作区，请从应用卡片或聊天页右栏重新打开。"
     />
     <div v-else class="zc-wsv-body">
-      <WorkspaceExplorer :workspace-id="workspaceId" :workspace-name="workspaceName" />
+      <WorkspaceWorkbench
+        :workspace-id="workspaceId"
+        :workspace-name="workspaceName"
+        :initial-file="initialFile"
+      />
     </div>
   </div>
 </template>
@@ -75,10 +84,6 @@ const heading = computed(() => {
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
-}
-.zc-wsv-tip {
-  font-size: 12px;
-  color: var(--zc-text-sub);
 }
 .zc-wsv-bad {
   margin-top: 16px;

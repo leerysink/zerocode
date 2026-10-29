@@ -154,4 +154,10 @@ describe('downloadUrl', () => {
     expect(downloadUrl(7, '报告.txt')).toBe('/api/fs/download?workspace_id=7&path=%E6%8A%A5%E5%91%8A.txt')
     expect(downloadUrl(7, 'src/a.txt')).toBe('/api/fs/download?workspace_id=7&path=src%2Fa.txt')
   })
+
+  it('inline=1 追加在末尾，默认不改变既有下载地址', () => {
+    expect(downloadUrl(7, 'docs/img/a.png', true))
+      .toBe('/api/fs/download?workspace_id=7&path=docs%2Fimg%2Fa.png&inline=1')
+    expect(downloadUrl(7, 'a.txt', false)).toBe('/api/fs/download?workspace_id=7&path=a.txt')
+  })
 })

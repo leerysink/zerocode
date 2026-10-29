@@ -114,7 +114,9 @@ export function formatMtime(epochSeconds) {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
 }
 
-// 下载走浏览器原生 <a href>（不引 blob/axios）：鉴权靠同源 cookie/无鉴权本地服务，够轻也够稳
-export function downloadUrl(workspaceId, path) {
-  return `/api/fs/download?workspace_id=${workspaceId}&path=${encodeURIComponent(path)}`
+// 下载走浏览器原生 <a href>（不引 blob/axios）：鉴权靠同源 cookie/无鉴权本地服务，够轻也够稳。
+// inline=1 让后端省掉 attachment 头，图片才能直接进 <img>（Markdown 渲染视图用）。
+export function downloadUrl(workspaceId, path, inline = false) {
+  const base = `/api/fs/download?workspace_id=${workspaceId}&path=${encodeURIComponent(path)}`
+  return inline ? `${base}&inline=1` : base
 }
