@@ -875,7 +875,7 @@ def test_no_preview_block_by_default():
 
 - [ ] **Step 3: 跑测试确认失败**
 
-Run: `pytest tests/test_preview_tools.py -k schema tests/test_prompts.py -k preview -v`
+Run: `pytest tests/test_preview_tools.py -k "preview_tool or base_tools" -v` 与 `pytest tests/test_prompts.py -k preview -v`
 Expected: FAIL —— `ImportError: cannot import name 'PREVIEW_TOOLS'`；`TypeError: build_system_prompt() got an unexpected keyword argument 'preview'`
 
 - [ ] **Step 4: 写实现（schema）**
