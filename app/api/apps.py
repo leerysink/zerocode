@@ -9,10 +9,8 @@ Task 12 追加 dev 生命周期与 sqlchange 端点：长任务（起栈/迁移�
 Task 8 追加发布/回滚/prod 生命周期/发布历史端点（规格 04 §5）：与 dev 同一条 `_spawn` 单任务契约；
 chat 闸门（FR4-09）的 409 detail 是**字典** `{code, message}`——前端要按 code 分支弹确认，不能只吃字符串。
 """
-import asyncio
 import logging
 import re
-from functools import partial
 
 from fastapi import APIRouter, Request, HTTPException
 from pydantic import BaseModel
@@ -20,6 +18,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 from app.deploy import engine, prod, records, sqlrun
 from app.deploy import provision
+from app.deploy import tasks as deploy_tasks
 from app.deploy.errors import DeployError
 from app.deploy.provision import read_cred
 from app.deploy.slugs import suggest_slug, validate_slug
@@ -64,9 +63,8 @@ def _reject_if_task_running(request: Request, app_id: int) -> None:
     删记录时后台起栈/迁移任务还在跑，会留下一只没人认领的容器（行没了，状态回执无处可写），
     所以直接 409 让用户等一等，而不是在这里发明一套取消协议。
     """
-    task: asyncio.Task | None = getattr(request.app.state, "dev_tasks", {}).get(app_id)
-    if task and not task.done():
-        raise DeployError("该应用有部署任务进行中，请稍候", status=409)
+    if deploy_tasks.task_running(request.app.state.dev_tasks, app_id):
+        raise DeployError(deploy_tasks.BUSY_MESSAGE, status=409)
 
 
 # 隔离接缝（Ticket 006）：以下端点内的 get_app 均传当前账号，别人的应用 404；
@@ -148,34 +146,13 @@ async def remove(request: Request, app_id: int):
 
 # ---------- dev 生命周期（Task 12 / 规格 03 §4.4）：202 受理 + 后台执行，进度走 WS ----------
 
-def _log_task_crash(app_id: int, task: asyncio.Task) -> None:
-    """`_spawn` 的 done 回调：只记真抛了异常的任务，取消与正常返回（exception() is None）一律不动。
-
-    先 `task.cancelled()` 再取 `exception()`：对已取消的任务调 `exception()` 会抛 CancelledError，
-    在回调里再抛一次只会给日志添乱。
-    """
-    if task.cancelled():
-        return
-    exc = task.exception()
-    if exc is None:
-        return
-    logger.exception("部署后台任务异常退出（app_id=%s）", app_id, exc_info=exc)
-
-
 def _spawn(request: Request, app_id: int, coro_factory) -> None:
     """长任务句柄表：同一应用同时只允许一个部署任务（重复受理 → 409，而不是排队双跑）。
 
-    202 之后任务异常没有 HTTP 出口，done 回调负责 retrieve + 记堆栈：既消掉 asyncio 的
-    「Task exception was never retrieved」噪音（审查 I-1 配套 / Minor-3），也给「引擎事件之后才失败」
-    的路子（如 CLI 缺失时的后台 stop）留下一条可读现场。
+    实现与 Agent 预览工具共用 `app.deploy.tasks`（同应用单栈的判据只有一份）；
+    本函数只负责把 `request.app.state.dev_tasks` 递过去，行为与状态码不变。
     """
-    tasks: dict[int, asyncio.Task] = request.app.state.dev_tasks
-    old = tasks.get(app_id)
-    if old and not old.done():
-        raise DeployError("该应用有部署任务进行中，请稍候", status=409)
-    task = asyncio.create_task(coro_factory())
-    task.add_done_callback(partial(_log_task_crash, app_id))
-    tasks[app_id] = task
+    deploy_tasks.spawn(request.app.state.dev_tasks, app_id, coro_factory)
 
 
 async def _dev_task(request: Request, app_id: int, action, *, docker_gate: bool = False,
