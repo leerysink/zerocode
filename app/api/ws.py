@@ -104,6 +104,9 @@ async def ws_chat(ws: WebSocket, session_id: int):
     # 视为空闲 → 输入框解锁而后端仍在执行，用户每发一句都撞拒绝（死循环根因之一）。
     if session_id in hub.running:
         await emit(session_id, {"type": "status", "status": "running"})
+    # 挂起中的提问/确认在重连时补发：切走、刷新、另开标签页后卡片不消失，
+    # ask/confirm future 不会永久挂起（否则会话卡死，用户既答不了也停不掉）。
+    await hub.replay_pending(session_id)
 
     async def config_getter():
         # 用户视图（Ticket 007）：会话经 workspace 取 owner，llm.* 读自己的/回落全局；

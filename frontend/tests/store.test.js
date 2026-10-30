@@ -100,6 +100,19 @@ describe('chat store 事件流', () => {
     expect(send).toHaveBeenCalledWith(JSON.stringify({ type: 'confirm', approved: true }))
     expect(s.pendingConfirm).toBeNull()
   })
+  it('declineAsk 上行「自行决定」固定答复并清卡（不是取消执行）', () => {
+    const s = useChatStore()
+    applyEvent(s, { type: 'ask_user', questions: [{ question: '选哪个' }] })
+    const send = vi.fn()
+    s._ws = { readyState: 1, send }
+    s.declineAsk()
+    const payload = JSON.parse(send.mock.calls[0][0])
+    expect(payload.type).toBe('ask_submit')
+    expect(payload.answers).toHaveLength(1)
+    expect(payload.answers[0].answer).toContain('自行决定')
+    expect(payload.answers[0].answer).toContain('不要再提问')
+    expect(s.pendingAsk).toBeNull()
+  })
   it('requestCompact 上行 compact；loadModels/setModel 走 REST 并同步 currentModelId', async () => {
     const s = useChatStore()
     const send = vi.fn()

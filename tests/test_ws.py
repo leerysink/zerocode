@@ -98,7 +98,8 @@ def test_ws_ask_flow(client):
     client.app.state.llm_factory = lambda cfg: ScriptedLLM([
         done(None, [{"id": "c1", "function": {
             "name": "ask_user",
-            "arguments": json.dumps({"questions": [{"question": "选哪个", "options": [{"label": "A"}]}]}, ensure_ascii=False)}}]),
+            "arguments": json.dumps({"question": "选哪个", "options": [{"label": "A"}]},
+                                    ensure_ascii=False)}}]),
         done("好的，按 A 继续"),
     ])
     with client.websocket_connect(f"/ws/chat/{client.zc_sid}") as ws:
@@ -122,27 +123,28 @@ def test_ws_ask_flow(client):
                 break
         assert seen_result and seen_done
 
-def test_ws_multi_question_submit(client):
+def test_ws_multi_question_rejected(client):
+    """单题协议：模型一次传多个问题会被工具拒绝（不静默截断），模型据此改口继续。"""
     client.app.state.llm_factory = lambda cfg: ScriptedLLM([
         done(None, [{"id": "c1", "function": {
             "name": "ask_user", "arguments": json.dumps({"questions": [
-                {"question": "用哪种库", "options": [{"label": "X", "recommended": True}, {"label": "Y"}],
-                 "multi_select": False},
+                {"question": "用哪种库", "options": [{"label": "X", "recommended": True}, {"label": "Y"}]},
                 {"question": "补充说明？"}]}, ensure_ascii=False)}}]),
-        done("按回答继续"),
+        done("改为逐个问"),
     ])
     with client.websocket_connect(f"/ws/chat/{client.zc_sid}") as ws:
         ws.send_json({"type": "user_message", "content": "提问"})
-        for _ in range(6):
+        types, result = [], None
+        for _ in range(10):
             ev = ws.receive_json()
-            if ev["type"] == "ask_user":
-                break
-        assert len(ev["questions"]) == 2
-        ws.send_json({"type": "ask_submit", "answers": [{"options": ["X"]}, {"answer": "无"}]})
-        for _ in range(8):
-            ev = ws.receive_json()
+            types.append(ev["type"])
+            if ev["type"] == "tool_result":
+                result = ev["result"]
             if ev["type"] == "message_done":
                 break
+    assert "ask_user" not in types  # 多题不会弹卡
+    assert result and result.get("ok") is False
+    assert "一次只能问一个问题" in result.get("error", "")
 
 def test_ws_steer_while_running_then_cancel(client):
     """契约更新（steering 上线后）：执行中再发消息**不再被拒**，而是入队等边界注入；
@@ -165,6 +167,8 @@ def test_ws_steer_while_running_then_cancel(client):
         # 取消后的事件都发给 ws2。后连首帧是 running 快照（重连状态自洽），不是拒绝。
         with client.websocket_connect(f"/ws/chat/{sid}") as ws2:
             assert ws2.receive_json() == {"type": "status", "status": "running"}
+            # 连入补发的是同一张待答卡，不是第二轮提问；消费掉再读取消链路的帧序
+            assert ws2.receive_json()["type"] == "ask_user"
             # 同连接上行严格 FIFO：插话先入队，cancel 后到 —— 不必（也不能）读 hub.pending 抢时序
             ws2.send_json({"type": "user_message", "content": "插一句"})
             ws2.send_json({"type": "cancel"})
@@ -410,6 +414,78 @@ def test_ws_reconnect_replays_running_status(client):
     with client.websocket_connect(f"/ws/chat/{sid}") as ws3:
         ws3.send_json({"type": "user_message", "content": "hi"})
         assert ws3.receive_json()["type"] == "message_done"
+
+
+def test_ws_reconnect_replays_pending_ask(client):
+    """切走/刷新后重连：挂起中的提问卡要补发，用户才能继续回答。
+    不补则卡片消失、ask future 永久挂起，会话进入「既答不了也停不掉」的卡死态。"""
+    client.app.state.llm_factory = lambda cfg: ScriptedLLM([
+        done(None, [_ask_tool_call("c1", "重连后还要答")]),
+        done("答完了"),
+    ])
+    sid = client.zc_sid
+    with client.websocket_connect(f"/ws/chat/{sid}") as ws:
+        ws.send_json({"type": "user_message", "content": "先挂着"})
+        for _ in range(6):
+            if ws.receive_json()["type"] == "ask_user":
+                break
+    # 第一连接已断开，ask 仍挂起；重连应在 status(running) 后补发同一张卡
+    with client.websocket_connect(f"/ws/chat/{sid}") as ws2:
+        assert ws2.receive_json() == {"type": "status", "status": "running"}
+        replayed = ws2.receive_json()
+        assert replayed["type"] == "ask_user"
+        assert replayed["questions"][0]["question"] == "重连后还要答"
+        ws2.send_json({"type": "ask_submit", "answers": [{"answer": "答了"}]})
+        for _ in range(10):
+            if ws2.receive_json()["type"] == "message_done":
+                break
+        else:
+            pytest.fail("补发提问卡后应答，runner 应跑到 message_done")
+
+
+def test_ws_reconnect_replays_pending_confirm(client, monkeypatch):
+    """写入确认卡同一类卡死：重连时补发，confirm future 才能被兑现。"""
+    import time
+    import app.api.ws as ws_module
+    real_get_all = ws_module.config_service.get_all
+
+    async def with_write_confirm(session, owner_user_id=None):
+        cfg = await real_get_all(session, owner_user_id=owner_user_id)
+        cfg["agent.write_confirm"] = True
+        return cfg
+
+    monkeypatch.setattr(ws_module.config_service, "get_all", with_write_confirm)
+    client.app.state.llm_factory = lambda cfg: ScriptedLLM([
+        done(None, [{"id": "c1", "function": {
+            "name": "write_file",
+            "arguments": json.dumps({"path": "a.txt", "content": "hi"})}}]),
+        done("写好了"),
+    ])
+    sid = client.zc_sid
+    with client.websocket_connect(f"/ws/chat/{sid}") as ws:
+        ws.send_json({"type": "user_message", "content": "写个文件"})
+        for _ in range(8):
+            if ws.receive_json()["type"] == "confirm_request":
+                break
+        else:
+            pytest.fail("write_confirm 开启后应收到确认卡")
+        # runner 先发确认事件、后登记 future；等登记完成再断开，避免命中微秒级竞态
+        hub = client.app.state.hub
+        deadline = time.time() + 2
+        while sid not in hub.pending_confirms and time.time() < deadline:
+            time.sleep(0.01)
+        assert sid in hub.pending_confirms
+    with client.websocket_connect(f"/ws/chat/{sid}") as ws2:
+        assert ws2.receive_json() == {"type": "status", "status": "running"}
+        replayed = ws2.receive_json()
+        assert replayed["type"] == "confirm_request"
+        assert replayed["tool"] == "write_file"
+        ws2.send_json({"type": "confirm", "approved": True})
+        for _ in range(10):
+            if ws2.receive_json()["type"] == "message_done":
+                break
+        else:
+            pytest.fail("补发确认卡后批准，runner 应跑到 message_done")
 
 
 # ---------- 插话（steering）：执行中的新消息排队，下一轮工具边界注入 ----------

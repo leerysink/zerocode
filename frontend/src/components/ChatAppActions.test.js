@@ -1,5 +1,5 @@
 // @vitest-environment happy-dom
-// 聊天页应用操作条（票 001 / spec §5.2 §5.4）：反查接缝与「复制预览地址」这条端到端路径。
+// 聊天页应用操作条（票 001 / spec §5.2 §5.4）：反查接缝与「正式环境启停」这条端到端路径。
 // 主按钮与打开预览由 002／003 接上——本票不渲染没有行为的占位按钮。
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { h } from 'vue'
@@ -11,6 +11,7 @@ vi.mock('../api', () => ({
   getApp: vi.fn(),
   devStart: vi.fn(), devStop: vi.fn(), devRestart: vi.fn(),
   devReset: vi.fn().mockResolvedValue({ data: { ok: true } }),
+  prodStart: vi.fn(), prodStop: vi.fn(),
   // chat store 的 import 面，组件不直接调，但不给会解析失败
   getMessages: vi.fn(), getSessionDetail: vi.fn(), listModels: vi.fn(),
   listWorkspaces: vi.fn(), patchSessionModel: vi.fn(), wsUrl: vi.fn(() => 'ws://test'),
@@ -21,7 +22,7 @@ vi.mock('ant-design-vue', () => ({
   Modal: { confirm: vi.fn() },
 }))
 
-import { listApps, getApp, devReset, devStart, devRestart } from '../api'
+import { listApps, getApp, devReset, devStart, devRestart, prodStart, prodStop } from '../api'
 import { message, Modal } from 'ant-design-vue'
 import ChatAppActions from './ChatAppActions.vue'
 import { useChatStore } from '../stores/chat'
@@ -80,9 +81,12 @@ beforeEach(() => {
   getApp.mockReset().mockImplementation((id) => Promise.resolve({ data: APPS.find((a) => a.id === id) }))
   devStart.mockReset().mockResolvedValue({ data: { ok: true } })
   devRestart.mockReset().mockResolvedValue({ data: { ok: true } })
+  prodStart.mockReset().mockResolvedValue({ data: { ok: true } })
+  prodStop.mockReset().mockResolvedValue({ data: { ok: true } })
   message.success.mockClear()
   message.error.mockClear()
   message.info.mockClear()
+  message.warning.mockClear()
   Modal.confirm.mockReset()
 })
 
@@ -90,12 +94,12 @@ afterEach(() => {
   vi.useRealTimers()
 })
 
-it('会话所属应用可反查时渲染操作条，「更多」里有「复制预览地址」', async () => {
+it('会话所属应用可反查时渲染操作条，「更多」里有「启动生产」', async () => {
   useChatStore().currentWorkspaceId = 102
   const w = mountActions()
   await flushPromises()
   expect(w.find('.zc-app-actions').exists()).toBe(true)
-  expect(w.text()).toContain('复制预览地址')
+  expect(w.text()).toContain('启动生产')
 })
 
 // 隐藏而不是置灰：反查不到时用户既无该应用、也无从判断「为什么点不动」，留一个灰按钮只会多问一句。
@@ -114,41 +118,97 @@ it('会话还没绑定工作区时不渲染', async () => {
   expect(w.find('.zc-app-actions').exists()).toBe(false)
 })
 
-// 地址只从接口字段来，不许前端按 dev_port 自拼（ADR-0021 后果条）。
-// 断言逐字相等而不是 toContain：拼出来的死链和真地址在界面上无法区分。
-const stubClipboard = () => {
-  const writeText = vi.fn().mockResolvedValue(undefined)
-  Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true })
-  return writeText
-}
+// ---- 「启动生产 / 停止生产」：菜单第一项按 status_prod 变身，走 prod 启停端点 ----
 
-it('点「复制预览地址」写入的字符串逐字等于接口的 preview_url', async () => {
-  const writeText = stubClipboard()
-  useChatStore().currentWorkspaceId = 102
+it('正式环境停着时菜单项是「启动生产」，点它打 prodStart 并带上当前应用 id', async () => {
+  useChatStore().currentWorkspaceId = 102 // status_prod: stopped
   const w = mountActions()
   await flushPromises()
-  await w.find('.zc-menu-copy').trigger('click')
-  expect(writeText).toHaveBeenCalledWith('http://localhost:8213/')
-  expect(message.success).toHaveBeenCalled()
+  expect(w.find('.zc-menu-prod').text()).toContain('启动生产')
+  await w.find('.zc-menu-prod').trigger('click')
+  expect(prodStart).toHaveBeenCalledWith(12)
+  expect(prodStop).not.toHaveBeenCalled()
+  expect(message.info).toHaveBeenCalled()
 })
 
-// http + IP 访问控制台时 navigator.clipboard 是 undefined，直接 .writeText 抛 TypeError；
-// AppsView 的 copyUrl 就为这个踩过一次「点了什么都没发生，连复制失败也不说」（AppsView.vue::copyUrl）。
-it('剪贴板不可用时给明确失败提示而不是静默或抛错', async () => {
-  Object.defineProperty(navigator, 'clipboard', { value: undefined, configurable: true })
+it('正式环境跑着时菜单项是「停止生产」，点它打 prodStop', async () => {
+  useChatStore().currentWorkspaceId = 101 // status_prod: running
+  const w = mountActions()
+  await flushPromises()
+  expect(w.find('.zc-menu-prod').text()).toContain('停止生产')
+  await w.find('.zc-menu-prod').trigger('click')
+  expect(prodStop).toHaveBeenCalledWith(11)
+  expect(prodStart).not.toHaveBeenCalled()
+})
+
+// 202 后台受理与轮询捞回终态之间最多 5s 空窗，这期间菜单项看着可再点，连点就是双发启停
+it('发起启停后菜单项立即置灰，重复点击不再发第二次请求', async () => {
   useChatStore().currentWorkspaceId = 102
   const w = mountActions()
   await flushPromises()
-  await w.find('.zc-menu-copy').trigger('click')
+  await w.find('.zc-menu-prod').trigger('click')
+  expect(w.find('.zc-menu-prod').classes()).toContain('is-disabled')
+  await w.find('.zc-menu-prod').trigger('click')
+  expect(prodStart).toHaveBeenCalledTimes(1)
+})
+
+// 发布中插一次 prod up 会与发布互踩版本与容器（apps.py::_dev_task 的二次闸），前端先挡一道
+it('status_prod 为 publishing 时启停项不可点，点了不发请求', async () => {
+  const publishing = [{ ...APPS[1], status_prod: 'publishing' }]
+  listApps.mockResolvedValue({ data: publishing })
+  getApp.mockImplementation((id) => Promise.resolve({ data: publishing.find((a) => a.id === id) }))
+  useChatStore().currentWorkspaceId = 102
+  const w = mountActions()
+  await flushPromises()
+  expect(w.find('.zc-menu-prod').classes()).toContain('is-disabled')
+  await w.find('.zc-menu-prod').trigger('click')
+  expect(prodStart).not.toHaveBeenCalled()
+})
+
+// 从没发布过的应用，prod_start 在后台被凭据/版本闸门判死（prod.py::prod_start 的 409）。
+// 本页不订阅 deploy WS，轮询到 error 是唯一能开口的通道。
+it('轮询到 status_prod 变 error 时报启动失败并解开自锁', async () => {
+  useChatStore().currentWorkspaceId = 102
+  const w = mountActions()
+  await flushPromises()
+  await w.find('.zc-menu-prod').trigger('click')
+  getApp.mockResolvedValue({ data: { ...APPS[1], status_prod: 'error' } })
+  await vi.advanceTimersByTimeAsync(5000)
   await flushPromises()
   expect(message.error).toHaveBeenCalled()
-  expect(message.success).not.toHaveBeenCalled()
+  expect(w.find('.zc-menu-prod').classes()).not.toContain('is-disabled')
+})
+
+// 轮询到 running 才算真起来：闸门解不开的话「打开生产」会一直灰着，用户以为没启动成功
+it('轮询到 status_prod 转 running 时报就绪并解锁', async () => {
+  useChatStore().currentWorkspaceId = 102
+  const w = mountActions()
+  await flushPromises()
+  await w.find('.zc-menu-prod').trigger('click')
+  getApp.mockResolvedValue({ data: { ...APPS[1], status_prod: 'running' } })
+  await vi.advanceTimersByTimeAsync(5000)
+  await flushPromises()
+  expect(message.success).toHaveBeenCalledWith('正式环境已启动')
+  expect(w.find('.zc-menu-prod').classes()).not.toContain('is-disabled')
+  expect(w.find('.zc-menu-prod').text()).toContain('停止生产')
+})
+
+// 同步立答的拒绝（发布中 409、Docker 预检 503）不进后台，detail 原样报出来；
+// 报完必须立刻解锁，否则一次拒绝就把菜单项永久钉死。
+it('prodStart 被同步拒绝时报后端原文并立即解锁', async () => {
+  prodStart.mockRejectedValue({ response: { data: { detail: '发布/回滚进行中，请等待完成' } } })
+  useChatStore().currentWorkspaceId = 102
+  const w = mountActions()
+  await flushPromises()
+  await w.find('.zc-menu-prod').trigger('click')
+  await flushPromises()
+  expect(message.error).toHaveBeenCalledWith('发布/回滚进行中，请等待完成')
+  expect(w.find('.zc-menu-prod').classes()).not.toContain('is-disabled')
 })
 
 // 应用列表只拉一次并缓存在组件内（spec §5.5）；切会话重算的是反查，不是请求。
-// 不重算的后果是「在 B 应用的会话里复制走 A 应用的地址」——两个地址长得一样，用户无从发现。
+// 不重算的后果是「在 B 应用的会话里启停了 A 应用的正式环境」，而两处文案长得一样。
 it('切到另一个应用的会话后，入口跟着换应用且不重复请求列表', async () => {
-  stubClipboard()
   useChatStore().currentWorkspaceId = 101
   const w = mountActions()
   await flushPromises()
@@ -156,8 +216,9 @@ it('切到另一个应用的会话后，入口跟着换应用且不重复请求�
 
   useChatStore().currentWorkspaceId = 102
   await flushPromises()
-  await w.find('.zc-menu-copy').trigger('click')
+  await w.find('.zc-menu-prod').trigger('click')
   expect(listApps).toHaveBeenCalledTimes(1)
+  expect(prodStart).toHaveBeenCalledWith(12)
 })
 
 // ---- 票 002：主按钮按 status_dev 变身并接上启停 ----
@@ -211,7 +272,7 @@ it('预览未运行时「打开预览」禁用', async () => {
 
 // dev_port 缺位时后端刻意回空串（app_service.py::_with_public_urls），拼不出地址也不能开 about:blank。
 // 两个来源都要空：listApps 那一份和轮询那一份，任一有值都不该判死。
-it('preview_url 为空串时「打开预览」与「复制预览地址」都不可用', async () => {
+it('preview_url 为空串时「打开预览」不可用', async () => {
   const noUrl = [{ ...APPS[0], preview_url: '' }]
   listApps.mockResolvedValue({ data: noUrl })
   getApp.mockImplementation((id) => Promise.resolve({ data: noUrl.find((a) => a.id === id) }))
@@ -219,7 +280,6 @@ it('preview_url 为空串时「打开预览」与「复制预览地址」都不�
   const w = mountActions()
   await flushPromises()
   expect(w.find('.zc-act-open').attributes('disabled')).toBeDefined()
-  expect(w.find('.zc-menu-copy').classes()).toContain('is-disabled')
 })
 
 // window.open 被弹窗拦截或 transient activation 过期时返回 null，静默失败等于按钮坏了
@@ -325,7 +385,7 @@ it('「更多」渲染七项并按三段分隔线组织', async () => {
   await flushPromises()
   const items = w.findAll('.zc-app-menu-item').map((n) => n.text())
   expect(items).toEqual([
-    '复制预览地址', '数据库操作', '重建 dev 库',
+    '启动生产', '数据库操作', '重建 dev 库',
     '发布新版本', '发布记录', '资源监控', '预览日志',
   ])
   expect(w.findAll('.zc-app-menu-sep').length).toBe(2)
@@ -604,6 +664,22 @@ it('切换会话时四个壳子全部关闭', async () => {
   useChatStore().currentWorkspaceId = 101
   await flushPromises()
   expect(w.find('.stub-logs').exists()).toBe(false)
+})
+
+// 上一个应用的启停还在飞时切走：新会话既不继承那个自锁，也不许把旧应用的终态报成新应用的结果
+// （切应用时轮询读数会先清成 null，那是读数的空档而不是失败）。
+it('切换会话解开正式环境启停的自锁，且不误报失败', async () => {
+  useChatStore().currentWorkspaceId = 102
+  const w = mountActions()
+  await flushPromises()
+  await w.find('.zc-menu-prod').trigger('click')
+  expect(w.find('.zc-menu-prod').classes()).toContain('is-disabled')
+
+  useChatStore().currentWorkspaceId = 101 // 这个应用的正式环境是 running
+  await flushPromises()
+  expect(message.error).not.toHaveBeenCalled()
+  expect(w.find('.zc-menu-prod').classes()).not.toContain('is-disabled')
+  expect(w.find('.zc-menu-prod').text()).toContain('停止生产')
 })
 
 it('发布弹层开着时切会话也会关掉', async () => {

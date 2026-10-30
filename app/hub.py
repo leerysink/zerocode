@@ -11,6 +11,9 @@
 - emits：按会话分槽的下行发送器（session_id → async (session_id, event) -> None），
   同会话后连覆盖；断连 drop 清槽（仅清自己注入的槽，防误删后连者的槽），
   跨会话互不串扰（终审修复轮2：原全局单槽会被任意会话的连接覆盖导致事件串线）。
+- pending_asks / pending_confirms：挂起中的提问卡/确认卡载荷。WS 连入时由
+  replay_pending 补发（同一张卡的恢复，不是重复提问）——不补则切走/刷新后卡片
+  消失、future 永久挂起，会话卡死。
 """
 import asyncio
 
@@ -18,6 +21,8 @@ class ChatHub:
     def __init__(self):
         self.ask_futures: dict[int, asyncio.Future] = {}
         self.confirm_futures: dict[int, asyncio.Future] = {}
+        self.pending_asks: dict[int, list[dict]] = {}
+        self.pending_confirms: dict[int, dict] = {}
         self.cancel_events: dict[int, asyncio.Event] = {}
         self.running: set[int] = set()
         self.compacting: set[int] = set()  # 压缩占位（无工具边界可注入，插话要区别对待）
@@ -59,21 +64,34 @@ class ChatHub:
     async def ask(self, session_id, questions, timeout):
         fut = asyncio.get_running_loop().create_future()
         self.ask_futures[session_id] = fut
+        self.pending_asks[session_id] = questions
         try:
             await self.emit_event(session_id, {"type": "ask_user", "questions": questions})
             return await fut
         finally:
             self.ask_futures.pop(session_id, None)
+            self.pending_asks.pop(session_id, None)
+
+    async def replay_pending(self, session_id):
+        """WS 连入补发挂起中的提问卡/确认卡（同一张卡的恢复，不是重复提问）。"""
+        questions = self.pending_asks.get(session_id)
+        if questions is not None:
+            await self.emit_event(session_id, {"type": "ask_user", "questions": questions})
+        payload = self.pending_confirms.get(session_id)
+        if payload is not None:
+            await self.emit_event(session_id, {"type": "confirm_request", **payload})
 
     async def confirm(self, session_id, payload):
         fut = asyncio.get_running_loop().create_future()
         self.confirm_futures[session_id] = fut
+        self.pending_confirms[session_id] = payload
         try:
             # confirm_request 事件由 AgentRunner._dispatch 统一下发（Task 7 裁定：runner 唯一发出方），
             # hub 只负责挂 future 等待前端 confirm 上行，避免前端收到重复卡片
             return await fut
         finally:
             self.confirm_futures.pop(session_id, None)
+            self.pending_confirms.pop(session_id, None)
 
     def _resolve(self, store, session_id, value):
         fut = store.get(session_id)

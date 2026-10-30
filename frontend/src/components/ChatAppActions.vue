@@ -4,11 +4,12 @@
 // 「未绑工作区 / 无应用 / 非本人应用」三种情形，前端不重复实现权限判定（ADR-0020）。
 import { computed, h, onMounted, reactive, ref, watch } from 'vue'
 import {
-  CloudServerOutlined, CloudUploadOutlined, CopyOutlined, DashboardOutlined, DatabaseOutlined,
-  HistoryOutlined, MenuUnfoldOutlined, ProfileOutlined, RedoOutlined, SelectOutlined, SyncOutlined,
+  CloudServerOutlined, CloudUploadOutlined, DashboardOutlined, DatabaseOutlined,
+  HistoryOutlined, MenuUnfoldOutlined, PlayCircleOutlined, PoweroffOutlined, ProfileOutlined,
+  RedoOutlined, SelectOutlined, SyncOutlined,
 } from '@ant-design/icons-vue'
 import { message, Modal } from 'ant-design-vue'
-import { devReset, devRestart, devStart, listApps } from '../api'
+import { devReset, devRestart, devStart, listApps, prodStart, prodStop } from '../api'
 import { useChatStore } from '../stores/chat'
 import { useDevStatus } from '../composables/useDevStatus'
 import { devActionLabel, findAppByWorkspace, isDevBusy } from '../utils/appLookup'
@@ -40,6 +41,14 @@ const canOpenPreview = computed(() => devStatus.value === 'running' && !!preview
 const prodStatus = computed(() => polled.statusProd.value ?? app.value?.status_prod ?? null)
 const prodUrl = computed(() => polled.prodUrl.value || app.value?.prod_url || '')
 const canOpenProd = computed(() => prodStatus.value === 'running' && !!prodUrl.value)
+// 正式环境启停：菜单项按状态在「启动生产 / 停止生产」之间变身（与卡面 toggleProd 同一语义）。
+// 202 受理后没有回调，本页也不订阅 deploy WS，所以点击当场自锁，等轮询把终态捞回来再解锁播报。
+const prodPending = ref(null) // 'start' | 'stop'
+const prodBusy = computed(() => prodPending.value !== null)
+// starting / publishing 期间不可点：前者是上一轮还没落定，后者插队会与发布互踩版本与容器
+// （apps.py::_dev_task 的二次闸在前端先挡一道，省一次注定 409 的往返）。
+const prodMenuDisabled = computed(() =>
+  prodBusy.value || prodStatus.value === 'starting' || prodStatus.value === 'publishing')
 
 // 四个查看壳子互斥：同时至多一个开着。用单一 active 源 + 可写 computed，
 // 互斥由构造保证，不需要「开这个就关其余」的遍历；v-model:open 直绑布尔也是
@@ -61,6 +70,7 @@ watch(() => chatStore.currentWorkspaceId, () => {
   // 切会话即清场，顺带解自锁：上一个会话的启动还在飞时切走，新会话不该继承那个转圈
   active.value = null
   submitting.value = false
+  prodPending.value = null
 })
 
 // 栈闸门与列表页同源（utils/publishableStacks.js），不在聊天页另立一份名单
@@ -157,18 +167,32 @@ function resetDev() {
   })
 }
 
-async function copyPreviewUrl() {
-  if (!previewUrl.value) return
-  // clipboard 只在安全上下文（https 或 localhost）存在：用 IP + http 访问控制台时它是
-  // undefined，直接 .writeText 抛 TypeError。失败必须说出来，不能点了没反应。
+async function toggleProd() {
+  const a = app.value
+  if (!a || prodMenuDisabled.value) return
+  const stopping = prodStatus.value === 'running'
+  prodPending.value = stopping ? 'stop' : 'start'
   try {
-    if (!navigator.clipboard) throw new Error('clipboard unavailable outside a secure context')
-    await navigator.clipboard.writeText(previewUrl.value)
-    message.success('预览地址已复制')
-  } catch {
-    message.error('复制失败，请手动选择地址')
+    await (stopping ? prodStop : prodStart)(a.id)
+    message.info(stopping ? '正式环境停止中，稍候自动刷新' : '正式环境启动中，稍候自动刷新')
+  } catch (e) {
+    prodPending.value = null
+    message.error(e?.response?.data?.detail || '操作失败')
   }
 }
+
+// 启停结果只有轮询这一条通道。失败原文（如「尚未发布过：prod 数据库凭据不存在」）落在
+// deploy 日志里，而 prod 侧没有运行日志接口，所以这里只报结论，不挂「查看日志」——
+// 那个链接开的是 dev 栈的日志，把它指到 prod 失败上是骗人。
+watch(prodStatus, (next) => {
+  const pending = prodPending.value
+  // null 是切应用时轮询读数被清空，不是启停结果——那一轮由上面的会话切换 watch 负责解自锁
+  if (!pending || next == null || next === 'starting' || next === 'publishing') return
+  prodPending.value = null
+  const ok = pending === 'start' ? next === 'running' : next === 'stopped'
+  if (ok) message.success(pending === 'start' ? '正式环境已启动' : '正式环境已停止')
+  else message.error(pending === 'start' ? '正式环境启动失败' : '正式环境停止失败')
+})
 </script>
 
 <template>
@@ -200,11 +224,13 @@ async function copyPreviewUrl() {
       <template #overlay>
         <div class="zc-app-menu">
           <div
-            class="zc-app-menu-item zc-menu-copy"
-            :class="{ 'is-disabled': !previewUrl }"
-            @click="copyPreviewUrl"
+            class="zc-app-menu-item zc-menu-prod"
+            :class="{ 'is-disabled': prodMenuDisabled }"
+            @click="toggleProd"
           >
-            <copy-outlined /> 复制预览地址
+            <poweroff-outlined v-if="prodStatus === 'running'" />
+            <play-circle-outlined v-else />
+            {{ prodStatus === 'running' ? '停止生产' : '启动生产' }}
           </div>
           <div class="zc-app-menu-sep" />
           <a class="zc-app-menu-item zc-menu-db" :href="`/apps/${app.id}/db`" target="_blank" @click.stop>

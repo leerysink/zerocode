@@ -28,18 +28,19 @@ TOOLS = [
             "new_string": {"type": "string"}}, "required": ["path", "old_string", "new_string"]}}},
     {"type": "function", "function": {
         "name": "ask_user",
-        "description": "当需求不明确或有多种实现方案时，向用户提问；可一次提多个问题，每题具体可决策",
+        "description": ("当需求不明确、有多种实现方案或信息缺失时，向用户提一个问题；"
+                        "一次只问一个，得到回答并思考后再决定是否继续提问。"
+                        "用户明确表示不要再提问时不要调用此工具"),
         "parameters": {"type": "object", "properties": {
-            "questions": {"type": "array", "items": {"type": "object", "properties": {
-                "question": {"type": "string"},
-                "options": {"type": "array", "items": {"type": "object", "properties": {
-                    "label": {"type": "string"},
-                    "description": {"type": "string", "description": "选项说明"},
-                    "recommended": {"type": "boolean", "description": "推荐标注"}},
-                    "required": ["label"]},
-                    "description": "可选项（可为空，空则用户自由输入）"},
-                "multi_select": {"type": "boolean", "description": "是否多选"}},
-                "required": ["question"]}}}, "required": ["questions"]}}},
+            "question": {"type": "string", "description": "要问用户的问题"},
+            "options": {"type": "array", "items": {"type": "object", "properties": {
+                "label": {"type": "string"},
+                "description": {"type": "string", "description": "选项说明"},
+                "recommended": {"type": "boolean", "description": "推荐标注"}},
+                "required": ["label"]},
+                "description": "可选项（可为空，空则用户自由输入）"},
+            "multi_select": {"type": "boolean", "description": "是否多选"}},
+            "required": ["question"]}}},
     {"type": "function", "function": {
         "name": "todo_write",
         "description": "写入/全量替换当前任务清单。多步任务开始前先建清单，每完成一步即更新状态",

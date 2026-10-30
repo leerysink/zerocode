@@ -22,16 +22,37 @@ from sqlalchemy import text
 
 logger = logging.getLogger(__name__)
 
+def _normalize_question(q: dict) -> dict:
+    text = str(q.get("question") or "").strip()
+    if not text:
+        raise ToolError("缺少 question")
+    raw_opts = q.get("options")
+    opts = [{"label": o} if isinstance(o, str) else o
+            for o in raw_opts] if isinstance(raw_opts, list) else []
+    out = {"question": text, "options": opts}
+    if "multi_select" in q:
+        out["multi_select"] = bool(q["multi_select"])
+    return out
+
+
 def _normalize_questions(args: dict) -> list[dict]:
-    """新协议 questions 优先；兼容旧单题参数（question/options 字符串）。"""
+    """单题协议：question/options/multi_select；旧 questions 数组仅兼容单元素。
+
+    多题数组直接报错而不是截断——被丢掉的问题用户根本看不到，等于静默吞需求。
+    返回长度恒为 1 的列表，hub/事件/answers 的既有形状不变。
+    """
     qs = args.get("questions")
-    if isinstance(qs, list) and qs:
-        return qs
+    if isinstance(qs, list):
+        if len(qs) != 1 or not isinstance(qs[0], dict):
+            raise ToolError("一次只能问一个问题，请先只问最关键的一个")
+        return [_normalize_question(qs[0])]
     q = args.get("question")
-    if isinstance(q, str) and q:
-        opts = [{"label": o} if isinstance(o, str) else o for o in (args.get("options") or [])]
-        return [{"question": q, "options": opts}]
-    raise ToolError("缺少 question(s)")
+    if isinstance(q, str) and q.strip():
+        one = {"question": q, "options": args.get("options")}
+        if "multi_select" in args:
+            one["multi_select"] = args["multi_select"]
+        return [_normalize_question(one)]
+    raise ToolError("缺少 question")
 
 class AgentRunner:
     def __init__(self, session_factory, llm, config_provider, send, ask, confirm, pop_pending=None,

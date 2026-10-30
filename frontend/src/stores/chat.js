@@ -35,7 +35,7 @@ export function applyEvent(store, ev) {
     case 'tool_progress': // 预览工具的临时进度（不落库，刷新即消失；最终结论看 tool_result）
       store.toolProgress = { name: ev.name, line: ev.line }
       break
-    case 'ask_user': // 多问题新协议：questions 逐题渲染（AskPanel 消费）
+    case 'ask_user': // 单题协议：questions 恒为一项（AskUserCard 只渲染首题）
       store.pendingAsk = { questions: ev.questions || [] }
       break
     case 'confirm_request':
@@ -352,9 +352,18 @@ export const useChatStore = defineStore('chat', {
       return true
     },
     submitAsk(answers) {
-      // 旧 ask_answer/ask_choice 已随后端删除；ask_submit 一次提交全部答案。
+      // 旧 ask_answer/ask_choice 已随后端删除；单题协议下 answers 恒为一项。
       // 仅上行成功才清卡片；失败保留，连接恢复后用户可重试同一操作
       if (this._uplink({ type: 'ask_submit', answers })) this.pendingAsk = null
+    },
+    declineAsk() {
+      // 「不再提问，自行决定」：不是取消执行，而是把决定权交还模型并继续本轮。
+      // 固定答复即协议：模型在工具结果里读到后停止追问、按默认继续并说明假设。
+      const answer = {
+        answer: '用户选择「自行决定」，不再回答本题。请按最合理默认继续，本轮及后续不要再提问，'
+          + '并在最终答复中说明你采用了哪些假设。',
+      }
+      if (this._uplink({ type: 'ask_submit', answers: [answer] })) this.pendingAsk = null
     },
     confirm(approved) {
       if (this._uplink({ type: 'confirm', approved })) this.pendingConfirm = null
