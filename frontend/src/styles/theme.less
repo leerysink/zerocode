@@ -7,3 +7,15 @@
   --zc-text-sub: #8a97a5;
 }
 body { background: var(--zc-bg); color: var(--zc-text); }
+
+/* 侧栏拖拽调宽期间：指针移出热区也保持 col-resize、不选中正文，宽度实时跟手不补动画 */
+body.zc-panel-resizing,
+body.zc-panel-resizing * {
+  cursor: col-resize !important;
+  user-select: none !important;
+}
+body.zc-panel-resizing .zc-sidebar,
+body.zc-panel-resizing .zc-fp,
+body.zc-panel-resizing .zc-edge {
+  transition: none !important;
+}

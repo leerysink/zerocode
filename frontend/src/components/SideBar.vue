@@ -15,6 +15,12 @@ import { useChatStore } from '../stores/chat'
 import { relativeTime } from '../utils/time'
 import NewSessionModal from './NewSessionModal.vue'
 
+const props = defineProps({
+  width: { type: Number, default: 260 },
+  collapsed: { type: Boolean, default: false },
+})
+const panelStyle = computed(() => ({ width: props.collapsed ? '0px' : `${props.width}px` }))
+
 const store = useChatStore()
 const showNew = ref(false)
 const loading = ref(true)
@@ -133,7 +139,7 @@ async function doDelete() {
 </script>
 
 <template>
-  <aside class="zc-sidebar">
+  <aside class="zc-sidebar" :class="{ 'is-collapsed': collapsed }" :style="panelStyle">
     <div class="zc-logo">zerocode</div>
     <a-button type="primary" block @click="showNew = true">＋ 新会话</a-button>
     <div class="zc-groups">
@@ -216,7 +222,7 @@ async function doDelete() {
 
 <style scoped>
 .zc-sidebar {
-  flex: 0 0 260px;
+  flex: 0 0 auto;
   width: 260px;
   display: flex;
   flex-direction: column;
@@ -224,6 +230,14 @@ async function doDelete() {
   border-right: 1px solid var(--zc-border);
   padding: 12px;
   box-sizing: border-box;
+  overflow: hidden;
+  transition: width 0.2s ease, padding 0.2s ease;
+}
+/* 0 宽 + 内边距会被 border-box 撑成 24px，必须一并归零；内容留在 DOM 里，收起不丢状态 */
+.zc-sidebar.is-collapsed {
+  padding-left: 0;
+  padding-right: 0;
+  border-right-width: 0;
 }
 .zc-logo {
   color: var(--zc-primary);

@@ -1,5 +1,6 @@
 <script setup>
-// 右栏文件面板（Task 14 / 工作台 008）：可折叠 a-layout-sider（宽 300 / collapsedWidth 0）。
+// 右栏文件面板（Task 14 / 工作台 008）：宽度与收起状态由聊天页记忆并受控传入，
+// 收起/拖拽入口在面板左缘的手柄（SidePanelHandle），antd 自带 trigger 不再挂。
 // 「文件」tab：工作区文件树（GET /fs/tree → treeData）+ 顶部刷新按钮 + 打开文件夹按钮；
 //   点击文件 → 只读内容预览（pre）；后端对二进制/超 200KB 文件拒读（400），错误详情展示在预览区即「>200KB 提示」；
 //   编辑收口到工作台：这里只给「在编辑器中打开」，新标签带 ?name=&file= 跳到工作台并定位该文件。
@@ -18,6 +19,8 @@ import MemoryPanel from './MemoryPanel.vue'
 
 const props = defineProps({
   workspaceId: { type: Number, required: true },
+  width: { type: Number, default: 300 },
+  collapsed: { type: Boolean, default: false },
 })
 
 const store = useChatStore()
@@ -152,7 +155,7 @@ onMounted(loadTree)
 </script>
 
 <template>
-  <a-layout-sider class="zc-fp" :width="300" :collapsed-width="0" collapsible theme="light">
+  <a-layout-sider class="zc-fp" :width="width" :collapsed="collapsed" :collapsed-width="0" theme="light">
     <a-tabs v-model:activeKey="tab" size="middle" class="zc-fp-tabs" @tab-click="onTabClick">
       <a-tab-pane key="files" tab="文件">
         <div class="zc-fp-toolbar">

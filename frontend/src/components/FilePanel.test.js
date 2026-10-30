@@ -47,8 +47,19 @@ const AlertStub = {
     return h('div', { class: 'stub-a-alert' }, this.message)
   },
 }
+const SiderStub = {
+  name: 'a-layout-sider',
+  props: ['width', 'collapsed', 'collapsedWidth'],
+  render() {
+    return h('div', {
+      class: 'stub-a-layout-sider',
+      'data-width': String(this.width),
+      'data-collapsed': String(this.collapsed),
+    }, this.$slots.default ? this.$slots.default() : [])
+  },
+}
 const STUBS = {
-  'a-layout-sider': slotDiv('a-layout-sider'),
+  'a-layout-sider': SiderStub,
   'a-tabs': slotDiv('a-tabs'),
   'a-tab-pane': slotDiv('a-tab-pane'),
   'a-button': ButtonStub,
@@ -196,6 +207,19 @@ describe('FilePanel 打开文件夹入口', () => {
 
     expect(open.mock.calls[0][0]).toBe('/workspaces/7/files')
     expect(message.warning).not.toHaveBeenCalled()
+  })
+})
+
+describe('FilePanel 受控宽度与收起', () => {
+  it('默认 300 展开；宽度与收起状态原样交给 sider，antd 自带 trigger 不再挂', async () => {
+    const wrapper = await mountPanel()
+    const sider = wrapper.find('.stub-a-layout-sider')
+    expect(sider.attributes('data-width')).toBe('300')
+    expect(sider.attributes('data-collapsed')).toBe('false')
+
+    await wrapper.setProps({ width: 420, collapsed: true })
+    expect(wrapper.find('.stub-a-layout-sider').attributes('data-width')).toBe('420')
+    expect(wrapper.find('.stub-a-layout-sider').attributes('data-collapsed')).toBe('true')
   })
 })
 

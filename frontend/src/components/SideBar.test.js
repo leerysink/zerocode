@@ -119,13 +119,13 @@ function sessions(n, workspaceId = 1) {
   }))
 }
 
-async function mountSideBar({ appRows = [APP], wsRows = [LEGACY_WS], sessionRows } = {}) {
+async function mountSideBar({ appRows = [APP], wsRows = [LEGACY_WS], sessionRows, props } = {}) {
   const pinia = createPinia()
   setActivePinia(pinia)
   listApps.mockResolvedValue({ data: appRows })
   listWorkspaces.mockResolvedValue({ data: wsRows })
   listSessions.mockImplementation(async (wsId) => ({ data: sessionRows ?? sessions(8, wsId) }))
-  const wrapper = mount(SideBar, { global: { plugins: [pinia], stubs: STUBS } })
+  const wrapper = mount(SideBar, { props, global: { plugins: [pinia], stubs: STUBS } })
   await flushPromises()
   const store = useChatStore()
   store.openSession = vi.fn()      // 打开会话要连 WS，与本组断言无关，桩掉
@@ -300,3 +300,15 @@ describe('SideBar 删除应用', () => {
 })
 
 // 账户区已迁至右上角顶栏 AccountBar，用例见 AccountBar.test.js（Ticket 010 后的位置调整）。
+
+describe('SideBar 受控宽度', () => {
+  it('展开态用传入宽度；收起态宽度归零、内容仍留在 DOM 里', async () => {
+    const { wrapper } = await mountSideBar({ props: { width: 320 } })
+    expect(wrapper.find('.zc-sidebar').element.style.width).toBe('320px')
+
+    await wrapper.setProps({ collapsed: true })
+    expect(wrapper.find('.zc-sidebar').element.style.width).toBe('0px')
+    expect(wrapper.find('.zc-sidebar').classes()).toContain('is-collapsed')
+    expect(wrapper.find('.zc-logo').exists()).toBe(true)
+  })
+})
