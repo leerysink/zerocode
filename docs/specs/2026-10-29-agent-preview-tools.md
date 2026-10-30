@@ -1,6 +1,6 @@
 # Agent 预览验证工具（preview tools）规格说明
 
-**日期**：2026-10-29  **来源**：需求访谈（「Agent 执行终端命令」可行性 → 第一步）  **状态**：已实现（自动化验证通过，§10.4 手工矩阵待走）
+**日期**：2026-10-29  **来源**：需求访谈（「Agent 执行终端命令」可行性 → 第一步）  **状态**：已实现（自动化验证通过，§10.4 手工矩阵 11 项已走）
 
 **相关文件**：[tools.py](../../app/agent/tools.py)、[loop.py](../../app/agent/loop.py)、[llm.py](../../app/agent/llm.py)、[prompts.py](../../app/agent/prompts.py)、[engine.py](../../app/deploy/engine.py)、[hub.py](../../app/deploy/hub.py)、[apps.py](../../app/api/apps.py)、[dev_logs.py](../../app/api/dev_logs.py)、[app_service.py](../../app/services/app_service.py)、[ws.py](../../app/api/ws.py)、[chat.js](../../frontend/src/stores/chat.js)、[ChatMessages.vue](../../frontend/src/components/ChatMessages.vue)
 
@@ -521,6 +521,12 @@ ctx 的字段，所有错误都作为结果返回；`tools.py` 在分派分支�
 8. Docker 关闭：启动返回中文引导，状态工具仍可读。
 9. 在应用日志里打印一个假口令：`preview_logs` 显示 `<redacted:...>`。
 10. 非应用工作区：对话里没有预览工具，模型说明原因。
+11. 刷新聊天页：历史里的预览卡从 `tool_result` 重画终态，进度条不复活。
+
+**结果（2026-10-30，真 Docker + 浏览器 + 已合并代码）**：11 项逐条走过，10 项通过。唯一未在本机复现的是第 1 项的
+「改 Vue 文件不重启即刷新可见」——dev 栈的 Vite 跑在容器里、工作区是 Windows bind mount，容器收不到
+文件事件，属 dev 栈在本机的既有限制，与预览工具无关（同项的后端 `--reload` 半段已通过）。第 8 项以注入
+无效 `DOCKER_HOST` 的方式模拟，未真实停用 Docker Desktop（平台库容器跑在它上面）。
 
 **完成标志**：上述后端用例串行全绿、`cd frontend && npm run test -- --run` 全绿、
 `npm run build` 成功，手工矩阵走通。
