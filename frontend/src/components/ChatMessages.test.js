@@ -13,6 +13,7 @@ import ChatMessages from './ChatMessages.vue'
 import ToolCallBlock from './ToolCallBlock.vue'
 import AskUserCard from './AskUserCard.vue'
 import { useChatStore } from '../stores/chat'
+import { DECLINE_ANSWER } from '../stores/messageModel'
 
 const ImageStub = {
   name: 'a-image',
@@ -439,6 +440,19 @@ describe('提问卡在消息流里', () => {
     expect(w.find('.zc-ask-state').text()).toContain('已中断')
     expect(w.find('.zc-ask-state').text()).toContain('提问超时')
     expect(w.findAll('.zc-opt.is-picked')).toHaveLength(0)
+    expect(w.find('textarea').exists()).toBe(false)
+    expect(w.findAll('button')).toHaveLength(0)
+  })
+
+  it('「自行决定」的已答态单独标注，与普通手输回答区分', () => {
+    const w = mountWithRealAsk([
+      {
+        role: 'tool', name: 'ask_user',
+        args: { questions: [{ question: '选哪个', options: [{ label: 'A' }] }] },
+        result: { answers: [{ answer: DECLINE_ANSWER }] },
+      },
+    ])
+    expect(w.find('.zc-ask-state').text()).toBe('自行决定')
     expect(w.find('textarea').exists()).toBe(false)
     expect(w.findAll('button')).toHaveLength(0)
   })

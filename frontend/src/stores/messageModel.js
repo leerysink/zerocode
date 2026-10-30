@@ -106,10 +106,19 @@ export function askQuestionsOf(args) {
     })
 }
 
+// 「不再提问，自行决定」的固定答复**即协议**：模型在工具结果里读到它就停止追问、按默认继续。
+// 单点定义在此——chat.js 的 declineAsk 上行用它，已答态识别也用它。历史行里存的就是这段文案，
+// 识别只能靠逐字比对，两处各写一遍必然漂移。
+export const DECLINE_ANSWER = '用户选择「自行决定」，不再回答本题。请按最合理默认继续，本轮及后续不要再提问，'
+  + '并在最终答复中说明你采用了哪些假设。'
+
 // 结果行 → 已答信息。没有结果行就是待答；cancelled 覆盖两种情形（用户点「停止」、提问超时），
 // 两者都是后端补写的配对结果行，形状一致。answers 与 questions 同序。
+// declined 单列一态：用户放弃回答与普通手输回答在留痕上必须看得出区别。
 export function askOutcomeOf(result) {
   if (!result) return { state: 'pending', answers: [], reason: '' }
   if (result.cancelled) return { state: 'cancelled', answers: [], reason: result.reason || '' }
-  return { state: 'answered', answers: Array.isArray(result.answers) ? result.answers : [], reason: '' }
+  const answers = Array.isArray(result.answers) ? result.answers : []
+  const declined = answers.some((a) => a && a.answer === DECLINE_ANSWER)
+  return { state: declined ? 'declined' : 'answered', answers, reason: '' }
 }

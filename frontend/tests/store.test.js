@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { setActivePinia, createPinia } from 'pinia'
 import { useChatStore, applyEvent } from '../src/stores/chat'
+import { DECLINE_ANSWER } from '../src/stores/messageModel'
 import { getMessages, getSessionDetail, listModels, patchSessionModel } from '../src/api'
 
 // 把 openSession/模型 actions 依赖的 REST 换成可编排的 mock（openSession 依赖
@@ -116,6 +117,8 @@ describe('chat store 事件流', () => {
     expect(payload.answers).toHaveLength(1)
     expect(payload.answers[0].answer).toContain('自行决定')
     expect(payload.answers[0].answer).toContain('不要再提问')
+    // 文案单点定义：上行与已答态识别共用同一份常量，两处各写一遍必然漂移
+    expect(payload.answers[0].answer).toBe(DECLINE_ANSWER)
     // 卡片由结果行翻转，本地不清任何字段：上行后待答卡仍在消息流里
     expect(s.messages.filter(m => m.role === 'tool' && !m.result)).toHaveLength(1)
   })

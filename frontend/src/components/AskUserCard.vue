@@ -54,7 +54,8 @@ function submit() {
 // 已答态：单题协议下 answers 恒为一项
 const outcome = computed(() => askOutcomeOf(props.result))
 const readonly = computed(() => outcome.value.state !== 'pending')
-const stateText = computed(() => (outcome.value.state === 'cancelled' ? '已中断' : '已回答'))
+const STATE_TEXT = { cancelled: '已中断', declined: '自行决定', answered: '已回答' }
+const stateText = computed(() => STATE_TEXT[outcome.value.state] || '已回答')
 const pickedLabels = computed(() => {
   const opts = outcome.value.answers[0]?.options
   return Array.isArray(opts) ? opts : []

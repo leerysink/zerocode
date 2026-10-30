@@ -16,7 +16,7 @@ import {
   fetchAttachmentBlob, uploadAttachment, wsUrl,
 } from '../api'
 import { newClientMsgId } from '../utils/imageAttachments'
-import { findOpenToolCall } from './messageModel'
+import { findOpenToolCall, DECLINE_ANSWER } from './messageModel'
 
 // 「执行中被拦下」的三条文案：单点定义，本地拦截与后端 busy 回包共用同一口径
 const BUSY_HINT = '会话正在执行中：点右侧「停止」结束当前执行后即可继续发言'
@@ -362,12 +362,8 @@ export const useChatStore = defineStore('chat', {
     },
     declineAsk() {
       // 「不再提问，自行决定」：不是取消执行，而是把决定权交还模型并继续本轮。
-      // 固定答复即协议：模型在工具结果里读到后停止追问、按默认继续并说明假设。
-      const answer = {
-        answer: '用户选择「自行决定」，不再回答本题。请按最合理默认继续，本轮及后续不要再提问，'
-          + '并在最终答复中说明你采用了哪些假设。',
-      }
-      this._uplink({ type: 'ask_submit', answers: [answer] })
+      // 固定答复即协议，常量单点定义在 messageModel.js——已答态靠它逐字识别并标注「自行决定」。
+      this._uplink({ type: 'ask_submit', answers: [{ answer: DECLINE_ANSWER }] })
     },
     confirm(approved) {
       if (this._uplink({ type: 'confirm', approved })) this.pendingConfirm = null

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { normalizeMessages, askQuestionsOf } from './messageModel'
+import { normalizeMessages, askQuestionsOf, askOutcomeOf, DECLINE_ANSWER } from './messageModel'
 import { applyEvent } from './chat'
 
 // 历史行的真实形状（GET /sessions/{id}/messages 直接回 DB 行）：
@@ -103,6 +103,28 @@ describe('实时 ≡ 历史（完整问答执行）', () => {
         questions: ASK_ARGS.questions, result: ANSWER,
       })
     }
+  })
+})
+
+// 「自行决定」的固定答复即协议：模型在工具结果里读到它就停止追问。历史行里存的就是这段
+// 文案，所以已答态只能靠它识别——常量必须单点定义，declineAsk 上行与识别共用同一份。
+describe('askOutcomeOf 已答信息', () => {
+  it('没有结果行＝待答', () => {
+    expect(askOutcomeOf(null)).toEqual({ state: 'pending', answers: [], reason: '' })
+    expect(askOutcomeOf(undefined).state).toBe('pending')
+  })
+  it('选项答案＝已答', () => {
+    expect(askOutcomeOf({ answers: [{ options: ['B'] }] })).toEqual({
+      state: 'answered', answers: [{ options: ['B'] }], reason: '',
+    })
+  })
+  it('中断标记＝已中断，带原因', () => {
+    expect(askOutcomeOf({ cancelled: true, reason: '提问超时' }).state).toBe('cancelled')
+    expect(askOutcomeOf({ cancelled: true }).reason).toBe('')
+  })
+  it('「自行决定」的固定答复单独成一态，与普通手输回答区分', () => {
+    expect(askOutcomeOf({ answers: [{ answer: DECLINE_ANSWER }] }).state).toBe('declined')
+    expect(askOutcomeOf({ answers: [{ answer: '我自己写一句' }] }).state).toBe('answered')
   })
 })
 
