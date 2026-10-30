@@ -167,8 +167,8 @@ def test_ws_steer_while_running_then_cancel(client):
         # 取消后的事件都发给 ws2。后连首帧是 running 快照（重连状态自洽），不是拒绝。
         with client.websocket_connect(f"/ws/chat/{sid}") as ws2:
             assert ws2.receive_json() == {"type": "status", "status": "running"}
-            # 连入补发的是同一张待答卡，不是第二轮提问；消费掉再读取消链路的帧序
-            assert ws2.receive_json()["type"] == "ask_user"
+            # 提问卡不再补发（ADR 0029：待答态由消息流里的调用行重建），所以 running 快照
+            # 之后直接就是取消链路的帧序，中间没有多余的一帧要消费
             # 同连接上行严格 FIFO：插话先入队，cancel 后到 —— 不必（也不能）读 hub.pending 抢时序
             ws2.send_json({"type": "user_message", "content": "插一句"})
             ws2.send_json({"type": "cancel"})
@@ -416,9 +416,10 @@ def test_ws_reconnect_replays_running_status(client):
         assert ws3.receive_json()["type"] == "message_done"
 
 
-def test_ws_reconnect_replays_pending_ask(client):
-    """切走/刷新后重连：挂起中的提问卡要补发，用户才能继续回答。
-    不补则卡片消失、ask future 永久挂起，会话进入「既答不了也停不掉」的卡死态。"""
+def test_ws_reconnect_recovers_pending_ask_from_history(client):
+    """切走/刷新后重连：挂起中的提问不再靠补发事件恢复，而是从消息历史重建——
+    assistant 行带着 ask_user 调用、且没有配对的 tool 行，就是「待答」（ADR 0029）。
+    ask future 仍挂着，所以从重连的连接应答照样能推进本轮，不会「既答不了也停不掉」。"""
     client.app.state.llm_factory = lambda cfg: ScriptedLLM([
         done(None, [_ask_tool_call("c1", "重连后还要答")]),
         done("答完了"),
@@ -429,18 +430,25 @@ def test_ws_reconnect_replays_pending_ask(client):
         for _ in range(6):
             if ws.receive_json()["type"] == "ask_user":
                 break
-    # 第一连接已断开，ask 仍挂起；重连应在 status(running) 后补发同一张卡
+    # 第一连接已断开，ask 仍挂起。历史里必须能看出「有一道题在等回答」
+    rows = client.get(f"/api/sessions/{sid}/messages").json()
+    carriers = [r for r in rows if r["role"] == "assistant" and r["tool_args"]]
+    assert len(carriers) == 1
+    call = carriers[0]["tool_args"]["tool_calls"][0]
+    assert call["function"]["name"] == "ask_user"
+    assert json.loads(call["function"]["arguments"])["question"] == "重连后还要答"
+    # 没有配对的 tool 行 = 待答态（有了就是已答/已中断）
+    assert not [r for r in rows if r["role"] == "tool"]
+    # 重连不再补发提问卡事件；应答照样推进本轮，终态看 status 而非 message_done
     with client.websocket_connect(f"/ws/chat/{sid}") as ws2:
         assert ws2.receive_json() == {"type": "status", "status": "running"}
-        replayed = ws2.receive_json()
-        assert replayed["type"] == "ask_user"
-        assert replayed["questions"][0]["question"] == "重连后还要答"
         ws2.send_json({"type": "ask_submit", "answers": [{"answer": "答了"}]})
         for _ in range(10):
-            if ws2.receive_json()["type"] == "message_done":
+            ev = ws2.receive_json()
+            if ev["type"] == "status" and ev["status"] == "idle":
                 break
         else:
-            pytest.fail("补发提问卡后应答，runner 应跑到 message_done")
+            pytest.fail("重连后应答，runner 应跑到终态")
 
 
 def test_ws_reconnect_replays_pending_confirm(client, monkeypatch):
