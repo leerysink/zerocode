@@ -4,7 +4,8 @@
 下行：token / tool_call / tool_result / tool_progress / ask_user / confirm_request /
 message_done / error / status / file_change / compacting / compaction_done / busy /
 steering_done（由 runner 与 hub 经 emit 下发）。tool_progress 是预览工具的**临时**进度，
-不落库、刷新即消失；error 与 status 是本轮终态；busy 是执行中被拒的非终态提示
+不落库、刷新即消失；error 与 status 是本轮终态；message_done 是**轮次收口**而非终态
+（工具轮在派发工具前也发一次，一次执行可以有多条，判终态一律看 status）；busy 是执行中被拒的非终态提示
 （不得据此复位前端执行态，否则「停止」按钮消失 → 发不出也停不掉的死循环）。
 
 执行中再发 user_message = 插话（steering）：进 hub.pending 队列（对象项：content +

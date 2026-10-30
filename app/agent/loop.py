@@ -4,6 +4,9 @@
 另有 confirm_request（写入或重启预览的确认请求）、status（终态回执）、compaction_done（自动压缩完成）
 与 session_title（首条消息自动命名后的新标题，前端就地刷新侧栏）。tool_progress 由预览工具经
 同一个 send 下发，临时、不落库。
+
+message_done 是**轮次收口**，不是执行终态：每个工具轮在派发工具之前也会发一次（content 为空则不发），
+把本轮已流式输出的文字固化成一条消息，所以一次执行可以发多次。执行终态只由 status/error 判定。
 """
 import asyncio, datetime, inspect, itertools, json
 import logging
@@ -448,13 +451,21 @@ class AgentRunner:
                                   tool_args={"tool_calls": sanitized_calls})
                 messages.append({"role": "assistant", "content": final.get("content"),
                                  "tool_calls": sanitized_calls})
+                # 轮次收口：本轮的文字必须在派发工具**之前**固化下发。上面那行已经把它存进库了，
+                # 缺的只是事件——不补的话这段文字只活在前端的流式缓冲区里，等下一轮收口到达时
+                # 被直接抹掉，表现为「问答结束后，提问前那段说明消失了」，而刷新页面又回来。
+                # content 为空则不发：发了前端会 push 一条空 assistant 消息，实时与历史条数就此叉开。
+                if final.get("content"):
+                    await self.send({"type": "message_done", "content": final["content"]})
                 # 结构被 redact 原样保留（id/type/name 不变、只改 arguments），按位次配对：
                 # exec_tc 供工具真实执行，push_tc 供前端事件展示。等长同序是配对成立的前提，
                 # 加一道廉价护栏：万一将来给 redact 加了过滤分支致列表变短，在这里显式炸，
                 # 不要静默丢一个工具调用 / 错位 tool_call_id 配对（OpenAI 兼容 API 会 400）。
                 assert len(sanitized_calls) == len(original_calls)
-                for exec_tc, push_tc in zip(original_calls, sanitized_calls):
+                pairs = list(zip(original_calls, sanitized_calls))
+                for idx, (exec_tc, push_tc) in enumerate(pairs):
                     if cancel.is_set():
+                        await self._pair_undispatched(session_id, pairs[idx:])
                         raise _Cancelled()
                     name = exec_tc["function"]["name"]
                     try:
@@ -488,6 +499,25 @@ class AgentRunner:
                 continue
             return
         raise RuntimeError(f"已达到最大工具轮数（{max_rounds}）")
+
+    async def _pair_undispatched(self, session_id, pairs):
+        """中断落在轮中间：给没派发的调用补写配对 tool 行，并补下发同样两个事件。
+
+        库里缺这些行会留下「assistant 行带 N 个 tool_calls、只有 k 条 tool 行」的孤儿。
+        _history 只从窗口**头部**修剪孤儿，中间的修不到，回注模型时 OpenAI 兼容 API 会 400；
+        前端也会把没人认领的调用画成永远待答的死卡。事件一并补齐，实时流才不与刷新后的历史叉开。"""
+        for exec_tc, push_tc in pairs:
+            name = exec_tc["function"]["name"]
+            try:
+                push_args = json.loads(push_tc["function"]["arguments"] or "{}")
+            except json.JSONDecodeError:
+                push_args = {}
+            await self.send({"type": "tool_call", "name": name, "args": push_args})
+            # 落库与下发共用同一个对象：两处各写一遍字面量，改一处就会让实时与历史叉开
+            cancelled = {"cancelled": True}
+            await add_message(self.sf, session_id, "tool", tool_call_id=exec_tc.get("id"),
+                              tool_name=name, tool_result=cancelled)
+            await self.send({"type": "tool_result", "name": name, "result": cancelled})
 
     async def _dispatch(self, ctx, cfg, session_id, name, args, cancel):
         if name == "ask_user":

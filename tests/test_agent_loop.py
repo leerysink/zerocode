@@ -85,6 +85,51 @@ async def test_ask_user_resume(test_engine, tmp_path):
     assert row["answers"] == [{"options": ["方案A"]}]
 
 @pytest.mark.asyncio
+async def test_tool_round_text_flushed_before_dispatch(test_engine, tmp_path):
+    """工具轮里模型说的文字必须在派发工具**之前**固化下发。
+
+    否则它只活在前端的流式缓冲区里，等下一轮收口到达时被直接抹掉——表现为
+    「问答结束后，提问前那段说明文字消失了」，而刷新页面又回来（库里其实存着）。
+    见 spec 2026-10-30-chat-ask-trace-live-history-parity 用户故事 9/10/13。"""
+    async def ask_ok(session_id, questions, timeout):
+        return {"answers": [{"options": ["方案A"]}]}
+    turns = [
+        [delta("让我看看"),
+         *done("让我看看", [tool_call("c1", "ask_user", question="选哪个", options=["方案A", "方案B"])])],
+        [delta("好了"), *done("好了")],
+    ]
+    sid, status, evs, sf = await run_once(test_engine, tmp_path, turns, ask=ask_ok)
+    assert status == "idle"
+    types = [e["type"] for e in evs]
+    # 收口排在同轮第一个 tool_call 之前：前端才会先固化文字、再画提问卡
+    assert types.index("message_done") < types.index("tool_call"), types
+    # 两轮文字各固化一条，顺序与轮次一致
+    assert [e["content"] for e in evs if e["type"] == "message_done"] == ["让我看看", "好了"]
+    # 同构的后端一半：事件里的文字序列 == DB assistant 行的 content 序列
+    async with sf() as s:
+        rows = (await s.execute(sql(
+            "SELECT content FROM message WHERE session_id=:i AND role='assistant' ORDER BY seq"),
+            {"i": sid})).scalars().all()
+    assert list(rows) == ["让我看看", "好了"]
+
+@pytest.mark.asyncio
+async def test_tool_round_without_text_emits_no_close(test_engine, tmp_path):
+    """模型没说话就调工具的那一轮不发收口事件。
+
+    发了前端就会 push 一条空 assistant 消息（渲染门 `content || reasoning` 会跳过它，
+    但消息流里多出一条空记录，实时与历史的条数就此叉开）。
+    注意 DB 里的 assistant 行**必须**照常写——它承载 tool_calls，缺了回注模型会 400。"""
+    async def ask_ok(session_id, questions, timeout):
+        return {"answers": [{"options": ["A"]}]}
+    turns = [done(None, [tool_call("c1", "ask_user", question="选哪个", options=["A"])]), done("好了")]
+    sid, status, evs, sf = await run_once(test_engine, tmp_path, turns, ask=ask_ok)
+    assert [e["content"] for e in evs if e["type"] == "message_done"] == ["好了"]
+    async with sf() as s:
+        n = (await s.execute(sql(
+            "SELECT count(*) FROM message WHERE session_id=:i AND role='assistant'"), {"i": sid})).scalar()
+    assert n == 2  # 工具轮那条（content 为空、带 tool_args）+ 终答那条
+
+@pytest.mark.asyncio
 async def test_ask_user_legacy_args_wrapped(test_engine, tmp_path):
     # 旧参数（question/options 为字符串）自动包装为单题，保证模型误用时对话不断
     async def ask_ok(session_id, questions, timeout):
@@ -132,6 +177,33 @@ async def test_cancel(test_engine, tmp_path):
     sid, status, evs, sf = await run_once(test_engine, tmp_path, turns, ask=ask_and_cancel, cancel=cancel)
     assert status == "idle"
     assert any(e["type"] == "error" and e["message"] == "已取消" for e in evs)
+
+@pytest.mark.asyncio
+async def test_cancel_midround_pairs_undispatched_calls(test_engine, tmp_path):
+    """中断落在多调用轮的中间时，没派发的那些调用也要补写配对结果行。
+
+    否则库里留下「assistant 行带 N 个 tool_calls、只有 k 条 tool 行」的孤儿：
+    _history 只从窗口**头部**修剪孤儿（见 test_history_trim_keeps_tool_pairs），中间的修不到，
+    回注模型时 OpenAI 兼容 API 会 400；前端也会把没人认领的调用画成永远待答的死卡。"""
+    cancel = asyncio.Event()
+    async def ask_and_cancel(session_id, questions, timeout):
+        cancel.set()
+        return None
+    turns = [done(None, [tool_call("c1", "ask_user", question="?"),
+                         tool_call("c2", "read_file", path="a.txt")]),
+             done("不该到达")]
+    sid, status, evs, sf = await run_once(test_engine, tmp_path, turns, ask=ask_and_cancel, cancel=cancel)
+    assert status == "idle"
+    async with sf() as s:
+        rows = (await s.execute(sql(
+            "SELECT tool_call_id, tool_name, tool_result FROM message "
+            "WHERE session_id=:i AND role='tool' ORDER BY seq"), {"i": sid})).mappings().all()
+    assert [r["tool_call_id"] for r in rows] == ["c1", "c2"]
+    assert rows[1]["tool_name"] == "read_file"
+    assert rows[1]["tool_result"] == {"cancelled": True}
+    # 事件也要补齐：实时流少一条记录，就会和刷新后的历史叉开
+    types = [e["type"] for e in evs]
+    assert types.count("tool_call") == 2 and types.count("tool_result") == 2
 
 @pytest.mark.asyncio
 async def test_history_trim_keeps_tool_pairs(test_engine, tmp_path):
