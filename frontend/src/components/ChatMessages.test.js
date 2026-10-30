@@ -10,6 +10,8 @@ vi.mock('../api', () => ({
 }))
 
 import ChatMessages from './ChatMessages.vue'
+import ToolCallBlock from './ToolCallBlock.vue'
+import AskUserCard from './AskUserCard.vue'
 import { useChatStore } from '../stores/chat'
 
 const ImageStub = {
@@ -97,6 +99,26 @@ describe('预览工具在消息流里的渲染', () => {
   it('非预览工具仍走 ToolCallBlock', () => {
     const w = mountMessages([{ role: 'tool', name: 'read_file', result: { ok: true } }])
     expect(w.find('.zc-preview').exists()).toBe(false)
+  })
+
+  // 历史行里 args 不在 tool 行上，而在前一条 assistant 行的 tool_args.tool_calls 里（JSON 字符串）。
+  // 归一化必须把它抽出来配到 tool 记录上，否则刷新后每个工具块都只剩「结果」、丢掉「参数」。
+  it('历史行经归一化后，工具块同时拿到 args 与 result', () => {
+    const w = mountMessages([
+      {
+        role: 'assistant', content: '让我看看',
+        tool_args: {
+          tool_calls: [{
+            id: 'c1', type: 'function',
+            function: { name: 'read_file', arguments: '{"path":"a.txt"}' },
+          }],
+        },
+      },
+      { role: 'tool', tool_call_id: 'c1', tool_name: 'read_file', tool_result: { ok: true } },
+    ])
+    expect(w.findComponent(ToolCallBlock).props('msg')).toEqual({
+      role: 'tool', name: 'read_file', args: { path: 'a.txt' }, result: { ok: true },
+    })
   })
 
   it('实时流里一次调用只画一张预览卡（call 行不再长驻「进行中」）', () => {
@@ -287,5 +309,161 @@ describe('preview_page 在消息流里的渲染', () => {
     ])
     expect(w.findAll('.zc-page').length).toBe(1)
     expect(w.text()).not.toContain('正在打开预览页')
+  })
+})
+
+// ---- 提问卡进消息流（spec 2026-10-30 用户故事 1/5）----
+// 卡片由 ask_user 调用行驱动：无结果行 = 待答可交互。不再依赖挂起态字段，
+// 所以刷新/切会话/断线重连后，待答的题从历史行原样重建。
+
+// 已答态要验真实渲染（高亮/灰显/无输入无按钮），所以这个挂载口不 stub AskUserCard
+function mountWithRealAsk(messages) {
+  setActivePinia(createPinia())
+  return mount(ChatMessages, {
+    props: { messages, hasSession: true },
+    global: {
+      stubs: {
+        'a-image': ImageStub, 'a-image-preview-group': GroupStub, 'a-button': ButtonStub,
+        MarkdownView: true, ToolCallBlock: true, ThinkingBlock: true, TodoCard: true,
+      },
+    },
+  })
+}
+
+describe('提问卡在消息流里', () => {
+  it('ask_user 调用行（无结果）渲染成待答提问卡，不再落回折叠块', () => {
+    const w = mountMessages([
+      { role: 'tool', name: 'ask_user', args: { questions: [{ question: '选哪个', options: [{ label: 'A' }] }] } },
+    ])
+    expect(w.findComponent(AskUserCard).props('questions'))
+      .toEqual([{ question: '选哪个', options: [{ label: 'A' }] }])
+    expect(w.findComponent(ToolCallBlock).exists()).toBe(false)
+  })
+
+  it('历史行形状（args 在前一条 assistant 行上）同样画出待答卡', () => {
+    const w = mountMessages([
+      {
+        role: 'assistant', content: '让我先确认一件事',
+        tool_args: {
+          tool_calls: [{
+            id: 'c1', type: 'function',
+            function: { name: 'ask_user', arguments: '{"questions":[{"question":"选哪个","options":[{"label":"A"}]}]}' },
+          }],
+        },
+      },
+      { role: 'tool', tool_call_id: 'c1', tool_name: 'ask_user' },
+    ])
+    expect(w.findComponent(AskUserCard).props('questions'))
+      .toEqual([{ question: '选哪个', options: [{ label: 'A' }] }])
+  })
+
+  it('模型给的字符串选项也能画出来（调用行存的是原始 args，没经后端规整）', () => {
+    const w = mountMessages([
+      { role: 'tool', name: 'ask_user', args: { question: '选哪个', options: ['A', 'B'] } },
+    ])
+    expect(w.findComponent(AskUserCard).props('questions'))
+      .toEqual([{ question: '选哪个', options: [{ label: 'A' }, { label: 'B' }] }])
+  })
+
+  it('结果行到达后不再落回折叠 JSON 块，而是转成只读卡', () => {
+    const w = mountMessages([
+      { role: 'tool', name: 'ask_user', args: { questions: [{ question: '选哪个' }] }, result: { answers: [{ options: ['A'] }] } },
+    ])
+    expect(w.findComponent(AskUserCard).exists()).toBe(true)
+    expect(w.findComponent(ToolCallBlock).exists()).toBe(false)
+  })
+
+  it('同一次执行里两次提问，两张卡各自独立按序渲染', () => {
+    const w = mountMessages([
+      { role: 'tool', name: 'ask_user', args: { questions: [{ question: '第一题' }] }, result: { answers: [{ options: ['A'] }] } },
+      { role: 'tool', name: 'ask_user', args: { questions: [{ question: '第二题' }] } },
+    ])
+    const cards = w.findAllComponents(AskUserCard)
+    expect(cards).toHaveLength(2)
+    expect(cards[0].props('questions')).toEqual([{ question: '第一题' }])
+    expect(cards[1].props('questions')).toEqual([{ question: '第二题' }])
+  })
+
+  it('已答态：选中项高亮带对勾、未选项灰显、输入框与按钮全部摘除', () => {
+    const w = mountWithRealAsk([
+      {
+        role: 'tool', name: 'ask_user',
+        args: { questions: [{ question: '选哪个', options: [{ label: '方案A' }, { label: '方案B' }] }] },
+        result: { answers: [{ options: ['方案B'] }] },
+      },
+    ])
+    expect(w.find('.zc-ask').classes()).toContain('is-answered')
+    expect(w.find('.zc-ask-state').text()).toBe('已回答')
+    expect(w.find('.zc-ask-question').text()).toBe('选哪个')
+    const opts = w.findAll('.zc-opt')
+    expect(opts).toHaveLength(2)
+    expect(opts[0].classes()).toContain('is-dim')
+    expect(opts[1].classes()).toContain('is-picked')
+    expect(opts[1].text()).toContain('✓')
+    // 只读：没有输入框，也没有任何按钮
+    expect(w.find('textarea').exists()).toBe(false)
+    expect(w.findAll('button')).toHaveLength(0)
+  })
+
+  it('已答态：手输回答原文附在选项区下方，未选中的选项仍灰显留痕', () => {
+    const w = mountWithRealAsk([
+      {
+        role: 'tool', name: 'ask_user',
+        args: { questions: [{ question: '叫什么名字', options: [{ label: '小蓝' }] }] },
+        result: { answers: [{ answer: '就叫阿青' }] },
+      },
+    ])
+    expect(w.find('.zc-ask-free-answer').text()).toBe('就叫阿青')
+    expect(w.findAll('.zc-opt')[0].classes()).toContain('is-dim')
+  })
+
+  it('已答态：多选题同时高亮多个选中项', () => {
+    const w = mountWithRealAsk([
+      {
+        role: 'tool', name: 'ask_user',
+        args: { questions: [{ question: '要哪些', multi_select: true, options: [{ label: 'A' }, { label: 'B' }, { label: 'C' }] }] },
+        result: { answers: [{ options: ['A', 'C'] }] },
+      },
+    ])
+    expect(w.findAll('.zc-opt').map(o => o.classes().includes('is-picked'))).toEqual([true, false, true])
+  })
+
+  it('已中断态：显示「已中断」与原因，全选项灰显且不可交互', () => {
+    const w = mountWithRealAsk([
+      {
+        role: 'tool', name: 'ask_user',
+        args: { questions: [{ question: '选哪个', options: [{ label: 'A' }] }] },
+        result: { cancelled: true, reason: '提问超时' },
+      },
+    ])
+    expect(w.find('.zc-ask-state').text()).toContain('已中断')
+    expect(w.find('.zc-ask-state').text()).toContain('提问超时')
+    expect(w.findAll('.zc-opt.is-picked')).toHaveLength(0)
+    expect(w.find('textarea').exists()).toBe(false)
+    expect(w.findAll('button')).toHaveLength(0)
+  })
+
+  // 同构不变式的组件层形态：同一次问答，实时形状与历史形状必须渲染出逐字相同的卡片
+  it('历史行形状的已答卡与实时形状渲染逐字相同', () => {
+    const live = mountWithRealAsk([
+      {
+        role: 'tool', name: 'ask_user',
+        args: { questions: [{ question: '选哪个', options: [{ label: 'A' }, { label: 'B' }] }] },
+        result: { answers: [{ options: ['B'] }] },
+      },
+    ])
+    const hist = mountWithRealAsk([
+      {
+        role: 'assistant', content: '先确认一下',
+        tool_args: {
+          tool_calls: [{
+            id: 'c1', type: 'function',
+            function: { name: 'ask_user', arguments: '{"questions":[{"question":"选哪个","options":[{"label":"A"},{"label":"B"}]}]}' },
+          }],
+        },
+      },
+      { role: 'tool', tool_call_id: 'c1', tool_name: 'ask_user', tool_result: { answers: [{ options: ['B'] }] } },
+    ])
+    expect(hist.find('.zc-ask').html()).toBe(live.find('.zc-ask').html())
   })
 })

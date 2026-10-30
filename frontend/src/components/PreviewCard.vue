@@ -16,8 +16,9 @@ const RUNNING_TITLE = {
   preview_restart: '正在重启预览…',
 }
 
-const name = computed(() => props.msg.name ?? props.msg.tool_name ?? '')
-const result = computed(() => props.msg.result ?? props.msg.tool_result ?? null)
+// msg 一律是归一化后的记录（name/args/result），实时与历史同形，见 stores/messageModel.js
+const name = computed(() => props.msg.name || '')
+const result = computed(() => props.msg.result ?? null)
 
 const tone = computed(() => {
   const r = result.value

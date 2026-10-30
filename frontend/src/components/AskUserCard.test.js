@@ -89,7 +89,7 @@ function mountCard(question) {
   const send = vi.fn()
   store._ws = { readyState: 1, send }
   const w = mount(AskUserCard, {
-    props: { ask: { questions: [question] } },
+    props: { questions: [question] },
     global: { stubs: STUBS },
   })
   return { w, send }

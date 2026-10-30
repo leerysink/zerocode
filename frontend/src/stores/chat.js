@@ -1,18 +1,22 @@
 // chat store：会话/消息/待办/模型/WS 状态。事件处理抽为导出的纯函数 applyEvent(store, ev)，
 // 便于 vitest 不经组件直接调用（connect 的 onmessage 只做 applyEvent(this, JSON.parse(e.data))）。
 // 下行事件类型与后端 loop.py / hub.py 协议一致：
-// token / reasoning_delta / tool_call / tool_result / ask_user(多问题) / confirm_request / message_done
+// token / reasoning_delta / tool_call / tool_result / confirm_request / message_done
 // / error / status / file_change / todo_sync / compacting / compaction_done / notice(压缩 skip 终态)
 // / busy(执行中被拒的非终态提示) / steering_done(插话已在工具边界被模型看见)
 // / tool_progress(预览工具的临时进度，不落库不进气泡，收到结果/终态即清)
 // / session_title(首条消息自动命名，就地更新侧栏标题)；
 // 终态 = error / status(idle|error)，busy、status(running) 与 steering_done 都不是。
+// message_done 是**轮次收口**而非终态：工具轮在派发工具前也发一次，一次执行可以有多条。
+// ask_user 后端仍会发，但前端**不消费**：提问卡由消息流里的 ask_user 调用行渲染，
+// 这样刷新/切会话/重连后待答的题能从历史原样重建，不需要任何补发。
 import { defineStore } from 'pinia'
 import {
   getMessages, getSessionDetail, listModels, listWorkspaces, patchSessionModel,
   fetchAttachmentBlob, uploadAttachment, wsUrl,
 } from '../api'
 import { newClientMsgId } from '../utils/imageAttachments'
+import { findOpenToolCall } from './messageModel'
 
 // 「执行中被拦下」的三条文案：单点定义，本地拦截与后端 busy 回包共用同一口径
 const BUSY_HINT = '会话正在执行中：点右侧「停止」结束当前执行后即可继续发言'
@@ -27,16 +31,18 @@ export function applyEvent(store, ev) {
     case 'tool_call':
       store.messages.push({ role: 'tool', name: ev.name, args: ev.args })
       break
-    case 'tool_result':
-      store.messages.push({ role: 'tool', name: ev.name, result: ev.result })
+    case 'tool_result': {
+      // 一次调用在消息流里只占一条记录：结果就地并进「同名、还没结果」的那条调用记录。
+      // 历史里一次调用本来就是一条行，实时若拆成两条，刷新前后就会一个调用画两个块。
+      const open = findOpenToolCall(store.messages, ev.name)
+      if (open) open.result = ev.result
+      else store.messages.push({ role: 'tool', name: ev.name, result: ev.result })
       // 进度只属于「正在跑的那个工具」：同名结果到达即收口，别的工具的结果不误清
       if (!store.toolProgress || store.toolProgress.name === ev.name) store.toolProgress = null
       break
+    }
     case 'tool_progress': // 预览工具的临时进度（不落库，刷新即消失；最终结论看 tool_result）
       store.toolProgress = { name: ev.name, line: ev.line }
-      break
-    case 'ask_user': // 单题协议：questions 恒为一项（AskUserCard 只渲染首题）
-      store.pendingAsk = { questions: ev.questions || [] }
       break
     case 'confirm_request':
       // summary 是可选的人话摘要（预览重启用）：没有它时对象形状必须一字不变，
@@ -181,7 +187,6 @@ export const useChatStore = defineStore('chat', {
     messages: [],
     streamingContent: '',
     wsStatus: 'disconnected',
-    pendingAsk: null,
     pendingConfirm: null,
     toolProgress: null, // 预览工具的临时进度 {name, line}：不落库、不进消息流，终态即清
     running: false,
@@ -246,7 +251,6 @@ export const useChatStore = defineStore('chat', {
         })
       }
       this.streamingContent = ''
-      this.pendingAsk = null
       this.pendingConfirm = null
       this.toolProgress = null // 临时进度不跨会话：切会话/重开时一并抹掉
       // 执行态一律以服务端为准，不在这里猜：DB 的 status='running' 在进程崩溃后会滞留
@@ -353,8 +357,8 @@ export const useChatStore = defineStore('chat', {
     },
     submitAsk(answers) {
       // 旧 ask_answer/ask_choice 已随后端删除；单题协议下 answers 恒为一项。
-      // 仅上行成功才清卡片；失败保留，连接恢复后用户可重试同一操作
-      if (this._uplink({ type: 'ask_submit', answers })) this.pendingAsk = null
+      // 卡片状态由结果行到达时翻转，本地不清任何字段：上行失败时卡片自然还在，用户可重试。
+      this._uplink({ type: 'ask_submit', answers })
     },
     declineAsk() {
       // 「不再提问，自行决定」：不是取消执行，而是把决定权交还模型并继续本轮。
@@ -363,7 +367,7 @@ export const useChatStore = defineStore('chat', {
         answer: '用户选择「自行决定」，不再回答本题。请按最合理默认继续，本轮及后续不要再提问，'
           + '并在最终答复中说明你采用了哪些假设。',
       }
-      if (this._uplink({ type: 'ask_submit', answers: [answer] })) this.pendingAsk = null
+      this._uplink({ type: 'ask_submit', answers: [answer] })
     },
     confirm(approved) {
       if (this._uplink({ type: 'confirm', approved })) this.pendingConfirm = null
@@ -373,7 +377,6 @@ export const useChatStore = defineStore('chat', {
     },
     cancel() {
       this._uplink({ type: 'cancel' })
-      this.pendingAsk = null
       this.pendingConfirm = null
       this.toolProgress = null // 用户点了「停止」：那行进度当场作废，不等后端回执
       // 后端 hub.cancel 会一并丢弃未注入的插话（不落库）：本地同步摘掉那些「排队中」气泡，

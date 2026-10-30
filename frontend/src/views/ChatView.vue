@@ -38,7 +38,6 @@ onMounted(() => store.loadWorkspaces())
         :messages="store.messages"
         :streaming="store.streamingContent"
         :streaming-thinking="store.streamingThinking"
-        :pending-ask="store.pendingAsk"
         :pending-confirm="store.pendingConfirm"
         :has-session="!!store.currentSessionId"
       />

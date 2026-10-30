@@ -1,10 +1,12 @@
 <script setup>
 // 中栏对话流：无会话空态（大标题+副标题）/ 消息渲染（user 右侧浅蓝气泡、assistant Markdown 高亮、
-// tool 折叠块与预览卡、error 红气泡+重试）/ 流式气泡（streamingContent 非空才渲染）/ 消息流底部
-// 插入确认卡（pendingConfirm：写入确认／重启预览）与提问卡（pendingAsk）。
+// tool 折叠块与预览卡、提问卡、error 红气泡+重试）/ 流式气泡（streamingContent 非空才渲染）/
+// 消息流底部插入确认卡（pendingConfirm：写入确认／重启预览）。
+// 提问卡不在此列：它是消息流的一部分，由 ask_user 调用行渲染（见 isAskCard）。
 // 滚动策略：新消息/新卡片强制滚底；流式增量仅在用户已贴底时跟随，不打断上翻阅读。
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useChatStore } from '../stores/chat'
+import { normalizeMessages } from '../stores/messageModel'
 import MarkdownView from './MarkdownView.vue'
 import ToolCallBlock from './ToolCallBlock.vue'
 import AskUserCard from './AskUserCard.vue'
@@ -17,7 +19,6 @@ const props = defineProps({
   messages: { type: Array, default: () => [] },
   streaming: { type: String, default: '' },
   streamingThinking: { type: String, default: '' },
-  pendingAsk: { type: Object, default: null },
   pendingConfirm: { type: Object, default: null },
   hasSession: { type: Boolean, default: false },
 })
@@ -43,37 +44,43 @@ const PREVIEW_TOOL_NAMES = ['preview_status', 'preview_logs', 'preview_restart']
 // 漏改的后果是落回通用折叠块，不会静默出错。
 const PAGE_TOOL_NAMES = ['preview_page']
 
-function toolNameOf(m) {
-  return m.name ?? m.tool_name ?? ''
-}
+// 渲染前统一归一化：实时事件形状与历史行形状都过这一个函数，组件只认归一化后的字段。
+// 归一化后一次工具调用恒为一条记录（args 与 result 同体），所以「call 行/result 行」的
+// 区分不再存在，卡片判定只看有没有结果。
+const view = computed(() => normalizeMessages(props.messages))
 
 function isPreviewTool(m) {
-  return PREVIEW_TOOL_NAMES.includes(toolNameOf(m))
+  return PREVIEW_TOOL_NAMES.includes(m.name || '')
 }
 
 function isPageTool(m) {
-  return PAGE_TOOL_NAMES.includes(toolNameOf(m))
+  return PAGE_TOOL_NAMES.includes(m.name || '')
 }
 
-// 一次调用在实时流里是两条 message（tool_call 行 + tool_result 行）：
-// 只有「已出结果」或「它就是最后一条（仍在进行）」才渲染预览卡，
-// 否则结果到达后那张进行中的卡会永久停在「正在重启预览…」，而刷新后又只剩一张
+// 提问卡：ask_user 调用行一律渲染成卡片，待答/已答由有没有结果行决定（见 AskUserCard）。
+// 题目已在归一化阶段整形好；没有题目（模型给了空参数）就落回折叠块，不画一张空卡。
+function isAskCard(m) {
+  return m.name === 'ask_user' && !!m.questions?.length
+}
+
+// 有结果就画终态卡；没结果时只有「消息流最后一条」才画进行中卡——
+// 更早的无结果记录只可能是进程崩溃留下的孤儿（正常中断会补写结果行），
+// 画成进行中会让人以为又在重启
 function isPreviewCard(m, i) {
-  return isPreviewTool(m) && !!(m.result || m.tool_result || i === props.messages.length - 1)
+  return isPreviewTool(m) && !!(m.result || i === view.value.length - 1)
 }
 
-// 与 isPreviewCard 同一道闸：实时流里 call 行与 result 行是两条 message，
-// 只给「有结果」或「仍是最后一条」的那条画卡，避免进行中的卡片永久停住。
+// 与 isPreviewCard 同一道闸：归一化后一次调用恒为一条记录，只看有没有结果
 function isPageCard(m, i) {
-  return isPageTool(m) && !!(m.result || m.tool_result || i === props.messages.length - 1)
+  return isPageTool(m) && !!(m.result || i === view.value.length - 1)
 }
 
 // 进度只给「消息流最后一条、还没有结果」的那张卡：历史卡片复活进度条会让人以为又在重启
 function liveProgress(m, i) {
-  if (m.result || m.tool_result) return null
-  if (i !== props.messages.length - 1) return null
+  if (m.result) return null
+  if (i !== view.value.length - 1) return null
   const p = store.toolProgress
-  return p && p.name === toolNameOf(m) ? p : null
+  return p && p.name === (m.name || '') ? p : null
 }
 
 // 确认卡按工具换口径：写入确认（args 摘要）／重启预览（后端给的人话 summary）
@@ -96,7 +103,7 @@ function scrollToBottom() {
   })
 }
 watch(() => props.messages.length, scrollToBottom) // 新消息（user/tool/error/assistant）强制滚底
-watch(() => [props.pendingAsk, props.pendingConfirm], scrollToBottom) // 卡片插入滚底
+watch(() => props.pendingConfirm, scrollToBottom) // 确认卡插入滚底（提问卡已在消息流里，由 messages.length 覆盖）
 watch(
   () => props.streaming,
   () => {
@@ -115,11 +122,11 @@ onMounted(scrollToBottom)
       <p class="zc-empty-sub">从左侧选择一个会话继续，或新建会话开始探索</p>
     </div>
     <template v-else>
-      <div v-if="!messages.length && !streaming" class="zc-empty zc-empty-lite">
+      <div v-if="!view.length && !streaming" class="zc-empty zc-empty-lite">
         <p class="zc-empty-sub">开始你的第一句话吧</p>
       </div>
 
-      <template v-for="(m, i) in messages" :key="i">
+      <template v-for="(m, i) in view" :key="i">
         <!-- user：右侧浅蓝气泡（图片网格在文字之前；queued = 执行中发出的插话，等下一个工具边界注入） -->
         <div v-if="m.role === 'user'" class="zc-msg is-user">
           <div class="zc-bubble">
@@ -144,11 +151,12 @@ onMounted(scrollToBottom)
         <div v-else-if="m.role === 'notice'" class="zc-msg is-notice">
           <span class="zc-notice-text">{{ m.content }}</span>
         </div>
-        <!-- tool：todo_write 渲染任务卡；preview_* 渲染预览卡（还要过 isPreviewCard 的闸——实时流里
-             call 行与 result 行是两条 message，只给「有结果」或「仍在进行」的那条画卡）；其余落回通用折叠块。
-             实时消息字段为 name/args/result，历史消息为 tool_name/tool_result，两者都认。 -->
+        <!-- tool：todo_write 渲染任务卡；preview_* 渲染预览卡（还要过 isPreviewCard 的闸——
+             只有「有结果」或「仍在进行」的那条画卡）；其余落回通用折叠块。
+             字段一律是归一化后的 name/args/result，实时与历史同形（见 messageModel.js）。 -->
         <div v-else-if="m.role === 'tool'" class="zc-msg is-tool">
-          <TodoCard v-if="m.name === 'todo_write' && m.args && m.args.todos" :todos="m.args.todos" />
+          <AskUserCard v-if="isAskCard(m)" :questions="m.questions" :result="m.result" />
+          <TodoCard v-else-if="m.name === 'todo_write' && m.args && m.args.todos" :todos="m.args.todos" />
           <PageInspectCard v-else-if="isPageCard(m, i)" :msg="m" :progress="liveProgress(m, i)" />
           <PreviewCard v-else-if="isPreviewCard(m, i)" :msg="m" :progress="liveProgress(m, i)" />
           <ToolCallBlock v-else :msg="m" />
@@ -186,9 +194,6 @@ onMounted(scrollToBottom)
           </div>
         </div>
       </div>
-
-      <!-- 提问卡：pendingAsk 时插入消息流底部 -->
-      <AskUserCard v-if="pendingAsk" :ask="pendingAsk" />
     </template>
   </div>
 </template>

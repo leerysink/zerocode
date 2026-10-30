@@ -1,15 +1,15 @@
 <script setup>
 // 工具调用块：role=tool 消息折叠展示——头部 `🔧 工具名`，展开看 JSON 参数/结果。
-// 实时消息字段为 name/args/result，历史消息为 tool_name/tool_args/tool_result，二者都兼容。
+// msg 一律是归一化后的记录（name/args/result），实时与历史同形，见 stores/messageModel.js。
 // 写入类工具的 file_change 事件挂在最近的 tool 消息上（store.applyEvent），有 diff 时在其下渲染 DiffBlock。
 import { computed } from 'vue'
 import DiffBlock from './DiffBlock.vue'
 
 const props = defineProps({ msg: { type: Object, required: true } })
 
-const toolName = computed(() => props.msg.name ?? props.msg.tool_name ?? 'tool')
-const args = computed(() => props.msg.args ?? props.msg.tool_args ?? null)
-const result = computed(() => props.msg.result ?? props.msg.tool_result ?? null)
+const toolName = computed(() => props.msg.name || 'tool')
+const args = computed(() => props.msg.args ?? null)
+const result = computed(() => props.msg.result ?? null)
 
 const pretty = (v) => JSON.stringify(v, null, 2)
 </script>

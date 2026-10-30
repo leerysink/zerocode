@@ -134,10 +134,10 @@ describe('PreviewCard 状态（规格 §8.2）', () => {
     expect(w.text()).toContain('本次任务还可重启 1 次')
   })
 
-  it('历史消息（只有 tool_name / tool_result，没有 args）也能渲染', () => {
+  it('归一化后的历史记录（只有 name / result，没有 args）也能渲染', () => {
     const w = mountCard({
-      role: 'tool', tool_name: 'preview_status',
-      tool_result: { ok: true, status: 'stopped', healthy: false, probe: '', url: '', hint: '预览未运行' },
+      role: 'tool', name: 'preview_status',
+      result: { ok: true, status: 'stopped', healthy: false, probe: '', url: '', hint: '预览未运行' },
     })
     expect(w.text()).toContain('预览未就绪')
     expect(w.text()).toContain('预览未运行')

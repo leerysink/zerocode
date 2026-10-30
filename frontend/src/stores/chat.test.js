@@ -17,7 +17,7 @@ vi.mock('../api', async (importOriginal) => ({
 function mk() {
   return {
     messages: [], streamingContent: '', streamingThinking: '', todoList: [],
-    compacting: false, pendingAsk: null, currentSessionId: 1,
+    compacting: false, currentSessionId: 1,
     toolProgress: null, pendingConfirm: null,
     pendingEcho: '', pendingEchoId: '', pendingOutbox: {}, rejectedDraft: '',
     rejectedAttachments: [], running: false, visionSupported: false,
@@ -37,6 +37,22 @@ describe('applyEvent 新事件', () => {
     applyEvent(s, { type: 'message_done', content: '答' })
     expect(s.messages[0]).toEqual({ role: 'assistant', content: '答', reasoning: '想' })
     expect(s.streamingThinking).toBe('')
+  })
+  // 工具轮也发收口之后，一次执行会有多条 assistant 消息：思考留痕必须各归各轮。
+  it('多轮执行里思考留痕各归各轮，不串到下一轮', () => {
+    const s = mk()
+    applyEvent(s, { type: 'reasoning_delta', content: '先想想' })
+    applyEvent(s, { type: 'token', delta: '让我看看' })
+    applyEvent(s, { type: 'message_done', content: '让我看看' })
+    applyEvent(s, { type: 'tool_call', name: 'read_file', args: {} })
+    applyEvent(s, { type: 'tool_result', name: 'read_file', result: { ok: true } })
+    applyEvent(s, { type: 'reasoning_delta', content: '再想想' })
+    applyEvent(s, { type: 'token', delta: '好了' })
+    applyEvent(s, { type: 'message_done', content: '好了' })
+    expect(s.messages.filter(m => m.role === 'assistant')).toEqual([
+      { role: 'assistant', content: '让我看看', reasoning: '先想想' },
+      { role: 'assistant', content: '好了', reasoning: '再想想' },
+    ])
   })
   it('todo_sync 覆盖清单', () => {
     const s = mk()
@@ -272,7 +288,7 @@ describe('tool_progress 与确认卡 summary', () => {
     applyEvent(s, { type: 'tool_progress', name: 'preview_restart', line: 'x' })
     applyEvent(s, { type: 'tool_result', name: 'preview_restart', result: { ok: true } })
     expect(s.toolProgress).toBe(null)
-    expect(s.messages.length).toBe(2)
+    expect(s.messages.length).toBe(1)   // 调用与结果折叠成一条记录（见 messageModel.js）
   })
 
   it('别的工具的结果不误清当前进度', () => {
