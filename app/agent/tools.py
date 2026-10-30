@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 from sqlalchemy import text
 
-from app.agent.llm import PREVIEW_TOOL_NAMES
+from app.agent.llm import PREVIEW_TOOL_NAMES, DB_TOOL_NAMES
 
 MAX_READ_BYTES = 200 * 1024
 BINARY_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".pdf", ".zip", ".gz", ".exe", ".dll", ".so", ".bin", ".db", ".sqlite", ".mp3", ".mp4"}
@@ -126,6 +126,11 @@ async def execute_tool(ctx: ToolContext, name: str, args: dict, *, confirmed: bo
         # 模型需要读到「Docker 没开」「已有部署任务」这类可行动的原因并向用户解释。
         from app.agent.preview_tools import run_preview_tool
         return await run_preview_tool(ctx, name, args, confirmed=confirmed)
+    if name in DB_TOOL_NAMES:
+        # 数据库工具（规格 docs/specs/2026-10-30-agent-db-verification-tools.md §5）：
+        # 与预览工具同款约定——失败一律是正常结果，模型要读到可行动的原因。
+        from app.agent.db_tools import run_db_tool
+        return await run_db_tool(ctx, name, args, confirmed=confirmed)
     if name == "list_dir":
         d = resolve_in_workspace(ctx.root, args.get("path"))
         if not d.is_dir():

@@ -360,3 +360,19 @@ Agent 通过 `ask_user` 向用户提问时的规范口径。旧称「问题列�
 
 - `model_config.supports_vision = true` 的对话模型；没有默认模型时用全局 `llm.supports_vision`。
 - 只有视觉模型能发送带图消息；能力位默认 false，必须在设置里显式打开。
+
+## 测试库（test db）
+
+- 「运行测试库」语境下的规范释义：**承载测试数据集的数据库**（应用 `<slug>_dev` 库 + 一份种子/测试数据），
+  用作 Agent 数据验证的基准状态。
+- 它**不是**测试用例集合（pytest/vitest 套件），也**不是**平台内核自测用的 `zerocode_test` 库——
+  后两者在本功能域内明确排除。
+
+## Agent 数据库工具（db_query / db_write）
+
+给平台 Agent 的数据验证工具对，与预览工具同为「零命令面、应用身份服务端解析」风格。
+
+- **db_query**：只读查询，env 可选 dev/prod；不带 expect 时回结果表格供模型阅读，带 expect 时工具内机器比对回判定。
+- **db_write**：仅 dev 库的写通道（INSERT/UPDATE 等），逐条串行遇错即停，执行前走用户确认卡；schema 不暴露 env 参数。
+- **断言（expect）**：Agent 提交的期望值，三档形态——`count`（命中行数）/ `scalar`（单值）/ `rows`（排序后全行比对）。断言判定由工具完成，不由模型目测。
+- 「验证数据准确性」不是第三个工具：它是 db_query+断言 与 db_write 组合出来的**用法**。

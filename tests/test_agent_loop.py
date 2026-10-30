@@ -465,7 +465,8 @@ async def test_preview_tools_mounted_only_for_app_workspace(test_engine, tmp_pat
     sid, aid, sf = await mk_app_session(test_engine, tmp_path)
     llm = ScriptedLLM([[delta("好"), *done("好了")]])
     await mk_runner(sf, llm, Recorder()).run(sid, "起个预览", asyncio.Event())
-    assert tool_names(llm)[-3:] == ["preview_status", "preview_logs", "preview_restart"]
+    assert tool_names(llm)[-5:] == ["preview_status", "preview_logs", "preview_restart",
+                                    "db_query", "db_write"]
     assert "<preview>" in llm.received[0][0]["content"]
     assert "vue3-fastapi" in llm.received[0][0]["content"]
 
@@ -479,7 +480,9 @@ async def test_no_preview_tools_without_app_row(test_engine, tmp_path):
     await mk_runner(sf, llm, Recorder()).run(sid, "起个预览", asyncio.Event())
     names = tool_names(llm)
     assert not any(n.startswith("preview_") for n in names)
+    assert not any(n.startswith("db_") for n in names)
     assert "<preview>" not in llm.received[0][0]["content"]
+    assert "<database>" not in llm.received[0][0]["content"]
 
 
 @pytest.mark.asyncio
@@ -496,6 +499,8 @@ async def test_duplicate_workspace_binding_fails_closed_with_note(test_engine, t
     llm = ScriptedLLM([[delta("好"), *done("好了")]])
     await mk_runner(sf, llm, Recorder()).run(sid, "起个预览", asyncio.Event())
     assert not any(n.startswith("preview_") for n in tool_names(llm))
+    assert not any(n.startswith("db_") for n in tool_names(llm))   # 数据库工具同闸 fail closed
+    assert "<database>" not in llm.received[0][0]["content"]
     assert "绑定了多个应用" in llm.received[0][0]["content"]
 
 
@@ -785,3 +790,69 @@ async def test_db_failure_reading_app_row_degrades_to_idle_turn(test_engine, tmp
     assert tr["result"]["ok"] is False and tr["result"]["status"] == "running"
     assert "预览已在运行，请重试并在确认框中选择确认" in tr["result"]["error"]
     assert "工具执行异常" not in json.dumps(tr["result"], ensure_ascii=False)
+
+
+# ---------- db_write 确认流（规格 2026-10-30 §3 US-12/US-15，ADR-0027） ----------
+
+@pytest.mark.asyncio
+async def test_db_write_always_confirms_and_passes_flag(test_engine, tmp_path, monkeypatch):
+    """US-12/US-15：db_write 恒弹确认卡——mk_runner 默认 agent.write_confirm=False 也照弹；
+    摘要逐条列 op 且无 WHERE 的 delete 标危险；批准后 execute_tool 收到 confirmed=True。"""
+    from app.agent import db_tools
+    sid, aid, sf = await mk_app_session(test_engine, tmp_path, slug="dbwok",
+                                        dev_port=8297, prod_port=8296)
+    rec, asked, captured = Recorder(), [], {}
+
+    async def approve(session_id, payload):
+        asked.append(payload)
+        return True
+
+    async def fake_run(ctx, name, args, *, confirmed=False):
+        captured.update(name=name, confirmed=confirmed)
+        return {"ok": True, "results": []}
+
+    monkeypatch.setattr(db_tools, "run_db_tool", fake_run)
+    turns = [done(None, [tool_call("c1", "db_write", statements=["delete from t"])]), done("好了")]
+    await mk_runner(sf, ScriptedLLM(turns), rec, confirm=approve).run(
+        sid, "清一下数据", asyncio.Event())
+    ev = next(e for e in rec.events if e["type"] == "confirm_request")
+    assert ev["tool"] == "db_write"
+    assert "[delete]" in ev["summary"] and "危险" in ev["summary"]
+    assert asked and asked[0]["tool"] == "db_write" and asked[0]["summary"] == ev["summary"]
+    assert captured == {"name": "db_write", "confirmed": True}
+
+
+@pytest.mark.asyncio
+async def test_db_write_declined_never_executes(test_engine, tmp_path, monkeypatch):
+    """US-12：用户拒绝 → 一条不执行，模型收到「用户拒绝」的正常结果继续对话。"""
+    from app.agent import db_tools
+    sid, aid, sf = await mk_app_session(test_engine, tmp_path, slug="dbwno",
+                                        dev_port=8299, prod_port=8298)
+    executed = []
+
+    async def deny(session_id, payload):
+        return False
+
+    async def fake_run(ctx, name, args, *, confirmed=False):
+        executed.append(name)
+        return {"ok": True}
+
+    monkeypatch.setattr(db_tools, "run_db_tool", fake_run)
+    turns = [done(None, [tool_call("c1", "db_write",
+                                   statements=["insert into t values (1)"])]), done("好吧")]
+    rec = Recorder()
+    await mk_runner(sf, ScriptedLLM(turns), rec, confirm=deny).run(
+        sid, "灌点数据", asyncio.Event())
+    assert executed == []
+    tr = next(e for e in rec.events if e["type"] == "tool_result")
+    assert tr["result"]["ok"] is False and "拒绝" in tr["result"]["error"]
+
+
+@pytest.mark.asyncio
+async def test_db_prompt_mounted_only_for_app_workspace(test_engine, tmp_path):
+    """US-17：应用工作区随工具挂载 <database> 使用口径；指引与工具同生同灭。"""
+    sid, aid, sf = await mk_app_session(test_engine, tmp_path, slug="dbpmt",
+                                        dev_port=8301, prod_port=8300)
+    llm = ScriptedLLM([[delta("好"), *done("好了")]])
+    await mk_runner(sf, llm, Recorder()).run(sid, "看看数据", asyncio.Event())
+    assert "<database>" in llm.received[0][0]["content"]

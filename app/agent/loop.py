@@ -10,6 +10,7 @@ import logging
 from pathlib import Path
 from app.agent.preview_tools import (build_preview_prompt, confirm_summary, fetch_app,
                                      need_confirm, resolve_session_app)
+from app.agent.db_tools import build_db_prompt, db_confirm_summary
 from app.agent.prompts import build_system_prompt
 from app.agent.tools import ToolContext, ToolError, execute_tool
 from app.agent.mentions import expand_mentions
@@ -381,7 +382,11 @@ class AgentRunner:
         # 非应用工作区一个 preview_* 都不给模型看——不给它一个「调了才发现不能用」的假工具。
         app, preview_note = await self._resolve_app(session_id)
         preview_prompt = preview_note or (build_preview_prompt(app["stack"]) if app else None)
-        tools = _TOOLS + PREVIEW_TOOLS if app else _TOOLS
+        if app:
+            # 数据库指引与工具同生同灭：多应用 fail closed（preview_note）时两者都不注入。
+            # <database> 放在 <preview> 之前——system 尾部锚定 </preview> 是既有契约
+            preview_prompt = build_db_prompt() + (preview_prompt or "")
+        tools = _TOOLS + PREVIEW_TOOLS + DB_TOOLS if app else _TOOLS
         # 先消费上一次 run 停止/收尾前没来得及注入的插话，再落本次新问题：
         # 保证 DB seq 与对话顺序一致（插话发生在先，新问题在后）
         await self._drain_steering(session_id, root, [])
@@ -513,6 +518,17 @@ class AgentRunner:
                 if not approved:
                     return {"ok": False, "error": "用户拒绝重启预览"}
                 confirmed = True
+        elif name == "db_write":
+            # 写库恒确认，不受 agent.write_confirm 开关影响（ADR-0027）：文件写入可 git 回滚，
+            # 数据库写入不可回滚。摘要逐条列 op 与危险标记，用户在确认卡里看到将发生什么。
+            summary = db_confirm_summary(args.get("statements") or [])
+            await self.send({"type": "confirm_request", "tool": name, "args": args,
+                             "summary": summary})
+            approved = await self.confirm(session_id, {"tool": name, "args": args,
+                                                       "summary": summary})
+            if not approved:
+                return {"ok": False, "error": "用户拒绝本次数据库写入"}
+            confirmed = True
         try:
             return await execute_tool(ctx, name, args, confirmed=confirmed)
         except ToolError as e:
@@ -523,4 +539,4 @@ class AgentRunner:
 class _Cancelled(Exception):
     pass
 
-from app.agent.llm import PREVIEW_TOOLS, TOOLS as _TOOLS
+from app.agent.llm import PREVIEW_TOOLS, DB_TOOLS, TOOLS as _TOOLS

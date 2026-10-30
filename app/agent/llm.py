@@ -97,6 +97,35 @@ PREVIEW_TOOLS = [
 
 PREVIEW_TOOL_NAMES = ("preview_status", "preview_logs", "preview_restart")
 
+# 数据库工具（规格 docs/specs/2026-10-30-agent-db-verification-tools.md）：零命令面、无 app 参数，
+# 应用身份由服务端解析；db_write 与 expect 参数按工单逐票补齐。
+DB_TOOLS = [
+    {"type": "function", "function": {
+        "name": "db_query",
+        "description": "对当前应用的库执行一条只读 SELECT 查询并返回结果表（dev/prod 均只读）",
+        "parameters": {"type": "object", "properties": {
+            "sql": {"type": "string", "description": "单条 SELECT 语句"},
+            "env": {"type": "string", "enum": ["dev", "prod"],
+                    "description": "查哪套库，默认 dev"},
+            "expect": {"type": "object", "properties": {
+                "type": {"type": "string", "enum": ["count", "scalar", "rows"],
+                         "description": "断言档：行数/单值/全行比对"},
+                "value": {"description": "期望值：count=整数，scalar=单值，rows=行对象数组"}},
+                "required": ["type"],
+                "description": "可选机器断言；给出后由工具判定 passed，不给则模型自己看结果"}},
+            "required": ["sql"]}}},
+    {"type": "function", "function": {
+        "name": "db_write",
+        "description": ("对当前应用的 dev 库执行写入 SQL（灌测试数据/修数据），需用户确认后执行；"
+                        "同一连接按序串行、遇错即停，已成功的不回滚。prod 库不可写"),
+        "parameters": {"type": "object", "properties": {
+            "statements": {"type": "array", "items": {"type": "string"},
+                           "description": "按执行顺序的 SQL 语句（INSERT/UPDATE/DELETE/表级 DDL）"}},
+            "required": ["statements"]}}},
+]
+
+DB_TOOL_NAMES = ("db_query", "db_write")
+
 def _reasoning_of(delta):
     """兼容取 reasoning_content：SDK 具名属性优先，其次 model_extra（未知字段兜底）。"""
     if delta is None:

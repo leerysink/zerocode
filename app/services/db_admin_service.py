@@ -61,15 +61,19 @@ def target_engine_url(request, cred: dict) -> str:
 
 async def log_operation(sf, *, app_id: int, actor_user_id, env: str, op_type: str,
                         sql_text, target_table, status: str, affected=None,
-                        error=None, duration_ms=None) -> None:
-    """向平台库 db_operation_log 写一条审计（成功/失败均调）。"""
+                        error=None, duration_ms=None, source: str = "console",
+                        session_id=None) -> None:
+    """向平台库 db_operation_log 写一条审计（成功/失败均调）。
+
+    source 区分写入方：console=人工操作台，agent=聊天页数据库工具（此时 session_id 记会话）。"""
     async with sf() as s:
         await s.execute(text(
             "INSERT INTO db_operation_log (app_id, actor_user_id, env, op_type, sql_text, "
-            "target_table, status, affected, error, duration_ms) "
-            "VALUES (:a, :u, :e, :o, :q, :t, :st, :af, :er, :d)"),
+            "target_table, status, affected, error, duration_ms, source, session_id) "
+            "VALUES (:a, :u, :e, :o, :q, :t, :st, :af, :er, :d, :src, :sid)"),
             {"a": app_id, "u": actor_user_id, "e": env, "o": op_type, "q": sql_text,
-             "t": target_table, "st": status, "af": affected, "er": error, "d": duration_ms})
+             "t": target_table, "st": status, "af": affected, "er": error, "d": duration_ms,
+             "src": source, "sid": session_id})
         await s.commit()
 
 
@@ -232,49 +236,72 @@ async def execute_sql(request, slug: str, env: str, sql: str) -> dict:
         await eng.dispose()
 
 
-async def execute_batch(request, slug: str, env: str, statements: list[str]) -> list[dict]:
-    """同一引擎/同一连接内**按序**执行多条 SQL，逐条返回结果（不记审计）。
-
-    只建一次连接：N 条语句重连 N 次既慢又会让"已成功的语句"落在不同会话里。
-    审计留到 API 层逐条写（保持 service 只管执行、API 只管归属/留痕/状态码的分工）。
+async def run_batch_on(conn, statements: list[str]) -> list[dict]:
+    """在**已打开的连接**上按序执行多条 SQL，逐条返回结果（不建连、不记审计）。
 
     遇错即停：某条抛异常 → 该条 {status:'error', error:str(e)}，其后所有可执行条
     {status:'skipped'} 并立即 break。**不回滚**已成功的条目——每条在 execute_one 内已各自提交，
     整体回滚反而会把用户已经看到的成功结果抹掉（ADR 0007）。
 
-    异常原样上抛（不缀号、不做行号定位），错误原文是用户唯一能拿去改 SQL 的东西。
-
     两条不进结果集的语句：
     - 空白/纯注释段不送 PG：PG 对空语句报错会让一个杂散空段误停整批；也不占结果位。
-    - index 始终是**原数组下标**，前端据此显示"第 N 条"，不靠数组长度猜。
-    所以统一口径：结果集只含可执行语句。建连阶段的异常仍上抛给 API 换 503——
-    那时一条都没执行，没有可展示的逐条结果。"""
+    - index 始终是**原数组下标**，调用方据此显示"第 N 条"，不靠数组长度猜。
+
+    REST 批量端点与 Agent 的 db_write 共用本函数：串行语义只此一份（规格 2026-10-30 §2）。"""
+    results = []
+    for index, sql in enumerate(statements):
+        if not has_executable_content(sql):
+            continue
+        t0 = time.monotonic()
+        item = {"index": index, "op": classify_op(sql), "sql": sql}
+        try:
+            outcome = await execute_one(conn, sql)
+        except Exception as e:
+            item.update(status="error", error=str(e),
+                        duration_ms=int((time.monotonic() - t0) * 1000))
+            results.append(item)
+            for j in range(index + 1, len(statements)):
+                if has_executable_content(statements[j]):
+                    results.append({"index": j, "op": classify_op(statements[j]),
+                                    "sql": statements[j], "status": "skipped"})
+            break
+        item.update(status="ok", duration_ms=int((time.monotonic() - t0) * 1000), **outcome)
+        results.append(item)
+    return results
+
+
+async def audit_batch(sf, *, app_id: int, actor_user_id, env: str, results: list[dict],
+                      source: str = "console", session_id=None) -> None:
+    """把 run_batch_on 的逐条结果落成逐条审计——skipped 的不留痕（没执行的事
+    记 success 或 error 都是凭空捏造一条执行记录）。"""
+    for it in results:
+        if it["status"] == "skipped":
+            continue
+        ok = it["status"] == "ok"
+        await log_operation(
+            sf, app_id=app_id, actor_user_id=actor_user_id, env=env,
+            op_type=it["op"], sql_text=it["sql"], target_table=None,
+            status="success" if ok else "error",
+            affected=(it["affected"] if it["kind"] == "affected" else len(it["rows"])) if ok else None,
+            error=None if ok else it["error"], duration_ms=it["duration_ms"],
+            source=source, session_id=session_id)
+
+
+async def execute_batch(request, slug: str, env: str, statements: list[str]) -> list[dict]:
+    """同一引擎/同一连接内**按序**执行多条 SQL，逐条返回结果（不记审计）。
+
+    只建一次连接：N 条语句重连 N 次既慢又会让"已成功的语句"落在不同会话里。
+    审计留到调用方逐条写（audit_batch，保持 service 只管执行、上层只管归属/留痕的分工）。
+
+    异常原样上抛（不缀号、不做行号定位），错误原文是用户唯一能拿去改 SQL 的东西。
+    建连阶段的异常仍上抛给调用方——那时一条都没执行，没有可展示的逐条结果。"""
     cred = await _cred_or_409(request, slug, env)
     eng = create_async_engine(target_engine_url(request, cred))
-    results = []
     try:
         async with eng.connect() as conn:
-            for index, sql in enumerate(statements):
-                if not has_executable_content(sql):
-                    continue
-                t0 = time.monotonic()
-                item = {"index": index, "op": classify_op(sql), "sql": sql}
-                try:
-                    outcome = await execute_one(conn, sql)
-                except Exception as e:
-                    item.update(status="error", error=str(e),
-                                duration_ms=int((time.monotonic() - t0) * 1000))
-                    results.append(item)
-                    for j in range(index + 1, len(statements)):
-                        if has_executable_content(statements[j]):
-                            results.append({"index": j, "op": classify_op(statements[j]),
-                                            "sql": statements[j], "status": "skipped"})
-                    break
-                item.update(status="ok", duration_ms=int((time.monotonic() - t0) * 1000), **outcome)
-                results.append(item)
+            return await run_batch_on(conn, statements)
     finally:
         await eng.dispose()
-    return results
 
 
 async def list_audit(sf, app_id: int, *, env: str | None = None, op: str | None = None,

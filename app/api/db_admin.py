@@ -174,14 +174,6 @@ async def db_sql_batch(request: Request, app_id: int, env: str, body: SqlBatchIn
     except Exception as e:
         # 建连阶段就失败：实际执行了 0 条，没有逐条结果可展示，因此也不写审计。
         raise HTTPException(503, f"数据库连接失败，请检查 zerocode-pg16：{e}")
-    for it in results:
-        if it["status"] == "skipped":
-            continue  # 没执行的事不留痕：记 success 或 error 都是凭空捏造一条执行记录
-        ok = it["status"] == "ok"
-        await svc.log_operation(
-            sf, app_id=app_id, actor_user_id=actor_id, env=env,
-            op_type=it["op"], sql_text=it["sql"], target_table=None,
-            status="success" if ok else "error",
-            affected=(it["affected"] if it["kind"] == "affected" else len(it["rows"])) if ok else None,
-            error=None if ok else it["error"], duration_ms=it["duration_ms"])
+    # 逐条审计（skipped 不留痕）与 Agent 写通道共用同一实现，口径不漂移
+    await svc.audit_batch(sf, app_id=app_id, actor_user_id=actor_id, env=env, results=results)
     return {"results": results}
