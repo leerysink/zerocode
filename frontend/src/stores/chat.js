@@ -5,13 +5,13 @@
 // / error / status / file_change / todo_sync / compacting / compaction_done / notice(压缩 skip 终态)
 // / busy(执行中被拒的非终态提示) / steering_done(插话已在工具边界被模型看见)
 // / tool_progress(预览工具的临时进度，不落库不进气泡，收到结果/终态即清)
-// / session_title(首条消息自动命名，就地更新侧栏标题)；
+// / session_title(首条消息自动命名，就地更新侧栏标题)
+// / interaction_expired(后端已无这次确认/回答的挂起点：把待答卡收口成已中断并解锁输入)；
 // 终态 = error / status(idle|error)，busy、status(running) 与 steering_done 都不是。
 // message_done 是**轮次收口**而非终态：工具轮在派发工具前也发一次，一次执行可以有多条。
-// ask_user 后端仍会发，但前端**不消费**：提问卡由消息流里的 ask_user 调用行渲染，
-// 这样刷新/切会话/重连后待答的题能从历史原样重建，不需要任何补发。
-// confirm_request 只作**标记**（哪一行在等确认），卡片内容一律从消息行读——已答态靠结果行里的
-// confirm 字段推出，历史里没有事件也能重建；标记本身在重连时由 hub 补发同一份。
+// 提问卡与确认卡都画在消息流的调用行上，但**待答**的那次调用在历史里没有 tool 行（工具行要等
+// 结果回来才落库），所以两类的待答态都还要 ask_user / confirm_request 事件：重连时 hub 补发
+// 同一份，reducer 找不到可附着的行就合成一条无结果调用行（ADR 0029 的「靠行重建」只覆盖已答态）。
 import { defineStore } from 'pinia'
 import {
   getMessages, getSessionDetail, listModels, listWorkspaces, patchSessionModel,
@@ -53,6 +53,16 @@ export function applyEvent(store, ev) {
     case 'tool_progress': // 预览工具的临时进度（不落库，刷新即消失；最终结论看 tool_result）
       store.toolProgress = { name: ev.name, line: ev.line }
       break
+    case 'ask_user': {
+      // 提问卡画在 ask_user 调用行上（ADR 0029）。实时流里 tool_call 已先把行建好，这里不动它；
+      // 刷新/切会话后历史里**没有**待答调用的 tool 行（工具行要等答案回来才落库），重连补发的
+      // 问题只能自己合成一条——丢弃就等于把题目连同唯一的回答入口一起抹掉，用户答不了也停不掉。
+      const open = findOpenToolCall(store.messages, 'ask_user')
+      if (!open) {
+        store.messages.push({ role: 'tool', name: 'ask_user', args: { questions: ev.questions || [] } })
+      }
+      break
+    }
     case 'confirm_request': {
       // 事件只作**标记**：卡片内容一律从消息行读（历史里没有事件，靠行才能重建已答态）。
       // 「本次调用需要确认」这件事不在任何行里——它取决于写入确认开关与预览/写库的运行时判据，
@@ -63,7 +73,37 @@ export function applyEvent(store, ev) {
         // summary 只服务待答态（hub 补发会一并带回来）；已答态一律回落参数摘要——
         // summary 不落消息行，拿它渲染已答态就会让实时与刷新后叉开。
         open.confirmSummary = ev.summary || ''
+      } else {
+        // 刷新/切会话回来的路径：待确认的那次调用在历史里**没有** tool 行（工具行要等执行完
+        // 才落库），补发的标记没有行可贴。丢弃等于把卡片连同唯一的出口一起抹掉——用户既确认
+        // 不了也看不见，runner 的 future 永久挂起。这里合成一条无结果调用行，等价于实时流里
+        // 先到的 tool_call（args 事件本身就带着，不必回读 assistant 行的 tool_args）。
+        store.messages.push({
+          role: 'tool', name: ev.tool, args: ev.args,
+          awaitingConfirm: true, confirmSummary: ev.summary || '',
+        })
       }
+      break
+    }
+    case 'interaction_expired': {
+      // 后端收到 confirm / ask_submit 时已无挂起点（进程重启、或执行早已收口）且该会话不在跑。
+      // 不回这一帧的话，卡片永远停在可点状态、点下去零反馈，输入框也一直被执行态锁着。
+      // 收口 = 给待答行补一条「已中断」的配对结果：状态从行上推出来，与真实中断留痕同形。
+      let closed = false
+      for (const m of store.messages) {
+        // 「还没结果」两套形状都要认：实时记录用 result，openSession 装入的历史行用 tool_result。
+        // 只认 result 会把已答的历史行当成待答，一帧下去答案就被覆盖成已中断。
+        if (m.role !== 'tool' || m.result !== undefined || m.tool_result !== undefined) continue
+        const openAsk = (m.name ?? m.tool_name) === 'ask_user'
+        if (!m.awaitingConfirm && !openAsk) continue
+        m.result = { cancelled: true, ...(m.awaitingConfirm ? { confirm: 'cancelled' } : {}) }
+        delete m.awaitingConfirm
+        delete m.confirmSummary
+        closed = true
+      }
+      store.running = false
+      store.toolProgress = null
+      store.hint = closed ? '后端已无这次确认/回答的记录（执行已中断或后端重启），卡片已收口' : ''
       break
     }
     case 'message_done': // 整段回复固化（附带思考留痕）
@@ -371,16 +411,18 @@ export const useChatStore = defineStore('chat', {
     submitAsk(answers) {
       // 旧 ask_answer/ask_choice 已随后端删除；单题协议下 answers 恒为一项。
       // 卡片状态由结果行到达时翻转，本地不清任何字段：上行失败时卡片自然还在，用户可重试。
-      this._uplink({ type: 'ask_submit', answers })
+      if (!this._uplink({ type: 'ask_submit', answers })) this.hint = OFFLINE_HINT
     },
     declineAsk() {
       // 「不再提问，自行决定」：不是取消执行，而是把决定权交还模型并继续本轮。
       // 固定答复即协议，常量单点定义在 messageModel.js——已答态靠它逐字识别并标注「自行决定」。
-      this._uplink({ type: 'ask_submit', answers: [{ answer: DECLINE_ANSWER }] })
+      const answers = [{ answer: DECLINE_ANSWER }]
+      if (!this._uplink({ type: 'ask_submit', answers })) this.hint = OFFLINE_HINT
     },
     confirm(approved) {
-      // 卡片状态由结果行里的 confirm 字段翻转，本地不清任何字段：上行失败时卡片自然还在，可重试。
-      this._uplink({ type: 'confirm', approved })
+      // 卡片状态由结果行里的 confirm 字段翻转，本地不清任何字段：上行失败时卡片自然还在，
+      // 但必须在输入框留一句原因——否则点下去什么也不发生，用户无从判断是没点上还是后端没了。
+      if (!this._uplink({ type: 'confirm', approved })) this.hint = OFFLINE_HINT
     },
     async requestCompact() {
       this._uplink({ type: 'compact' })

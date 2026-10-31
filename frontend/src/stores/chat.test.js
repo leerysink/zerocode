@@ -347,6 +347,85 @@ describe('tool_progress 与确认卡 summary', () => {
     expect(marked[0].args).toEqual({ path: 'b.txt' })
   })
 
+  it('刷新后补发的标记没有可调用的行时，合成一条待答调用行', () => {
+    // 历史里待确认的调用**没有** tool 行：工具行要等执行完才落库。hub 补发的标记若只往
+    // 已有行上贴就会静默丢弃 —— 卡片消失、runner 的 future 永久挂起（既确认不了也停不掉）。
+    const s = mk()
+    s.messages = [{
+      role: 'assistant', content: '方案已确认',
+      tool_args: {
+        tool_calls: [{
+          id: 'c1', type: 'function',
+          function: { name: 'write_file', arguments: '{"path":"a.txt"}' },
+        }],
+      },
+    }]
+    applyEvent(s, { type: 'confirm_request', tool: 'write_file', args: { path: 'a.txt' } })
+    const row = s.messages.at(-1)
+    expect(row.role).toBe('tool')
+    expect(row.name).toBe('write_file')
+    expect(row.args).toEqual({ path: 'a.txt' })
+    expect(row.awaitingConfirm).toBe(true)
+  })
+
+  it('ask_user 事件：已有待答调用行时不重复建行', () => {
+    const s = mk()
+    applyEvent(s, { type: 'tool_call', name: 'ask_user', args: { questions: [{ question: '选哪个' }] } })
+    applyEvent(s, { type: 'ask_user', questions: [{ question: '选哪个', options: [{ label: 'A' }] }] })
+    expect(s.messages.filter(m => m.name === 'ask_user')).toHaveLength(1)
+  })
+
+  it('刷新后补发的 ask_user 没有调用行可附着时，合成一条待答行', () => {
+    // 与确认卡同一处缺口：ask_user 的工具行要等答案回来才落库，历史里没有它。
+    const s = mk()
+    s.messages = [{
+      role: 'assistant', content: '先确认一下',
+      tool_args: {
+        tool_calls: [{
+          id: 'c1', type: 'function',
+          function: { name: 'ask_user', arguments: '{"questions":[{"question":"选哪个"}]}' },
+        }],
+      },
+    }]
+    applyEvent(s, { type: 'ask_user', questions: [{ question: '选哪个', options: [{ label: 'A' }, { label: 'B' }] }] })
+    const row = s.messages.at(-1)
+    expect(row.role).toBe('tool')
+    expect(row.name).toBe('ask_user')
+    expect(row.args.questions[0].question).toBe('选哪个')
+  })
+
+  it('interaction_expired 把待答确认卡收口成已中断并解锁输入', () => {
+    const s = mk()
+    applyEvent(s, { type: 'tool_call', name: 'write_file', args: { path: 'a.txt' } })
+    applyEvent(s, { type: 'confirm_request', tool: 'write_file', args: { path: 'a.txt' } })
+    s.running = true
+    applyEvent(s, { type: 'interaction_expired' })
+    const row = s.messages.at(-1)
+    expect(row.result).toEqual({ cancelled: true, confirm: 'cancelled' })
+    expect(row.awaitingConfirm).toBeUndefined()
+    expect(s.running).toBe(false)
+  })
+
+  it('interaction_expired 同样收口待答的提问卡，已答卡一律不碰', () => {
+    const s = mk()
+    applyEvent(s, { type: 'tool_call', name: 'ask_user', args: { questions: [{ question: '第一题' }] } })
+    applyEvent(s, { type: 'tool_result', name: 'ask_user', result: { answers: [{ answer: 'A' }] } })
+    applyEvent(s, { type: 'tool_call', name: 'ask_user', args: { questions: [{ question: '选哪个' }] } })
+    applyEvent(s, { type: 'interaction_expired' })
+    const [answered, pending] = s.messages.filter(m => m.name === 'ask_user')
+    expect(answered.result).toEqual({ answers: [{ answer: 'A' }] })   // 已答的原样留着
+    expect(pending.result).toEqual({ cancelled: true })
+  })
+
+  it('确认上行失败（连接未就绪）要留下提示，不能零反馈', () => {
+    setActivePinia(createPinia())
+    const s = useChatStore()
+    s._ws = { readyState: 0, send: vi.fn() }
+    s.confirm(true)
+    expect(s._ws.send).not.toHaveBeenCalled()
+    expect(s.hint).toContain('连接未就绪')
+  })
+
   it('cancel 顺手清掉进度', () => {
     setActivePinia(createPinia())
     const s = useChatStore()

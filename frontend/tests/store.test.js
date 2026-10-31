@@ -46,10 +46,12 @@ describe('chat store 事件流', () => {
     expect(tools).toHaveLength(1)
     expect(tools[0]).toMatchObject({ name: 'write_file', args: { path: 'a.txt' }, result: { ok: true } })
   })
-  it('ask_user 事件不改动消息流（题目由 tool_call 行承载），confirm_request 只打标记', () => {
+  it('ask_user 只在没有待答调用行时合成一条，confirm_request 只给调用行打标记', () => {
     const s = useChatStore()
+    // 实时流里 tool_call 已先行建好行，事件不得再补一条（否则一次提问画两张卡）
+    applyEvent(s, { type: 'tool_call', name: 'ask_user', args: { questions: [{ question: '选哪个' }] } })
     applyEvent(s, { type: 'ask_user', questions: [{ question: '选哪个', options: [{ label: 'A' }] }] })
-    expect(s.messages).toEqual([])
+    expect(s.messages.filter(m => m.name === 'ask_user')).toHaveLength(1)
     applyEvent(s, { type: 'tool_call', name: 'write_file', args: { path: 'a.txt' } })
     applyEvent(s, { type: 'confirm_request', tool: 'write_file', args: { path: 'a.txt' } })
     expect(s.messages.at(-1).awaitingConfirm).toBe(true)

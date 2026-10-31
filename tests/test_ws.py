@@ -167,8 +167,9 @@ def test_ws_steer_while_running_then_cancel(client):
         # 取消后的事件都发给 ws2。后连首帧是 running 快照（重连状态自洽），不是拒绝。
         with client.websocket_connect(f"/ws/chat/{sid}") as ws2:
             assert ws2.receive_json() == {"type": "status", "status": "running"}
-            # 提问卡不再补发（ADR 0029：待答态由消息流里的调用行重建），所以 running 快照
-            # 之后直接就是取消链路的帧序，中间没有多余的一帧要消费
+            # 待答的提问卡靠重连补发重建：ask_user 的工具行要等答案回来才落库，
+            # 历史里没有这一行，不补发前端就没有回答入口
+            assert ws2.receive_json()["type"] == "ask_user"
             # 同连接上行严格 FIFO：插话先入队，cancel 后到 —— 不必（也不能）读 hub.pending 抢时序
             ws2.send_json({"type": "user_message", "content": "插一句"})
             ws2.send_json({"type": "cancel"})
@@ -417,9 +418,10 @@ def test_ws_reconnect_replays_running_status(client):
 
 
 def test_ws_reconnect_recovers_pending_ask_from_history(client):
-    """切走/刷新后重连：挂起中的提问不再靠补发事件恢复，而是从消息历史重建——
-    assistant 行带着 ask_user 调用、且没有配对的 tool 行，就是「待答」（ADR 0029）。
-    ask future 仍挂着，所以从重连的连接应答照样能推进本轮，不会「既答不了也停不掉」。"""
+    """切走/刷新后重连：库里确实「有带 ask_user 调用的 assistant 行、没有配对的 tool 行」，
+    这份形状能证明有一道题在等回答，但**画不出卡**——前端不把未认领的 tool_calls 物化成调用行，
+    待答的题仍要靠重连补发的 ask_user 事件合成（见 test_ws_reconnect_replays_pending_ask）。
+    ask future 一直挂着，所以从重连的连接应答照样能推进本轮，不会「既答不了也停不掉」。"""
     client.app.state.llm_factory = lambda cfg: ScriptedLLM([
         done(None, [_ask_tool_call("c1", "重连后还要答")]),
         done("答完了"),
@@ -439,9 +441,10 @@ def test_ws_reconnect_recovers_pending_ask_from_history(client):
     assert json.loads(call["function"]["arguments"])["question"] == "重连后还要答"
     # 没有配对的 tool 行 = 待答态（有了就是已答/已中断）
     assert not [r for r in rows if r["role"] == "tool"]
-    # 重连不再补发提问卡事件；应答照样推进本轮，终态看 status 而非 message_done
+    # 重连补发提问事件（待答卡的题目来源）；应答照样推进本轮，终态看 status 而非 message_done
     with client.websocket_connect(f"/ws/chat/{sid}") as ws2:
         assert ws2.receive_json() == {"type": "status", "status": "running"}
+        assert ws2.receive_json()["type"] == "ask_user"
         ws2.send_json({"type": "ask_submit", "answers": [{"answer": "答了"}]})
         for _ in range(10):
             ev = ws2.receive_json()
@@ -449,6 +452,39 @@ def test_ws_reconnect_recovers_pending_ask_from_history(client):
                 break
         else:
             pytest.fail("重连后应答，runner 应跑到终态")
+
+
+def test_ws_reconnect_replays_pending_ask(client):
+    """提问侧与确认侧同一道闸：ask_user 的工具行要等答案回来才落库，所以刷新/切会话后
+    历史里没有待答的题。不补发就没有回答入口，ask future 永久挂起、会话卡死。"""
+    import time
+    client.app.state.llm_factory = lambda cfg: ScriptedLLM([
+        done(None, [_ask_tool_call(cid="c1", q="选哪个")]),
+        done("好的"),
+    ])
+    sid = client.zc_sid
+    hub = client.app.state.hub
+    with client.websocket_connect(f"/ws/chat/{sid}") as ws:
+        ws.send_json({"type": "user_message", "content": "问我一句"})
+        for _ in range(8):
+            if ws.receive_json()["type"] == "ask_user":
+                break
+        else:
+            pytest.fail("ask_user 调用应下发提问事件")
+        # runner 先发事件、后清挂起点：等登记完成再断开，避免命中微秒级竞态
+        deadline = time.time() + 2
+        while sid not in hub.pending_asks and time.time() < deadline:
+            time.sleep(0.01)
+        assert sid in hub.pending_asks
+    with client.websocket_connect(f"/ws/chat/{sid}") as ws2:
+        assert ws2.receive_json() == {"type": "status", "status": "running"}
+        assert ws2.receive_json()["type"] == "ask_user"
+        ws2.send_json({"type": "ask_submit", "answers": [{"answer": "选 A"}]})
+        for _ in range(10):
+            if ws2.receive_json()["type"] == "message_done":
+                break
+        else:
+            pytest.fail("补发提问后回答，runner 应跑到 message_done")
 
 
 def test_ws_reconnect_replays_pending_confirm(client, monkeypatch):
@@ -494,6 +530,28 @@ def test_ws_reconnect_replays_pending_confirm(client, monkeypatch):
                 break
         else:
             pytest.fail("补发确认卡后批准，runner 应跑到 message_done")
+
+
+def test_ws_stale_uplinks_notify_frontend(client):
+    """后端进程重启后，卡片在前端仍是可点的幽灵：confirm / ask_submit 上行时既无挂起点
+    也不在跑，必须各回一帧。不回的话用户点下去什么也不会发生，卡片永远停在可点状态。"""
+    client.app.state.llm_factory = lambda cfg: ScriptedLLM([done("好的")])
+    sid = client.zc_sid
+    hub = client.app.state.hub
+    assert sid not in hub.confirm_futures and sid not in hub.ask_futures
+    with client.websocket_connect(f"/ws/chat/{sid}") as ws:
+        ws.send_json({"type": "confirm", "approved": True})
+        ws.send_json({"type": "ask_submit", "answers": [{"answer": "A"}]})
+        # 再发一条正常消息取个回执：只等帧的话，实现缺失时用例会挂在收帧上
+        ws.send_json({"type": "user_message", "content": "在吗"})
+        types = []
+        for _ in range(10):
+            ev = ws.receive_json()
+            types.append(ev["type"])
+            if ev["type"] == "status" and ev.get("status") in ("idle", "error"):
+                break
+    assert types.count("interaction_expired") == 2, \
+        f"两条撞空的上行应各回一帧收口幽灵卡，实收 {types}"
 
 
 # ---------- 插话（steering）：执行中的新消息排队，下一轮工具边界注入 ----------

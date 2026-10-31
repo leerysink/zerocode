@@ -3,7 +3,8 @@
 上行：user_message / ask_submit / confirm / cancel / compact；
 下行：token / tool_call / tool_result / tool_progress / ask_user / confirm_request /
 message_done / error / status / file_change / compacting / compaction_done / busy /
-steering_done（由 runner 与 hub 经 emit 下发）。tool_progress 是预览工具的**临时**进度，
+steering_done（由 runner 与 hub 经 emit 下发）/ interaction_expired（confirm、ask_submit 上行时
+后端已无挂起点且该会话不在跑，让前端把幽灵卡收口成已中断）。tool_progress 是预览工具的**临时**进度，
 不落库、刷新即消失；error 与 status 是本轮终态；message_done 是**轮次收口**而非终态
 （工具轮在派发工具前也发一次，一次执行可以有多条，判终态一律看 status）；busy 是执行中被拒的非终态提示
 （不得据此复位前端执行态，否则「停止」按钮消失 → 发不出也停不掉的死循环）。
@@ -275,9 +276,16 @@ async def ws_chat(ws: WebSocket, session_id: int):
 
                 asyncio.create_task(run_task(text_, attachment_ids, cfg_now, model_cfg))
             elif t == "ask_submit":
-                await hub.submit_answers(session_id, msg.get("answers") or [])
+                resolved = await hub.submit_answers(session_id, msg.get("answers") or [])
+                if not resolved and session_id not in hub.running:
+                    await emit(session_id, {"type": "interaction_expired"})
             elif t == "confirm":
-                await hub.resolve_confirm(session_id, bool(msg.get("approved")))
+                resolved = await hub.resolve_confirm(session_id, bool(msg.get("approved")))
+                # 挂起点不在（进程重启/执行早已收口）且确实没在跑，才回帧收口幽灵卡：
+                # 少这一帧的话前端点「确认写入」零反馈，卡片永远停在可点状态。
+                # 仍在跑时不回：那多半是连点第二下，真实结果正在路上，回帧会把好卡打成已中断。
+                if not resolved and session_id not in hub.running:
+                    await emit(session_id, {"type": "interaction_expired"})
             elif t == "cancel":
                 hub.cancel(session_id)
             elif t == "compact":

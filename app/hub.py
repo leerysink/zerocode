@@ -11,10 +11,10 @@
 - emits：按会话分槽的下行发送器（session_id → async (session_id, event) -> None），
   同会话后连覆盖；断连 drop 清槽（仅清自己注入的槽，防误删后连者的槽），
   跨会话互不串扰（终审修复轮2：原全局单槽会被任意会话的连接覆盖导致事件串线）。
-- pending_confirms：挂起中的确认卡载荷。WS 连入时由 replay_pending 补发（同一张卡的恢复，
-  不是重复确认）——不补则切走/刷新后卡片消失、future 永久挂起，会话卡死。
-  提问卡不在此列：它由消息流里的 ask_user 调用行渲染，「有调用行、无结果行」就是待答态，
-  重连后从历史原样重建，不需要补发（ADR 0029）。
+- pending_asks / pending_confirms：挂起中的提问卡/确认卡载荷。WS 连入时由 replay_pending
+  补发（同一张卡的恢复，不是重复提问、重复确认）——两张卡都画在消息流的调用行上，而**待答**
+  的那次调用还没有 tool 行（工具行要等结果回来才落库），刷新后历史里没有可贴标记的行，
+  只能靠补发让前端合成一条；不补则卡片消失、future 永久挂起，会话卡死。
 """
 import asyncio
 
@@ -22,6 +22,7 @@ class ChatHub:
     def __init__(self):
         self.ask_futures: dict[int, asyncio.Future] = {}
         self.confirm_futures: dict[int, asyncio.Future] = {}
+        self.pending_asks: dict[int, list[dict]] = {}
         self.pending_confirms: dict[int, dict] = {}
         self.cancel_events: dict[int, asyncio.Event] = {}
         self.running: set[int] = set()
@@ -64,15 +65,26 @@ class ChatHub:
     async def ask(self, session_id, questions, timeout):
         fut = asyncio.get_running_loop().create_future()
         self.ask_futures[session_id] = fut
+        self.pending_asks[session_id] = questions
         try:
-            # 事件只是「本轮正等人回答」的信号：卡片本身由调用行渲染，前端不消费这个事件建卡
+            # 实时流里 ask_user 调用行已由 tool_call 事件建好，这个事件只是「本轮正等人回答」
+            # 的信号；重连补发时它是待答卡的唯一来源（见 replay_pending）
             await self.emit_event(session_id, {"type": "ask_user", "questions": questions})
             return await fut
         finally:
             self.ask_futures.pop(session_id, None)
+            self.pending_asks.pop(session_id, None)
 
     async def replay_pending(self, session_id):
-        """WS 连入补发挂起中的确认卡（同一张卡的恢复，不是重复确认）。"""
+        """WS 连入补发挂起中的提问/确认（同一张卡的恢复，不是重复提问、重复确认）。
+
+        两类卡片都画在消息流的调用行上，而**待答**的那次调用还没有 tool 行——工具行要等
+        答案/结果回来才落库。所以刷新或切回会话后历史里根本没有可贴标记的行，只能靠这两份
+        补发让前端合成一条；不补则卡片连同唯一的回答入口一起消失，future 永久挂起、会话卡死。
+        """
+        questions = self.pending_asks.get(session_id)
+        if questions is not None:
+            await self.emit_event(session_id, {"type": "ask_user", "questions": questions})
         payload = self.pending_confirms.get(session_id)
         if payload is not None:
             await self.emit_event(session_id, {"type": "confirm_request", **payload})
@@ -89,14 +101,20 @@ class ChatHub:
             self.confirm_futures.pop(session_id, None)
             self.pending_confirms.pop(session_id, None)
 
-    def _resolve(self, store, session_id, value):
+    def _resolve(self, store, session_id, value) -> bool:
+        """兑现挂起点，返回**是否真有东西被兑现**。
+        调用方（ws）拿它判断「这次上行是不是撞在了空挂起点上」——进程重启后挂起点全在
+        丢失的内存里，前端却还留着可点的卡片。"""
         fut = store.get(session_id)
         if fut and not fut.done():
             fut.set_result(value)
+            return True
+        return False
 
     async def submit_answers(self, session_id, answers):
-        self._resolve(self.ask_futures, session_id, {"answers": answers})
-    async def resolve_confirm(self, session_id, approved): self._resolve(self.confirm_futures, session_id, bool(approved))
+        return self._resolve(self.ask_futures, session_id, {"answers": answers})
+    async def resolve_confirm(self, session_id, approved):
+        return self._resolve(self.confirm_futures, session_id, bool(approved))
 
     def cancel(self, session_id):
         ev = self.cancel_events.get(session_id)

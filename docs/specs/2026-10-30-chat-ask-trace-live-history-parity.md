@@ -26,8 +26,9 @@
 - **前端收口成一个纯归一化函数**：实时事件形状（`name/args/result`）与历史行形状（`tool_name/tool_args/tool_result`）都先归一化成同一个渲染模型，卡片判定沿用 `isPreviewCard` 已验证过的「一次调用 = 两条消息行」配对模式。删除 `pendingAsk`/`pendingConfirm` 及它们在消息流底部的独立渲染。
 - **后端每轮收口**：在派发工具之前，把本轮已流式输出的文字固化下发（content 为空则不发，避免空行）。执行终态仍只由 `status` 事件判定。
 - **数据永远成对**：中断时给挂起的提问与确认补写一条配对结果行，**并补发同样的 `tool_call`/`tool_result` 两个事件**（不补发则实时流比刷新后的历史少一条记录，同构不变式就此破功）。前端据结果行渲染「已中断」。孤儿调用行不再可能出现，刷新后自然不会复活成死卡。
-- **hub 的提问卡补发删除**：待答的提问由消息流原样重建，补发成为冗余。挂起用的 future 表保留（watchdog 依赖它判定「等人不算卡死」）。
-- **确认卡是真源的一处例外**：「本次调用需要确认」这个事实不在任何消息行里——它取决于写入确认开关与预览重启的运行时判据，前端无法从 `write_file` 的调用行推断它是在等确认、正在跑、还是已跑完。所以确认侧的补发保留，`confirm_request` 事件从「卡片的数据源」降级为「标记哪一行在等确认」，卡片内容仍一律从消息行读。
+- **两张卡的待答态都要靠 hub 补发重建**（初稿判定「提问补发是冗余、删掉」是错的）：工具行在结果回来时才落库，所以**待答的那次调用在历史里根本没有行**，assistant 行带着 `tool_args` 只能证明「有个调用没配对」，画不出题也画不出按钮。因此 `pending_asks` 与 `replay_pending` 的提问分支恢复，`ask_user`/`confirm_request` 在找不到可附着的调用行时由 reducer 合成一条无结果调用行（args 事件自带），等价于实时流里先到的 `tool_call`。挂起用的 future 表保留（watchdog 依赖它判定「等人不算卡死」）。
+- **确认卡是真源的一处例外**：「本次调用需要确认」这个事实不在任何消息行里——它取决于写入确认开关与预览重启的运行时判据，前端无法从 `write_file` 的调用行推断它是在等确认、正在跑、还是已跑完。所以 `confirm_request` 事件从「卡片的数据源」降级为「标记哪一行在等确认」，卡片内容仍一律从消息行读。
+- **挂起点是内存态，进程重启会留下可点的幽灵卡**：新增 `interaction_expired` 下行——`confirm`/`ask_submit` 上行撞上「无挂起点且该会话不在跑」时回一帧，前端把待答行补成 `{cancelled: true}`（确认侧再带 `confirm: 'cancelled'`）并复位 running。仍在跑时不回：那多半是连点第二下，真实结果正在路上，回帧会把好卡打成已中断。上行本身失败（连接未就绪）时前端在输入框留一句原因，不留零反馈。
 
 ## 3. 用户故事
 
@@ -73,7 +74,7 @@
 | 留痕形态 | 只读提问卡，原地转灰 | 转两条普通气泡／只美化工具块摘要 |
 | 已答态信息密度 | 保留全部选项，选中项高亮 | 只显选中项其余折叠／压成一行摘要 |
 | 卡片数据真源 | 复用现有调用行 + 结果行 | 新增专用事件与角色行／纯前端本地合成 |
-| 待答态定义 | 提问卡只认工具行（删挂起态字段与提问补发）；确认卡保留补发，但只作「哪一行在等确认」的标记 | 挂起态降为开关／实时照旧只补历史 |
+| 待答态定义 | 两卡都保留 hub 补发：提问卡认「有调用行无结果行」，确认卡再叠一层「哪一行在等确认」的标记；补发找不到行时前端合成无结果调用行 | 挂起态降为开关／实时照旧只补历史 |
 | 中间文本收口 | 后端工具轮补发轮次收口事件 | 前端在 `tool_call` 时固化／新增 `round_end` |
 | 确认卡 | 一并修，与提问卡同构 | 只管问答／只美化摘要 |
 | 中断死卡 | 后端补写配对结果行 | 前端加执行态闸／两道都做 |
@@ -96,7 +97,7 @@
 
 - `tests/test_ws.py` 里按帧数硬断言的用例：`test_ws_plain_flow` 的固定帧数计数、`test_ws_ask_flow`、以及 `test_ws_steering_*` 中「`message_done` 只有一条」类断言——工具轮补发后一次执行会有多条。
 - **凡把轮次收口事件当「执行结束」标志的地方都要改用 `status` 终态判定**：`tests/test_ws.py` 里多处 `while ... if ev["type"] == "message_done": break` 会在工具轮提前跳出，误判执行已结束。
-- `test_ws_reconnect_replays_pending_ask` 作废，由「刷新/重连后待答提问从消息流重建」的新用例取代；`test_ws_reconnect_replays_pending_confirm` **保持绿**（确认侧补发不动）。
+- `test_ws_reconnect_replays_pending_ask` 曾被判作废（理由是「待答提问从消息流重建」），实为待答卡的唯一来源，已恢复；`test_ws_reconnect_replays_pending_confirm` 保持绿。`test_ws_reconnect_recovers_pending_ask_from_history` 只断言库里的行形状（有 assistant 调用行、无配对 tool 行），不再声称卡片能凭它重建。
 - `frontend/tests/store.test.js` 中断言 `ask_user` 置 `pendingAsk`、`confirm_request` 置 `pendingConfirm` 的用例。
 
 **「完成」长什么样**：前后端全量测试绿（后端 pytest **必须串行**，并发会死锁并污染结果）；手工各走一遍「提问 → 回答 → 刷新」与「提问 → 停止 → 刷新」，确认已答卡与已中断卡都在，且刷新前后逐字一致。
@@ -117,7 +118,7 @@
 
 - `isPreviewCard(m, i)` 已经验证过「一次调用在实时流里是两条消息行」的配对判据，新卡片沿用同一模式，不发明新机制。
 - 字段形状必须同时认实时与历史两套，**归一化函数是唯一收口点**——任何在组件里就地读 `m.name ?? m.tool_name` 的散点写法都是这次要消灭的东西。
-- `hub.ask_futures` / `hub.confirm_futures` **必须保留**：`app/main.py` 的 watchdog 靠它们判定「挂起等人不算卡死」。被删的是提问卡的**载荷**（`pending_asks`，只为补发而存），不是**挂起凭证**；`pending_confirms` 与 `replay_pending` 的确认分支同样保留。
+- `hub.ask_futures` / `hub.confirm_futures` **必须保留**：`app/main.py` 的 watchdog 靠它们判定「挂起等人不算卡死」。被删的只有前端侧的挂起态字段（`pendingAsk`/`pendingConfirm`），不是**挂起凭证**，也不是补发用的载荷——`pending_asks`/`pending_confirms` 与 `replay_pending` 两个分支都保留（待答的调用在历史里没有行，补发是待答态的唯一来源）。
 - **确认卡的人话文案：待答态可用后端 `summary`，已答态必须由前端按工具名生成**。判据不是「字段是否只出现在事件里」，而是「刷新后能不能重建」：`summary` 会随 hub 的确认补发在重连时一并带回来，所以待答态用它是安全的；已答态没有补发、只能读消息行，用了就会与刷新后叉开。同构不变式约束的是**可重建性**，不是字段来源。
 - 中断时补写配对结果行有额外收益：回注模型的历史不会缺 tool 消息，而 tool_calls 与 tool 消息配对是 OpenAI 兼容 API 的硬要求。
 - `ChatView.vue` 传给 `ChatMessages` 的 `pendingAsk`/`pendingConfirm` 两个 prop 及对应的滚底 watch 一并移除；卡片进入消息流后，滚底由既有的 `messages.length` watch 覆盖。

@@ -12,7 +12,7 @@ vi.mock('../api', () => ({
 import ChatMessages from './ChatMessages.vue'
 import ToolCallBlock from './ToolCallBlock.vue'
 import AskUserCard from './AskUserCard.vue'
-import { useChatStore } from '../stores/chat'
+import { applyEvent, useChatStore } from '../stores/chat'
 import { DECLINE_ANSWER } from '../stores/messageModel'
 
 const ImageStub = {
@@ -240,6 +240,27 @@ describe('预览工具在消息流里的渲染', () => {
     expect(w.find('.zc-confirm-args').text()).toContain('a.txt')
   })
 
+  it('刷新后 hub 补发的标记能重建可交互的待答确认卡', () => {
+    // 刷新/切会话回到会话时，store.messages 是历史行：待确认的那次调用还没有 tool 行
+    // （工具行要等执行完才落库），卡片只能靠重连补发的 confirm_request 重建。
+    setActivePinia(createPinia())
+    const s = useChatStore()
+    s.messages = [{
+      role: 'assistant', content: '方案已确认',
+      tool_args: {
+        tool_calls: [{
+          id: 'c1', type: 'function',
+          function: { name: 'write_file', arguments: '{"path":"a.txt","content":"hi"}' },
+        }],
+      },
+    }]
+    applyEvent(s, { type: 'confirm_request', tool: 'write_file', args: { path: 'a.txt', content: 'hi' } })
+    const w = mountMessages(s.messages)
+    expect(w.text()).toContain('写入确认')
+    expect(w.findAll('button')).toHaveLength(2)   // 确认写入 / 拒绝
+    expect(w.find('.zc-confirm-args').text()).toContain('a.txt')
+  })
+
   it('已答态确认卡由结果行的 confirm 字段推出，历史行同样能画', () => {
     const w = mountMessages([
       {
@@ -383,6 +404,24 @@ describe('提问卡在消息流里', () => {
       },
       { role: 'tool', tool_call_id: 'c1', tool_name: 'ask_user' },
     ])
+    expect(w.findComponent(AskUserCard).props('questions'))
+      .toEqual([{ question: '选哪个', options: [{ label: 'A' }] }])
+  })
+
+  it('刷新后重连补发的问题能重建待答提问卡（历史里没有未执行工具的 tool 行）', () => {
+    setActivePinia(createPinia())
+    const s = useChatStore()
+    s.messages = [{
+      role: 'assistant', content: '让我先确认一件事',
+      tool_args: {
+        tool_calls: [{
+          id: 'c1', type: 'function',
+          function: { name: 'ask_user', arguments: '{"questions":[{"question":"选哪个"}]}' },
+        }],
+      },
+    }]
+    applyEvent(s, { type: 'ask_user', questions: [{ question: '选哪个', options: [{ label: 'A' }] }] })
+    const w = mountMessages(s.messages)
     expect(w.findComponent(AskUserCard).props('questions'))
       .toEqual([{ question: '选哪个', options: [{ label: 'A' }] }])
   })
