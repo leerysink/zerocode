@@ -6,7 +6,7 @@
 // 滚动策略：新消息/新卡片强制滚底；流式增量仅在用户已贴底时跟随，不打断上翻阅读。
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useChatStore } from '../stores/chat'
-import { normalizeMessages, confirmStateOf } from '../stores/messageModel'
+import { normalizeMessages } from '../stores/messageModel'
 import MarkdownView from './MarkdownView.vue'
 import ToolCallBlock from './ToolCallBlock.vue'
 import AskUserCard from './AskUserCard.vue'
@@ -78,10 +78,10 @@ function liveProgress(m, i) {
 // 确认卡：待答态一律接管（没有它用户无从批准/拒绝，而此时预览卡只会显示「正在重启…」，
 // 把等决定的场面画成正在执行）；已答态只给非预览工具留痕——预览三件套的结果卡本来就会
 // 表达重启成功/被拒/中断，再叠一张确认卡是同一件事说两遍。
+// 状态本身已在归一化阶段推出（m.confirmState），这里只做「画不画」的取舍。
 function confirmCardState(m) {
-  const st = confirmStateOf(m)
-  if (!st || st === 'pending') return st
-  return isPreviewTool(m) ? null : st
+  if (!m.confirmState || m.confirmState === 'pending') return m.confirmState || null
+  return isPreviewTool(m) ? null : m.confirmState
 }
 
 // 自动滚底

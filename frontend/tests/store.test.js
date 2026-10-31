@@ -124,6 +124,41 @@ describe('chat store 事件流', () => {
     // 卡片由结果行翻转，本地不清任何字段：上行后待答卡仍在消息流里
     expect(s.messages.filter(m => m.role === 'tool' && !m.result)).toHaveLength(1)
   })
+  it('重连补发的 confirm_request 能把历史里的调用行重新标成待答（用户故事 16）', async () => {
+    stubWsGlobals()
+    // 刷新后拿到的历史：写入调用行已落库，结果行还没有——但光看行分不清
+    // 「在等确认」还是「工具正在跑」，这个事实只存在于 confirm_request 事件里
+    getMessages.mockResolvedValue({ data: [
+      { id: 1, seq: 1, role: 'user', content: '写个文件', attachments: [] },
+      { id: 2, seq: 2, role: 'assistant', content: '我来写',
+        tool_args: { tool_calls: [{ id: 'c1', type: 'function',
+          function: { name: 'write_file', arguments: '{"path":"a.txt"}' } }] } },
+      { id: 3, seq: 3, role: 'tool', tool_call_id: 'c1', tool_name: 'write_file' },
+    ] })
+    const s = useChatStore()
+    await s.openSession('s1')
+    expect(s.messages.filter(m => m.role === 'tool' && !m.result)).toHaveLength(1)
+    // hub 在连入时补发同一份确认请求 → 标记打回那一行，卡片恢复可交互
+    applyEvent(s, { type: 'confirm_request', tool: 'write_file', args: { path: 'a.txt' } })
+    const marked = s.messages.filter(m => m.awaitingConfirm)
+    expect(marked).toHaveLength(1)
+    expect(marked[0].tool_name).toBe('write_file')
+  })
+  it('刷新后回答提问：结果折叠进历史行，而不是另起一条', async () => {
+    stubWsGlobals()
+    getMessages.mockResolvedValue({ data: [
+      { id: 2, seq: 2, role: 'assistant', content: '先确认一件事',
+        tool_args: { tool_calls: [{ id: 'c1', type: 'function',
+          function: { name: 'ask_user', arguments: '{"question":"选哪个"}' } }] } },
+      { id: 3, seq: 3, role: 'tool', tool_call_id: 'c1', tool_name: 'ask_user' },
+    ] })
+    const s = useChatStore()
+    await s.openSession('s1')
+    applyEvent(s, { type: 'tool_result', name: 'ask_user', result: { answers: [{ options: ['A'] }] } })
+    const tools = s.messages.filter(m => m.role === 'tool')
+    expect(tools).toHaveLength(1)
+    expect(tools[0].result).toEqual({ answers: [{ options: ['A'] }] })
+  })
   it('requestCompact 上行 compact；loadModels/setModel 走 REST 并同步 currentModelId', async () => {
     const s = useChatStore()
     const send = vi.fn()

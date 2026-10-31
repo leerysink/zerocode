@@ -10,14 +10,18 @@
 // 归一化施加在渲染层（ChatMessages 的 computed）而非 store：store.messages 里的
 // client_msg_id / pendingEcho 是 busy 回滚要用的活字段，投影掉会打断它。
 
-// 「同名、还没结果」的那条调用记录：tool_result 到达时就地并进去，而不是另起一条。
-// 找不到（历史里只有结果行、或事件乱序）时返回 null，由调用方决定补一条。
-// 从后往前找即可：后端逐个派发（call→result→call→result），同一时刻同名工具至多一条待结果，
-// 不存在需要在多条同名待结果记录里挑一条的情形。
+// 「同名、还没结果」的那条调用记录：tool_result / confirm_request 到达时就地并进去，
+// 而不是另起一条。找不到时返回 null，由调用方决定补一条。
+// 必须同时认两种形状：store.messages 里既有实时事件推进来的记录（name/result），也有
+// openSession 直接装入的历史行（tool_name/tool_result）——刷新后回答提问、或重连补发的
+// 确认请求，要认领的正是历史行。归一化只发生在渲染层，store 内部保持原样（见文件头）。
+// 从后往前找即可：后端逐个派发（call→result→call→result），同一时刻同名工具至多一条待结果。
 export function findOpenToolCall(messages, name) {
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i]
-    if (m.role === 'tool' && m.name === name && m.result === undefined) return m
+    if (m.role !== 'tool') continue
+    if ((m.name ?? m.tool_name) !== name) continue
+    if (m.result === undefined && m.tool_result === undefined) return m
   }
   return null
 }
@@ -65,6 +69,8 @@ export function normalizeMessages(list) {
       // 确认卡的待答标记（confirm_request 事件打在调用行上）与人话摘要
       if (raw.awaitingConfirm) rec.awaitingConfirm = true
       put(rec, 'confirmSummary', raw.confirmSummary)
+      // 确认状态在归一化阶段就推出来，渲染层只读字段（与 questions 同一个道理）
+      put(rec, 'confirmState', confirmStateOf(rec))
       put(rec, 'diff', raw.diff)
       put(rec, 'diff_path', raw.diff_path)
       put(rec, 'diff_action', raw.diff_action)
