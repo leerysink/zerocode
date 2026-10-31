@@ -109,6 +109,7 @@
 - **不动执行终态判定**：`status` 事件仍是 running 的唯一真源；轮次收口事件不承担终态，前端不得拿它复位 running。
 - **不改非卡片工具的展示**：折叠 JSON 块继续服务其余工具。
 - **不合并两份重复的前端 store 测试**（`frontend/tests/store.test.js` 与 `frontend/src/stores/chat.test.js`）——是独立的一件事。
+- **不修 `file_change` 的 diff 不回放**：写入类工具的 diff 由实时 `file_change` 事件挂到消息上，历史接口（`GET /sessions/{id}/messages`）不回放它，所以刷新后 diff 块消失。这是与本次同族的既有缺口，但修法要动历史接口（`file_change` 表已有 `message_id`，可以 join 回来），属独立一件事。真实 LLM 的端到端同构校验里把它单独断言、单独排除，不让它藏进「通过」里。
 - **不给老会话补数据**：历史里已存在的孤儿调用行按「已中断」只读态渲染即可，不写迁移脚本。
 - **不改附件、插话（steering）、上下文压缩的既有行为**。
 
