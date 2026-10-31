@@ -448,6 +448,7 @@ class AgentRunner:
                 sanitized_calls, _ = redact_tool_calls_args(original_calls)
                 final["tool_calls"] = sanitized_calls
                 await add_message(self.sf, session_id, "assistant", content=final.get("content"),
+                                  reasoning=final.get("reasoning"),
                                   tool_args={"tool_calls": sanitized_calls})
                 messages.append({"role": "assistant", "content": final.get("content"),
                                  "tool_calls": sanitized_calls})
@@ -554,6 +555,9 @@ class AgentRunner:
             ok = await self.confirm(session_id, {"tool": name, "args": args})
             if not ok:
                 return self._denied(cancel, "用户拒绝该修改")
+            # 批准也要置位：confirmed 是结果里 confirm 标记的唯一来源，漏了它前端就认不出
+            # 「这次写入是用户点头放行的」——已答态确认卡与刷新后的留痕都会退化成普通折叠块。
+            confirmed = True
         elif name == "preview_restart":
             # 中断运行中的预览要用户点头（§5.6）。AgentRunner 仍是 confirm_request 的唯一发出方；
             # 事件多带一个 summary，前端据此把「写入确认」换成「重启预览」的人话文案。

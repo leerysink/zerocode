@@ -698,6 +698,68 @@ async def test_cancel_while_awaiting_confirm_records_cancelled_not_denied(test_e
 
 
 @pytest.mark.asyncio
+async def test_approved_write_file_carries_confirm_flag(test_engine, tmp_path):
+    """写入确认批准后，结果里必须带 confirm='approved'。
+
+    write_file/edit_file 分支此前**不设** confirmed（只有 preview_restart 与 db_write 设），
+    于是最常见的那张确认卡——写入确认——批准之后前端拿不到任何标记：已答态认不出来，
+    刷新后更认不出（历史里没有事件，只能靠结果行）。真实 LLM 端到端跑出来的结果行键是
+    ['ok','error']，没有 confirm，才暴露这一处；单测只覆盖了 preview_restart 所以漏掉。"""
+    async def approve(session_id, payload):
+        assert payload["tool"] == "write_file"
+        return True
+    turns = [done(None, [tool_call("c1", "write_file", path="hello.txt", content="hi")]), done("写好了")]
+    sid, status, evs, sf = await run_once(test_engine, tmp_path, turns, confirm=approve,
+                                          write_confirm=True)
+    assert status == "idle"
+    tr = next(e for e in evs if e["type"] == "tool_result")
+    assert tr["result"].get("confirm") == "approved", tr["result"]
+    async with sf() as s:
+        row = (await s.execute(sql(
+            "SELECT tool_result FROM message WHERE session_id=:i AND role='tool'"), {"i": sid})).scalar()
+    assert row["confirm"] == "approved"
+
+
+@pytest.mark.asyncio
+async def test_write_confirm_off_leaves_no_confirm_flag(test_engine, tmp_path):
+    """开关关掉时没有确认这道闸，结果里就不该有 confirm 标记——否则前端会凭空画出确认卡。"""
+    turns = [done(None, [tool_call("c1", "write_file", path="hello.txt", content="hi")]), done("写好了")]
+    sid, status, evs, sf = await run_once(test_engine, tmp_path, turns, write_confirm=False)
+    assert not [e for e in evs if e["type"] == "confirm_request"]
+    tr = next(e for e in evs if e["type"] == "tool_result")
+    assert "confirm" not in tr["result"], tr["result"]
+
+
+@pytest.mark.asyncio
+async def test_tool_round_persists_reasoning(test_engine, tmp_path):
+    """工具轮的思考留痕也要落库。
+
+    此前只有终答那一轮把 reasoning 存进去，工具轮存的是 NULL：实时流里思考块挂在
+    该轮消息上（message_done 带 reasoning），刷新后却整段消失——与「实时 ≡ 历史」
+    同构不变式直接冲突，症状和用户最初报的「问答内容找不到」是同一族。
+    真实 LLM 端到端跑出来的 dump 就是这么叉开的。"""
+    async def ask_ok(session_id, questions, timeout):
+        return {"answers": [{"options": ["A"]}]}
+
+    def done_r(content, reasoning, tool_calls=None):
+        return {"type": "done", "message": {"role": "assistant", "content": content,
+                                            "reasoning": reasoning, "tool_calls": tool_calls}}
+
+    turns = [
+        [{"type": "reasoning_delta", "content": "先想想"}, delta("让我看看"),
+         done_r("让我看看", "先想想", [tool_call("c1", "ask_user", question="选哪个", options=["A"])])],
+        [{"type": "reasoning_delta", "content": "再想想"}, delta("好了"), done_r("好了", "再想想")],
+    ]
+    sid, status, evs, sf = await run_once(test_engine, tmp_path, turns, ask=ask_ok)
+    assert status == "idle"
+    async with sf() as s:
+        rows = (await s.execute(sql(
+            "SELECT reasoning FROM message WHERE session_id=:i AND role='assistant' ORDER BY seq"),
+            {"i": sid})).scalars().all()
+    assert list(rows) == ["先想想", "再想想"]
+
+
+@pytest.mark.asyncio
 async def test_confirmed_restart_uses_the_shared_task_table(test_engine, tmp_path, pv_seams):
     """US-24：Agent 起的栈登记在 `app.state.dev_tasks` 里——与用户手点「启动预览」同一张表。"""
     sid, aid, sf = await mk_app_session(test_engine, tmp_path, status="running", slug="pvok",
