@@ -46,12 +46,13 @@ describe('chat store 事件流', () => {
     expect(tools).toHaveLength(1)
     expect(tools[0]).toMatchObject({ name: 'write_file', args: { path: 'a.txt' }, result: { ok: true } })
   })
-  it('ask_user 事件不再改动消息流（题目由 tool_call 行承载），confirm_request 仍置 pendingConfirm', () => {
+  it('ask_user 事件不改动消息流（题目由 tool_call 行承载），confirm_request 只打标记', () => {
     const s = useChatStore()
     applyEvent(s, { type: 'ask_user', questions: [{ question: '选哪个', options: [{ label: 'A' }] }] })
     expect(s.messages).toEqual([])
-    applyEvent(s, { type: 'confirm_request', tool: 'write_file' })
-    expect(s.pendingConfirm).toBeTruthy()
+    applyEvent(s, { type: 'tool_call', name: 'write_file', args: { path: 'a.txt' } })
+    applyEvent(s, { type: 'confirm_request', tool: 'write_file', args: { path: 'a.txt' } })
+    expect(s.messages.at(-1).awaitingConfirm).toBe(true)
   })
   it('error 追加错误消息并复位 running/thinking', () => {
     const s = useChatStore()
@@ -84,10 +85,11 @@ describe('chat store 事件流', () => {
     expect(tool.diff_path).toBe('a.txt')
     expect(tool.diff_action).toBe('create')
   })
-  it('上行失败（WS 非 OPEN）不发帧；提问卡由消息流驱动，不随上行成败增删', () => {
+  it('上行失败（WS 非 OPEN）不发帧；两张卡都由消息流驱动，不随上行成败增删', () => {
     const s = useChatStore()
     applyEvent(s, { type: 'tool_call', name: 'ask_user', args: { questions: [{ question: '选哪个', options: [{ label: 'A' }] }] } })
-    applyEvent(s, { type: 'confirm_request', tool: 'write_file' })
+    applyEvent(s, { type: 'tool_call', name: 'write_file', args: { path: 'a.txt' } })
+    applyEvent(s, { type: 'confirm_request', tool: 'write_file', args: { path: 'a.txt' } })
     const send = vi.fn()
     vi.spyOn(console, 'warn').mockImplementation(() => {}) // 静音 _uplink 的未就绪告警
     // 模拟断线→重连窗口期：readyState=0（CONNECTING），上行失败不发帧，卡片留在消息流里供重试
@@ -95,16 +97,16 @@ describe('chat store 事件流', () => {
     s.submitAsk([{ options: ['A'] }])
     s.confirm(true)
     expect(send).not.toHaveBeenCalled()
-    expect(s.messages.filter(m => m.role === 'tool')).toHaveLength(1)
-    expect(s.pendingConfirm).toBeTruthy()
-    // 连接就绪（readyState=1 即 OPEN）后重试同一操作：真正发出；提问卡仍要等结果行才翻转
+    expect(s.messages.filter(m => m.role === 'tool')).toHaveLength(2)
+    expect(s.messages.at(-1).awaitingConfirm).toBe(true)
+    // 连接就绪（readyState=1 即 OPEN）后重试同一操作：真正发出；两张卡都仍要等结果行才翻转
     s._ws = { readyState: 1, send }
     s.submitAsk([{ options: ['A'] }])
     expect(send).toHaveBeenCalledWith(JSON.stringify({ type: 'ask_submit', answers: [{ options: ['A'] }] }))
-    expect(s.messages.filter(m => m.role === 'tool')).toHaveLength(1)
     s.confirm(true)
     expect(send).toHaveBeenCalledWith(JSON.stringify({ type: 'confirm', approved: true }))
-    expect(s.pendingConfirm).toBeNull()
+    expect(s.messages.filter(m => m.role === 'tool')).toHaveLength(2)
+    expect(s.messages.at(-1).awaitingConfirm).toBe(true)
   })
   it('declineAsk 上行「自行决定」固定答复，卡片留在消息流等结果行翻转（不是取消执行）', () => {
     const s = useChatStore()

@@ -38,7 +38,6 @@ onMounted(() => store.loadWorkspaces())
         :messages="store.messages"
         :streaming="store.streamingContent"
         :streaming-thinking="store.streamingThinking"
-        :pending-confirm="store.pendingConfirm"
         :has-session="!!store.currentSessionId"
       />
       <TodoBar v-if="store.todoList.length" :todos="store.todoList" />

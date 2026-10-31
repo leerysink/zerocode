@@ -217,46 +217,75 @@ describe('预览工具在消息流里的渲染', () => {
     expect(w.text()).toContain('预览日志（1 行）')
   })
 
-  it('重启确认卡：标题与按钮换成重启口径，正文用 summary', () => {
-    const w = mount(ChatMessages, {
-      props: {
-        messages: [], hasSession: true,
-        pendingConfirm: {
-          tool: 'preview_restart', args: { wait_seconds: 240 },
-          summary: '应用「演示应用」的 dev 预览正在运行，重启会中断正在进行的调试。确定重启？',
-        },
+  it('重启确认卡：待答态由调用行上的标记驱动，标题与按钮换成重启口径，正文用 summary', () => {
+    const w = mountMessages([
+      {
+        role: 'tool', name: 'preview_restart', args: { wait_seconds: 240 }, awaitingConfirm: true,
+        confirmSummary: '应用「演示应用」的 dev 预览正在运行，重启会中断正在进行的调试。确定重启？',
       },
-      global: {
-        stubs: {
-          'a-image': ImageStub, 'a-image-preview-group': GroupStub, 'a-button': ButtonStub,
-          MarkdownView: true, ToolCallBlock: true, AskUserCard: true,
-          ThinkingBlock: true, TodoCard: true, PreviewCard: true,
-        },
-      },
-    })
+    ])
     expect(w.text()).toContain('重启预览')
     expect(w.text()).toContain('正在运行')
     expect(w.text()).toContain('确认重启')
     expect(w.find('.zc-confirm-args').exists()).toBe(false)   // 有 summary 就不甩 args JSON
+    expect(w.find('.zc-preview').exists()).toBe(false)        // 待答时确认卡接管，不画「正在重启…」
   })
 
   it('写入确认卡文案一字不变（无 summary 时回落 args 摘要）', () => {
-    const w = mount(ChatMessages, {
-      props: {
-        messages: [], hasSession: true,
-        pendingConfirm: { tool: 'write_file', args: { path: 'a.txt', content: 'hi' } },
-      },
-      global: {
-        stubs: {
-          'a-image': ImageStub, 'a-image-preview-group': GroupStub, 'a-button': ButtonStub,
-          MarkdownView: true, ToolCallBlock: true, AskUserCard: true,
-          ThinkingBlock: true, TodoCard: true, PreviewCard: true,
-        },
-      },
-    })
+    const w = mountMessages([
+      { role: 'tool', name: 'write_file', args: { path: 'a.txt', content: 'hi' }, awaitingConfirm: true },
+    ])
     expect(w.text()).toContain('写入确认')
     expect(w.text()).toContain('确认写入')
     expect(w.find('.zc-confirm-args').text()).toContain('a.txt')
+  })
+
+  it('已答态确认卡由结果行的 confirm 字段推出，历史行同样能画', () => {
+    const w = mountMessages([
+      {
+        role: 'assistant', content: '我来写',
+        tool_args: {
+          tool_calls: [{
+            id: 'c1', type: 'function',
+            function: { name: 'write_file', arguments: '{"path":"a.txt"}' },
+          }],
+        },
+      },
+      { role: 'tool', tool_call_id: 'c1', tool_name: 'write_file', tool_result: { ok: true, confirm: 'approved' } },
+    ])
+    expect(w.text()).toContain('已批准写入')
+    expect(w.find('.zc-confirm-args').text()).toContain('a.txt')
+    expect(w.findAll('button')).toHaveLength(0)   // 只读：没有按钮
+  })
+
+  it('拒绝与中断各留各的痕', () => {
+    const denied = mountMessages([
+      { role: 'tool', name: 'db_write', args: { statements: [] }, result: { ok: false, confirm: 'denied' } },
+    ])
+    expect(denied.text()).toContain('已拒绝')
+    const cancelled = mountMessages([
+      { role: 'tool', name: 'write_file', args: { path: 'a.txt' }, result: { cancelled: true, confirm: 'cancelled' } },
+    ])
+    expect(cancelled.text()).toContain('已中断')
+  })
+
+  it('中断补写的普通工具行没有 confirm 字段，不得画成确认卡', () => {
+    const w = mountMessages([
+      { role: 'tool', name: 'read_file', args: { path: 'a.txt' }, result: { cancelled: true } },
+    ])
+    expect(w.find('.zc-confirm').exists()).toBe(false)
+    expect(w.findComponent(ToolCallBlock).exists()).toBe(true)
+  })
+
+  it('预览工具批准后仍画预览卡（结果卡已能表达重启结局，不再叠一张确认卡）', () => {
+    const w = mountMessages([
+      {
+        role: 'tool', name: 'preview_restart',
+        result: { ok: true, status: 'running', healthy: true, url: 'http://10.0.0.5:8213', confirm: 'approved' },
+      },
+    ])
+    expect(w.find('.zc-preview').exists()).toBe(true)
+    expect(w.find('.zc-confirm').exists()).toBe(false)
   })
 })
 

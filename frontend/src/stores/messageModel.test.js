@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { normalizeMessages, askQuestionsOf, askOutcomeOf, DECLINE_ANSWER } from './messageModel'
+import { normalizeMessages, askQuestionsOf, askOutcomeOf, confirmStateOf, DECLINE_ANSWER } from './messageModel'
 import { applyEvent } from './chat'
 
 // 历史行的真实形状（GET /sessions/{id}/messages 直接回 DB 行）：
@@ -148,5 +148,65 @@ describe('askQuestionsOf 提问载荷整形', () => {
     expect(askQuestionsOf({})).toEqual([])
     expect(askQuestionsOf(null)).toEqual([])
     expect(askQuestionsOf({ questions: [] })).toEqual([])
+  })
+})
+
+// 确认卡的同构：待答态靠事件打在调用行上的标记（重连时 hub 补发同一份），已答态完全靠
+// 结果行里的 confirm 字段。所以结果到达后实时记录必须与历史行逐字相同——标记不能残留，
+// 否则实时记录比历史多两个键（标记不落库），同构断言就此叉开。
+describe('实时 ≡ 历史（带确认的写入执行）', () => {
+  const WRITE_ARGS = { path: 'a.txt', content: 'hi' }
+  const RESULT = { ok: true, confirm: 'approved' }
+
+  function liveFromEvents() {
+    const s = { messages: [], streamingContent: '', streamingThinking: '', toolProgress: null }
+    s.messages.push({ role: 'user', content: '写个文件', attachments: [], client_msg_id: 'm1' })
+    for (const ev of [
+      { type: 'token', delta: '我来写' },
+      { type: 'message_done', content: '我来写' },
+      { type: 'tool_call', name: 'write_file', args: WRITE_ARGS },
+      { type: 'confirm_request', tool: 'write_file', args: WRITE_ARGS },
+      { type: 'tool_result', name: 'write_file', result: RESULT },
+      { type: 'token', delta: '写好了' },
+      { type: 'message_done', content: '写好了' },
+    ]) applyEvent(s, ev)
+    return s.messages
+  }
+
+  function historyFromDb() {
+    return [
+      { id: 1, seq: 1, role: 'user', content: '写个文件', attachments: [], created_at: 't1' },
+      {
+        id: 2, seq: 2, role: 'assistant', content: '我来写', reasoning: null,
+        tool_args: {
+          tool_calls: [{
+            id: 'c1', type: 'function',
+            function: { name: 'write_file', arguments: JSON.stringify(WRITE_ARGS) },
+          }],
+        },
+      },
+      { id: 3, seq: 3, role: 'tool', tool_call_id: 'c1', tool_name: 'write_file', tool_result: RESULT },
+      { id: 4, seq: 4, role: 'assistant', content: '写好了', reasoning: null },
+    ]
+  }
+
+  it('归一化后逐条 deep-equal（确认标记不残留在实时记录上）', () => {
+    expect(normalizeMessages(liveFromEvents())).toEqual(normalizeMessages(historyFromDb()))
+  })
+
+  it('已答态确认卡的状态只从结果行推出，两种来源同判', () => {
+    for (const src of [liveFromEvents(), historyFromDb()]) {
+      const row = normalizeMessages(src).find((m) => m.name === 'write_file')
+      expect(confirmStateOf(row)).toBe('approved')
+    }
+  })
+
+  it('待答态只认标记：没有结果行、也没有标记的调用行不是确认卡', () => {
+    const bare = normalizeMessages([{ role: 'tool', name: 'write_file', args: WRITE_ARGS }])
+    expect(confirmStateOf(bare[0])).toBe(null)
+    const marked = normalizeMessages([
+      { role: 'tool', name: 'write_file', args: WRITE_ARGS, awaitingConfirm: true },
+    ])
+    expect(confirmStateOf(marked[0])).toBe('pending')
   })
 })

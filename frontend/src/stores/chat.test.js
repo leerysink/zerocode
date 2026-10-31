@@ -18,7 +18,7 @@ function mk() {
   return {
     messages: [], streamingContent: '', streamingThinking: '', todoList: [],
     compacting: false, currentSessionId: 1,
-    toolProgress: null, pendingConfirm: null,
+    toolProgress: null,
     pendingEcho: '', pendingEchoId: '', pendingOutbox: {}, rejectedDraft: '',
     rejectedAttachments: [], running: false, visionSupported: false,
   }
@@ -316,23 +316,35 @@ describe('tool_progress 与确认卡 summary', () => {
     expect(s.toolProgress.line).toBe('x')
   })
 
-  it('confirm_request 无 summary 时对象形状一字不变', () => {
+  it('confirm_request 只给对应的调用行打标记，不再另立挂起态字段', () => {
     const s = mk()
+    applyEvent(s, { type: 'tool_call', name: 'write_file', args: { path: 'a.txt' } })
     applyEvent(s, { type: 'confirm_request', tool: 'write_file', args: { path: 'a.txt' } })
-    expect(s.pendingConfirm).toEqual({ tool: 'write_file', args: { path: 'a.txt' } })
-    // toEqual 会忽略值为 undefined 的键（实测：toEqual 放过 summary: undefined，toStrictEqual 才拦）：
-    // 只靠上面那条测不出「多一个空键」，补一条键清单，才真正守住「形状一字不变」
-    expect(Object.keys(s.pendingConfirm)).toEqual(['tool', 'args'])
+    expect(s.pendingConfirm).toBeUndefined()
+    const row = s.messages.at(-1)
+    expect(row.awaitingConfirm).toBe(true)
+    expect(row.args).toEqual({ path: 'a.txt' })   // 卡片内容仍来自调用行，事件不覆盖它
   })
 
-  it('confirm_request 带 summary 时保存', () => {
+  it('confirm_request 带 summary 时存到调用行上（只服务待答态）', () => {
     const s = mk()
+    applyEvent(s, { type: 'tool_call', name: 'preview_restart', args: { wait_seconds: 240 } })
     applyEvent(s, {
       type: 'confirm_request', tool: 'preview_restart', args: { wait_seconds: 240 },
       summary: '应用「演示应用」的 dev 预览正在运行，重启会中断正在进行的调试。确定重启？',
     })
-    expect(s.pendingConfirm.summary).toContain('正在运行')
-    expect(s.pendingConfirm.tool).toBe('preview_restart')
+    expect(s.messages.at(-1).confirmSummary).toContain('正在运行')
+  })
+
+  it('同名工具调用过两次时，标记落在还没结果的那一次上', () => {
+    const s = mk()
+    applyEvent(s, { type: 'tool_call', name: 'write_file', args: { path: 'a.txt' } })
+    applyEvent(s, { type: 'tool_result', name: 'write_file', result: { ok: true } })
+    applyEvent(s, { type: 'tool_call', name: 'write_file', args: { path: 'b.txt' } })
+    applyEvent(s, { type: 'confirm_request', tool: 'write_file', args: { path: 'b.txt' } })
+    const marked = s.messages.filter(m => m.awaitingConfirm)
+    expect(marked).toHaveLength(1)
+    expect(marked[0].args).toEqual({ path: 'b.txt' })
   })
 
   it('cancel 顺手清掉进度', () => {

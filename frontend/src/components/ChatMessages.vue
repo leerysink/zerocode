@@ -1,15 +1,16 @@
 <script setup>
 // 中栏对话流：无会话空态（大标题+副标题）/ 消息渲染（user 右侧浅蓝气泡、assistant Markdown 高亮、
-// tool 折叠块与预览卡、提问卡、error 红气泡+重试）/ 流式气泡（streamingContent 非空才渲染）/
-// 消息流底部插入确认卡（pendingConfirm：写入确认／重启预览）。
-// 提问卡不在此列：它是消息流的一部分，由 ask_user 调用行渲染（见 isAskCard）。
+// tool 折叠块与预览卡、提问卡、确认卡、error 红气泡+重试）/ 流式气泡（streamingContent 非空才渲染）。
+// 提问卡与确认卡都不是浮在底部的独立控件：它们是消息流的一部分，由对应工具调用行渲染
+// （见 isAskCard / confirmCardState），所以刷新、切会话、重连后都能从历史原样重建。
 // 滚动策略：新消息/新卡片强制滚底；流式增量仅在用户已贴底时跟随，不打断上翻阅读。
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useChatStore } from '../stores/chat'
-import { normalizeMessages } from '../stores/messageModel'
+import { normalizeMessages, confirmStateOf } from '../stores/messageModel'
 import MarkdownView from './MarkdownView.vue'
 import ToolCallBlock from './ToolCallBlock.vue'
 import AskUserCard from './AskUserCard.vue'
+import ConfirmCard from './ConfirmCard.vue'
 import ThinkingBlock from './ThinkingBlock.vue'
 import TodoCard from './TodoCard.vue'
 import PreviewCard from './PreviewCard.vue'
@@ -19,7 +20,6 @@ const props = defineProps({
   messages: { type: Array, default: () => [] },
   streaming: { type: String, default: '' },
   streamingThinking: { type: String, default: '' },
-  pendingConfirm: { type: Object, default: null },
   hasSession: { type: Boolean, default: false },
 })
 
@@ -27,14 +27,6 @@ const store = useChatStore()
 
 // Markdown 渲染已抽至 MarkdownView.vue（markdown-it 模块级单例 + 按 content 的 computed 缓存）：
 // 流式期间本组件随 token 重渲染，但历史气泡的 content 不变 → 子组件 computed 不重算，零重解析。
-
-// 确认卡 args 摘要：超长截断，避免大文件内容撑爆卡片
-const confirmSummary = computed(() => {
-  const args = props.pendingConfirm?.args
-  if (args == null) return ''
-  const text = JSON.stringify(args, null, 2)
-  return text.length > 600 ? `${text.slice(0, 600)}\n…（已截断）` : text
-})
 
 // 预览工具（规格 2026-10-29-agent-preview-tools §8）：三个工具共用 PreviewCard。
 // 名单与后端 llm.PREVIEW_TOOL_NAMES 同名同序；这里刻意不 import 后端常量（前端拿不到），
@@ -83,12 +75,14 @@ function liveProgress(m, i) {
   return p && p.name === (m.name || '') ? p : null
 }
 
-// 确认卡按工具换口径：写入确认（args 摘要）／重启预览（后端给的人话 summary）
-const isRestartConfirm = computed(() => props.pendingConfirm?.tool === 'preview_restart')
-const confirmTitle = computed(() => (isRestartConfirm.value ? '重启预览' : '写入确认'))
-const confirmOkText = computed(() => (isRestartConfirm.value ? '确认重启' : '确认写入'))
-const confirmNoText = computed(() => (isRestartConfirm.value ? '取消' : '拒绝'))
-const confirmSummaryText = computed(() => props.pendingConfirm?.summary || '')
+// 确认卡：待答态一律接管（没有它用户无从批准/拒绝，而此时预览卡只会显示「正在重启…」，
+// 把等决定的场面画成正在执行）；已答态只给非预览工具留痕——预览三件套的结果卡本来就会
+// 表达重启成功/被拒/中断，再叠一张确认卡是同一件事说两遍。
+function confirmCardState(m) {
+  const st = confirmStateOf(m)
+  if (!st || st === 'pending') return st
+  return isPreviewTool(m) ? null : st
+}
 
 // 自动滚底
 const scrollRef = ref(null)
@@ -103,7 +97,6 @@ function scrollToBottom() {
   })
 }
 watch(() => props.messages.length, scrollToBottom) // 新消息（user/tool/error/assistant）强制滚底
-watch(() => props.pendingConfirm, scrollToBottom) // 确认卡插入滚底（提问卡已在消息流里，由 messages.length 覆盖）
 watch(
   () => props.streaming,
   () => {
@@ -151,11 +144,13 @@ onMounted(scrollToBottom)
         <div v-else-if="m.role === 'notice'" class="zc-msg is-notice">
           <span class="zc-notice-text">{{ m.content }}</span>
         </div>
-        <!-- tool：todo_write 渲染任务卡；preview_* 渲染预览卡（还要过 isPreviewCard 的闸——
+        <!-- tool：ask_user 渲染提问卡；需确认的调用渲染确认卡（待答可交互／已答只读留痕）；
+             todo_write 渲染任务卡；preview_* 渲染预览卡（还要过 isPreviewCard 的闸——
              只有「有结果」或「仍在进行」的那条画卡）；其余落回通用折叠块。
              字段一律是归一化后的 name/args/result，实时与历史同形（见 messageModel.js）。 -->
         <div v-else-if="m.role === 'tool'" class="zc-msg is-tool">
           <AskUserCard v-if="isAskCard(m)" :questions="m.questions" :result="m.result" />
+          <ConfirmCard v-else-if="confirmCardState(m)" :msg="m" :state="confirmCardState(m)" />
           <TodoCard v-else-if="m.name === 'todo_write' && m.args && m.args.todos" :todos="m.args.todos" />
           <PageInspectCard v-else-if="isPageCard(m, i)" :msg="m" :progress="liveProgress(m, i)" />
           <PreviewCard v-else-if="isPreviewCard(m, i)" :msg="m" :progress="liveProgress(m, i)" />
@@ -178,21 +173,6 @@ onMounted(scrollToBottom)
       <!-- 流式气泡：streamingContent 非空才渲染（仅此气泡随 token 重算 Markdown） -->
       <div v-if="streaming" class="zc-msg is-assistant">
         <MarkdownView class="zc-md is-streaming" :content="streaming" />
-      </div>
-
-      <!-- 确认卡：写入确认（args 摘要）／重启预览（人话 summary），pendingConfirm 时插入消息流 -->
-      <div v-if="pendingConfirm" class="zc-msg is-confirm">
-        <div class="zc-confirm">
-          <div class="zc-confirm-head">
-            {{ confirmTitle }}<span class="zc-confirm-tool">{{ pendingConfirm.tool }}</span>
-          </div>
-          <p v-if="confirmSummaryText" class="zc-confirm-summary">{{ confirmSummaryText }}</p>
-          <pre v-else class="zc-confirm-args">{{ confirmSummary }}</pre>
-          <div class="zc-confirm-actions">
-            <a-button type="primary" @click="store.confirm(true)">{{ confirmOkText }}</a-button>
-            <a-button @click="store.confirm(false)">{{ confirmNoText }}</a-button>
-          </div>
-        </div>
       </div>
     </template>
   </div>
@@ -237,7 +217,6 @@ onMounted(scrollToBottom)
   justify-content: flex-end;
 }
 .zc-msg.is-tool,
-.zc-msg.is-confirm,
 .zc-msg.is-ask {
   width: 100%;
 }
@@ -327,57 +306,6 @@ onMounted(scrollToBottom)
   line-height: 1.7;
   white-space: pre-wrap;
   word-break: break-word;
-}
-
-/* 写入确认卡 */
-.zc-confirm {
-  width: 100%;
-  max-width: 640px;
-  background: #fdfaf3;
-  border: 1px solid #ecdfc4;
-  border-radius: 8px;
-  padding: 12px 14px;
-}
-.zc-confirm-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-weight: 500;
-  color: #8a6d3b;
-}
-.zc-confirm-tool {
-  font-size: 12px;
-  font-weight: 400;
-  background: rgba(138, 109, 59, 0.1);
-  border-radius: 4px;
-  padding: 1px 8px;
-}
-.zc-confirm-args {
-  margin: 10px 0;
-  max-height: 200px;
-  overflow: auto;
-  background: #fff;
-  border: 1px solid #ecdfc4;
-  border-radius: 6px;
-  padding: 8px 10px;
-  font-family: ui-monospace, SFMono-Regular, Consolas, 'Courier New', monospace;
-  font-size: 12px;
-  line-height: 1.7;
-  white-space: pre-wrap;
-  word-break: break-all;
-  color: var(--zc-text);
-}
-.zc-confirm-summary {
-  margin: 10px 0;
-  font-size: 13px;
-  line-height: 1.7;
-  color: var(--zc-text);
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-.zc-confirm-actions {
-  display: flex;
-  gap: 8px;
 }
 
 /* Markdown 正文（v-html 内容需 :deep 穿透） */

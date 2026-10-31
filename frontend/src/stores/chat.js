@@ -10,6 +10,8 @@
 // message_done 是**轮次收口**而非终态：工具轮在派发工具前也发一次，一次执行可以有多条。
 // ask_user 后端仍会发，但前端**不消费**：提问卡由消息流里的 ask_user 调用行渲染，
 // 这样刷新/切会话/重连后待答的题能从历史原样重建，不需要任何补发。
+// confirm_request 只作**标记**（哪一行在等确认），卡片内容一律从消息行读——已答态靠结果行里的
+// confirm 字段推出，历史里没有事件也能重建；标记本身在重连时由 hub 补发同一份。
 import { defineStore } from 'pinia'
 import {
   getMessages, getSessionDetail, listModels, listWorkspaces, patchSessionModel,
@@ -35,8 +37,15 @@ export function applyEvent(store, ev) {
       // 一次调用在消息流里只占一条记录：结果就地并进「同名、还没结果」的那条调用记录。
       // 历史里一次调用本来就是一条行，实时若拆成两条，刷新前后就会一个调用画两个块。
       const open = findOpenToolCall(store.messages, ev.name)
-      if (open) open.result = ev.result
-      else store.messages.push({ role: 'tool', name: ev.name, result: ev.result })
+      if (open) {
+        open.result = ev.result
+        // 确认标记的使命到此为止：状态已能从结果行的 confirm 字段推出来。留着标记会让实时
+        // 记录比历史行多两个键（标记不落库），同构断言就此叉开。
+        delete open.awaitingConfirm
+        delete open.confirmSummary
+      } else {
+        store.messages.push({ role: 'tool', name: ev.name, result: ev.result })
+      }
       // 进度只属于「正在跑的那个工具」：同名结果到达即收口，别的工具的结果不误清
       if (!store.toolProgress || store.toolProgress.name === ev.name) store.toolProgress = null
       break
@@ -44,13 +53,19 @@ export function applyEvent(store, ev) {
     case 'tool_progress': // 预览工具的临时进度（不落库，刷新即消失；最终结论看 tool_result）
       store.toolProgress = { name: ev.name, line: ev.line }
       break
-    case 'confirm_request':
-      // summary 是可选的人话摘要（预览重启用）：没有它时对象形状必须一字不变，
-      // 既有写入确认的断言与渲染都不受影响
-      store.pendingConfirm = ev.summary
-        ? { tool: ev.tool, args: ev.args, summary: ev.summary }
-        : { tool: ev.tool, args: ev.args }
+    case 'confirm_request': {
+      // 事件只作**标记**：卡片内容一律从消息行读（历史里没有事件，靠行才能重建已答态）。
+      // 「本次调用需要确认」这件事不在任何行里——它取决于写入确认开关与预览/写库的运行时判据，
+      // 前端无从推断，所以待答态仍需这个标记；重连时 hub 会补发同一份，标记因此不会丢。
+      const open = findOpenToolCall(store.messages, ev.tool)
+      if (open) {
+        open.awaitingConfirm = true
+        // summary 只服务待答态（hub 补发会一并带回来）；已答态一律回落参数摘要——
+        // summary 不落消息行，拿它渲染已答态就会让实时与刷新后叉开。
+        open.confirmSummary = ev.summary || ''
+      }
       break
+    }
     case 'message_done': // 整段回复固化（附带思考留痕）
       store.messages.push({ role: 'assistant', content: ev.content, reasoning: store.streamingThinking || undefined })
       store.streamingContent = ''
@@ -187,7 +202,6 @@ export const useChatStore = defineStore('chat', {
     messages: [],
     streamingContent: '',
     wsStatus: 'disconnected',
-    pendingConfirm: null,
     toolProgress: null, // 预览工具的临时进度 {name, line}：不落库、不进消息流，终态即清
     running: false,
     todoList: [],
@@ -251,7 +265,6 @@ export const useChatStore = defineStore('chat', {
         })
       }
       this.streamingContent = ''
-      this.pendingConfirm = null
       this.toolProgress = null // 临时进度不跨会话：切会话/重开时一并抹掉
       // 执行态一律以服务端为准，不在这里猜：DB 的 status='running' 在进程崩溃后会滞留
       // 最多 10 分钟（watchdog 周期），拿它立 running=true 会造出「假在跑、又停不掉」的新死结。
@@ -366,14 +379,14 @@ export const useChatStore = defineStore('chat', {
       this._uplink({ type: 'ask_submit', answers: [{ answer: DECLINE_ANSWER }] })
     },
     confirm(approved) {
-      if (this._uplink({ type: 'confirm', approved })) this.pendingConfirm = null
+      // 卡片状态由结果行里的 confirm 字段翻转，本地不清任何字段：上行失败时卡片自然还在，可重试。
+      this._uplink({ type: 'confirm', approved })
     },
     async requestCompact() {
       this._uplink({ type: 'compact' })
     },
     cancel() {
       this._uplink({ type: 'cancel' })
-      this.pendingConfirm = null
       this.toolProgress = null // 用户点了「停止」：那行进度当场作废，不等后端回执
       // 后端 hub.cancel 会一并丢弃未注入的插话（不落库）：本地同步摘掉那些「排队中」气泡，
       // 文本与附件按原顺序退回输入框，别让用户以为说出去了

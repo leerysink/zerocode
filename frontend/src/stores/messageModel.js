@@ -62,6 +62,9 @@ export function normalizeMessages(list) {
       // ask_user 的题目在归一化阶段就整形好：渲染层只读字段，不再自己做形状转换
       // （否则同一个纯函数会在每次渲染里被 isAskCard 与 :questions 各调一遍）。
       if (rec.name === 'ask_user') put(rec, 'questions', askQuestionsOf(rec.args))
+      // 确认卡的待答标记（confirm_request 事件打在调用行上）与人话摘要
+      if (raw.awaitingConfirm) rec.awaitingConfirm = true
+      put(rec, 'confirmSummary', raw.confirmSummary)
       put(rec, 'diff', raw.diff)
       put(rec, 'diff_path', raw.diff_path)
       put(rec, 'diff_action', raw.diff_action)
@@ -121,4 +124,15 @@ export function askOutcomeOf(result) {
   const answers = Array.isArray(result.answers) ? result.answers : []
   const declined = answers.some((a) => a && a.answer === DECLINE_ANSWER)
   return { state: declined ? 'declined' : 'answered', answers, reason: '' }
+}
+
+// 确认卡状态：'pending' | 'approved' | 'denied' | 'cancelled'，不是确认卡则 null。
+// 已答态完全由结果行里的 confirm 字段推出（历史里没有事件可读）；待答态靠 confirm_request
+// 事件打在调用行上的标记——「本次调用需要确认」这件事不在任何行里，它取决于写入确认开关与
+// 预览/写库的运行时判据，前端无从推断（ADR 0029 记了这条例外，hub 重连会补发同一份标记）。
+// 不认裸 cancelled：中断补写的配对行也是 {cancelled: true}，那条属于没派发的普通工具。
+export function confirmStateOf(m) {
+  const c = m.result?.confirm
+  if (c === 'approved' || c === 'denied' || c === 'cancelled') return c
+  return m.awaitingConfirm && !m.result ? 'pending' : null
 }
