@@ -147,6 +147,107 @@ async def test_missing_file_does_not_consume_inline_budget(
     assert isinstance(user_msgs[1]["content"], list)
 
 
+async def _compact_to(test_engine, sid, up_to, summary="旧摘要"):
+    sf = make_session_factory(test_engine)
+    async with sf() as s:
+        await s.execute(sql(
+            "INSERT INTO compaction (session_id, summary, up_to_seq) VALUES (:i, :s, :u)"),
+            {"i": sid, "s": summary, "u": up_to})
+        await s.commit()
+
+
+async def test_compacted_image_message_is_reattached(test_engine, tmp_path, monkeypatch):
+    """ADR-0030：图片消息落在压缩水位之前，仍是最近 2 条带图消息 → 重挂回模型历史。"""
+    monkeypatch.setenv("ZEROCODE_DATA_DIR", str(tmp_path))
+    sf = make_session_factory(test_engine)
+    sid = await mk_session(test_engine, tmp_path)
+    a = await att.create_attachment(sf, 7, sid, "a.png", PNG, "image/png")
+    await add_message(sf, sid, "user", content="看图", attachment_ids=[a["id"]])
+    for i in range(10):
+        await add_message(sf, sid, "assistant", content=f"答{i}")
+    await _compact_to(test_engine, sid, 6)
+    runner = AgentRunner(sf, ScriptedLLM([]), _cfg(), Recorder(),
+                         lambda *a, **k: asyncio.sleep(0, None),
+                         lambda *a, **k: True)
+    msgs, summary = await runner._history(sid, 40)
+    assert summary == "旧摘要"
+    user = next(m for m in msgs if m["role"] == "user")
+    assert isinstance(user["content"], list)
+    assert user["content"][1]["type"] == "image_url"
+    assert user["content"][1]["image_url"]["url"].startswith("data:image/png;base64,")
+
+
+async def test_compaction_releases_older_images(test_engine, tmp_path, monkeypatch):
+    """只有最近 2 条带图消息重挂；水位前更早的图不再进原文窗口（只留摘要）。"""
+    monkeypatch.setenv("ZEROCODE_DATA_DIR", str(tmp_path))
+    sf = make_session_factory(test_engine)
+    sid = await mk_session(test_engine, tmp_path)
+    a = await att.create_attachment(sf, 7, sid, "old.png", PNG, "image/png")
+    b = await att.create_attachment(sf, 7, sid, "mid.png", PNG, "image/png")
+    c = await att.create_attachment(sf, 7, sid, "new.png", PNG, "image/png")
+    await add_message(sf, sid, "user", content="第一", attachment_ids=[a["id"]])
+    await add_message(sf, sid, "assistant", content="好")
+    await add_message(sf, sid, "user", content="第二", attachment_ids=[b["id"]])
+    await add_message(sf, sid, "assistant", content="好")
+    await add_message(sf, sid, "user", content="第三", attachment_ids=[c["id"]])
+    await add_message(sf, sid, "assistant", content="好")
+    await _compact_to(test_engine, sid, 3)
+    runner = AgentRunner(sf, ScriptedLLM([]), _cfg(), Recorder(),
+                         lambda *a, **k: asyncio.sleep(0, None),
+                         lambda *a, **k: True)
+    msgs, _ = await runner._history(sid, 40)
+    user_msgs = [m for m in msgs if m["role"] == "user"]
+    assert [p["type"] for p in user_msgs[0]["content"]] == ["text", "image_url"]
+    assert [p["type"] for p in user_msgs[1]["content"]] == ["text", "image_url"]
+    assert all("第一" not in (m["content"] if isinstance(m["content"], str)
+                             else m["content"][0]["text"]) for m in user_msgs)
+
+
+async def test_pinned_image_outside_history_window_not_reattached(
+        test_engine, tmp_path, monkeypatch):
+    """重挂范围与历史窗口对齐：超出最近 window 条的图不再回到模型上下文。"""
+    monkeypatch.setenv("ZEROCODE_DATA_DIR", str(tmp_path))
+    sf = make_session_factory(test_engine)
+    sid = await mk_session(test_engine, tmp_path)
+    a = await att.create_attachment(sf, 7, sid, "a.png", PNG, "image/png")
+    await add_message(sf, sid, "user", content="看图", attachment_ids=[a["id"]])
+    for i in range(12):
+        await add_message(sf, sid, "assistant", content=f"答{i}")
+    await _compact_to(test_engine, sid, 2)
+    runner = AgentRunner(sf, ScriptedLLM([]), _cfg(), Recorder(),
+                         lambda *a, **k: asyncio.sleep(0, None),
+                         lambda *a, **k: True)
+    msgs, _ = await runner._history(sid, 10)
+    assert not any(m["role"] == "user" for m in msgs)
+    msgs_all, _ = await runner._history(sid, 40)
+    assert any(m["role"] == "user" for m in msgs_all)
+
+
+async def test_pinned_image_shares_inline_budget(test_engine, tmp_path, monkeypatch):
+    """重挂图与当前消息共用 10MB 预算：超预算先降级最旧的历史图，当前消息保留。"""
+    monkeypatch.setenv("ZEROCODE_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(att, "MAX_INLINE_BYTES", 70)
+    small = PNG + b"x" * 16  # 40 字节
+    sf = make_session_factory(test_engine)
+    sid = await mk_session(test_engine, tmp_path)
+    old = await att.create_attachment(sf, 7, sid, "old.png", small, "image/png")
+    cur = await att.create_attachment(sf, 7, sid, "cur.png", small, "image/png")
+    await add_message(sf, sid, "user", content="旧图", attachment_ids=[old["id"]])
+    await add_message(sf, sid, "assistant", content="好")
+    await add_message(sf, sid, "user", content="新图", attachment_ids=[cur["id"]])
+    await _compact_to(test_engine, sid, 2)
+    runner = AgentRunner(sf, ScriptedLLM([]), _cfg(), Recorder(),
+                         lambda *a, **k: asyncio.sleep(0, None),
+                         lambda *a, **k: True)
+    msgs, _ = await runner._history(sid, 40)
+    user_msgs = [m for m in msgs if m["role"] == "user"]
+    assert isinstance(user_msgs[0]["content"], str)
+    assert "较早的图片已省略" in user_msgs[0]["content"]
+    assert isinstance(user_msgs[1]["content"], list)
+    assert user_msgs[1]["content"][1]["type"] == "image_url"
+    assert runner._inline_used == len(small)
+
+
 def _pop_third(items):
     """只在第 3 次弹出时返回插话：第 1 次是 _inner 预清理，第 2 次是 round 0 边界。"""
     calls = {"n": 0}

@@ -1,6 +1,7 @@
 """上下文压缩（spec §4.3）：水位读取、字符估算、LLM 摘要、落库与事件下发。
 
 - 摘要覆盖 up_to_seq 之前的所有消息；保留最近 keep_recent 条原文；
+- 摘要链式合并上一份摘要（ADR-0030），并封顶 SUMMARY_MAX_CHARS；
 - 摘要拼装在 loop._build_messages 中注入 system 尾部 <context_summary>；
 - 消息不足（skip）send notice 终态事件后返回 None；失败只 send error 事件并返回 None；
   均不抛出、不改会话状态、不阻断对话。
@@ -10,10 +11,15 @@ from sqlalchemy import text
 
 from app.services.attachment_service import IMAGE_CHAR_EQUIVALENT
 
+SUMMARY_MAX_CHARS = 8000
+
 SUMMARY_PROMPT = (
-    "你是会话摘要器。把以下对话与工具结果压缩为继续工作所需的最小上下文，"
-    "必须保留：任务目标、关键决策、涉及文件与改动、当前任务清单、遗留问题。"
-    "直接输出摘要正文，不要客套。")
+    "你是会话摘要器。把此前摘要与本段新增对话、工具结果合并为一份覆盖全部历史的摘要，"
+    "压缩为继续工作所需的最小上下文。"
+    "必须保留：任务目标、关键决策、涉及文件与改动、当前任务清单、遗留问题、"
+    "带图消息记录（消息序号与文件名）。"
+    "摘要里的文件名不等于图片内容，不要写成已经看过图。"
+    "直接输出摘要正文，不要客套；全文不超过 8000 字。")
 
 async def latest(sf, session_id: int) -> tuple[str | None, int]:
     async with sf() as s:
@@ -46,7 +52,9 @@ def estimate_chars(rows: list[dict]) -> int:
     return n
 
 async def compact(sf, llm, session_id: int, send, keep_recent: int = 8) -> dict | None:
-    _, wm = await latest(sf, session_id)
+    # 摘要链（ADR-0030）：上一次摘要必须并入本次输入，否则第二次压缩后
+    # 最早那段历史（可能正是图片存在过的唯一记录）会被最新摘要顶掉
+    prev, wm = await latest(sf, session_id)
     rows = await rows_after(sf, session_id, wm)
     if len(rows) <= keep_recent:
         # skip 也是终态（fix-round Fix 1）：不下发任何事件会让前端 compacting 永久占用，
@@ -62,7 +70,8 @@ async def compact(sf, llm, session_id: int, send, keep_recent: int = 8) -> dict 
         if r.get("attachment_count"):
             body = (body or "") + f"\n[图片 ×{r['attachment_count']}：{r['attachment_names']}]"
         lines.append(f"[{r['seq']}][{r['role']}] {body}")
-    digest = "\n".join(lines)[:120_000]
+    body = "\n".join(lines)
+    digest = (f"[此前摘要]\n{prev}\n\n[本段新增]\n{body}" if prev else body)[:120_000]
     parts = []
     final = ""  # done 事件聚合全文（OpenAI 兼容流 done.message.content == 全部 delta 拼接）
     try:
@@ -77,7 +86,7 @@ async def compact(sf, llm, session_id: int, send, keep_recent: int = 8) -> dict 
         await send({"type": "error", "message": f"压缩失败，已保留原文: {e}"})
         return None
     # done 兜底：摘要轮只回 done（无增量 delta）时也能取到摘要（test_auto_compaction_triggers 契约）
-    summary = "".join(parts).strip() or final.strip()
+    summary = ("".join(parts).strip() or final.strip())[:SUMMARY_MAX_CHARS]
     if not summary:
         await send({"type": "error", "message": "压缩失败：模型未返回摘要，已保留原文"})
         return None

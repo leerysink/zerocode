@@ -91,6 +91,40 @@ async def test_estimate_counts_images_as_4000_chars(test_engine, tmp_path, monke
     assert comp.estimate_chars(rows) == len("看图") + 8000
 
 
+async def test_compact_chains_previous_summary(test_engine, tmp_path):
+    # ADR-0030：第二次压缩必须把上一份摘要并进输入，否则最早一段历史被顶掉
+    sf = make_session_factory(test_engine)
+    sid = await mk_session(test_engine, tmp_path)
+    await _seed_messages(sf, sid, 12)
+    first = ScriptedLLM([[{"type": "content_delta", "content": "第一摘要：目标A"},
+                          {"type": "done", "message": {"role": "assistant", "content": "第一摘要：目标A",
+                                                       "tool_calls": None}}]])
+    assert await comp.compact(sf, first, sid, _Rec(), keep_recent=8)
+    from app.services.message_service import add_message
+    for i in range(12):
+        await add_message(sf, sid, "assistant", content=f"新增{i}")
+    second = ScriptedLLM([[{"type": "done", "message": {"role": "assistant",
+                                                        "content": "第二摘要：目标A+B",
+                                                        "tool_calls": None}}]])
+    assert await comp.compact(sf, second, sid, _Rec(), keep_recent=8)
+    digest = second.received[0][1]["content"]
+    assert "第一摘要：目标A" in digest
+    assert await comp.latest(sf, sid) == ("第二摘要：目标A+B", 16)
+
+
+async def test_compact_summary_capped(test_engine, tmp_path):
+    # 摘要链会累积内容，必须封顶，防止 system 尾部无限膨胀
+    sf = make_session_factory(test_engine)
+    sid = await mk_session(test_engine, tmp_path)
+    await _seed_messages(sf, sid, 12)
+    llm = ScriptedLLM([[{"type": "done", "message": {"role": "assistant",
+                                                     "content": "长" * 9000,
+                                                     "tool_calls": None}}]])
+    assert await comp.compact(sf, llm, sid, _Rec(), keep_recent=8)
+    summary, _ = await comp.latest(sf, sid)
+    assert len(summary) == comp.SUMMARY_MAX_CHARS
+
+
 async def test_compact_digest_contains_image_note_but_not_bytes(test_engine, tmp_path, monkeypatch):
     monkeypatch.setenv("ZEROCODE_DATA_DIR", str(tmp_path))
     from app.services import attachment_service as att

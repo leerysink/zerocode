@@ -23,7 +23,8 @@ def build_system_prompt(root: str, date: str, app_contract: str | None = None,
         "同义条目用 update 不重复 create；system 尾部 <memories> 是当前召回结果，据此衔接。\n"
         "10. 用户消息可能直接附带图片（content part 中的 image_url 就是原图）。"
         "需要看图时直接依据消息里的图片回答，不要尝试用 read_file 去工作区找同名文件；"
-        "图片附件不占用工作区路径。")
+        "图片附件不占用工作区路径。摘要或占位里只有文件名、没有 image_url 的图片不可查看："
+        "不要假装看过，也不要 read_file，需要时请用户重新发送。")
     if skills:
         text += _render_available_skills(skills)
     if app_contract:

@@ -51,6 +51,7 @@ describe('applyEvent 新事件', () => {
     applyEvent(s, { type: 'compaction_done', summary: 'x', up_to_seq: 4 })
     expect(s.compacting).toBe(false)
     expect(s.messages[0].role).toBe('notice')
+    expect(s.messages[0].content).toContain('最近的对话与图片仍可查看')
   })
   it('error/status 复位 thinking', () => {
     const s = mk()

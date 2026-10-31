@@ -62,7 +62,7 @@ export function applyEvent(store, ev) {
       break
     case 'compaction_done': // 压缩完成：复位 + 消息流提示条
       store.compacting = false
-      store.messages.push({ role: 'notice', content: '已压缩上下文：更早对话已替换为摘要，最近几轮保留原文' })
+      store.messages.push({ role: 'notice', content: '已压缩上下文：更早对话已替换为摘要；最近的对话与图片仍可查看' })
       break
     case 'notice': // 系统提示（压缩 skip 终态等）：复位压缩态 + 居中灰字提示条
       store.compacting = false

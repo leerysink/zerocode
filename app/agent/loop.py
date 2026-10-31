@@ -162,14 +162,16 @@ class AgentRunner:
             await s.commit()
 
     async def _history(self, session_id: int, window: int) -> tuple[list[dict], str | None]:
-        # 水位过滤（Task 8）：已压缩摘要覆盖 seq≤wm 的旧消息，窗口只取 wm 之后的原文
+        # 水位过滤（Task 8）：已压缩摘要覆盖 seq≤wm 的旧消息，原文窗口只取 wm 之后。
+        # 重挂（ADR-0030）：历史窗口内最近 2 条带图 user 消息不受水位限制——压缩后
+        # 它们仍按原文回到模型上下文，否则工具密集的回合会让刚发过的图也看不见。
         summary, wm = await _comp.latest(self.sf, session_id)
         async with self.sf() as s:
             rows = (await s.execute(text(
-                "SELECT id, role, COALESCE(context_content, content) AS content, "
+                "SELECT id, seq, role, COALESCE(context_content, content) AS content, "
                 "tool_call_id, tool_name, tool_args, tool_result "
-                "FROM message WHERE session_id=:i AND seq > :w ORDER BY seq DESC LIMIT :win"),
-                {"i": session_id, "w": wm, "win": window})).mappings().all()
+                "FROM message WHERE session_id=:i ORDER BY seq DESC LIMIT :win"),
+                {"i": session_id, "win": window})).mappings().all()
         rows = list(reversed(rows))
         # 附件只回放最近两条带图用户消息：内联原图对 token/带宽都太重，更早的退化为
         # 文字占位（文件名仍可见，模型知道自己漏看了什么）。当前消息（窗口最后一条
@@ -179,6 +181,8 @@ class AgentRunner:
         meta = await _att.for_messages(self.sf, session_id, user_ids)
         with_atts = [mid for mid in user_ids if meta.get(mid)]
         inline = set(with_atts[-2:])
+        # 水位前只放行被钉住的带图消息；其余旧消息仍只走摘要
+        rows = [r for r in rows if r["seq"] > wm or r["id"] in inline]
         self._inline_used = 0
         files = await _att.for_llm(self.sf, sorted(inline)) if inline else {}
         if inline:
