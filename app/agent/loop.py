@@ -519,6 +519,21 @@ class AgentRunner:
                               tool_name=name, tool_result=cancelled)
             await self.send({"type": "tool_result", "name": name, "result": cancelled})
 
+    @staticmethod
+    def _denied(cancel, message):
+        """确认没通过：区分「用户点了拒绝」与「用户点了停止」。
+
+        hub.cancel 把 confirm future 解成 False，只看这个布尔值会把中断记成拒绝——
+        刷新后留痕说用户拒绝了这次写入，其实用户只是停了执行。提问侧早就分了这两种
+        （ask future 解成 None → cancelled），确认侧对齐。
+
+        结果里的 confirm 字段是前端已答态确认卡的**唯一**判据：它必须落库，历史里没有
+        事件可读。不复用裸 cancelled/ok——中断补写的配对行也是 {cancelled: true}，
+        那条属于没派发的普通工具，画成确认卡就是假阳性。"""
+        if cancel.is_set():
+            return {"cancelled": True, "confirm": "cancelled"}
+        return {"ok": False, "error": message, "confirm": "denied"}
+
     async def _dispatch(self, ctx, cfg, session_id, name, args, cancel):
         if name == "ask_user":
             timeout = cfg.get("agent.ask_timeout_seconds", 0)
@@ -538,7 +553,7 @@ class AgentRunner:
             await self.send({"type": "confirm_request", "tool": name, "args": args})
             ok = await self.confirm(session_id, {"tool": name, "args": args})
             if not ok:
-                return {"ok": False, "error": "用户拒绝该修改"}
+                return self._denied(cancel, "用户拒绝该修改")
         elif name == "preview_restart":
             # 中断运行中的预览要用户点头（§5.6）。AgentRunner 仍是 confirm_request 的唯一发出方；
             # 事件多带一个 summary，前端据此把「写入确认」换成「重启预览」的人话文案。
@@ -557,7 +572,7 @@ class AgentRunner:
                 approved = await self.confirm(session_id, {"tool": name, "args": args,
                                                            "summary": summary})
                 if not approved:
-                    return {"ok": False, "error": "用户拒绝重启预览"}
+                    return self._denied(cancel, "用户拒绝重启预览")
                 confirmed = True
         elif name == "db_write":
             # 写库恒确认，不受 agent.write_confirm 开关影响（ADR-0027）：文件写入可 git 回滚，
@@ -568,14 +583,19 @@ class AgentRunner:
             approved = await self.confirm(session_id, {"tool": name, "args": args,
                                                        "summary": summary})
             if not approved:
-                return {"ok": False, "error": "用户拒绝本次数据库写入"}
+                return self._denied(cancel, "用户拒绝本次数据库写入")
             confirmed = True
         try:
-            return await execute_tool(ctx, name, args, confirmed=confirmed)
+            result = await execute_tool(ctx, name, args, confirmed=confirmed)
         except ToolError as e:
-            return {"ok": False, "error": str(e)}
+            result = {"ok": False, "error": str(e)}
         except Exception as e:  # pragma: no cover
-            return {"ok": False, "error": f"工具执行异常: {e}"}
+            result = {"ok": False, "error": f"工具执行异常: {e}"}
+        # 确认留痕：批准也要在结果里留机器可读的标记。前端已答态的确认卡只读得到消息行
+        # （历史里没有事件），没有这个标记就分不清「用户点头放行的写入」与普通工具调用。
+        if confirmed and isinstance(result, dict):
+            result = {**result, "confirm": "approved"}
+        return result
 
 class _Cancelled(Exception):
     pass

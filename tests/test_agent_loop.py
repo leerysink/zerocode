@@ -637,6 +637,67 @@ async def test_running_restart_asks_and_rejection_changes_nothing(test_engine, t
 
 
 @pytest.mark.asyncio
+async def test_rejected_confirm_result_carries_denied_flag(test_engine, tmp_path, pv_seams):
+    """拒绝必须留机器可读标记：结果行带 confirm='denied'。
+
+    已答态的确认卡只能读消息行（历史里没有事件），靠「用户拒绝重启预览」这类散文识别
+    必然随文案漂移；三个需确认的工具各有一句不同的拒绝文案，更不可能逐个匹配。"""
+    async def reject(session_id, payload):
+        return False
+    sid, aid, sf = await mk_app_session(test_engine, tmp_path, status="running", slug="pvdenied",
+                                        dev_port=8283, prod_port=8282)
+    rec = Recorder()
+    turns = [done(None, [tool_call("c1", "preview_restart")]), done("好，那不重启")]
+    await mk_runner(sf, ScriptedLLM(turns), rec, confirm=reject, hub=DeployHub(),
+                    tasks={}).run(sid, "重启一下", asyncio.Event())
+    tr = next(e for e in rec.events if e["type"] == "tool_result")
+    assert tr["result"]["confirm"] == "denied"
+    # 落库的结果行同样带标记：刷新后前端只读得到这一行
+    async with sf() as s:
+        row = (await s.execute(sql(
+            "SELECT tool_result FROM message WHERE session_id=:i AND role='tool'"), {"i": sid})).scalar()
+    assert row["confirm"] == "denied"
+
+
+@pytest.mark.asyncio
+async def test_approved_confirm_result_carries_confirmed_flag(test_engine, tmp_path, pv_seams):
+    """批准同样要留标记：否则历史里「用户点头放行的写入」与普通工具调用无从区分。"""
+    sid, aid, sf = await mk_app_session(test_engine, tmp_path, status="running", slug="pvokflag",
+                                        dev_port=8285, prod_port=8284)
+    rec = Recorder()
+    turns = [done(None, [tool_call("c1", "preview_restart")]), done("已重启")]
+    await mk_runner(sf, ScriptedLLM(turns), rec, hub=DeployHub(),
+                    tasks={}).run(sid, "重启", asyncio.Event())
+    tr = next(e for e in rec.events if e["type"] == "tool_result")
+    assert tr["result"]["confirm"] == "approved"
+
+
+@pytest.mark.asyncio
+async def test_cancel_while_awaiting_confirm_records_cancelled_not_denied(test_engine, tmp_path, pv_seams):
+    """点「停止」时挂起的确认要记成中断，不是拒绝。
+
+    hub.cancel 把 confirm future 解成 False，_dispatch 只看这个布尔值就会写下
+    「用户拒绝重启预览」——刷新后留痕说用户拒绝了，其实用户只是停了执行。
+    提问侧早就区分了这两种（ask 解成 None → cancelled），确认侧要对齐。"""
+    cancel = asyncio.Event()
+    async def confirm_and_cancel(session_id, payload):
+        cancel.set()
+        return False
+    sid, aid, sf = await mk_app_session(test_engine, tmp_path, status="running", slug="pvcancel",
+                                        dev_port=8287, prod_port=8286)
+    rec = Recorder()
+    turns = [done(None, [tool_call("c1", "preview_restart")]), done("不该到达")]
+    await mk_runner(sf, ScriptedLLM(turns), rec, confirm=confirm_and_cancel, hub=DeployHub(),
+                    tasks={}).run(sid, "重启一下", cancel)
+    tr = next(e for e in rec.events if e["type"] == "tool_result")
+    assert tr["result"] == {"cancelled": True, "confirm": "cancelled"}
+    async with sf() as s:
+        row = (await s.execute(sql(
+            "SELECT tool_result FROM message WHERE session_id=:i AND role='tool'"), {"i": sid})).scalar()
+    assert row == {"cancelled": True, "confirm": "cancelled"}
+
+
+@pytest.mark.asyncio
 async def test_confirmed_restart_uses_the_shared_task_table(test_engine, tmp_path, pv_seams):
     """US-24：Agent 起的栈登记在 `app.state.dev_tasks` 里——与用户手点「启动预览」同一张表。"""
     sid, aid, sf = await mk_app_session(test_engine, tmp_path, status="running", slug="pvok",
