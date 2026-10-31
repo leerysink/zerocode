@@ -5,8 +5,8 @@
 #   --check      只跑前置检查，不改任何东西（预检失败原因与实跑一致）
 #   --no-build   不重建平台镜像，直接 up -d（只改 .env 时用）
 #   --gateway    顺带起中央网关（要 DNS 已解析、宿主 80/443 空闲；缺证书会自签）
-#   --takeover   允许动旧栈：移除占着 zerocode-pg16/zerocode-backend 写死名字的容器，
-#                并 stop 掉占着控制台/网关端口的容器（都不碰数据卷，宿主进程一律不碰）
+#   --takeover   允许动旧栈：移除占着 zerocode-pg16/zerocode-backend/zerocode-browser 写死
+#                名字的容器，并 stop 掉占着控制台/网关端口的容器（都不碰数据卷，宿主进程一律不碰）
 #   --fresh-db   连 pgdata 卷一起删再重来（平台库与所有应用分库全没，需手打 yes）
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -14,7 +14,7 @@ cd "$(dirname "$0")"
 # 打包时烘死的部署根：compose 的同路径挂载、镜像 WORKDIR、init.sql 里的 root_path 三处同源，
 # .env 改不了它。包放错目录时容器会在挂载点建出空目录，症状是「应用列表空、新建应用找不到」。
 DEPLOY_ROOT="/opt/zerocode"
-FIXED_NAMES=(zerocode-pg16 zerocode-backend)
+FIXED_NAMES=(zerocode-pg16 zerocode-backend zerocode-browser)
 APP_PORT_FROM=8210
 APP_PORT_TO=8399
 
@@ -52,6 +52,14 @@ if [ "$(uname -s)" = Linux ] && [ ! -S /var/run/docker.sock ]; then
   fail "缺 /var/run/docker.sock：平台要在宿主起应用 dev/prod 栈，compose 里那条挂载会直接失败"
 fi
 ok "docker、compose v2、docker.sock 就位"
+
+# compose 落后于包（只往服务器重传 backend/ 时最常见）会整块没有 browser 服务：平台照常
+# 起得来，预览也照常，只有 Agent 每次 preview_page 固定报「浏览器检查服务不可用」。
+# 只有在这里拦才拦得住——后端回落的是代码默认的 127.0.0.1:8101，症状不出现在部署过程里。
+SVC="$(docker compose config --services 2>&1)" || fail "compose 解析失败：$SVC"
+printf '%s\n' "$SVC" | grep -qx browser || fail \
+  "compose 里没有 browser 服务：这份 docker-compose.yml 比 preview_page 还旧。传新包的 docker-compose.yml 与 browser/ 目录再重跑（换整份 compose 前先 diff 保住服务器本地改过的默认值）"
+ok "compose 里有 browser sidecar 服务"
 
 PROBE="$(envval ZEROCODE_PREVIEW_PROBE_HOST)"
 [ "$PROBE" = "127.0.0.1" ] && fail \
@@ -163,6 +171,21 @@ docker exec zerocode-backend python -c \
   'import socket; socket.gethostbyname("host.docker.internal")' >/dev/null 2>&1 \
   || fail "容器里解析不了 host.docker.internal：compose 缺 extra_hosts: [host.docker.internal:host-gateway]"
 ok "探针宿主 $got 已就位且可解析"
+
+# 浏览器 sidecar 要探实连，不能只看 compose 里有服务：根文件系统只读 + tmpfs + cap_drop
+# 这套约束下 Chromium 起不来时容器会反复重启，而 preview_page 只会吐一句没有出路的
+# 「浏览器检查服务不可用」。URL 经 -e 传进容器，绝不拼进 python 源码。
+burl="$(cenv ZEROCODE_BROWSER_URL)"
+[ -n "$burl" ] || fail "容器里没有 ZEROCODE_BROWSER_URL：compose 的 backend environment 不是这一版（后端回落连 127.0.0.1:8101，preview_page 固定失败）"
+sidecar=0
+for _ in $(seq 1 10); do
+  if docker exec -e ZCB_URL="$burl" zerocode-backend python -c \
+       'import os,httpx; httpx.get(os.environ["ZCB_URL"].rstrip("/")+"/healthz",timeout=8).raise_for_status()' \
+       >/dev/null 2>&1; then sidecar=1; break; fi
+  sleep 2
+done
+[ "$sidecar" -eq 1 ] || fail "后端容器里连不通 $burl/healthz：docker compose ps browser 看它是否在反复重启，再 docker compose logs browser --tail 100 看 Chromium 启动错误；内存紧的机器先 docker inspect -f '{{.State.OOMKilled}}' zerocode-browser"
+ok "浏览器 sidecar 就位（$burl，/healthz 已通）"
 for k in ZEROCODE_GATEWAY_DOMAIN ZEROCODE_PREVIEW_HOST ZEROCODE_PYPI_MIRROR ZEROCODE_NPM_REGISTRY; do
   v="$(cenv "$k")"; ok "$k=${v:-（未设）}"
 done

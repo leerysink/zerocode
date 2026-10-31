@@ -257,6 +257,19 @@ def test_repo_deploy_script_busy_is_a_real_predicate():
     assert "|| true" not in line, f"busy() 又挂上 || true 了：{line}"
 
 
+def test_repo_deploy_script_gates_the_browser_sidecar():
+    """回归钉：sidecar 漏部署时平台与预览全都照常，只有 Agent 每次 preview_page 报一句
+    「浏览器检查服务不可用」，部署过程零提示（2026-11-01 演示机实撞：宿主的 compose 比包旧，
+    整块没有 browser 服务）。deploy.sh 两道都要在——预检按服务名核 compose 声明，
+    自检从后端容器实探 /healthz（compose 有服务不等于 Chromium 起得来）。"""
+    text = (bo.REPO_ROOT / "scripts" / "deploy.sh").read_text(encoding="utf-8")
+    assert "grep -qx browser" in text, "预检不再核对 compose 里的 browser 服务声明"
+    assert "ZEROCODE_BROWSER_URL" in text, "自检不再读后端容器里的 sidecar 地址"
+    assert "/healthz" in text, "自检不再实探浏览器 sidecar"
+    # 地址只能经 -e 进容器，不许拼进 python 源码（compose 默认值可被 .env 换成任意串）
+    assert 'docker exec -e ZCB_URL="$burl"' in text, "sidecar 探针把 URL 拼进了 python 源码"
+
+
 def test_repo_gateway_upstream_keeps_desktop_default():
     """仓库版本服务本机 Docker Desktop，默认值必须留在 host.docker.internal；
     出包版本才换成 172.17.0.1（见 test_gateway_defaults_baked_into_gateway_compose）。
