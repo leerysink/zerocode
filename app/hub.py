@@ -29,6 +29,10 @@ class ChatHub:
         self.compacting: set[int] = set()  # 压缩占位（无工具边界可注入，插话要区别对待）
         self.pending: dict[int, list[dict]] = {}  # 执行中插话：{content, attachment_ids, client_msg_id}
         self.run_vision: dict[int, bool] = {}  # 本 run 实际模型是否支持视觉（插话能力门）
+        # 需求澄清门禁的会话级解除标记（ADR-0032）：用户点过「自行决定」即置位，
+        # 后续每个 run 都不再强制澄清。与挂起点同样是内存态——进程重启后失效（该会话
+        # 回到「未解除」状态），这是既有代价，不为它加一层持久化。
+        self.clarify_waived: dict[int, bool] = {}
         self.emits: dict[int, callable] = {}  # session_id → 下行发送器: async (session_id, event) -> None
 
     def queue(self, session_id, item, max_pending) -> bool:
@@ -111,8 +115,14 @@ class ChatHub:
             return True
         return False
 
-    async def submit_answers(self, session_id, answers):
-        return self._resolve(self.ask_futures, session_id, {"answers": answers})
+    async def submit_answers(self, session_id, answers, declined=False):
+        # declined 是「用户点了不再提问，自行决定」的机器可读标记（ADR-0032）：
+        # 门禁据此解除本会话的强制澄清。刻意不靠匹配那段固定文案识别——散文匹配的真源
+        # 在前端常量里，改一个字就静默失效（ADR-0029 同类教训）。
+        payload = {"answers": answers}
+        if declined:
+            payload["declined"] = True
+        return self._resolve(self.ask_futures, session_id, payload)
     async def resolve_confirm(self, session_id, approved):
         return self._resolve(self.confirm_futures, session_id, bool(approved))
 

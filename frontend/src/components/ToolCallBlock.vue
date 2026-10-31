@@ -11,13 +11,28 @@ const toolName = computed(() => props.msg.name || 'tool')
 const args = computed(() => props.msg.args ?? null)
 const result = computed(() => props.msg.result ?? null)
 
+// clarify_done 的「我对需求的理解是…」是用户对这次自声明豁免唯一看得见的东西（ADR-0032），
+// 所以它进标题、而不是只躺在折叠面板的 JSON 里。文案一律读消息行的字段——实时与刷新后同形
+// 才有 ADR-0029 那条不变式，事件只提供标记不提供数据源。
+const header = computed(() => {
+  const name = toolName.value
+  if (name !== 'clarify_done') return `🔧 ${name}`
+  const r = result.value
+  if (!r) return `🔧 ${name}`
+  // 失败要显式说出来：收口没过却画成普通工具行，用户看不出这一轮其实没对齐
+  if (r.ok === false) return `⚠ 澄清收口未通过：${r.error || '缺少 understanding'}`
+  if (!r.understanding) return `🔧 ${name}`
+  const skipped = r.basis === 'already_clear' && !r.asked
+  return `✓ 需求已对齐：${r.understanding}${skipped ? '（未提问，直接开工）' : ''}`
+})
+
 const pretty = (v) => JSON.stringify(v, null, 2)
 </script>
 
 <template>
   <div class="zc-toolblock">
     <a-collapse ghost>
-      <a-collapse-panel key="tool" :header="`🔧 ${toolName}`">
+      <a-collapse-panel key="tool" :header="header">
         <template v-if="args != null">
           <div class="zc-tool-label">参数</div>
           <pre class="zc-tool-json">{{ pretty(args) }}</pre>

@@ -148,6 +148,8 @@ describe('AskUserCard 单题卡', () => {
     const payload = JSON.parse(send.mock.calls[0][0])
     expect(payload.type).toBe('ask_submit')
     expect(payload.answers[0].answer).toContain('自行决定')
+    // declined 是给后端的机器标记：澄清门禁据此解除本会话，后端不拿上面那段文案当判据（ADR-0032）
+    expect(payload.declined).toBe(true)
     expect(btn(w, '取消执行')).toBeTruthy()
   })
 

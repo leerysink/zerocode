@@ -47,6 +47,26 @@ def client(monkeypatch):
         yield c
         c.delete(f"/api/workspaces/{c.zc_wsid}")
 
+@pytest.fixture(autouse=True)
+def _clarify_off(client, monkeypatch):
+    """本文件的用例一律关掉需求澄清门禁。
+
+    原因是 `client` 连的是**开发库 zerocode**（见上面注释），而 changelog/V20261101 已经把
+    那套库的 `clarify.enabled` 播成 true。门禁开着时 `write_file` 会在确认卡**之前**被挡回，
+    下发的帧数不够，用例里的 `ws.receive_json()` 就永久等待——表现是挂死而不是报错。
+    聊天协议用例与澄清无关；澄清自身的覆盖在 tests/test_agent_loop.py 与 tests/test_clarify.py。
+    """
+    from app.services import config_service as _cs
+    real_get_all = _cs.get_all
+
+    async def without_clarify(session, owner_user_id=None):
+        cfg = await real_get_all(session, owner_user_id=owner_user_id)
+        cfg["clarify.enabled"] = False
+        return cfg
+
+    monkeypatch.setattr(_cs, "get_all", without_clarify)
+
+
 def done(content, tool_calls=None):
     return [{"type": "done", "message": {"role": "assistant", "content": content, "tool_calls": tool_calls}}]
 
@@ -909,7 +929,7 @@ def test_ws_injects_deploy_hub_and_task_table(client, monkeypatch):
 
     class Spy:
         def __init__(self, sf, llm, config_provider, send, ask, confirm, pop_pending=None,
-                     deploy_hub=None, dev_tasks=None, model_cfg=None):
+                     deploy_hub=None, dev_tasks=None, model_cfg=None, clarify_waived=None):
             self.get_cfg = config_provider
             self.send = send
             captured.update(hub=deploy_hub, tasks=dev_tasks, model_cfg=model_cfg)
@@ -970,7 +990,7 @@ def test_ws_confirm_switch_can_be_turned_off_from_config(client, monkeypatch):
 
     class Spy:
         def __init__(self, sf, llm, config_provider, send, ask, confirm, pop_pending=None,
-                     deploy_hub=None, dev_tasks=None, model_cfg=None):
+                     deploy_hub=None, dev_tasks=None, model_cfg=None, clarify_waived=None):
             self.get_cfg = config_provider
             self.send = send
 

@@ -12,7 +12,10 @@ from app.store import anchor as anchor_mod
 
 SCHEMA = "zc-release/1"
 # 顶层不进 src 的：平台生成物（deploy 含明文凭据）、独立进包的 sqlchange、清单与说明
-EXCLUDE_TOP = {"deploy", "sqlchange", "app.json", "README.md"}
+# 黑名单制：顶层目录不写在这里就**默认进包**（ADR-0033）。docs/ 是 Agent 沉淀的应用过程文档
+# （需求决策与计划），与同样被排除的 README.md/deploy/sqlchange 一类——不是应用运行内容，
+# 且 ADR 里可能含内部讨论，不能让装机者拿到。新增顶层目录时记得回来交代它算哪一类。
+EXCLUDE_TOP = {"deploy", "sqlchange", "app.json", "README.md", "docs"}
 EXCLUDE_DIRS = {"node_modules", ".venv", "dist", "__pycache__", ".pytest_cache", ".vite",
                 "venv", "build"}
 # 大型栈 dev 预览就地跑 mvn：backend/target 与 backend/logs 直接落在应用工作区里。不收它们，

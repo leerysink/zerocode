@@ -15,7 +15,8 @@ from app.agent.preview_tools import (build_preview_prompt, confirm_summary, fetc
                                      need_confirm, resolve_session_app)
 from app.agent.browser_tools import build_browser_prompt
 from app.agent.db_tools import build_db_prompt, db_confirm_summary
-from app.agent.prompts import build_system_prompt
+from app.agent.prompts import build_clarify_prompt, build_system_prompt
+from app.agent import clarify as _cl
 from app.agent.tools import ToolContext, ToolError, execute_tool
 from app.agent.mentions import expand_mentions
 from app.agent.redact import redact_tool_calls_args, redact_tool_result
@@ -61,7 +62,7 @@ def _normalize_questions(args: dict) -> list[dict]:
 
 class AgentRunner:
     def __init__(self, session_factory, llm, config_provider, send, ask, confirm, pop_pending=None,
-                 deploy_hub=None, dev_tasks=None, model_cfg=None):
+                 deploy_hub=None, dev_tasks=None, model_cfg=None, clarify_waived=None):
         self.sf = session_factory
         self.llm = llm
         self.get_config = config_provider
@@ -79,6 +80,10 @@ class AgentRunner:
         # 本 run 实际模型的能力位（preview_page 的视觉诊断按这个放行/降级）；缺省 None
         # 表示调用方未提供——浏览器工具仍可用，只是跳过看图诊断。
         self.model_cfg = model_cfg or {}
+        # 需求澄清门禁的会话级解除登记表（session_id → bool，由 ChatHub 持有，ADR-0032）：
+        # 用户点过「自行决定」的会话不再强制澄清，跨 run 生效。缺省 None = 不接线
+        # （既有调用方与单测的原签名可用，此时解除只在本轮内有效）。
+        self.clarify_waived = clarify_waived
         # 本轮历史已内联的图片原始字节合计（_history 构建时写入）：插话带图与历史共用
         # 同一份 MAX_INLINE_BYTES 预算，否则一次运行的内联总量可以越过上限
         self._inline_used = 0
@@ -289,7 +294,8 @@ class AgentRunner:
         skills = await self._enabled_skills_of(session_id)
         system_text = build_system_prompt(str(root), datetime.date.today().isoformat(),
                                           app_contract=build_app_contract(root), skills=skills,
-                                          preview=preview)
+                                          preview=preview,
+                                          clarify=build_clarify_prompt() if _cl.enabled(cfg) else None)
         if summary:
             system_text += f"\n\n<context_summary>\n{summary}\n</context_summary>"
         # 当前任务清单回灌：todo_write 调用会被历史窗口截掉，模型跨运行就"看不见"清单，
@@ -312,6 +318,12 @@ class AgentRunner:
             system_text += ("\n\n<memories>\n"
                             + "\n".join(self._memory_line(m) for m in memories)
                             + "\n</memories>")
+        # 决策索引回灌（ADR-0033 故事 15）：把 docs/adr 与 docs/specs 的摘要行交给模型，
+        # 否则「把决策写成文档」只是把蒸发地点从上下文换成磁盘。与 <memories> 同规矩：
+        # 空清单不注块；扫描按与澄清开关无关的独立行为——用户关掉拷问，已有文档仍该被看见。
+        decisions = _cl.render_decisions(_cl.collect_decisions(root))
+        if decisions:
+            system_text += decisions
         return [{"role": "system", "content": system_text}] + history
 
     async def _memories_of(self, session_id: int, user_text: str,
@@ -400,6 +412,15 @@ class AgentRunner:
             preview_prompt = (build_db_prompt() + (preview_prompt or "")
                               + build_browser_prompt())
         tools = _TOOLS + PREVIEW_TOOLS + DB_TOOLS + BROWSER_TOOLS if app else _TOOLS
+        # 澄清工具与门禁同生同灭（规格 §4 故事 20）：关掉开关的账户既不该看见 clarify_done，
+        # 更不该被一道模型看不见的闸拦下写入——那只会让写文件变成莫名失败。
+        clarify_on = _cl.enabled(cfg)
+        if clarify_on:
+            tools = tools + CLARIFY_TOOLS
+        run_state = {}
+        if (clarify_on and self.clarify_waived is not None
+                and self.clarify_waived.get(session_id)):
+            run_state[_cl.WAIVED_KEY] = True   # 「自行决定」跨 run 生效（ADR-0032 故事 7）
         # 先消费上一次 run 停止/收尾前没来得及注入的插话，再落本次新问题：
         # 保证 DB seq 与对话顺序一致（插话发生在先，新问题在后）
         await self._drain_steering(session_id, root, [])
@@ -419,7 +440,7 @@ class AgentRunner:
         ctx = ToolContext(root=root, session_id=session_id, session_factory=self.sf, send=self.send,
                           skills_root=await self._skills_root_of(session_id),
                           app=app, cfg=cfg, cancel=cancel, deploy_hub=self.deploy_hub,
-                          deploy_tasks=self.dev_tasks, run_state={},
+                          deploy_tasks=self.dev_tasks, run_state=run_state,
                           model_cfg=self.model_cfg, llm=await self._llm_for(cfg))
         max_rounds = int(cfg.get("agent.max_tool_rounds", 30))
         # <=0 = 不限工具轮数（与超时参数 <=0 不限制的约定一致），不再 range(0) 零轮即错
@@ -548,16 +569,51 @@ class AgentRunner:
                 return {"cancelled": True, "reason": "提问超时"}
             if ans is None:
                 return {"cancelled": True}
-            return {"answers": ans.get("answers", [])}
+            result = {"answers": ans.get("answers", [])}
+            if _cl.enabled(cfg):
+                declined = bool(ans.get("declined"))
+                _cl.note_ask(ctx.run_state, declined=declined)
+                if declined and self.clarify_waived is not None:
+                    self.clarify_waived[session_id] = True
+                notice = _cl.ask_notice(ctx.run_state, cfg)
+                if notice:
+                    result["notice"] = notice
+            return result
+        if name == "clarify_done":
+            # 收口声明不派发任何动作，本身就是结果。understanding 是用户对这次「自声明豁免」
+            # 唯一看得见的东西——缺了它，豁免就又变回模型说了算（ADR-0032）。
+            understanding = str(args.get("understanding") or "").strip()
+            if not understanding:
+                return {"ok": False,
+                        "error": "clarify_done 必须给出 understanding：一句话说清你对本次需求的理解"}
+            basis = _cl.note_done(ctx.run_state, args.get("basis"))
+            result = {"ok": True, "basis": basis, "understanding": understanding,
+                      "asked": int(ctx.run_state.get(_cl.ASKS_KEY) or 0)}
+            assumptions = args.get("assumptions")
+            if isinstance(assumptions, list) and assumptions:
+                result["assumptions"] = [str(a) for a in assumptions][:20]
+            return result
         confirmed = False
-        if name in ("write_file", "edit_file") and cfg.get("agent.write_confirm"):
-            await self.send({"type": "confirm_request", "tool": name, "args": args})
-            ok = await self.confirm(session_id, {"tool": name, "args": args})
-            if not ok:
-                return self._denied(cancel, "用户拒绝该修改")
-            # 批准也要置位：confirmed 是结果里 confirm 标记的唯一来源，漏了它前端就认不出
-            # 「这次写入是用户点头放行的」——已答态确认卡与刷新后的留痕都会退化成普通折叠块。
-            confirmed = True
+        if name in ("write_file", "edit_file"):
+            # 门禁挡在写入确认**之前**：不能让用户先吃一张确认卡、再告之后端其实没写。
+            if _cl.enabled(cfg):
+                blocked = _cl.gate_block(ctx.run_state)
+                if blocked:
+                    return {"ok": False, "error": blocked, "blocked_by": "clarify_gate"}
+            # docs/ 下的新建文档免二次确认（ADR-0033 故事 14）：用户刚在提问卡里同意写这份文档，
+            # 再弹一张「确认写入」就是同一件事确认两次。两个条件都机器可判——本轮确实问过
+            # （同意发生在提问卡里），且目标是 docs/ 下的**新建**文件（用户点头的范围是
+            # 「新建这一份」，覆盖已有文档仍要确认）。围栏见 clarify.is_new_doc_write。
+            doc_free = (_cl.is_new_doc_write(ctx.root, args.get("path"))
+                        and int(ctx.run_state.get(_cl.ASKS_KEY) or 0) >= 1)
+            if cfg.get("agent.write_confirm") and not doc_free:
+                await self.send({"type": "confirm_request", "tool": name, "args": args})
+                ok = await self.confirm(session_id, {"tool": name, "args": args})
+                if not ok:
+                    return self._denied(cancel, "用户拒绝该修改")
+                # 批准也要置位：confirmed 是结果里 confirm 标记的唯一来源，漏了它前端就认不出
+                # 「这次写入是用户点头放行的」——已答态确认卡与刷新后的留痕都会退化成普通折叠块。
+                confirmed = True
         elif name == "preview_restart":
             # 中断运行中的预览要用户点头（§5.6）。AgentRunner 仍是 confirm_request 的唯一发出方；
             # 事件多带一个 summary，前端据此把「写入确认」换成「重启预览」的人话文案。
@@ -604,4 +660,4 @@ class AgentRunner:
 class _Cancelled(Exception):
     pass
 
-from app.agent.llm import PREVIEW_TOOLS, DB_TOOLS, BROWSER_TOOLS, TOOLS as _TOOLS
+from app.agent.llm import PREVIEW_TOOLS, DB_TOOLS, BROWSER_TOOLS, CLARIFY_TOOLS, TOOLS as _TOOLS

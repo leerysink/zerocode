@@ -13,6 +13,9 @@ const FIELD_TO_KEY = {
   maxToolRounds: 'agent.max_tool_rounds',
   historyWindow: 'agent.history_window',
   openFolderMode: 'fs.open_folder_mode', // auto | system | web，见 utils/openFolder.js
+  // clarify.* 是账户级键（ADR-0032）：门禁拷问的是「这个人」，关掉只影响自己。
+  // 默认值与后端 app/agent/clarify.py 的 DEFAULT_ENABLED 同口径——库里没这个键时算开。
+  clarifyEnabled: 'clarify.enabled',
 }
 
 export const useConfigStore = defineStore('config', {
@@ -27,6 +30,7 @@ export const useConfigStore = defineStore('config', {
       maxToolRounds: 30,
       historyWindow: 40,
       openFolderMode: 'web', // 没配过这个键时的默认：一律弹内置文件管理器，本机直开属于显式选择（ADR-0009）
+      clarifyEnabled: true, // 需求澄清模式默认开（ADR-0032）：库里没这行时后端也按开处理
     },
     saving: false,
     loaded: false, // 是否已从后端拉到过配置（ensureLoaded 的去重依据）

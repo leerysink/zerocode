@@ -85,7 +85,8 @@ def build_app_contract(root: Path) -> str | None:
             f"{STACK_LABEL.get(stack, stack)}，dev 预览端口 {ports.get('dev')}）。\n"
             + _db_facts(meta.get("database")) +
             "1) 目录：frontend/（Vue3+ant-design-vue）、backend/（后端工程，static 栈无）、"
-            "schema/（结构真相）、sqlchange/（数据轨）、deploy/。\n"
+            "schema/（结构真相）、sqlchange/（数据轨）、deploy/、"
+            "docs/（应用过程文档：adr/ 存需求决策、specs/ 存计划，不进市场包）。\n"
             "2) 技术栈与版本以现有脚手架为准，只能追加依赖，不得替换或降级已锁定版本。\n"
             "3) 数据库变更走双轨："
             "**改表结构 → 编辑 `schema/schema.sql` 的目标态**（只写幂等可重放 DDL："

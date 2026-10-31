@@ -70,6 +70,28 @@ TOOLS = [
             "required": ["op"]}}},
 ]
 
+# 需求澄清收口声明（规格 docs/specs/2026-11-01-agent-clarify-mode.md，ADR-0032）：
+# 首轮澄清门禁的两个放行信号之一。只在 clarify.enabled 开启时挂载（loop 侧按配置拼工具列表）。
+# understanding 写成必填是设计的关键：豁免之所以成立，全在这句话对用户可见。
+CLARIFY_TOOLS = [
+    {"type": "function", "function": {
+        "name": "clarify_done",
+        "description": ("声明需求澄清已收口、可以开工。本轮第一次写文件前必须调用它，否则写入会被门禁挡回。"
+                        "understanding 必填：一句话说清你最终理解的需求，它会原样展示给用户；"
+                        "basis=clarified 表示已通过 ask_user 与用户对齐，"
+                        "basis=already_clear 表示用户消息本身已把目标、范围与约束说清、无需提问"),
+        "parameters": {"type": "object", "properties": {
+            "understanding": {"type": "string",
+                              "description": "你对本次需求的理解，展示给用户"},
+            "basis": {"type": "string", "enum": ["clarified", "already_clear"],
+                      "description": "收口依据，缺省 clarified"},
+            "assumptions": {"type": "array", "items": {"type": "string"},
+                            "description": "采用的假设（停止追问但仍有未确认点时给出）"}},
+            "required": ["understanding"]}}},
+]
+
+CLARIFY_TOOL_NAMES = ("clarify_done",)
+
 # 预览工具（规格 docs/specs/2026-10-29-agent-preview-tools.md）：只在会话工作区解析出应用时挂载。
 # 刻意没有 app_id / slug / path 参数——应用身份由服务端从 chat_session.workspace_id 反查，
 # 模型无从指向别的应用或别人的应用。描述保持一句话：这三条随每次请求发送，教程在 system prompt。

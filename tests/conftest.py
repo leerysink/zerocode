@@ -46,7 +46,14 @@ async def test_engine():
             "('deploy.auto_stop_dev_on_exit', 'true'), "
             "('deploy.default_nic', '\"\"'), "
             "('store.enabled', 'true'), "
-            "('store.keep_prev', '1') "
+            "('store.keep_prev', '1'), "
+            # 需求澄清门禁（ADR-0032）：生产库里这两行由 changelog/V20261101 播成默认开，
+            # 但 CASCADE 清库会把 owner NULL 的平台行一并带走、只靠这份种子重放，所以键必须
+            # 跟着迁移走，否则「平台级打底行」这类事实在测试里根本不存在、测不出来。
+            # 值显式取 false：绝大多数既有用例测的是别的接缝，不该先撞上这道写入门禁；
+            # 澄清自身的用例各自打开（见 tests/test_agent_loop.py 的 clarify 夹具）。
+            "('clarify.enabled', 'false'), "
+            "('clarify.ask_remind_at', '6') "
             "ON CONFLICT DO NOTHING"))
     await engine.dispose()
 

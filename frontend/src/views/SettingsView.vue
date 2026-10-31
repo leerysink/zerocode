@@ -275,6 +275,12 @@ async function save() {
             <a-form-item label="写入前确认">
               <a-switch v-model:checked="store.form.writeConfirm" />
             </a-form-item>
+            <a-form-item
+              label="需求澄清模式"
+              extra="开启后 AI 改文件前会先跟你对齐需求（先给解读、再逐题确认）；这一项按账户生效，关掉只影响你自己"
+            >
+              <a-switch v-model:checked="store.form.clarifyEnabled" />
+            </a-form-item>
             <a-form-item label="提问等待超时（秒）" extra="0=不限制">
               <a-input-number v-model:value="store.form.askTimeoutSeconds" :min="0" style="width: 180px" />
             </a-form-item>

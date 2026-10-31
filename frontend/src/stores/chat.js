@@ -416,8 +416,10 @@ export const useChatStore = defineStore('chat', {
     declineAsk() {
       // 「不再提问，自行决定」：不是取消执行，而是把决定权交还模型并继续本轮。
       // 固定答复即协议，常量单点定义在 messageModel.js——已答态靠它逐字识别并标注「自行决定」。
+      // declined 是给后端的机器标记（ADR-0032）：需求澄清门禁据此解除本会话的强制澄清。
+      // 后端不拿上面那段文案当判据——真源在前端常量里，改一个字就会静默失效。
       const answers = [{ answer: DECLINE_ANSWER }]
-      if (!this._uplink({ type: 'ask_submit', answers })) this.hint = OFFLINE_HINT
+      if (!this._uplink({ type: 'ask_submit', answers, declined: true })) this.hint = OFFLINE_HINT
     },
     confirm(approved) {
       // 卡片状态由结果行里的 confirm 字段翻转，本地不清任何字段：上行失败时卡片自然还在，

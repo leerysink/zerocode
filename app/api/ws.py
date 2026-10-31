@@ -266,7 +266,8 @@ async def ws_chat(ws: WebSocket, session_id: int):
                                              hub.pop_pending,
                                              deploy_hub=app.state.deploy_hub,
                                              dev_tasks=app.state.dev_tasks,
-                                             model_cfg=model_cfg_)
+                                             model_cfg=model_cfg_,
+                                             clarify_waived=hub.clarify_waived)
                         await runner.run(session_id, user_text_, cancel,
                                          attachment_ids=attachment_ids_)
                     finally:
@@ -276,7 +277,10 @@ async def ws_chat(ws: WebSocket, session_id: int):
 
                 asyncio.create_task(run_task(text_, attachment_ids, cfg_now, model_cfg))
             elif t == "ask_submit":
-                resolved = await hub.submit_answers(session_id, msg.get("answers") or [])
+                # declined 是「不再提问，自行决定」的机器标记（ADR-0032）：门禁据此解除本会话的
+                # 强制澄清。旧客户端不带该字段，按 False 处理，提问链路本身不受影响。
+                resolved = await hub.submit_answers(session_id, msg.get("answers") or [],
+                                                    bool(msg.get("declined")))
                 if not resolved and session_id not in hub.running:
                     await emit(session_id, {"type": "interaction_expired"})
             elif t == "confirm":

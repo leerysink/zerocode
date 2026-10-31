@@ -1,5 +1,6 @@
 def build_system_prompt(root: str, date: str, app_contract: str | None = None,
-                       skills: list[dict] | None = None, preview: str | None = None) -> str:
+                       skills: list[dict] | None = None, preview: str | None = None,
+                       clarify: str | None = None) -> str:
     text = (
         f"你是 zerocode 编程助手，运行在本地 Web 应用中。今天是 {date}。\n"
         f"当前工作区根目录：{root}\n"
@@ -25,6 +26,9 @@ def build_system_prompt(root: str, date: str, app_contract: str | None = None,
         "需要看图时直接依据消息里的图片回答，不要尝试用 read_file 去工作区找同名文件；"
         "图片附件不占用工作区路径。摘要或占位里只有文件名、没有 image_url 的图片不可查看："
         "不要假装看过，也不要 read_file，需要时请用户重新发送。")
+    # 澄清段紧跟基础规则：它就是规则 4 的展开形态，隔太远会被当成另一件事。
+    if clarify:
+        text += clarify
     if skills:
         text += _render_available_skills(skills)
     if app_contract:
@@ -32,6 +36,38 @@ def build_system_prompt(root: str, date: str, app_contract: str | None = None,
     if preview:
         text += preview
     return text
+
+
+def build_clarify_prompt() -> str:
+    """需求澄清模式的流程细则（规格 docs/specs/2026-11-01-agent-clarify-mode.md，ADR-0032）。
+
+    刻意不进技能库：技能是账户级、用户可删可改的存储，平台默认能力住在那里会出现
+    「用户删掉了自己的拷问流程，然后抱怨 Agent 不问问题」。
+    """
+    return (
+        "\n\n<clarify_mode>\n"
+        "本轮按需求澄清流程工作，先对齐再动手：\n"
+        "1. 收到需求先输出一段结构化解读：你对需求的分层理解（由浅入深，逐条锚定项目现状）、"
+        "其中歧义词的全部候选含义及各选法的后果差异、你推测的用户动机。不要只复述用户的话。\n"
+        "2. 接着用 ask_user 请用户确认「以上解读有无偏差」——这一问算本轮的第 1 题。"
+        "用户确认前不要开始改文件。\n"
+        "3. 确认后逐条单题拷问：一次只问一个问题，得到回答先思考再决定是否问下一个；"
+        "按决策依赖顺序推进，先解决前置决策。能通过读代码、读文件自行确认的不要问。\n"
+        "4. 通常 3~5 题应当收口。超过 5 题还没收敛，多半是第 2 步的解读没把歧义摊开——"
+        "此时停止追问、按最合理默认开工，并在 clarify_done 里列出采用了哪些假设。\n"
+        "5. 收口一律调用 clarify_done：understanding 写清你最终理解的需求（这句话原样展示给用户），"
+        "basis 用 clarified（已与用户对齐）或 already_clear（需求本已明确、无需提问）。"
+        "不调用它，本轮写不进任何文件。\n"
+        "6. 「把标题改成 X」这类用户消息已把目标、范围、约束说清的小任务，"
+        "直接 clarify_done(basis=\"already_clear\") 说明你的理解即可开工，"
+        "不要为了走流程编一道无意义的问题。\n"
+        "7. 用户点「不再提问，自行决定」表示他放弃澄清：立刻停止提问、按最合理默认继续，"
+        "并在最终答复里说明采用了什么假设。\n"
+        "8. 澄清出的结论要沉淀下来：收口后用 ask_user 问用户「是否把计划写成 docs/specs/ 下的文档、"
+        "把关键决策写成 docs/adr/ 下的 ADR」。同意后才写；docs/adr 用 `NNNN-短横线标题.md` 命名，"
+        "写前先 list_dir docs/adr 取下一个序号；一条 ADR 只记一个难以逆转的决策，写清背景、决定、"
+        "为什么这样选与被否决的方案。用户不同意就不写，也不再追问。\n"
+        "</clarify_mode>")
 
 
 def _render_available_skills(skills: list[dict]) -> str:

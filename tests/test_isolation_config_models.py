@@ -110,6 +110,28 @@ async def test_memory配置按账号隔离不泄到平台级(two_auth_clients):
         "memory.* 必须只落 owner 行：平台级行不被 conftest 的 TRUNCATE 清掉，会漏给后续所有人"
 
 
+async def test_clarify配置按账号隔离不覆盖平台行(two_auth_clients):
+    """ADR-0032：clarify.* 进了 USER_PREFIXES——门禁拷问的是「这个人」，账户之间不该互相影响。
+
+    与 memory.* 的差别在于平台级有一行打底值（changelog/V20261101 播种成 true）。这里不假设
+    打底行的值（conftest 每轮清库会把 owner NULL 行连同 CASCADE 一起带走、再按种子重放，
+    测试里它是 false），只钉两条真不变式：别人的视图不随我变、我的覆盖不写平台行。
+    """
+    alice, bob = two_auth_clients
+    uid_a = await _me(alice)
+    base_b = (await bob.get("/api/config")).json().get("clarify.enabled")
+    assert (await alice.put("/api/config", json={"clarify.enabled": True})).status_code == 200
+    assert (await alice.get("/api/config")).json()["clarify.enabled"] is True
+    assert (await bob.get("/api/config")).json().get("clarify.enabled") == base_b, \
+        "alice 的覆盖漏给了 bob——他被拷问的次数不该由别人决定"
+    async with alice.app.state.session_factory() as s:
+        rows = (await s.execute(text(
+            "SELECT owner_user_id, value FROM app_config WHERE key = 'clarify.enabled'"))).fetchall()
+    assert dict(rows).get(uid_a) is True, "账户覆盖必须落在自己的 owner 行上"
+    platform = [v for o, v in rows if o is None]
+    assert platform in ([], [False]), f"账户覆盖改写了平台默认行：{rows}"
+
+
 async def test_Agent会话按owner解析模型配置(two_auth_clients, tmp_path, test_engine):
     """行为关键链：各自的默认档案只服务各自的会话；直绑他人行也被回落，不串 key。"""
     alice, bob = two_auth_clients

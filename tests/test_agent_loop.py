@@ -14,10 +14,13 @@ def done(content, tool_calls=None):
 def tool_call(id_, name, **args):
     return {"id": id_, "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}}
 
-def cfg_provider(write_confirm=False, ask_timeout=0, max_rounds=30):
+def cfg_provider(write_confirm=False, ask_timeout=0, max_rounds=30, clarify=False, **over):
     async def _p():
+        # clarify 缺省关：本夹具服务的是与澄清无关的用例，而门禁的代码默认是「缺行即开」，
+        # 不显式关掉就会让每个写文件的用例都先撞上这道闸。澄清自身的用例传 clarify=True。
         return {"agent.write_confirm": write_confirm, "agent.ask_timeout_seconds": ask_timeout,
-                "agent.max_tool_rounds": max_rounds, "agent.history_window": 40}
+                "agent.max_tool_rounds": max_rounds, "agent.history_window": 40,
+                "clarify.enabled": clarify, **over}
     return _p
 
 class Recorder:
@@ -303,7 +306,7 @@ async def test_auto_compaction_triggers(test_engine, tmp_path):
         return {"agent.write_confirm": False, "agent.ask_timeout_seconds": 0,
                 "agent.max_tool_rounds": 30, "agent.history_window": 40,
                 "agent.auto_compact_chars": 10, "agent.compact_min_new": 1,
-                "agent.compact_keep_recent": 8}
+                "agent.compact_keep_recent": 8, "clarify.enabled": False}
     runner = AgentRunner(sf, llm, _p, rec,
                          lambda *a, **k: asyncio.sleep(0, None), lambda *a, **k: True)
     status = await runner.run(sid, "继续", asyncio.Event())
@@ -509,7 +512,7 @@ async def mk_app_session(test_engine, tmp_path, *, stack="vue3-fastapi", status=
 def preview_cfg(**over):
     async def _p():
         base = {"agent.write_confirm": False, "agent.ask_timeout_seconds": 0,
-                "agent.max_tool_rounds": 10, "agent.history_window": 40}
+                "agent.max_tool_rounds": 10, "agent.history_window": 40, "clarify.enabled": False}
         base.update(over)
         return base
     return _p
@@ -1054,3 +1057,236 @@ async def test_db_prompt_mounted_only_for_app_workspace(test_engine, tmp_path):
     llm = ScriptedLLM([[delta("好"), *done("好了")]])
     await mk_runner(sf, llm, Recorder()).run(sid, "看看数据", asyncio.Event())
     assert "<database>" in llm.received[0][0]["content"]
+
+
+# ---------------------------------------------------------------- 需求澄清门禁
+# 规格 docs/specs/2026-11-01-agent-clarify-mode.md（ADR-0032 / ADR-0033），逐条对齐用户故事。
+
+def answered_ask(answer="按方案一"):
+    """ask 桩：返回一条正常回答。返回 None 在中断路径里表示「已取消」，不是「没内容」。"""
+    return lambda *a, **k: asyncio.sleep(0, {"answers": [{"answer": answer}]})
+
+
+def declined_ask():
+    """「不再提问，自行决定」的上行形状：hub 侧带机器标记 declined（不是靠文案识别）。"""
+    return lambda *a, **k: asyncio.sleep(0, {"answers": [{"answer": "自行决定"}],
+                                             "declined": True})
+
+
+def approved_confirm():
+    """确认桩必须是协程：`_dispatch` 会 await 它，run_once 的同步默认桩只在不走确认时安全。"""
+    return lambda *a, **k: asyncio.sleep(0, True)
+
+
+def results_of(evs):
+    return [e for e in evs if e["type"] == "tool_result"]
+
+
+@pytest.mark.asyncio
+async def test_gate_blocks_write_without_dialogue(test_engine, tmp_path):
+    """故事 1：一句话需求直接写文件 → 挡回，且磁盘上确实没写。"""
+    turns = [done(None, [tool_call("c1", "write_file", path="a.txt", content="x")]),
+             done("先去问用户")]
+    sid, status, evs, sf = await run_once(test_engine, tmp_path, turns, clarify=True)
+    assert status == "idle"
+    tr = results_of(evs)[0]
+    assert tr["name"] == "write_file"
+    assert tr["result"].get("blocked_by") == "clarify_gate"
+    assert "澄清" in tr["result"]["error"]
+    assert not (tmp_path / "a.txt").exists()
+
+
+@pytest.mark.asyncio
+async def test_gate_allows_read_tools(test_engine, tmp_path):
+    """故事 2：只读工具不受门禁影响，否则模型在门禁之内无法完成澄清本身。"""
+    turns = [done(None, [tool_call("c1", "list_dir", path="")]), done("看完就说")]
+    sid, status, evs, sf = await run_once(test_engine, tmp_path, turns, clarify=True)
+    assert status == "idle"
+    tr = results_of(evs)[0]
+    assert tr["result"].get("blocked_by") is None
+    assert "entries" in tr["result"] or tr["result"].get("ok") is not False
+
+
+@pytest.mark.asyncio
+async def test_gate_passes_after_ask_and_done(test_engine, tmp_path):
+    """故事 3：问过 + 收口 → 放行。两个信号都必须在消息流里留痕。"""
+    turns = [done(None, [tool_call("c1", "ask_user", question="要哪种形态")]),
+             done(None, [tool_call("c2", "clarify_done", understanding="给首页加一个按钮")]),
+             done(None, [tool_call("c3", "write_file", path="a.txt", content="x")]),
+             done("写好了")]
+    sid, status, evs, sf = await run_once(test_engine, tmp_path, turns,
+                                          ask=answered_ask(), clarify=True)
+    assert status == "idle"
+    assert (tmp_path / "a.txt").read_text(encoding="utf-8") == "x"
+    assert [e["name"] for e in results_of(evs)] == ["ask_user", "clarify_done", "write_file"]
+    done_row = results_of(evs)[1]["result"]
+    assert done_row["understanding"] == "给首页加一个按钮"
+    assert done_row["basis"] == "clarified"
+
+
+@pytest.mark.asyncio
+async def test_gate_blocks_when_asked_but_not_closed(test_engine, tmp_path):
+    """故事 4：问过但没收口 → 仍拦（串联判据缺一即拦）。"""
+    turns = [done(None, [tool_call("c1", "ask_user", question="q")]),
+             done(None, [tool_call("c2", "write_file", path="a.txt", content="x")]),
+             done("被挡回")]
+    sid, status, evs, sf = await run_once(test_engine, tmp_path, turns,
+                                          ask=answered_ask(), clarify=True)
+    assert results_of(evs)[1]["result"].get("blocked_by") == "clarify_gate"
+    assert not (tmp_path / "a.txt").exists()
+
+
+@pytest.mark.asyncio
+async def test_gate_blocks_declared_but_never_asked(test_engine, tmp_path):
+    """故事 4：收了口但从没问过、也没声明豁免 → 拦，且引导语指向「去提问」而不是「重新收口」。"""
+    turns = [done(None, [tool_call("c1", "clarify_done", understanding="自认为清楚了")]),
+             done(None, [tool_call("c2", "write_file", path="a.txt", content="x")]),
+             done("被挡回")]
+    sid, status, evs, sf = await run_once(test_engine, tmp_path, turns, clarify=True)
+    blocked = results_of(evs)[1]["result"]
+    assert blocked.get("blocked_by") == "clarify_gate"
+    assert "没有向用户提过任何问题" in blocked["error"]
+
+
+@pytest.mark.asyncio
+async def test_already_clear_basis_exempts_asking(test_engine, tmp_path):
+    """故事 5/6：小任务声明 already_clear 即放行；understanding 落进结果行供前端回显。"""
+    turns = [done(None, [tool_call("c1", "clarify_done", basis="already_clear",
+                                   understanding="把 README 的一级标题改成 Hello")]),
+             done(None, [tool_call("c2", "write_file", path="README.md", content="# Hello")]),
+             done("改好了")]
+    sid, status, evs, sf = await run_once(test_engine, tmp_path, turns, clarify=True)
+    assert status == "idle"
+    first = results_of(evs)[0]["result"]
+    assert first["basis"] == "already_clear" and first["asked"] == 0
+    assert "README" in first["understanding"]
+    assert (tmp_path / "README.md").exists()
+
+
+@pytest.mark.asyncio
+async def test_clarify_done_requires_understanding(test_engine, tmp_path):
+    """豁免的可审计性全在 understanding 上——缺它就退回「模型说了算」，必须拒。"""
+    turns = [done(None, [tool_call("c1", "clarify_done", basis="already_clear")]), done("补问")]
+    sid, status, evs, sf = await run_once(test_engine, tmp_path, turns, clarify=True)
+    res = results_of(evs)[0]["result"]
+    assert res["ok"] is False and "understanding" in res["error"]
+
+
+@pytest.mark.asyncio
+async def test_ask_notice_fires_at_threshold(test_engine, tmp_path):
+    """故事 9：第 N 题在结果里附一条止损提醒，且只在第 N 题那一次出现。"""
+    ask_turns = [done(None, [tool_call(f"c{i}", "ask_user", question=f"q{i}")]) for i in range(3)]
+    turns = ask_turns + [done("收工")]
+    sid, status, evs, sf = await run_once(test_engine, tmp_path, turns, ask=answered_ask(),
+                                          clarify=True, **{"clarify.ask_remind_at": 3})
+    rs = results_of(evs)
+    assert "notice" not in rs[0]["result"] and "notice" not in rs[1]["result"]
+    assert "停止追问" in rs[2]["result"]["notice"]
+
+
+@pytest.mark.asyncio
+async def test_declined_waives_gate_for_the_session_across_runs(test_engine, tmp_path):
+    """故事 7：用户点「自行决定」后，同一个会话的下一次 run 不再被门禁拦（跨 run 生效）。"""
+    sid = await mk_session(test_engine, tmp_path)
+    sf = make_session_factory(test_engine)
+    waived = {}
+
+    def build(turns):
+        rec = Recorder()
+        return AgentRunner(sf, ScriptedLLM(turns), cfg_provider(clarify=True), rec,
+                           declined_ask(), lambda *a, **k: True,
+                           clarify_waived=waived), rec
+
+    runner, rec1 = build([done(None, [tool_call("c1", "ask_user", question="要不要问")]),
+                          done("按默认继续")])
+    await runner.run(sid, "第一问", asyncio.Event())
+    assert waived.get(sid) is True                     # 解除标记登记在 hub 那份表里
+    assert results_of(rec1.events)[0]["result"]["answers"]
+
+    # 新一轮（新 runner、新 run_state）：没问过也没收口，仍应放行
+    runner2, rec2 = build([done(None, [tool_call("c2", "write_file", path="b.txt", content="y")]),
+                           done("写好了")])
+    await runner2.run(sid, "第二个任务", asyncio.Event())
+    assert results_of(rec2.events)[0]["result"].get("blocked_by") is None
+    assert (tmp_path / "b.txt").exists()
+
+
+@pytest.mark.asyncio
+async def test_clarify_tools_and_prompt_mounted_together(test_engine, tmp_path):
+    """故事 10/20：工具与澄清段同生同灭——关掉开关的账户既看不见闸也看不见 clarify_done。"""
+    sid = await mk_session(test_engine, tmp_path)
+    sf = make_session_factory(test_engine)
+    on = ScriptedLLM([[delta("好"), *done("好了")]])
+    await AgentRunner(sf, on, cfg_provider(clarify=True), Recorder(),
+                      lambda *a, **k: asyncio.sleep(0, None), lambda *a, **k: True
+                      ).run(sid, "开着的会话", asyncio.Event())
+    assert "clarify_done" in tool_names(on)
+    assert "<clarify_mode>" in on.received[0][0]["content"]
+
+    off = ScriptedLLM([[delta("好"), *done("好了")]])
+    await AgentRunner(sf, off, cfg_provider(clarify=False), Recorder(),
+                      lambda *a, **k: asyncio.sleep(0, None), lambda *a, **k: True
+                      ).run(sid, "关掉的会话", asyncio.Event())
+    assert "clarify_done" not in tool_names(off)
+    assert "<clarify_mode>" not in off.received[0][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_new_doc_write_skips_second_confirmation(test_engine, tmp_path):
+    """故事 14：docs/ 下的新建文档免二次确认；同轮的普通代码写入仍照旧弹确认卡。"""
+    turns = [done(None, [tool_call("c1", "ask_user", question="要不要把计划写成文档")]),
+             done(None, [tool_call("c2", "clarify_done", understanding="写计划文档")]),
+             done(None, [tool_call("c3", "write_file", path="docs/specs/plan.md", content="# 计划")]),
+             done(None, [tool_call("c4", "write_file", path="backend/app.py", content="print(1)")]),
+             done("都写好了")]
+    sid, status, evs, sf = await run_once(test_engine, tmp_path, turns, ask=answered_ask(),
+                                          confirm=approved_confirm(),
+                                          clarify=True, write_confirm=True)
+    confirms = [e for e in evs if e["type"] == "confirm_request"]
+    assert status == "idle", evs
+    assert [c["args"]["path"] for c in confirms] == ["backend/app.py"]
+    assert (tmp_path / "docs" / "specs" / "plan.md").exists()
+    assert (tmp_path / "backend" / "app.py").exists()
+
+
+@pytest.mark.asyncio
+async def test_existing_doc_still_needs_confirmation(test_engine, tmp_path):
+    """故事 14 的反向断言：用户点头的是「新建这一份」，覆盖已有文档仍要确认。"""
+    (tmp_path / "docs" / "adr").mkdir(parents=True)
+    (tmp_path / "docs" / "adr" / "0001-x.md").write_text("# 旧内容", encoding="utf-8")
+    turns = [done(None, [tool_call("c1", "ask_user", question="更新这份 ADR 吗")]),
+             done(None, [tool_call("c2", "clarify_done", understanding="更新 ADR")]),
+             done(None, [tool_call("c3", "write_file", path="docs/adr/0001-x.md", content="# 新")]),
+             done("好了")]
+    # 用户拒绝：确认卡弹出去了，文件就必须保持原样——免确认分支没有偷偷写盘的后门
+    sid, status, evs, sf = await run_once(test_engine, tmp_path, turns, ask=answered_ask(),
+                                          confirm=lambda *a, **k: asyncio.sleep(0, False),
+                                          clarify=True, write_confirm=True)
+    assert [e["args"]["path"] for e in evs if e["type"] == "confirm_request"] == ["docs/adr/0001-x.md"]
+    assert (tmp_path / "docs" / "adr" / "0001-x.md").read_text(encoding="utf-8") == "# 旧内容"
+
+
+@pytest.mark.asyncio
+async def test_app_decisions_injected_and_skipped_when_empty(test_engine, tmp_path):
+    """故事 15/16：docs 有文档时注入 <app_decisions> 索引，目录为空时不注空块。"""
+    sid = await mk_session(test_engine, tmp_path)
+    sf = make_session_factory(test_engine)
+
+    def _run():
+        llm = ScriptedLLM([[delta("好"), *done("好了")]])
+        runner = AgentRunner(sf, llm, cfg_provider(clarify=True), Recorder(),
+                             lambda *a, **k: asyncio.sleep(0, None), lambda *a, **k: True)
+        return llm, runner
+
+    llm, runner = _run()
+    await runner.run(sid, "接着上次做", asyncio.Event())
+    assert "<app_decisions>" not in llm.received[0][0]["content"]
+
+    (tmp_path / "docs" / "adr").mkdir(parents=True)
+    (tmp_path / "docs" / "adr" / "0001-gate.md").write_text(
+        "---\ntitle: 首轮澄清门禁\ndescription: 写文件前先对齐\n---\n", encoding="utf-8")
+    llm2, runner2 = _run()
+    await runner2.run(sid, "接着上次做", asyncio.Event())
+    system = llm2.received[0][0]["content"]
+    assert "<app_decisions>" in system and "docs/adr/0001-gate.md" in system
+    assert "首轮澄清门禁" in system

@@ -6,7 +6,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 # 维持平台级共享（owner NULL）——拷问阶段裁定。
 # memory.* 走同一套（Ticket 006）：召回上限决定「往 prompt 里塞多少自己的内容」，
 # 与 llm.* 一样是各人可调、不该互相影响的开关。
-USER_PREFIXES = ("llm.", "memory.")
+# clarify.* 同理（ADR-0032）：澄清模式是「问不问我的活」，被拷问的人得能自己关掉。
+# 另立新前缀而不是把 agent.* 整体改成账户级——那条「普通用户改 agent.* 影响全平台」
+# 是既有裁定，本条不推翻它。
+USER_PREFIXES = ("llm.", "memory.", "clarify.")
 
 
 def _is_user_key(k: str) -> bool:

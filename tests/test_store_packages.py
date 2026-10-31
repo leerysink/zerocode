@@ -136,6 +136,24 @@ def test_runtime_uploads_are_not_packaged_and_not_fingerprinted(app_tree):
     assert packages.source_hash(app_tree) == h, "上传不该让分叉判定误报"
 
 
+def test_docs_are_process_artifacts_and_stay_out_of_the_package(app_tree):
+    """ADR-0033：`docs/`（Agent 沉淀的需求决策与计划）是过程产物，与 README.md 同类。
+
+    打包是黑名单制——新顶层目录不显式交代就**默认进包**，所以这条断言守的是
+    「别把内部讨论发给装机者」；指纹同理：补一份 ADR 不该让下一次发布报成分叉。
+    """
+    for rel in ("docs/adr/0001-gate.md", "docs/specs/plan.md"):
+        p = app_tree / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("# 决策\n", encoding="utf-8", newline="")
+    rels = [rel for rel, _ in packages._iter_src(app_tree)]
+    assert not any(r.startswith("docs/") for r in rels), "包里有应用过程文档"
+    assert "backend/app/main.py" in rels, "其余内容照旧进包"
+    h = packages.source_hash(app_tree)
+    (app_tree / "docs" / "adr" / "0002-more.md").write_text("# 又一版\n", encoding="utf-8", newline="")
+    assert packages.source_hash(app_tree) == h, "补一份文档不该被判成分叉"
+
+
 def _md5(p):
     from app.store.anchor import file_md5
     return file_md5(p)
