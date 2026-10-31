@@ -417,6 +417,23 @@ describe('tool_progress 与确认卡 summary', () => {
     expect(pending.result).toEqual({ cancelled: true })
   })
 
+  it('interaction_expired 收口时执行态残留一起清掉（不能留一个转圈的思考块）', () => {
+    const s = mk()
+    applyEvent(s, { type: 'tool_call', name: 'write_file', args: { path: 'a.txt' } })
+    applyEvent(s, { type: 'confirm_request', tool: 'write_file', args: { path: 'a.txt' } })
+    s.running = true
+    s.streamingThinking = '半截思考'
+    s.toolProgress = { name: 'write_file', line: '正在写' }
+    s.compacting = true
+    applyEvent(s, { type: 'interaction_expired' })
+    // 这一帧就是本轮的终态：复位集合必须与 error / status(idle) 完全一致，
+    // 少清一项（实测漏了 streamingThinking）页面就永远挂着「思考中…」。
+    expect(s.streamingThinking).toBe('')
+    expect(s.toolProgress).toBeNull()
+    expect(s.compacting).toBe(false)
+    expect(s.running).toBe(false)
+  })
+
   it('确认上行失败（连接未就绪）要留下提示，不能零反馈', () => {
     setActivePinia(createPinia())
     const s = useChatStore()

@@ -25,6 +25,19 @@ const BUSY_HINT = '会话正在执行中：点右侧「停止」结束当前执�
 const COMPACT_HINT = '上下文压缩中，请稍候'
 const OFFLINE_HINT = '连接未就绪，正在重连，请稍候再发'
 
+// 本轮结束时要复位的执行态，单点定义：三个终态入口（error / status(idle|error) /
+// interaction_expired）共用同一集合。抄漏一项的后果是页面上留一个永远转圈的残块
+// （手工走查实测漏过 streamingThinking：卡片收了，「思考中…」还在）。
+function endRunState(store) {
+  store.running = false
+  store.streamingThinking = ''
+  store.compacting = false // 压缩失败也是终态：复位压缩按钮 loading
+  store.pendingEcho = ''
+  store.pendingOutbox = {}
+  store.pendingEchoId = ''
+  store.toolProgress = null
+}
+
 export function applyEvent(store, ev) {
   switch (ev.type) {
     case 'token': // 流式增量追加
@@ -101,8 +114,7 @@ export function applyEvent(store, ev) {
         delete m.confirmSummary
         closed = true
       }
-      store.running = false
-      store.toolProgress = null
+      endRunState(store)
       store.hint = closed ? '后端已无这次确认/回答的记录（执行已中断或后端重启），卡片已收口' : ''
       break
     }
@@ -199,26 +211,14 @@ export function applyEvent(store, ev) {
       break
     case 'error':
       store.messages.push({ role: 'error', content: ev.message })
-      store.running = false
-      store.streamingThinking = ''
-      store.compacting = false // 压缩失败也是终态：复位压缩按钮 loading
-      store.pendingEcho = ''
-      store.pendingOutbox = {}
-      store.pendingEchoId = ''
-      store.toolProgress = null
+      endRunState(store)
       break
     case 'status': // 终态回执（idle/error）复位执行态；status=running 是重连补发的非终态快照
       if (ev.status === 'running') {
         store.running = true // 后端仍在跑（刷新/重连/另开标签页）：把「停止」按钮立回来
         break // 快照不改进度：那一行还得继续显示
       }
-      store.running = false
-      store.streamingThinking = ''
-      store.compacting = false
-      store.pendingEcho = ''
-      store.pendingOutbox = {}
-      store.pendingEchoId = ''
-      store.toolProgress = null
+      endRunState(store)
       break
     case 'file_change': // 挂到最近一条 tool 消息，供 diff 渲染（Task 13 最小扩展：补存 path/action 供文件名显示）
       for (let i = store.messages.length - 1; i >= 0; i--) {
