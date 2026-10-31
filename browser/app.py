@@ -7,14 +7,16 @@ host 命中允许清单的 http(s) 地址；每次请求新建 BrowserContext，
 import asyncio
 import base64
 import os
+import socket
 import time
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from playwright.async_api import async_playwright
 
-from .inspect_core import (allow_request, parse_allowed_hosts, shape_result,
-                           validate_target)
+from .inspect_core import (allow_request, host_of, is_ip_literal, origin_of,
+                           parse_allowed_hosts, pick_connect_ip, rewrite_url_host,
+                           shape_result, validate_target)
 
 MAX_CONCURRENCY = 2
 DEFAULT_WAIT_MS = 1200
@@ -91,7 +93,30 @@ async def inspect(req: InspectRequest):
             return {"ok": False, "error": f"页面检查失败: {e}"}
 
 
+async def _connect_url(url: str) -> str:
+    """把 host 别名换成直连 IP 后再交给浏览器。
+
+    Vite 5+ 的 `server.allowedHosts` 只放行 localhost 与 IP 字面量：以
+    `Host: host.docker.internal` 访问应用 dev 端口会拿到 403 拦截页，浏览器渲染的是
+    拦截文案而不是用户的页面——工具会「成功」返回一页无关内容。IP 侧两者都放行，
+    且容器里 host.docker.internal 本来就是靠 DNS 指到宿主网关，换过去不改变目标。
+    解析失败按原 URL 走（尽力而为，不把可用链路换成硬失败）。
+    """
+    host = host_of(url)
+    origin = origin_of(url)
+    if not host or origin is None or is_ip_literal(host):
+        return url
+    try:
+        info = await asyncio.get_running_loop().getaddrinfo(
+            host, origin[2], type=socket.SOCK_STREAM)
+    except (socket.gaierror, OSError, UnicodeError):
+        return url
+    ip = pick_connect_ip(info)
+    return rewrite_url_host(url, ip) if ip else url
+
+
 async def _inspect(url: str, wait_ms: int, timeout_ms: int) -> dict:
+    connect_url = await _connect_url(url)
     started = time.monotonic()
     context = await _browser.new_context(
         viewport={"width": 1280, "height": 800},
@@ -100,12 +125,12 @@ async def _inspect(url: str, wait_ms: int, timeout_ms: int) -> dict:
         ignore_https_errors=False,
     )
     try:
-        return await _inspect_in_context(context, url, wait_ms, timeout_ms, started)
+        return await _inspect_in_context(context, connect_url, wait_ms, timeout_ms, started)
     finally:
         await context.close()
 
 
-async def _inspect_in_context(context, url: str, wait_ms: int, timeout_ms: int,
+async def _inspect_in_context(context, connect_url: str, wait_ms: int, timeout_ms: int,
                               started: float) -> dict:
     page = await context.new_page()
     console, page_errors, failed = [], [], []
@@ -117,7 +142,7 @@ async def _inspect_in_context(context, url: str, wait_ms: int, timeout_ms: int,
             await route.continue_()
             return
         is_main = request.is_navigation_request() and request.frame == page.main_frame
-        if allow_request(url, request.url, is_main_navigation=is_main):
+        if allow_request(connect_url, request.url, is_main_navigation=is_main):
             await route.continue_()
             return
         blocked_urls.add(request.url)
@@ -153,7 +178,7 @@ async def _inspect_in_context(context, url: str, wait_ms: int, timeout_ms: int,
 
     timed_out = False
     try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+        await page.goto(connect_url, wait_until="domcontentloaded", timeout=timeout_ms)
     except Exception as e:  # noqa: BLE001 - 超时后仍尽量取回已渲染内容
         if "timeout" not in str(e).lower():
             return {"ok": False, "error": f"页面打开失败: {e}", "elapsed_ms": _ms(started)}

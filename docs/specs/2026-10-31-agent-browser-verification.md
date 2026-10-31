@@ -161,6 +161,7 @@
 ### 6.2 校验与网络
 
 - 入口校验：`url` 必须是 `http://` 或 `https://`，host 必须命中 `BROWSER_ALLOWED_HOSTS`（默认 `host.docker.internal,127.0.0.1,localhost`）；不合法直接 400，不启动浏览器。
+- **连接宿主按 IP 落地**：导航前把目标 host 别名解析成直连地址（优先 IPv4）再交给 Chromium。原因不是网络，是应用 dev 服务器自己的宿主白名单：Vite 5+ 的 `server.allowedHosts` 只放行 `localhost` 与 IP 字面量，带 `Host: host.docker.internal` 的请求被 403 拦成一句「Blocked request. This host ...」，工具会「成功」返回这页拦截文案而不是用户的应用页面。别名 → IP 不改变目标（`host.docker.internal` 本来就是 DNS 指向宿主网关），且解析失败按原 URL 走，不把可用链路换成硬失败。
 - 主文档导航：仅允许目标 URL 的 origin；页面重定向到别的 host 一律阻断并记为失败。
 - 子资源：同源放行；公网 http(s) 放行（CDN 字体/图片）；私网地址（10/8、172.16/12、192.168/16、127/8、169.254/16、`*.internal`、`zerocode-*` 容器名）一律 `route.abort()`，失败请求里标注 `blocked`。
 - 每次请求新建 `BrowserContext`，不持久化 cookie/localStorage；不注入用户浏览器状态；不开放点击/输入/上传接口。
@@ -270,3 +271,28 @@
 3. **T3 前端卡片**：`PageInspectCard.vue` + `ChatMessages.vue` 路由 + vitest。
 4. **T4 打包与本地 dev**：`build_output.py` 纳入 browser、compose/env/镜像源、dev.bat 与交付说明、打包测试。
 5. **T5 验证**：后端全量 pytest（串行）、前端 vitest `--maxWorkers=4`、sidecar 自测、手工矩阵，最后由用户预览确认 UI。
+
+## 15. 手工矩阵走查记录（2026-10-31）
+
+驱动方式：本机没有可用真实 LLM，工具层由 `run_browser_tool` 直接调用（真实 sidecar 容器 +
+真实应用 dev 栈），结果按「用户标签 + tool 消息」落进临时会话，再在聊天页渲染结果卡。
+
+| 项 | 走法 | 结果 |
+| --- | --- | --- |
+| 正常页 | `preview_page {}` 打应用首页 | `ok:true`，标题/正文/截图齐备，0 控制台 0 失败请求 |
+| 白屏 | 临时探针页（空 body） | `ok:true`，`text` 空、截图 4.7KB 空白，卡片走「页面检查完成」 |
+| 控制台报错 | 探针页制造 error/warning/未捕获异常 | `console:2`、`page_errors:2`，卡片 is-warn 并带问题计数徽标 |
+| 接口 500 | 探针页请求应用自身接口越界 id（真实 500）与缺失路径（404） | `failed_requests:2`（500/404），`redacted:3` 且明文口令/令牌未进结果 |
+| 预览未运行 | 另一个 stopped 应用 | `ok:false` + `status:stopped` + 「先用 preview_restart」，未调 sidecar |
+| 无视觉模型 | `model_cfg.supports_vision=false` | 结果含 `vision.supported:false` 与说明，其余字段照常 |
+| sidecar 未启动 | `docker stop` 后调一次 | `ok:false`，`hint` 指向 `browser/dev-up.bat`，容器恢复后自动可用 |
+| 非应用工作区 | `resolve_session_app` 无应用行 | 工具不挂载（`tools` 不含 `preview_page`），无失败卡 |
+| 多应用工作区 | 临时插第二应用行 | 409 fail closed + 一句 `note` 注入 system，工具与数据库指引都不挂载（行已删） |
+| 截图刷新后可见 | 重载页面重开会话 | 6 张截图经 `/api/browser/shots/...` 全部 200 渲染 |
+| 删除会话截图清理 | `DELETE /api/sessions/{id}` | 会话行/消息/`data/browser_shots/{id}` 同灭；无凭据读图为 401 |
+
+走查中发现并修掉一处「成功但内容不对」的缺陷：sidecar 用 `host.docker.internal` 访问 Vite dev
+端口会被 `server.allowedHosts` 403 拦成拦截页，工具拿到的是无关文本却返回 `ok:true`。
+现在导航前把宿主别名解析成直连 IP（见 §6.2 与 `browser/README.md`）。
+
+状态：已实现，手工矩阵 11 项已走；UI 结果卡待用户预览放行。

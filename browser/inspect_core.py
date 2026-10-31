@@ -4,7 +4,8 @@
 """
 import ipaddress
 import re
-from urllib.parse import urlsplit
+import socket
+from urllib.parse import urlsplit, urlunsplit
 
 DEFAULT_ALLOWED_HOSTS = ("host.docker.internal", "127.0.0.1", "localhost")
 TEXT_MAX_CHARS = 8000
@@ -68,6 +69,37 @@ def origin_of(url: str) -> tuple[str, str, int | None] | None:
         return parts.scheme, parts.hostname.lower().rstrip("."), port
     except ValueError:
         return None
+
+
+def is_ip_literal(host: str) -> bool:
+    name = (host or "").strip().strip("[]").rstrip(".")
+    try:
+        ipaddress.ip_address(name)
+    except ValueError:
+        return False
+    return True
+
+
+def pick_connect_ip(addr_info) -> str | None:
+    """从 getaddrinfo 结果里挑一个直连地址：优先 IPv4。
+
+    Docker Desktop 给 `host.docker.internal` 同时返回 A 与 AAAA，而容器里那条 IPv6 路由
+    往往不可达（实测 Network is unreachable），按返回顺序取会把可用请求带进死胡同。
+    """
+    for want in (socket.AF_INET, socket.AF_INET6):
+        for entry in addr_info:
+            if entry and entry[0] == want:
+                return entry[4][0]
+    return None
+
+
+def rewrite_url_host(url: str, host: str) -> str:
+    """只替换 host，保留端口与 path/query/fragment；IPv6 地址补方括号。"""
+    parts = urlsplit(url)
+    netloc = f"[{host}]" if ":" in host else host
+    if parts.port:
+        netloc = f"{netloc}:{parts.port}"
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
 
 
 def is_private_host(host: str) -> bool:

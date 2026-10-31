@@ -1,6 +1,9 @@
 """浏览器 sidecar 纯函数测试：不需要 playwright 或 sidecar 进程。"""
-from browser.inspect_core import (allow_request, clean_text, is_private_host,
-                                  parse_allowed_hosts, shape_result, validate_target)
+import socket
+
+from browser.inspect_core import (allow_request, clean_text, is_ip_literal, is_private_host,
+                                  parse_allowed_hosts, pick_connect_ip, rewrite_url_host,
+                                  shape_result, validate_target)
 
 
 def test_parse_allowed_hosts_defaults_and_trim():
@@ -91,3 +94,39 @@ def test_shape_result_dedupes_failed_requests():
                        failed_requests=[item, dict(item)], elapsed_ms=1)
     assert len(out["failed_requests"]) == 1
     assert out["truncated"] is False
+
+
+def test_is_ip_literal_covers_v4_v6_and_names():
+    assert is_ip_literal("192.168.65.254") is True
+    assert is_ip_literal("[fdc4::254]") is True
+    assert is_ip_literal("host.docker.internal") is False
+    assert is_ip_literal("") is False
+
+
+def test_pick_connect_ip_prefers_ipv4_over_return_order():
+    info = [
+        (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("fdc4:f303:9324::254", 0, 0, 0)),
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.168.65.254", 8213)),
+    ]
+    assert pick_connect_ip(info) == "192.168.65.254"
+    assert pick_connect_ip([info[0]]) == "fdc4:f303:9324::254"
+    assert pick_connect_ip([]) is None
+
+
+def test_rewrite_url_host_keeps_port_path_and_query():
+    url = "http://host.docker.internal:8213/orders?x=1#frag"
+    assert rewrite_url_host(url, "192.168.65.254") == "http://192.168.65.254:8213/orders?x=1#frag"
+    assert rewrite_url_host(url, "127.0.0.1") == "http://127.0.0.1:8213/orders?x=1#frag"
+
+
+def test_rewrite_url_host_wraps_ipv6_in_brackets():
+    url = "http://host.docker.internal:8213/"
+    assert rewrite_url_host(url, "fdc4::254") == "http://[fdc4::254]:8213/"
+
+
+def test_allow_request_uses_the_rewritten_origin():
+    target = rewrite_url_host("http://host.docker.internal:8213/", "192.168.65.254")
+    assert allow_request(target, "http://192.168.65.254:8213/src/main.js",
+                         is_main_navigation=False) is True
+    assert allow_request(target, "http://host.docker.internal:8213/src/main.js",
+                         is_main_navigation=True) is False

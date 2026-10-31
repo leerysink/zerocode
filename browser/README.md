@@ -41,3 +41,14 @@ browser\dev-down.bat
   的 http(s) 地址；主文档只允许目标 origin，子资源阻断私网与容器地址。
 - 每次检查新建 BrowserContext，不复用 cookie/登录态；不提供点击、输入、上传接口。
 - 容器内 Chromium 关闭自带 sandbox（容器本身是隔离边界），这是 ADR-0031 记录过的取舍。
+
+## 为什么导航前要把宿主别名换成 IP
+
+Vite 5+ 的 dev 服务器有宿主白名单 `server.allowedHosts`，默认只放行 `localhost` 与 IP
+字面量。sidecar 用 `host.docker.internal:8213` 访问应用 dev 端口时，`Host` 头就是那个别名，
+会被 403 拦成一句 `Blocked request. This host ("host.docker.internal") is not allowed.`——
+浏览器渲染的是拦截页，`preview_page` 于是「成功」返回一段与用户应用无关的文字，比失败更坏。
+
+`app.py` 的 `_connect_url()` 在导航前把别名解析成直连地址（优先 IPv4：Docker Desktop 会给
+`host.docker.internal` 同时返回 A/AAAA，容器里那条 IPv6 常不可路由），端口与路径不变。
+目标仍是同一个宿主端口，只是不再触发对面的宿主检查；解析失败沿用原 URL。
