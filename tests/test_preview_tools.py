@@ -1139,6 +1139,7 @@ async def test_preview_context_fields_default_safely_and_are_not_shared(tmp_path
     ctx = ToolContext(root=tmp_path, session_id=1, session_factory=None, send=None)
     assert ctx.app is None and ctx.cfg == {} and ctx.cancel is None
     assert ctx.deploy_hub is None and ctx.deploy_tasks == {} and ctx.run_state == {}
+    assert ctx.model_cfg is None and ctx.llm is None
     other = ToolContext(root=tmp_path, session_id=2, session_factory=None, send=None)
     other.run_state["preview_restarts"] = 1
     other.deploy_tasks[9] = "x"

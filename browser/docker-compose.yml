@@ -1,0 +1,34 @@
+# 本地开发用 sidecar（平台后端跑在宿主，见仓库根 dev.bat）。
+# 首次启动：dev-up.bat；停止：dev-down.bat。
+name: zerocode-browser
+
+services:
+  browser:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # 与平台打包同一组变量名：本地 shell 里设了就跟着走，没设就用 Dockerfile 默认值。
+        ZEROCODE_APT_MIRROR: ${ZEROCODE_APT_MIRROR:-}
+        ZEROCODE_PYPI_MIRROR: ${ZEROCODE_PYPI_MIRROR:-}
+        PLAYWRIGHT_DOWNLOAD_HOST: ${PLAYWRIGHT_DOWNLOAD_HOST:-https://cdn.npmmirror.com/binaries/playwright}
+    image: zerocode-browser:dev
+    container_name: zerocode-browser-dev
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8101:8101"
+    environment:
+      BROWSER_ALLOWED_HOSTS: host.docker.internal,127.0.0.1,localhost
+      PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m
+      - /dev/shm:size=512m
+    cap_drop: [ALL]
+    security_opt:
+      - "no-new-privileges:true"
+    mem_limit: 1g
+    cpus: 1.0
+    pids_limit: 256

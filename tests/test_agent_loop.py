@@ -465,9 +465,10 @@ async def test_preview_tools_mounted_only_for_app_workspace(test_engine, tmp_pat
     sid, aid, sf = await mk_app_session(test_engine, tmp_path)
     llm = ScriptedLLM([[delta("好"), *done("好了")]])
     await mk_runner(sf, llm, Recorder()).run(sid, "起个预览", asyncio.Event())
-    assert tool_names(llm)[-5:] == ["preview_status", "preview_logs", "preview_restart",
-                                    "db_query", "db_write"]
+    assert tool_names(llm)[-6:] == ["preview_status", "preview_logs", "preview_restart",
+                                    "db_query", "db_write", "preview_page"]
     assert "<preview>" in llm.received[0][0]["content"]
+    assert "<browser>" in llm.received[0][0]["content"]
     assert "vue3-fastapi" in llm.received[0][0]["content"]
 
 
@@ -501,6 +502,7 @@ async def test_duplicate_workspace_binding_fails_closed_with_note(test_engine, t
     assert not any(n.startswith("preview_") for n in tool_names(llm))
     assert not any(n.startswith("db_") for n in tool_names(llm))   # 数据库工具同闸 fail closed
     assert "<database>" not in llm.received[0][0]["content"]
+    assert "<browser>" not in llm.received[0][0]["content"]
     assert "绑定了多个应用" in llm.received[0][0]["content"]
 
 
@@ -512,7 +514,8 @@ async def test_preview_prompt_follows_the_stack(test_engine, tmp_path):
     await mk_runner(sf, llm, Recorder()).run(sid, "改个后端", asyncio.Event())
     c = llm.received[0][0]["content"]
     assert "必须 preview_restart" in c and "uvicorn" not in c     # 按栈差异化，不串味
-    assert c.rstrip().endswith("</preview>")                      # 块在 system 尾部（契约/技能之后）
+    assert c.rstrip().endswith("</browser>")                      # 块在 system 尾部（契约/技能之后）
+    assert "</preview>" in c and "<browser>" in c                 # 浏览器指引跟在预览块之后
 
 
 @pytest.fixture

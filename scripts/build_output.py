@@ -70,6 +70,20 @@ PREVIEW_HOST_BAKED = "localhost"
 # 它只改地址展示，不停网关、不碰证书——开着网关不用没有任何代价。
 SSL_ENABLE_ENV = "ZEROCODE_SSL_ENABLE"
 SSL_ENABLE_BAKED = "true"
+# 浏览器 sidecar（ADR-0031）：backend 在 compose 网络里按服务名访问它；sidecar 自己再经
+# host-gateway 访问宿主上发布的应用 dev 端口。两个地址都留成运行期可覆盖位：把 sidecar
+# 拆到另一台机器、或应用端口发布在别的宿主上时，服务器 .env 改一次即可。
+BROWSER_URL_ENV = "ZEROCODE_BROWSER_URL"
+BROWSER_URL_BAKED = "http://browser:8101"
+BROWSER_TARGET_HOST_ENV = "ZEROCODE_BROWSER_TARGET_HOST"
+BROWSER_TARGET_HOST_BAKED = "host.docker.internal"
+# sidecar 的目标白名单（服务端读取）。改了上面的目标宿主就必须同步改这里，否则每次检查
+# 都会被 sidecar 以「host 不在白名单」拒绝——后端只会看到一句 unavailable。
+BROWSER_ALLOWED_HOSTS_ENV = "BROWSER_ALLOWED_HOSTS"
+BROWSER_ALLOWED_HOSTS_BAKED = "host.docker.internal,127.0.0.1,localhost"
+# Chromium 在**镜像构建期**下载；只进 browser 服务的 build args，不进容器运行期 env。
+PLAYWRIGHT_DOWNLOAD_HOST_ENV = "PLAYWRIGHT_DOWNLOAD_HOST"
+PLAYWRIGHT_DOWNLOAD_HOST_BAKED = "https://cdn.npmmirror.com/binaries/playwright"
 
 # 预置应用复制时的剔除名单：deploy/ 是凭据禁区（compose.py 的 STACK_SECRETS 就落在那里），
 # 其余都是可再生的依赖/产物目录——带上它们只会让包体膨胀几十倍且把本机路径带过去。
@@ -92,6 +106,7 @@ EXCLUDE_SUFFIXES = frozenset({".pyc", ".pyo", ".log"})
 # 注意它**不含** deploy：app/deploy/ 是平台自己的部署模块（engine/compose/provision/settings），
 # 必须进镜像；与预置应用的 deploy/（凭据目录）同名但完全不是一回事。
 BACKEND_EXCLUDE_DIRS = frozenset({"__pycache__", ".pytest_cache", "uploads"})
+BROWSER_EXCLUDE_DIRS = frozenset({"__pycache__", ".pytest_cache"})
 
 # 网关目录的剔除名单（ADR-0018）：
 #   - certs/ 里是 TLS 私钥（gateway.key）。它一旦随包发出去，任何拿到包的人都能冒充整个
@@ -106,6 +121,10 @@ GATEWAY_EXCLUDE_FILES = frozenset({".env"})
 # 网关入包必须齐全的文件：缺任何一个都意味着一份起不来的网关配置，宁可拒包。
 GATEWAY_REQUIRED = ("docker-compose.yml", "nginx.conf", "lua/router.lua", "404.html",
                     "make-cert.sh", "make-cert.ps1")
+
+# 浏览器 sidecar 入包必须齐全的文件：compose 会在服务器上按这个目录 build 镜像，
+# 少任何一个都以「镜像构建失败」的形式推迟到部署时才炸，所以打包期直接拒。
+BROWSER_REQUIRED = ("Dockerfile", "requirements.txt", "app.py", "inspect_core.py", "__init__.py")
 
 # 网关 compose 里两个默认值的形态（与平台 compose 的 ${VAR:-打包值} 同一副面孔）：
 # 域名 fallback 换成实际域名，上游 fallback 换成 Linux 可用的 IP。
@@ -259,6 +278,11 @@ def normalize_pypi_mirror(raw: str) -> str:
 
 def normalize_npm_registry(raw: str) -> str:
     return _normalize_mirror_url(raw, "npm 镜像源地址")
+
+
+def normalize_playwright_download_host(raw: str) -> str:
+    """Playwright 浏览器下载源：完整 http(s) 地址，规则与 pip/npm 镜像相同。"""
+    return _normalize_mirror_url(raw, "Playwright 下载源")
 
 
 def resolve_mirrors(apt_mirror: str | None = None, pypi_mirror: str | None = None,
@@ -836,6 +860,10 @@ def _backend_overlay_env(gateway_domain: str, mirrors: Mirrors) -> str:
         # SSL 开关只影响地址投影（控制台/发布记录/应用 README），网关不必停机：
         # 域名没备案时把它设成 false，应用就改以 http://<展示宿主>:<prod 端口> 露出来。
         "      " + _compose_override(SSL_ENABLE_ENV, SSL_ENABLE_BAKED),
+        # 浏览器检查 sidecar：平台在 compose 网络里按服务名访问；sidecar 再经自己的
+        # extra_hosts（host-gateway）访问宿主上发布的应用 dev 端口。
+        "      " + _compose_override(BROWSER_URL_ENV, BROWSER_URL_BAKED),
+        "      " + _compose_override(BROWSER_TARGET_HOST_ENV, BROWSER_TARGET_HOST_BAKED),
     ]
     if mirrors.pypi:
         lines.append("      " + _compose_override(PYPI_MIRROR_ENV, mirrors.pypi))
@@ -882,7 +910,8 @@ def _pip_index_block(pypi_url: str | None) -> str:
             f"ENV PIP_INDEX_URL={pypi_url}\n")
 
 
-def _env_example_overlay(gateway_domain: str, mirrors: Mirrors) -> str:
+def _env_example_overlay(gateway_domain: str, mirrors: Mirrors,
+                         playwright_download_host: str = PLAYWRIGHT_DOWNLOAD_HOST_BAKED) -> str:
     """`.env.example` 里的运行期覆盖位。一律写**裸值**，绝不写 `${VAR:-…}`。
 
     同一个变量名在 compose 里是 `${VAR:-打包值}`、在这里是打包值本体，形态不同是必然的：
@@ -906,6 +935,18 @@ def _env_example_overlay(gateway_domain: str, mirrors: Mirrors) -> str:
         "# 域名未备案、443 被拦截时设为 false，网关不必停机——控制台、发布记录与",
         "# 应用 README 里的应用地址会一起切换。",
         f"{SSL_ENABLE_ENV}={SSL_ENABLE_BAKED}",
+        "",
+        "# 浏览器检查 sidecar（Agent 的 preview_page）。平台容器经 compose 服务名访问它；",
+        "# 只有把 sidecar 拆到另一台机器时才需要改地址。",
+        f"{BROWSER_URL_ENV}={BROWSER_URL_BAKED}",
+        "# sidecar 连应用 dev 端口的宿主地址。应用端口发布在平台所在宿主上，保持",
+        "# host.docker.internal 即可（compose 已给 sidecar 配 host-gateway）。",
+        f"{BROWSER_TARGET_HOST_ENV}={BROWSER_TARGET_HOST_BAKED}",
+        "# sidecar 只检查白名单里的 host。若把上一行改成 IP/域名，必须把它加进这里，",
+        "# 否则 preview_page 会固定返回「浏览器检查服务不可用」。",
+        f"{BROWSER_ALLOWED_HOSTS_ENV}={BROWSER_ALLOWED_HOSTS_BAKED}",
+        "# browser 镜像构建期的 Chromium 下载源；改完要 docker compose build browser 才生效。",
+        f"{PLAYWRIGHT_DOWNLOAD_HOST_ENV}={playwright_download_host}",
     ]
     if mirrors.pypi:
         lines += ["", "# 应用预览环境（dev 栈）装 Python 依赖用的镜像源，打包时烘的是默认值。",
@@ -917,7 +958,8 @@ def _env_example_overlay(gateway_domain: str, mirrors: Mirrors) -> str:
 
 
 def compose_yaml(deploy_root: str, gateway_domain: str = DEFAULT_GATEWAY_DOMAIN,
-                 mirrors: Mirrors = DEFAULT_MIRRORS) -> str:
+                 mirrors: Mirrors = DEFAULT_MIRRORS,
+                 playwright_download_host: str = PLAYWRIGHT_DOWNLOAD_HOST_BAKED) -> str:
     """平台 compose：pg（pgvector）+ backend（挂 docker.sock 与同路径 apps/data/store）。
 
     - PG 容器名写死 `zerocode-pg16`：app/deploy/provision.py 的 ensure_zcnet 与应用栈的连接串
@@ -937,6 +979,8 @@ def compose_yaml(deploy_root: str, gateway_domain: str = DEFAULT_GATEWAY_DOMAIN,
     - backend 的 environment 段尾部追加 `ZEROCODE_*` 运行期覆盖位（见 _backend_overlay_env）。
     """
     extra_env = _backend_overlay_env(gateway_domain, mirrors)
+    browser_apt = mirrors.apt or ""
+    browser_pypi = mirrors.pypi or ""
     return f"""# zerocode 平台（演示部署）—— 由 scripts/build_output.py 生成，勿手改
 # 一条命令起全栈：docker compose up -d --build
 name: zerocode
@@ -971,6 +1015,8 @@ services:
     depends_on:
       pg:
         condition: service_healthy
+      browser:
+        condition: service_started
     environment:
       # 平台库连接账号需具备建库建角色权限（要供给应用分库）；镜像默认用户即超级用户
       ZEROCODE_DATABASE_URL: postgresql+asyncpg://${{POSTGRES_USER:-zerocode}}:${{POSTGRES_PASSWORD}}@zerocode-pg16:5432/zerocode
@@ -996,6 +1042,41 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks: [default, zcnet]
+
+  # 浏览器检查 sidecar（ADR-0031）：preview_page 的隔离执行环境。不持有 docker.sock、
+  # 不注入平台库凭据；也不发布宿主端口——只有 compose 内的 backend 能访问它。
+  browser:
+    build:
+      context: ./browser
+      dockerfile: Dockerfile
+      args:
+        # 构建期换源与 Chromium 下载源：变量名与打包机同一套（三级取值的中间那级留在服务器
+        # .env 里覆盖），改完要 docker compose build browser（up --build 也会重建）。
+        ZEROCODE_APT_MIRROR: ${{ZEROCODE_APT_MIRROR:-{browser_apt}}}
+        ZEROCODE_PYPI_MIRROR: ${{ZEROCODE_PYPI_MIRROR:-{browser_pypi}}}
+        PLAYWRIGHT_DOWNLOAD_HOST: ${{PLAYWRIGHT_DOWNLOAD_HOST:-{playwright_download_host}}}
+    image: zerocode-browser:demo
+    container_name: zerocode-browser
+    restart: unless-stopped
+    environment:
+      # 只接受这些 host 的检查目标；改了 ZEROCODE_BROWSER_TARGET_HOST 要同步加进来。
+      BROWSER_ALLOWED_HOSTS: ${{BROWSER_ALLOWED_HOSTS:-{BROWSER_ALLOWED_HOSTS_BAKED}}}
+    # sidecar 在容器里，应用 dev 端口发布在宿主上：host-gateway 是它唯一的出口。
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # 运行期根文件系统只读；Chromium 需要的可写路径全在 tmpfs 里。
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m
+      - /dev/shm:size=512m
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
+    mem_limit: 1g
+    cpus: 1.0
+    pids_limit: 256
+    networks: [default]
 
 volumes:
   pgdata: {{}}
@@ -1065,6 +1146,7 @@ def dockerignore() -> str:
     """
     return """# 由 scripts/build_output.py 生成：只让 backend/ 与 frontend/dist 进构建上下文
 apps
+browser
 data
 store
 gateway
@@ -1079,12 +1161,13 @@ README-deploy.md
 
 
 def env_example(deploy_root: str, gateway_domain: str = DEFAULT_GATEWAY_DOMAIN,
-                mirrors: Mirrors = DEFAULT_MIRRORS) -> str:
+                mirrors: Mirrors = DEFAULT_MIRRORS,
+                playwright_download_host: str = PLAYWRIGHT_DOWNLOAD_HOST_BAKED) -> str:
     """`.env` 模板：口令位、端口位，以及打包值可覆盖的 `ZEROCODE_*` 运行期位。
 
     刻意**不**给 DEPLOY_ROOT（见正文注释）：改它换不了部署根，只会让挂载点与 WORKDIR 分家。
     """
-    overlay = _env_example_overlay(gateway_domain, mirrors)
+    overlay = _env_example_overlay(gateway_domain, mirrors, playwright_download_host)
     return f"""# 复制成 .env 后按需修改（docker compose 会自动读取同目录 .env）
 #   cp .env.example .env
 
@@ -1160,7 +1243,9 @@ def readme_md(presets, deploy_root: str, generated_at: str, dist_stamp: str,
   `--pypi-mirror https://mirrors.aliyun.com/pypi/simple`
   `--npm-registry https://registry.npmmirror.com`，三个可只给其一、默认全不给；
   docker-ce 仓库走镜像站的 `/docker-ce/linux/debian` 约定路径），否则首次 build
-  会卡在拉依赖。
+  会卡在拉依赖。浏览器 sidecar 镜像还要在构建期下载 Chromium（约数百 MB），默认走
+  npmmirror；服务器访问不了时用 `--playwright-download-host` 或 `PLAYWRIGHT_DOWNLOAD_HOST`
+  环境变量指到可达的地址（apt / pip 换源沿用上面两个参数）。
 - 本目录必须放在 `{deploy_root}`。这个路径在打包时已烘死到三处（compose 的同路径挂载、
   镜像的 `WORKDIR`、init.sql 里预置应用的 `root_path`），`.env` 里改不了它；要换目录请重跑
   打包（`build-output.bat --deploy-root /新的路径`）。路径不一致会导致预置应用失联、新建应用
@@ -1179,12 +1264,20 @@ def readme_md(presets, deploy_root: str, generated_at: str, dist_stamp: str,
 cd {deploy_root}
 cp .env.example .env          # 改掉 POSTGRES_PASSWORD
 mkdir -p apps data store      # 同路径挂载点（compose 也会自动建，先建可避免属主是 root）
-docker compose up -d --build  # 起 pg + backend（首次要 build 平台镜像）
+docker compose up -d --build  # 起 pg + backend + browser（首次要 build 平台与浏览器镜像）
 docker compose ps             # 等 pg healthy、backend running
 bash apply-init.sh            # 执行全量 init.sql（结构 + 默认配置 + 预置应用行）
 ```
 
 打开控制台：`http://<服务器IP>:8100`
+
+浏览器 sidecar 是 Agent 的 `preview_page` 工具的执行环境：它**不发布宿主端口**，只有
+compose 网络里的 backend 能访问（`ZEROCODE_BROWSER_URL`，打包默认 `http://browser:8101`）；
+它再经 `host-gateway` 访问宿主上发布的应用 dev 端口（`ZEROCODE_BROWSER_TARGET_HOST`，
+默认 `host.docker.internal`；这个 host 必须同时在 sidecar 的 `BROWSER_ALLOWED_HOSTS` 白名单里）。
+sidecar 未启动或崩溃时，`preview_page` 会返回「浏览器检查服务不可用」，
+预览的启动/日志/重启不受影响。截图落在 `{deploy_root}/data/browser_shots/`（运行期数据，
+不在包里，也不要被发布命令的 `--delete` 扫掉）。
 
 ### 网关（通配域名 HTTPS）
 
@@ -1278,8 +1371,9 @@ scp -r build-output <user>@<server>:{deploy_root}/../
 # 服务器：下面五步都在部署根的同级目录里执行
 cd {deploy_root}/..
 
-# ① 平台代码与前端 dist：这两个目录里没有服务器现场产生的东西，可以整目录镜像
+# ① 平台代码、浏览器 sidecar 与前端 dist：这些目录里没有服务器现场产生的东西，可以整目录镜像
 rsync -a --delete build-output/backend/  {deploy_root}/backend/
+rsync -a --delete build-output/browser/  {deploy_root}/browser/
 rsync -a --delete build-output/frontend/ {deploy_root}/frontend/
 
 # ② 顶层文件：只覆盖、不删（{deploy_root}/.env 是服务器现场填的，绝不能删）
@@ -1341,6 +1435,9 @@ bash apply-init.sh                                 # 新表自动建上，既有
   重放会把它按默认值补回来。这不会覆盖任何人：配置读取是「用户自己的行 覆盖 平台行」，
   创始人看到的仍是自己填的密钥；新用户看到空密钥则与全新安装一致。
 - **后端容器持有宿主 docker.sock**，等价于宿主 root 权限。演示机不要跑不可信工作区。
+- **浏览器 sidecar 运行 headless Chromium**：镜像约 1GB，compose 限 1g 内存 / 1 CPU；
+  它没有 docker.sock、没有平台库凭据、根文件系统只读。页面文本、控制台与失败请求在进模型前
+  会做凭据遮断，但**截图是像素，无法可靠遮断**——演示机仍只应开给可信工作区。
 - **网关是独立 compose 项目**：`docker compose up -d` 只管平台，网关要 `-f gateway/docker-compose.yml`
   单独启停；它占用宿主 80/443，且证书/私钥只在服务器现场生成（`gateway/certs/` 不进包）。
   acme.sh 续期后要重启（或 reload）网关让 nginx 读到新证书。
@@ -1365,6 +1462,8 @@ bash apply-init.sh                                 # 新表自动建上，既有
 | 发布报 `docker compose -f …prod-compose.yml… 超时（600s）`、记账停在 build 步 | 应用的 prod 镜像要在**构建期**装依赖（`pip install` / `npm install`），境内机直连官方源会等到超时——dev 预览正常不代表发布能过，两条通道不同。重打包时给 `--pypi-mirror` 与 `--npm-registry`，平台会把同一份源经 `build.args` 注进每个应用的 prod 构建（ADR-0025）；`deploy.build_timeout` 调大只是把 10 分钟换成 30 分钟，不是修法 |
 | 控制台里应用地址点进去全 404 | 逐项核对：① 网关起了吗（`docker compose -f gateway/docker-compose.yml ps`）；② 平台 `.env` 与 `gateway/.env` 的域名是否一致；③ 应用 prod 是否 `running`（进没进 `gateway/routes/routes.json`）；④ 浏览器是否信任了自签 CA |
 | 域名打不开（未备案 / 443 被拦），想先走 IP | 把部署根 `.env` 的 `ZEROCODE_SSL_ENABLE` 设成 `false` 并 `docker compose up -d`：控制台、发布记录、应用 README 的应用地址一起改成 `http://<ZEROCODE_PREVIEW_HOST>:<prod 端口>`，网关不用停；宿主防火墙要放行应用端口段（默认 8210-8399）。备案或证书就绪后改回 `true` |
+| Agent 报「浏览器检查服务不可用」 | `docker compose ps browser` 看 sidecar 是否在跑、`docker compose logs browser` 看 Chromium 启动错误。sidecar 不发布宿主端口，别从宿主访问 8101；若改过 `ZEROCODE_BROWSER_TARGET_HOST`，确认同一 host 已加进 `.env` 的 `BROWSER_ALLOWED_HOSTS`（默认只放行 `host.docker.internal,127.0.0.1,localhost`） |
+| `preview_page` 能开页面但截图为空 / 视觉诊断为「未启用」 | 图像缺失是截图落盘失败（看后端日志与 `{deploy_root}/data/browser_shots/` 权限）；「未启用」表示当前会话模型没有声明视觉能力，属正常降级 |
 | 应用域名 502 Bad Gateway | 先看 `docker compose -f gateway/docker-compose.yml logs gateway`：出现 `host.docker.internal could not be resolved` 就是上游地址在 Linux 上解析不了（nginx 不读 `/etc/hosts`），把 `gateway/.env` 的 `ZEROCODE_GATEWAY_UPSTREAM` 设成宿主 docker0 网关（默认 `172.17.0.1`）后重建网关；若日志是 `connection refused`，核对应用 prod 栈与 `routes.json` 的端口是否一致 |
 | 网关容器起不来 / 反复重启 | `docker compose -f gateway/docker-compose.yml logs gateway`：多为 `gateway/certs/gateway.crt|key` 缺失，或 80/443 被占用 |
 | 发布成功但域名仍是 404 | 检查 `{deploy_root}/gateway/routes/routes.json` 里有没有该 slug；没有就看 backend 日志里 `gateway routes.json 刷新失败` 一行（该失败只告警、不阻断发布） |
@@ -1429,6 +1528,37 @@ def copy_backend(repo_root: Path, out_backend: Path, deploy_root: str,
     shutil.copyfile(req, out_backend / "requirements.txt")
     _write(out_backend / "Dockerfile", backend_dockerfile(deploy_root, mirrors))
     return _count_files(out_backend)
+
+
+BROWSER_LF_NAMES = frozenset({"Dockerfile"})
+BROWSER_LF_SUFFIXES = frozenset({".py", ".txt", ".yml", ".yaml"})
+
+
+def copy_browser(repo_root: Path, dst: Path) -> int:
+    """复制浏览器 sidecar 源码（browser/），返回文件数。
+
+    与网关配置同理，入包文件缺失时直接拒包：平台 compose 会在服务器上 build 这个目录，
+    缺一个文件只会变成「镜像构建失败」，把打包期就能发现的问题拖到部署现场。
+
+    Dockerfile / compose / Python 一律剥掉 CRLF（与 deploy.sh 同口径）：Windows 上
+    `core.autocrlf=true` 检出的副本自带 \\r，而 Dockerfile 里「续行反斜杠 + \\r」会让那条
+    RUN 断成两条指令。`.bat` 与 `.md` 原样保留——cmd.exe 对只有 LF 的 goto 标签并不可靠。
+    """
+    src = repo_root / "browser"
+    missing = [rel for rel in BROWSER_REQUIRED if not (src / rel).is_file()]
+    if missing:
+        raise BuildError(f"浏览器 sidecar 源码缺 {missing}（{src}）："
+                         f"preview_page 依赖它，缺文件不出包")
+    if dst.exists():
+        shutil.rmtree(dst)
+    shutil.copytree(src, dst, ignore=_ignore_names(BROWSER_EXCLUDE_DIRS))
+    for path in dst.rglob("*"):
+        if path.is_file() and (path.name in BROWSER_LF_NAMES
+                               or path.suffix.lower() in BROWSER_LF_SUFFIXES):
+            raw = path.read_bytes()
+            if b"\r\n" in raw:
+                path.write_bytes(raw.replace(b"\r\n", b"\n"))
+    return _count_files(dst)
 
 
 def _bake_fallback(text: str, token_re: re.Pattern, env_name: str, value: str) -> str:
@@ -1629,7 +1759,8 @@ def build(repo_root: Path = REPO_ROOT, out: Path | None = None, slugs=DEFAULT_SL
           deploy_root: str = DEFAULT_DEPLOY_ROOT, generated_at: str | None = None,
           allow_stale_dist: bool = False, gateway_domain: str | None = None,
           apt_mirror: str | None = None, pypi_mirror: str | None = None,
-          npm_registry: str | None = None) -> dict:
+          npm_registry: str | None = None,
+          playwright_download_host: str | None = None) -> dict:
     """装配整个 build-output 目录，返回摘要（供 main 打印与单测断言）。
 
     四个可选参数（域名 + 三个镜像源）都是三级取值：显式参数 > 打包机环境变量 > 默认值。
@@ -1645,6 +1776,9 @@ def build(repo_root: Path = REPO_ROOT, out: Path | None = None, slugs=DEFAULT_SL
     domain = _resolved_setting(gateway_domain, GATEWAY_DOMAIN_ENV, normalize_gateway_domain,
                                DEFAULT_GATEWAY_DOMAIN)
     mirrors = resolve_mirrors(apt_mirror, pypi_mirror, npm_registry)
+    pw_host = _resolved_setting(playwright_download_host, PLAYWRIGHT_DOWNLOAD_HOST_ENV,
+                                normalize_playwright_download_host,
+                                PLAYWRIGHT_DOWNLOAD_HOST_BAKED)
     presets = load_presets(repo_root / "apps", slugs)
     conflicts = detect_port_conflicts(presets)
     if conflicts:
@@ -1663,7 +1797,8 @@ def build(repo_root: Path = REPO_ROOT, out: Path | None = None, slugs=DEFAULT_SL
 
     try:
         summary = _assemble(repo_root, staging, presets, root, dist, dist_stamp, generated_at,
-                            gateway_domain=domain, mirrors=mirrors)
+                            gateway_domain=domain, mirrors=mirrors,
+                            playwright_download_host=pw_host)
     except OSError as e:
         shutil.rmtree(staging, ignore_errors=True)
         raise BuildError(f"装配时遇到文件系统错误（磁盘满 / 路径过长 / 文件被占用？）：{e}") from e
@@ -1700,10 +1835,12 @@ def build(repo_root: Path = REPO_ROOT, out: Path | None = None, slugs=DEFAULT_SL
 def _assemble(repo_root: Path, staging: Path, presets, root: str,
               dist: Path, dist_stamp: str, generated_at: str | None,
               gateway_domain: str = DEFAULT_GATEWAY_DOMAIN,
-              mirrors: Mirrors = DEFAULT_MIRRORS) -> dict:
+              mirrors: Mirrors = DEFAULT_MIRRORS,
+              playwright_download_host: str = PLAYWRIGHT_DOWNLOAD_HOST_BAKED) -> dict:
     """往暂存目录里装配整份交付包，返回摘要；任何失败由 build() 负责丢弃暂存目录。"""
     stamp = generated_at or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     backend_files = copy_backend(repo_root, staging / "backend", root, mirrors)
+    browser_files = copy_browser(repo_root, staging / "browser")
     frontend_files = copy_frontend_dist(dist, staging / "frontend")
     gateway_files = copy_gateway(repo_root, staging / "gateway", gateway_domain)
     preset_files = {p.slug: copy_preset_app(p.src, staging / "apps" / p.slug) for p in presets}
@@ -1713,9 +1850,11 @@ def _assemble(repo_root: Path, staging: Path, presets, root: str,
 
     init_sql = synth_init_sql(repo_root / "changelog", presets, root, generated_at=stamp)
     _write(staging / "init.sql", init_sql)
-    _write(staging / "docker-compose.yml", compose_yaml(root, gateway_domain, mirrors))
+    _write(staging / "docker-compose.yml",
+           compose_yaml(root, gateway_domain, mirrors, playwright_download_host))
     _write(staging / ".dockerignore", dockerignore())
-    _write(staging / ".env.example", env_example(root, gateway_domain, mirrors))
+    _write(staging / ".env.example",
+           env_example(root, gateway_domain, mirrors, playwright_download_host))
     _write(staging / "apply-init.sh", apply_init_sh())
     copy_deploy_script(repo_root, staging / "deploy.sh")
     _write(staging / "README-deploy.md",
@@ -1736,6 +1875,7 @@ def _assemble(repo_root: Path, staging: Path, presets, root: str,
         "presets": presets,
         "preset_files": preset_files,
         "backend_files": backend_files,
+        "browser_files": browser_files,
         "frontend_files": frontend_files,
         "gateway_files": gateway_files,
         "init_sql_bytes": len(init_sql.encode("utf-8")),
@@ -1786,6 +1926,10 @@ def main(argv=None) -> int:
     ap.add_argument("--npm-registry", default=None,
                     help=f"npm 镜像源完整地址（形如 https://registry.npmmirror.com；默认不注入，"
                          f"环境变量 {NPM_REGISTRY_ENV}）")
+    ap.add_argument("--playwright-download-host", default=None,
+                    help=f"浏览器 sidecar 镜像构建期的 Chromium 下载源（完整 http(s) 地址；"
+                         f"默认取环境变量 {PLAYWRIGHT_DOWNLOAD_HOST_ENV}，"
+                         f"都没有则 {PLAYWRIGHT_DOWNLOAD_HOST_BAKED}）")
     args = ap.parse_args(argv)
 
     slugs = tuple(s.strip() for s in (args.slugs or "").split(",") if s.strip())
@@ -1793,7 +1937,8 @@ def main(argv=None) -> int:
         summary = build(out=Path(args.out) if args.out else None, slugs=slugs,
                         deploy_root=args.deploy_root, allow_stale_dist=args.allow_stale_dist,
                         gateway_domain=args.gateway_domain, apt_mirror=args.apt_mirror,
-                        pypi_mirror=args.pypi_mirror, npm_registry=args.npm_registry)
+                        pypi_mirror=args.pypi_mirror, npm_registry=args.npm_registry,
+                        playwright_download_host=args.playwright_download_host)
     except BuildError as e:
         print(f"✗ 打包失败：{e}", file=sys.stderr)
         return 1
@@ -1812,6 +1957,7 @@ def main(argv=None) -> int:
     print("  依赖镜像源    " + ("、".join(f"{k}={v}" for k, v in given if v)
                               or "未注入（全部走官方源）"))
     print(f"  后端          {summary['backend_files']} 个文件（app/ + requirements.txt + Dockerfile）")
+    print(f"  浏览器 sidecar {summary['browser_files']} 个文件（browser/；服务名 browser，不发布宿主端口）")
     print(f"  前端 dist     {summary['frontend_files']} 个文件（构建于 {summary['dist_stamp']}）")
     print(f"  网关配置      {summary['gateway_files']} 个文件（gateway/；certs/ 与运行期 routes.json 不入包）")
     print(f"  init.sql      {summary['init_sql_bytes']:,} 字节（changelog 全量合成 + 预置应用种子）")

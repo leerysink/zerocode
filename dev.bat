@@ -49,7 +49,17 @@ if errorlevel 1 goto :npm_failed
 :fe_ready
 
 REM ------------------------------------------------------------
-REM 4. Start backend in its own window.
+REM 4. Browser sidecar for preview_page (optional)
+REM    It runs in its own container; start it with browser\dev-up.bat.
+REM    The backend defaults to this URL anyway - set explicitly so the
+REM    requirement is visible in this window.
+REM ------------------------------------------------------------
+set "ZEROCODE_BROWSER_URL=http://127.0.0.1:8101"
+echo [info] browser sidecar for preview_page: http://127.0.0.1:8101
+echo        start it separately with browser\dev-up.bat (optional)
+
+REM ------------------------------------------------------------
+REM 5. Start backend in its own window.
 REM    No --reload on purpose: the deploy suite writes generated
 REM    app files under apps/, which would restart uvicorn constantly.
 REM ------------------------------------------------------------
@@ -57,7 +67,7 @@ echo [run]   backend  http://127.0.0.1:8100   (window: zerocode-backend)
 start "zerocode-backend" cmd /k .venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8100
 
 REM ------------------------------------------------------------
-REM 5. Start Vite dev server in this window; it proxies /api and
+REM 6. Start Vite dev server in this window; it proxies /api and
 REM    /ws to :8100 (see frontend/vite.config.js).
 REM ------------------------------------------------------------
 echo [run]   frontend http://127.0.0.1:8082   (this window; Ctrl+C to stop)

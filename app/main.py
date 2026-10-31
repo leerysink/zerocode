@@ -153,6 +153,9 @@ def create_app(database_url: str | None = None) -> FastAPI:
     # 聊天图片附件（Task 4）：POST /api/sessions/{id}/attachments 上传、GET /api/attachments/{id} 读取
     from app.api import attachments as attachments_api
     app.include_router(attachments_api.router)
+    # preview_page 截图读取（规格 2026-10-31）：GET /api/browser/shots/{session_id}/{filename}
+    from app.api import browser_shots as browser_shots_api
+    app.include_router(browser_shots_api.router)
     # 部署发布套件（Task 6）：/api/apps 创建/校验 slug/列表/详情
     from app.api import apps as apps_api
     app.include_router(apps_api.router)

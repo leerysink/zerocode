@@ -126,6 +126,22 @@ DB_TOOLS = [
 
 DB_TOOL_NAMES = ("db_query", "db_write")
 
+# 预览页浏览器验证（规格 docs/specs/2026-10-31-agent-browser-verification.md）：
+# 与应用工作区同生同灭。唯一参数是同源相对 path——没有 url/app 参数，模型指不到别处。
+BROWSER_TOOLS = [
+    {"type": "function", "function": {
+        "name": "preview_page",
+        "description": ("用无头浏览器打开当前应用 dev 预览页，返回标题、可见文本、控制台错误、"
+                        "失败请求、截图与视觉诊断（只读）"),
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string",
+                     "description": "同源相对路径，默认 /；只能以 / 开头，不能是绝对 URL"}},
+            "required": []}}},
+]
+
+BROWSER_TOOL_NAMES = ("preview_page",)
+
+
 def _reasoning_of(delta):
     """兼容取 reasoning_content：SDK 具名属性优先，其次 model_extra（未知字段兜底）。"""
     if delta is None:

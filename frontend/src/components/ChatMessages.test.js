@@ -236,3 +236,56 @@ describe('预览工具在消息流里的渲染', () => {
     expect(w.find('.zc-confirm-args').text()).toContain('a.txt')
   })
 })
+
+// ---- preview_page 检查卡（规格 2026-10-31）----
+
+describe('preview_page 在消息流里的渲染', () => {
+  const result = {
+    ok: true,
+    app: { slug: 'demo', stack: 'vue3-fastapi' },
+    status: 'running',
+    url: 'http://localhost:8241/orders',
+    title: '订单管理',
+    text: '订单列表\n共 3 条',
+    text_truncated: false,
+    console: [{ level: 'error', text: 'Uncaught TypeError: x' }],
+    page_errors: [],
+    failed_requests: [],
+    screenshot: { url: '/api/browser/shots/7/a.png', width: 1280, height: 800, bytes: 100 },
+    vision: { supported: true, text: '页面整体正常，订单表格已渲染。' },
+    redacted: 2,
+    truncated: false,
+    checks_left: 5,
+  }
+
+  it('preview_page 走 PageInspectCard，显示文本/截图/视觉诊断', () => {
+    const w = mountMessages([{ role: 'tool', name: 'preview_page', result }])
+    expect(w.find('.zc-page').exists()).toBe(true)
+    expect(w.find('.zc-preview').exists()).toBe(false)
+    expect(w.text()).toContain('页面已打开（发现异常）')
+    expect(w.text()).toContain('订单列表')
+    expect(w.text()).toContain('页面整体正常')
+    expect(w.find('.zc-page-link').attributes('href')).toBe('http://localhost:8241/orders')
+    expect(w.find('.zc-page-shot img').attributes('src')).toBe('/api/browser/shots/7/a.png')
+  })
+
+  it('预览未运行显示状态与可行动提示', () => {
+    const w = mountMessages([{
+      role: 'tool', name: 'preview_page',
+      result: { ok: false, status: 'stopped', url: 'http://localhost:8241',
+                error: '预览未运行：先用 preview_restart 启动' },
+    }])
+    expect(w.text()).toContain('预览未就绪')
+    expect(w.text()).toContain('preview_restart')
+    expect(w.find('.zc-page-link').exists()).toBe(false)
+  })
+
+  it('实时流里 call 行与 result 行只画一张检查卡', () => {
+    const w = mountMessages([
+      { role: 'tool', name: 'preview_page', args: { path: '/orders' } },
+      { role: 'tool', name: 'preview_page', result },
+    ])
+    expect(w.findAll('.zc-page').length).toBe(1)
+    expect(w.text()).not.toContain('正在打开预览页')
+  })
+})

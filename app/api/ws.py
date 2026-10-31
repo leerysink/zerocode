@@ -263,7 +263,8 @@ async def ws_chat(ws: WebSocket, session_id: int):
                                              config_getter, send, hub.ask, hub.confirm,
                                              hub.pop_pending,
                                              deploy_hub=app.state.deploy_hub,
-                                             dev_tasks=app.state.dev_tasks)
+                                             dev_tasks=app.state.dev_tasks,
+                                             model_cfg=model_cfg_)
                         await runner.run(session_id, user_text_, cancel,
                                          attachment_ids=attachment_ids_)
                     finally:

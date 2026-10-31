@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 from sqlalchemy import text
 
-from app.agent.llm import PREVIEW_TOOL_NAMES, DB_TOOL_NAMES
+from app.agent.llm import PREVIEW_TOOL_NAMES, DB_TOOL_NAMES, BROWSER_TOOL_NAMES
 
 MAX_READ_BYTES = 200 * 1024
 BINARY_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".pdf", ".zip", ".gz", ".exe", ".dll", ".so", ".bin", ".db", ".sqlite", ".mp3", ".mp4"}
@@ -80,6 +80,10 @@ class ToolContext:
     deploy_hub: Any = None           # DeployHub：订阅 dev_log/dev_status 转成聊天进度
     deploy_tasks: dict = dataclasses.field(default_factory=dict)  # app.state.dev_tasks（与 REST 共用同一张表）
     run_state: dict = dataclasses.field(default_factory=dict)     # 单次 run 的计数（preview_restarts），不落库
+    # 视觉诊断（规格 2026-10-31 §8）：当前 run 实际模型的能力位与实例；缺省 None 时
+    # preview_page 跳过诊断并明确告知，不影响其余结果（既有构造点与单测零改动）。
+    model_cfg: dict | None = None
+    llm: Any = None
 
 def _unified_diff(path: str, before: str, after: str) -> str:
     return "".join(difflib.unified_diff(
@@ -131,6 +135,11 @@ async def execute_tool(ctx: ToolContext, name: str, args: dict, *, confirmed: bo
         # 与预览工具同款约定——失败一律是正常结果，模型要读到可行动的原因。
         from app.agent.db_tools import run_db_tool
         return await run_db_tool(ctx, name, args, confirmed=confirmed)
+    if name in BROWSER_TOOL_NAMES:
+        # 预览页浏览器验证（规格 docs/specs/2026-10-31-agent-browser-verification.md）：
+        # 只读，无确认、无命令面；失败同样是带原因的正常结果。
+        from app.agent.browser_tools import run_browser_tool
+        return await run_browser_tool(ctx, name, args)
     if name == "list_dir":
         d = resolve_in_workspace(ctx.root, args.get("path"))
         if not d.is_dir():

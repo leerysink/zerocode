@@ -11,6 +11,7 @@ import AskUserCard from './AskUserCard.vue'
 import ThinkingBlock from './ThinkingBlock.vue'
 import TodoCard from './TodoCard.vue'
 import PreviewCard from './PreviewCard.vue'
+import PageInspectCard from './PageInspectCard.vue'
 
 const props = defineProps({
   messages: { type: Array, default: () => [] },
@@ -38,6 +39,9 @@ const confirmSummary = computed(() => {
 // 名单与后端 llm.PREVIEW_TOOL_NAMES 同名同序；这里刻意不 import 后端常量（前端拿不到），
 // 增删预览工具时两处一起改——名字对不上的后果是卡片落回通用折叠块，不会静默出错。
 const PREVIEW_TOOL_NAMES = ['preview_status', 'preview_logs', 'preview_restart']
+// preview_page 有自己的结果卡（页面文本/截图/视觉诊断）；名单与后端 BROWSER_TOOL_NAMES 同名，
+// 漏改的后果是落回通用折叠块，不会静默出错。
+const PAGE_TOOL_NAMES = ['preview_page']
 
 function toolNameOf(m) {
   return m.name ?? m.tool_name ?? ''
@@ -47,11 +51,21 @@ function isPreviewTool(m) {
   return PREVIEW_TOOL_NAMES.includes(toolNameOf(m))
 }
 
+function isPageTool(m) {
+  return PAGE_TOOL_NAMES.includes(toolNameOf(m))
+}
+
 // 一次调用在实时流里是两条 message（tool_call 行 + tool_result 行）：
 // 只有「已出结果」或「它就是最后一条（仍在进行）」才渲染预览卡，
 // 否则结果到达后那张进行中的卡会永久停在「正在重启预览…」，而刷新后又只剩一张
 function isPreviewCard(m, i) {
   return isPreviewTool(m) && !!(m.result || m.tool_result || i === props.messages.length - 1)
+}
+
+// 与 isPreviewCard 同一道闸：实时流里 call 行与 result 行是两条 message，
+// 只给「有结果」或「仍是最后一条」的那条画卡，避免进行中的卡片永久停住。
+function isPageCard(m, i) {
+  return isPageTool(m) && !!(m.result || m.tool_result || i === props.messages.length - 1)
 }
 
 // 进度只给「消息流最后一条、还没有结果」的那张卡：历史卡片复活进度条会让人以为又在重启
@@ -135,6 +149,7 @@ onMounted(scrollToBottom)
              实时消息字段为 name/args/result，历史消息为 tool_name/tool_result，两者都认。 -->
         <div v-else-if="m.role === 'tool'" class="zc-msg is-tool">
           <TodoCard v-if="m.name === 'todo_write' && m.args && m.args.todos" :todos="m.args.todos" />
+          <PageInspectCard v-else-if="isPageCard(m, i)" :msg="m" :progress="liveProgress(m, i)" />
           <PreviewCard v-else-if="isPreviewCard(m, i)" :msg="m" :progress="liveProgress(m, i)" />
           <ToolCallBlock v-else :msg="m" />
         </div>

@@ -376,3 +376,25 @@ Agent 通过 `ask_user` 向用户提问时的规范口径。旧称「问题列�
 - **db_write**：仅 dev 库的写通道（INSERT/UPDATE 等），逐条串行遇错即停，执行前走用户确认卡；schema 不暴露 env 参数。
 - **断言（expect）**：Agent 提交的期望值，三档形态——`count`（命中行数）/ `scalar`（单值）/ `rows`（排序后全行比对）。断言判定由工具完成，不由模型目测。
 - 「验证数据准确性」不是第三个工具：它是 db_query+断言 与 db_write 组合出来的**用法**。
+
+## 预览页检查（preview_page）
+
+平台 Agent 的只读浏览器验证工具：用服务端 headless 浏览器打开**当前应用 dev 预览页**，
+产出页面标题、可见文本、控制台错误、失败请求、截图与视觉诊断。它补的是 `preview_status`
+回答不了的那一层——HTTP 可达不等于浏览器里真的渲染出了正确页面。
+
+- **范围**：只读当前会话所属应用的 dev 预览页；`path` 只能是同源相对路径（默认 `/`），
+  不接收任意 URL，不点击、不输入、不改表单。它不用于读取外部网页，也不操作用户自己的浏览器。
+- **身份**：应用身份仍由 `chat_session.workspace_id` 服务端解析，工具 schema 没有
+  `app_id` / `slug` / `url` 参数。
+- **截图**：随会话长期保留，存平台数据区；会话删除时一并清理，单会话有数量/体积上限。
+- **视觉诊断（vision diagnosis）**：把截图交给当前会话的视觉模型做一次「看图诊断」，
+  诊断文本回给主模型；当前会话模型不支持视觉时降级为纯文本并明确告知。
+- **触发**：由模型按需调用，`preview_restart` 不自动触发；预览未运行时只返回状态与
+  「先 preview_restart」的提示，不隐式起栈。
+
+## 浏览器 sidecar（browser sidecar）
+
+承载 `preview_page` 的独立容器：headless Chromium + Playwright，无 docker.sock、无平台库凭据、
+非 root、限资源；后端只经内部 HTTP 调用它，它只经 host-gateway 访回应用 dev 端口。
+它不是应用运行时的一部分，也不走网关；后端容器内不运行浏览器（ADR-0031）。

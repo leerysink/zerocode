@@ -1,0 +1,5 @@
+fastapi>=0.115
+uvicorn[standard]>=0.30
+# 需要 >=1.50：更旧的版本不带 Debian 13 的依赖包名表，`install --with-deps` 在
+# python:3.12-slim-trixie 上会因 ttf-unifont / ttf-ubuntu-font-family 改名而失败。
+playwright==1.64.1

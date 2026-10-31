@@ -5,7 +5,7 @@ from pydantic import BaseModel
 from sqlalchemy import text
 
 from app.agent.model_resolver import resolve_model
-from app.services import attachment_service, config_service
+from app.services import attachment_service, browser_shot_service, config_service
 from app.services.session_title_service import DEFAULT_TITLE
 
 router = APIRouter(prefix="/api/sessions")
@@ -147,6 +147,8 @@ async def delete_session(request: Request, session_id: int):
         await s.commit()
     # 兜底删除附件目录：commit 之后执行，remove_session_dir 自身吞掉 OSError，不影响删除响应
     await asyncio.to_thread(attachment_service.remove_session_dir, uid, session_id)
+    # preview_page 截图同样随会话删除清理（规格 2026-10-31 §7）
+    await asyncio.to_thread(browser_shot_service.remove_session_dir, session_id)
     return {"ok": True}
 
 @router.get("/{session_id}/messages")

@@ -832,12 +832,21 @@ def test_ws_injects_deploy_hub_and_task_table(client, monkeypatch):
 
     monkeypatch.setattr(ws_module.config_service, "get_all", defaults_stripped)
 
+    # 模型能力位也必须按身份钉住：runner 里的 preview_page 看图诊断靠 ctx.model_cfg，
+    # 漏接线时工具会静默降级成「没有视觉能力」，全绿但功能不存在。
+    sentinel_model_cfg = {"id": "spy-model", "supports_vision": False}
+
+    async def fake_resolve_model(sf, session_id, cfg):
+        return sentinel_model_cfg
+
+    monkeypatch.setattr(ws_module, "resolve_model", fake_resolve_model)
+
     class Spy:
         def __init__(self, sf, llm, config_provider, send, ask, confirm, pop_pending=None,
-                     deploy_hub=None, dev_tasks=None):
+                     deploy_hub=None, dev_tasks=None, model_cfg=None):
             self.get_cfg = config_provider
             self.send = send
-            captured.update(hub=deploy_hub, tasks=dev_tasks)
+            captured.update(hub=deploy_hub, tasks=dev_tasks, model_cfg=model_cfg)
 
         async def run(self, session_id, user_text, cancel, attachment_ids=None):
             # 配置在 runner 的调用点上取（与真实 run 同一次 await）：config_getter 是绑定了
@@ -859,6 +868,7 @@ def test_ws_injects_deploy_hub_and_task_table(client, monkeypatch):
 
     assert captured["hub"] is client.app.state.deploy_hub
     assert captured["tasks"] is client.app.state.dev_tasks
+    assert captured["model_cfg"] is sentinel_model_cfg
     # 断言引用 `preview_tools` 的常量而不是字面量：默认值只该有一份字面量，
     # ws.py 的 setdefault 与 build_preview_prompt 的 system 文案都必须读同一个来源（改常量时
     # 若 ws.py 还留着旧数字，模型先被骗）
@@ -894,7 +904,7 @@ def test_ws_confirm_switch_can_be_turned_off_from_config(client, monkeypatch):
 
     class Spy:
         def __init__(self, sf, llm, config_provider, send, ask, confirm, pop_pending=None,
-                     deploy_hub=None, dev_tasks=None):
+                     deploy_hub=None, dev_tasks=None, model_cfg=None):
             self.get_cfg = config_provider
             self.send = send
 

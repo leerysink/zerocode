@@ -10,6 +10,7 @@ import logging
 from pathlib import Path
 from app.agent.preview_tools import (build_preview_prompt, confirm_summary, fetch_app,
                                      need_confirm, resolve_session_app)
+from app.agent.browser_tools import build_browser_prompt
 from app.agent.db_tools import build_db_prompt, db_confirm_summary
 from app.agent.prompts import build_system_prompt
 from app.agent.tools import ToolContext, ToolError, execute_tool
@@ -57,7 +58,7 @@ def _normalize_questions(args: dict) -> list[dict]:
 
 class AgentRunner:
     def __init__(self, session_factory, llm, config_provider, send, ask, confirm, pop_pending=None,
-                 deploy_hub=None, dev_tasks=None):
+                 deploy_hub=None, dev_tasks=None, model_cfg=None):
         self.sf = session_factory
         self.llm = llm
         self.get_config = config_provider
@@ -72,6 +73,9 @@ class AgentRunner:
         # 缺省 None = 不接线（既有调用方与单测保持原签名可用），此时工具仍可只读工作。
         self.deploy_hub = deploy_hub
         self.dev_tasks = dev_tasks if dev_tasks is not None else {}
+        # 本 run 实际模型的能力位（preview_page 的视觉诊断按这个放行/降级）；缺省 None
+        # 表示调用方未提供——浏览器工具仍可用，只是跳过看图诊断。
+        self.model_cfg = model_cfg or {}
         # 本轮历史已内联的图片原始字节合计（_history 构建时写入）：插话带图与历史共用
         # 同一份 MAX_INLINE_BYTES 预算，否则一次运行的内联总量可以越过上限
         self._inline_used = 0
@@ -384,9 +388,11 @@ class AgentRunner:
         preview_prompt = preview_note or (build_preview_prompt(app["stack"]) if app else None)
         if app:
             # 数据库指引与工具同生同灭：多应用 fail closed（preview_note）时两者都不注入。
-            # <database> 放在 <preview> 之前——system 尾部锚定 </preview> 是既有契约
-            preview_prompt = build_db_prompt() + (preview_prompt or "")
-        tools = _TOOLS + PREVIEW_TOOLS + DB_TOOLS if app else _TOOLS
+            # <database> 放在 <preview> 之前；<browser> 跟在 <preview> 之后（system 尾部锚定
+            # </browser>，见 test_agent_loop 的提示词顺序断言）。
+            preview_prompt = (build_db_prompt() + (preview_prompt or "")
+                              + build_browser_prompt())
+        tools = _TOOLS + PREVIEW_TOOLS + DB_TOOLS + BROWSER_TOOLS if app else _TOOLS
         # 先消费上一次 run 停止/收尾前没来得及注入的插话，再落本次新问题：
         # 保证 DB seq 与对话顺序一致（插话发生在先，新问题在后）
         await self._drain_steering(session_id, root, [])
@@ -406,7 +412,8 @@ class AgentRunner:
         ctx = ToolContext(root=root, session_id=session_id, session_factory=self.sf, send=self.send,
                           skills_root=await self._skills_root_of(session_id),
                           app=app, cfg=cfg, cancel=cancel, deploy_hub=self.deploy_hub,
-                          deploy_tasks=self.dev_tasks, run_state={})
+                          deploy_tasks=self.dev_tasks, run_state={},
+                          model_cfg=self.model_cfg, llm=await self._llm_for(cfg))
         max_rounds = int(cfg.get("agent.max_tool_rounds", 30))
         # <=0 = 不限工具轮数（与超时参数 <=0 不限制的约定一致），不再 range(0) 零轮即错
         rounds = itertools.count() if max_rounds <= 0 else range(max_rounds)
@@ -539,4 +546,4 @@ class AgentRunner:
 class _Cancelled(Exception):
     pass
 
-from app.agent.llm import PREVIEW_TOOLS, DB_TOOLS, TOOLS as _TOOLS
+from app.agent.llm import PREVIEW_TOOLS, DB_TOOLS, BROWSER_TOOLS, TOOLS as _TOOLS

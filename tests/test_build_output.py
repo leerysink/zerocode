@@ -104,6 +104,21 @@ def _make_app(apps_root: Path, slug: str, *, name="演示应用", stack="vue3-fa
     return d
 
 
+def _make_browser(repo: Path) -> Path:
+    """在假仓库里造 sidecar 源码：打包器只搬运并核对必备文件是否存在。"""
+    b = repo / "browser"
+    b.mkdir()
+    (b / "Dockerfile").write_text("FROM python:3.12-slim\n", encoding="utf-8")
+    (b / "requirements.txt").write_text("fastapi\nplaywright\n", encoding="utf-8")
+    (b / "app.py").write_text("# sidecar stub\n", encoding="utf-8")
+    (b / "inspect_core.py").write_text("# pure helpers stub\n", encoding="utf-8")
+    (b / "__init__.py").write_text("", encoding="utf-8")
+    (b / "docker-compose.yml").write_text("name: zerocode-browser\n", encoding="utf-8")
+    (b / "__pycache__").mkdir()
+    (b / "__pycache__" / "app.cpython-312.pyc").write_bytes(b"\x00")
+    return b
+
+
 def _make_gateway(repo: Path) -> Path:
     """在假仓库里造网关配置，含三样**绝不能进包**的东西：私钥、现场路由、本地 .env。"""
     gw = repo / "gateway"
@@ -135,6 +150,7 @@ def fake_repo(tmp_path) -> Path:
     (tmp_path / "app" / "__pycache__").mkdir()
     (tmp_path / "app" / "__pycache__" / "main.cpython-312.pyc").write_bytes(b"\x00")
     (tmp_path / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+    _make_browser(tmp_path)
     (tmp_path / "scripts").mkdir()
     (tmp_path / "scripts" / "deploy.sh").write_text(DEPLOY_SH_STUB, encoding="utf-8")
 
@@ -170,6 +186,8 @@ def test_build_produces_every_artifact(fake_repo):
     for rel in ("init.sql", "docker-compose.yml", ".env.example", ".dockerignore",
                 "apply-init.sh", "deploy.sh", "README-deploy.md",
                 "backend/Dockerfile", "backend/requirements.txt", "backend/app/main.py",
+                "browser/Dockerfile", "browser/requirements.txt", "browser/app.py",
+                "browser/inspect_core.py", "browser/__init__.py",
                 "frontend/dist/index.html",
                 "gateway/docker-compose.yml", "gateway/nginx.conf", "gateway/lua/router.lua",
                 "gateway/404.html", "gateway/make-cert.sh", "gateway/certs/.gitkeep",
@@ -179,7 +197,7 @@ def test_build_produces_every_artifact(fake_repo):
         assert (out / rel).is_file(), f"交付包缺 {rel}"
     assert s["deploy_root"] == ROOT and s["generated_at"] == STAMP
     assert s["preset_files"]["demo1"] > 0 and s["init_sql_bytes"] > 0
-    assert s["gateway_files"] > 0
+    assert s["gateway_files"] > 0 and s["browser_files"] > 0
 
 
 def test_backend_copy_drops_pycache(fake_repo):
@@ -202,7 +220,8 @@ def test_generated_text_files_use_lf(fake_repo):
     """边界：CRLF 会让 apply-init.sh 在 bash 下直接报错，SQL 里也不该有 \\r。"""
     out = _build(fake_repo)["out"]
     for rel in ("init.sql", "docker-compose.yml", "apply-init.sh", "deploy.sh",
-                "README-deploy.md", ".env.example", "backend/Dockerfile"):
+                "README-deploy.md", ".env.example", "backend/Dockerfile",
+                "browser/Dockerfile", "browser/docker-compose.yml", "browser/app.py"):
         raw = (out / rel).read_bytes()
         assert b"\r\n" not in raw, f"{rel} 含 CRLF 行尾"
 
@@ -832,6 +851,147 @@ def test_ssl_switch_exposed_for_server_env(fake_repo):
     assert "ZEROCODE_SSL_ENABLE" in (out / "README-deploy.md").read_text(encoding="utf-8")
 
 
+def test_compose_browser_sidecar_is_contained(fake_repo):
+    """sidecar 的交付形态必须自己站得住：不发布端口、不挂 docker.sock、根只读、资源有上限。
+
+    这些约束就是 ADR-0031 的全部内容。有人「为了调试」加一行 ports 或一个 docker.sock 挂载时，
+    平台就凭空多出一个能在宿主网络上跑 Chromium 的 root 容器，而且运行期不会有任何一处报错。
+    """
+    out = _build(fake_repo)["out"]
+    doc = yaml.safe_load((out / "docker-compose.yml").read_text(encoding="utf-8"))
+    side = doc["services"]["browser"]
+    assert side["build"]["context"] == "./browser"
+    assert side["image"] == "zerocode-browser:demo"
+    assert "ports" not in side, "sidecar 发布宿主端口 = 把无头浏览器暴露到宿主网络"
+    assert "volumes" not in side, "sidecar 不该拿到宿主挂载（docker.sock / apps / data 都不行）"
+    assert side["read_only"] is True
+    assert list(side["cap_drop"]) == ["ALL"]
+    assert "no-new-privileges:true" in side["security_opt"]
+    assert side["tmpfs"] == ["/tmp:size=256m", "/dev/shm:size=512m"]
+    assert side["mem_limit"] == "1g" and side["pids_limit"] == 256
+    assert side["extra_hosts"] == ["host.docker.internal:host-gateway"]
+    assert side["networks"] == ["default"]             # 不进 zcnet：它不需要碰应用容器
+
+
+def test_repo_browser_dockerfile_is_non_root_with_local_context():
+    """事实核对（读仓库真文件，不是假仓库桩）：镜像以 uid 10001 运行，且构建上下文是 browser/。
+
+    上下文口径漂开的表现很隐蔽：本地 `browser/dev-up.bat` 与交付包 compose 都按同一个目录传
+    context，谁改了 COPY 路径没同步，就是「一边能 build、另一边镜像构建失败」。
+    """
+    dk = (bo.REPO_ROOT / "browser" / "Dockerfile").read_text(encoding="utf-8")
+    assert "USER 10001" in dk
+    assert "COPY app.py inspect_core.py __init__.py /service/browser/" in dk
+    assert "COPY browser/" not in dk
+    local = (bo.REPO_ROOT / "browser" / "docker-compose.yml").read_text(encoding="utf-8")
+    assert "context: ." in local
+    assert "context: ./browser" in bo.compose_yaml(ROOT)
+
+
+def test_repo_browser_base_image_is_codename_pinned():
+    """基础镜像与 playwright 版本必须成对钉死（实测踩过的坑）。
+
+    `python:3.12-slim` 是浮动 tag，拉到 Debian 13 后 `playwright install --with-deps` 仍在按
+    旧包名表 apt 安装，`ttf-unifont` / `ttf-ubuntu-font-family` 已改名 → 构建期退出码 100，
+    而且只在「换了台机器/重新拉镜像」时才复现。所以这里钉代号，也钉住 playwright 的下限。
+    """
+    dk = (bo.REPO_ROOT / "browser" / "Dockerfile").read_text(encoding="utf-8")
+    assert "FROM python:3.12-slim-" in dk, "浮动 slim tag 会让 --with-deps 随发行版换代而失败"
+    req = (bo.REPO_ROOT / "browser" / "requirements.txt").read_text(encoding="utf-8")
+    line = next(l for l in req.splitlines() if l.startswith("playwright=="))
+    version = tuple(int(p) for p in line.split("==")[1].split("."))
+    assert version >= (1, 50), "1.50 之前没有 Debian 13 的依赖包名表"
+
+
+def test_sidecar_addresses_are_runtime_overridable(fake_repo):
+    """三个地址位三段同名：后端读取 / compose 插值 / .env.example，README 里也搜得到。
+
+    `ZEROCODE_BROWSER_TARGET_HOST` 与 `BROWSER_ALLOWED_HOSTS` 是一对：前者改成别的宿主而
+    后者没跟上时，症状是 preview_page 恒返回「服务不可用」——所以两处都得在 .env.example 里露面。
+    """
+    out = _build(fake_repo)["out"]
+    doc = yaml.safe_load((out / "docker-compose.yml").read_text(encoding="utf-8"))
+    backend = doc["services"]["backend"]
+    env = backend["environment"]
+    assert env["ZEROCODE_BROWSER_URL"] == "${ZEROCODE_BROWSER_URL:-http://browser:8101}"
+    assert env["ZEROCODE_BROWSER_TARGET_HOST"] == "${ZEROCODE_BROWSER_TARGET_HOST:-host.docker.internal}"
+    assert backend["depends_on"]["browser"]["condition"] == "service_started"
+    assert "BROWSER_ALLOWED_HOSTS" in doc["services"]["browser"]["environment"]
+    example = (out / ".env.example").read_text(encoding="utf-8")
+    assert "ZEROCODE_BROWSER_URL=http://browser:8101" in example
+    assert "ZEROCODE_BROWSER_TARGET_HOST=host.docker.internal" in example
+    assert "BROWSER_ALLOWED_HOSTS=host.docker.internal,127.0.0.1,localhost" in example
+    readme = (out / "README-deploy.md").read_text(encoding="utf-8")
+    for token in ("ZEROCODE_BROWSER_URL", "BROWSER_ALLOWED_HOSTS", "PLAYWRIGHT_DOWNLOAD_HOST"):
+        assert token in readme, f"README 缺 {token}：排障的人搜不到这个变量名"
+
+
+def test_missing_sidecar_source_refuses_packaging(fake_repo):
+    """边界：compose 会在服务器上 build browser/，缺文件等于把失败推到部署现场。"""
+    (fake_repo / "browser" / "inspect_core.py").unlink()
+    with pytest.raises(bo.BuildError, match="inspect_core.py"):
+        _build(fake_repo)
+
+
+def test_browser_copy_drops_pycache(fake_repo):
+    out = _build(fake_repo)["out"]
+    assert not list((out / "browser").rglob("__pycache__"))
+    assert not list((out / "browser").rglob("*.pyc"))
+
+
+def test_browser_copy_strips_crlf(fake_repo):
+    """边界：Windows 检出的 CRLF 不能跟着 browser/ 进包——Dockerfile 里「续行反斜杠 + \\r」会断掉续行。
+
+    `.bat` 反过来必须原样：cmd.exe 对只有 LF 的 goto 标签不可靠，而它是开发机本地用的。
+    """
+    (fake_repo / "browser" / "Dockerfile").write_bytes(
+        b"FROM python:3.12-slim\r\nRUN set -eux; \\\r\n    echo ok\r\n")
+    (fake_repo / "browser" / "dev-up.bat").write_bytes(b"@echo off\r\ngoto :end\r\n")
+    out = _build(fake_repo)["out"]
+    assert b"\r" not in (out / "browser" / "Dockerfile").read_bytes()
+    assert b"\r\n" in (out / "browser" / "dev-up.bat").read_bytes()
+
+
+def test_playwright_download_host_is_three_level(fake_repo, monkeypatch):
+    """Chromium 下载源走「显式参数 > 打包机 env > 默认」，且同时进 build args 与 .env.example。
+
+    它是构建期值，所以不进容器 env；但必须能从服务器 .env 覆盖（包里写的是 `${VAR:-打包值}`），
+    否则换源只能回开发机重打包。
+    """
+    text = (_build(fake_repo)["out"] / "docker-compose.yml").read_text(encoding="utf-8")
+    assert ("PLAYWRIGHT_DOWNLOAD_HOST: "
+            "${PLAYWRIGHT_DOWNLOAD_HOST:-https://cdn.npmmirror.com/binaries/playwright}") in text
+
+    monkeypatch.setenv(PW_ENV, "https://mirrors.example.com/playwright")
+    out = _build(fake_repo)["out"]
+    assert "${PLAYWRIGHT_DOWNLOAD_HOST:-https://mirrors.example.com/playwright}" in \
+        (out / "docker-compose.yml").read_text(encoding="utf-8")
+    assert "PLAYWRIGHT_DOWNLOAD_HOST=https://mirrors.example.com/playwright" in \
+        (out / ".env.example").read_text(encoding="utf-8")
+
+    out = _build(fake_repo, playwright_download_host="https://explicit.example.com/pw")["out"]
+    assert "${PLAYWRIGHT_DOWNLOAD_HOST:-https://explicit.example.com/pw}" in \
+        (out / "docker-compose.yml").read_text(encoding="utf-8")
+
+
+def test_playwright_download_host_rejects_non_url(fake_repo):
+    with pytest.raises(bo.BuildError, match="Playwright"):
+        _build(fake_repo, playwright_download_host="cdn.npmmirror.com/binaries/playwright")
+
+
+def test_browser_mirrors_follow_packaging_mirrors(fake_repo):
+    """apt / pip 换源对 browser 镜像同样生效（它构建期要 apt 装浏览器依赖、pip 装 playwright）。"""
+    out = _build(fake_repo, apt_mirror="mirrors.example.com",
+                 pypi_mirror="https://mirrors.example.com/pypi/simple")["out"]
+    text = (out / "docker-compose.yml").read_text(encoding="utf-8")
+    assert "ZEROCODE_APT_MIRROR: ${ZEROCODE_APT_MIRROR:-mirrors.example.com}" in text
+    assert "ZEROCODE_PYPI_MIRROR: ${ZEROCODE_PYPI_MIRROR:-https://mirrors.example.com/pypi/simple}" in text
+    # 零注入时留空，而不是写进一个假默认值
+    plain = (_build(fake_repo)["out"] / "docker-compose.yml").read_text(encoding="utf-8")
+    assert "ZEROCODE_APT_MIRROR: ${ZEROCODE_APT_MIRROR:-}" in plain
+    assert "ZEROCODE_PYPI_MIRROR: ${ZEROCODE_PYPI_MIRROR:-}" in plain
+
+
 def test_dockerignore_keeps_apps_out_of_build_context(fake_repo):
     """边界：apps/ 若进了构建上下文，每次 build 都要把两个应用源码传给 daemon。"""
     ignore = (_build(fake_repo)["out"] / ".dockerignore").read_text(encoding="utf-8")
@@ -917,6 +1077,7 @@ def test_readme_publish_steps_are_split_per_directory(fake_repo):
 
     for required in (
             f"rsync -a --delete build-output/backend/  {ROOT}/backend/",
+            f"rsync -a --delete build-output/browser/  {ROOT}/browser/",
             f"rsync -a --delete build-output/frontend/ {ROOT}/frontend/",
             f"rsync -a --delete --exclude '/deploy/' build-output/apps/demo1/ {ROOT}/apps/demo1/",
             f"rsync -a --delete --exclude '/deploy/' build-output/apps/demo2/ {ROOT}/apps/demo2/",
@@ -1693,11 +1854,12 @@ def test_first_build_with_bad_domain_creates_no_output_dir(fake_repo, monkeypatc
 APT_ENV = "ZEROCODE_APT_MIRROR"
 PYPI_ENV = "ZEROCODE_PYPI_MIRROR"
 NPM_ENV = "ZEROCODE_NPM_REGISTRY"
+PW_ENV = "PLAYWRIGHT_DOWNLOAD_HOST"
 
 
 @pytest.fixture(autouse=True)
 def _neutralize_host_packaging_env(monkeypatch):
-    """每个用例起手清掉打包机上的四个 ZEROCODE_* 取值位。
+    """每个用例起手清掉打包机上的五个取值位（四个 `ZEROCODE_*` 加 Playwright 下载源）。
 
     这四个变量是「三级取值」的中间那级（显式参数 > 打包机 env > 默认），而打包功能本身就鼓励
     「配一次以后每次发布自动带上」——于是配过它们的机器上，pytest 进程会继承这份用户级变量，
@@ -1705,7 +1867,7 @@ def _neutralize_host_packaging_env(monkeypatch):
     与 test_pypi_mirror_injects… 等三条同时红，而换台机器全绿）。需要取值的用例自己 setenv，
     monkeypatch 的时序在本清除之后，覆盖得了。
     """
-    for name in (GATEWAY_ENV, APT_ENV, PYPI_ENV, NPM_ENV):
+    for name in (GATEWAY_ENV, APT_ENV, PYPI_ENV, NPM_ENV, PW_ENV):
         monkeypatch.delenv(name, raising=False)
 
 
