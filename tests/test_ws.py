@@ -776,6 +776,8 @@ def test_ws_manual_compact(client):
                 assert ev["summary"] == "压缩摘要OK"
                 break
         assert "compaction_done" in types
+        # 开始帧只有一处来源（compact()）：ws 侧再发一次会让聊天流里叠两条「压缩中」
+        assert types.count("compacting") == 1
 
 
 # ---------- 聊天图片输入（WS 协议） ----------

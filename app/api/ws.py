@@ -306,7 +306,8 @@ async def ws_chat(ws: WebSocket, session_id: int):
                     hub.running.add(session_id)
                     hub.compacting.add(session_id)  # 压缩无工具边界，插话要区别拒绝
                     try:
-                        await send_local({"type": "compacting"})
+                        # compacting 起始帧由 compaction_service.compact 单点下发（skip 分支不发）：
+                        # 这里再发一次，聊天流就会叠两条「压缩中」，而自动压缩路径本来没有这帧，两处发帧迟早对不上
                         cfg = await config_getter()
                         llm = llm_factory(cfg)
                         keep = int(cfg.get("agent.compact_keep_recent", 8))

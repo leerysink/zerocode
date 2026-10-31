@@ -69,6 +69,45 @@ describe('applyEvent 新事件', () => {
     expect(s.messages[0].role).toBe('notice')
     expect(s.messages[0].content).toContain('最近的对话与图片仍可查看')
   })
+  it('compacting 立刻在聊天流放「压缩中」标记，重复下发不叠加', () => {
+    const s = mk()
+    applyEvent(s, { type: 'compacting' })
+    expect(s.messages.length).toBe(1)
+    expect(s.messages[0]).toMatchObject({ role: 'notice', kind: 'compacting' })
+    expect(s.messages[0].content).toContain('正在压缩上下文')
+    applyEvent(s, { type: 'compacting' })
+    expect(s.messages.length).toBe(1)
+  })
+  it('compaction_done 把标记原地定稿，不是再追一条', () => {
+    const s = mk()
+    applyEvent(s, { type: 'compacting' })
+    applyEvent(s, { type: 'compaction_done', summary: 'x', up_to_seq: 4 })
+    expect(s.messages.length).toBe(1)
+    expect(s.messages[0]).toMatchObject({ role: 'notice', kind: 'compacted' })
+    expect(s.messages[0].content).toContain('已压缩上下文')
+    expect(s.messages[0].content).toContain('最近的对话与图片仍可查看')
+  })
+  it('错过 compacting（刷新期间压缩跑完）时 compaction_done 仍要留下一条', () => {
+    const s = mk()
+    applyEvent(s, { type: 'compaction_done', summary: 'x', up_to_seq: 4 })
+    expect(s.messages.length).toBe(1)
+    expect(s.messages[0].kind).toBe('compacted')
+  })
+  it('skip 的 notice 原地定稿为后端文案，不留压缩中', () => {
+    const s = mk()
+    applyEvent(s, { type: 'compacting' })
+    applyEvent(s, { type: 'notice', text: '历史消息不足，暂无需压缩' })
+    expect(s.messages.length).toBe(1)
+    expect(s.messages[0].content).toBe('历史消息不足，暂无需压缩')
+    expect(s.messages[0].kind).not.toBe('compacting')
+    expect(s.compacting).toBe(false)
+  })
+  it('压缩失败（error 终态）摘掉未定稿标记，不留永远转圈', () => {
+    const s = mk()
+    applyEvent(s, { type: 'compacting' })
+    applyEvent(s, { type: 'error', message: '压缩失败，已保留原文' })
+    expect(s.messages.filter((m) => m.kind === 'compacting').length).toBe(0)
+  })
   it('error/status 复位 thinking', () => {
     const s = mk()
     s.streamingThinking = 'x'
@@ -450,5 +489,26 @@ describe('tool_progress 与确认卡 summary', () => {
     applyEvent(s, { type: 'tool_progress', name: 'preview_restart', line: 'x' })
     s.cancel()
     expect(s.toolProgress).toBe(null)
+  })
+})
+
+describe('压缩期间的发言拦截', () => {
+  it('手动压缩（会话没在跑）本地拦下，文本留在输入框', () => {
+    setActivePinia(createPinia())
+    const s = useChatStore()
+    s.compacting = true
+    expect(s.send({ text: '先说一句' })).toBe(false)
+    expect(s.hint).toContain('上下文压缩中')
+    expect(s.rejectedDraft).toBe('先说一句')
+  })
+  it('自动压缩发生在执行中：不该本地拦话，交给后端插话队列', () => {
+    setActivePinia(createPinia())
+    const s = useChatStore()
+    s.compacting = true
+    s.running = true
+    s._ws = { readyState: 1, send: vi.fn() }
+    expect(s.send({ text: '插一句' })).toBe(true)
+    expect(s.hint).not.toContain('上下文压缩中')
+    expect(s._ws.send).toHaveBeenCalledTimes(1)
   })
 })

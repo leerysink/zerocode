@@ -314,6 +314,10 @@ async def test_auto_compaction_triggers(test_engine, tmp_path):
     system_msg = llm.received[1][0]
     assert system_msg["role"] == "system" and "<context_summary>" in system_msg["content"]
     assert "摘要：历史已压缩" in system_msg["content"]
+    # 自动压缩同样要在聊天流里可见：开始帧先于完成帧（前端据此在流中放/收「压缩中」标记）
+    types = [e["type"] for e in rec.events]
+    assert "compacting" in types
+    assert types.index("compacting") < types.index("compaction_done")
 
 # 平台清单合法形态（app_service 写入方的全字段产物），供契约注入用例复用
 APP_META = {"schema": "zc-app/1", "name": "来料登记", "slug": "lailiao", "scale": "small",

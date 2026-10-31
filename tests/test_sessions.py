@@ -30,6 +30,34 @@ async def test_message_seq_increments(client):
     assert [m["role"] for m in msgs] == ["user", "assistant"]
 
 @pytest.mark.asyncio
+async def test_messages_project_compaction_markers(client):
+    # 压缩留痕只活在 compaction 表：读取时投成 notice 行，插在「被摘到的最后一条消息」之后，
+    # 刷新/切会话后照样看得见。故意不写 message 表——模型上下文因此不会掺进提示条。
+    from sqlalchemy import text
+    ws = await _mk_ws(client)
+    s = (await client.post("/api/sessions", json={"workspace_id": ws["id"]})).json()
+    sf = client.app.state.session_factory
+    for i in range(6):
+        await add_message(sf, s["id"], "user", content=f"消息{i}")
+    async with sf() as db:
+        await db.execute(text("INSERT INTO compaction (session_id, summary, up_to_seq) "
+                             "VALUES (:i, '第一摘要', 2)"), {"i": s["id"]})
+        await db.execute(text("INSERT INTO compaction (session_id, summary, up_to_seq) "
+                             "VALUES (:i, '第二摘要', 4)"), {"i": s["id"]})
+        await db.commit()
+    msgs = (await client.get(f"/api/sessions/{s['id']}/messages")).json()
+    assert [(m["role"], m.get("kind")) for m in msgs] == [
+        ("user", None), ("user", None),
+        ("notice", "compacted"),
+        ("user", None), ("user", None),
+        ("notice", "compacted"),
+        ("user", None), ("user", None)]
+    marker = msgs[2]
+    assert marker["seq"] == 2  # 定位到被摘要的末条水位
+    assert marker["id"] is None and marker["attachments"] == []
+    assert "第一摘要" not in str(msgs)  # 摘要正文不外泄给列表接口，前端只显示事件
+
+@pytest.mark.asyncio
 async def test_message_jsonb_roundtrip(client):
     # add_message 的 json.dumps + CAST AS JSONB 写入 → 回读必须还原为等价 Python 对象
     ws = await _mk_ws(client)

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { normalizeMessages, askQuestionsOf, askOutcomeOf, confirmStateOf, DECLINE_ANSWER } from './messageModel'
+import { normalizeMessages, askQuestionsOf, askOutcomeOf, confirmStateOf, DECLINE_ANSWER, NOTICE_TEXT } from './messageModel'
 import { applyEvent } from './chat'
 
 // 历史行的真实形状（GET /sessions/{id}/messages 直接回 DB 行）：
@@ -218,5 +218,16 @@ describe('实时 ≡ 历史（带确认的写入执行）', () => {
       { role: 'tool', name: 'write_file', args: WRITE_ARGS, awaitingConfirm: true },
     ])
     expect(confirmStateOf(marked[0])).toBe('pending')
+  })
+})
+
+describe('压缩留痕的文案单点', () => {
+  it('历史投影行只有 kind、没有正文时，按 kind 补出文案', () => {
+    const [m] = normalizeMessages([{ id: null, seq: 2, role: 'notice', kind: 'compacted', content: null }])
+    expect(m.content).toBe(NOTICE_TEXT.compacted)
+  })
+  it('后端自带正文的提示条（skip 文案）不被覆盖', () => {
+    const [m] = normalizeMessages([{ role: 'notice', content: '历史消息不足，暂无需压缩' }])
+    expect(m.content).toBe('历史消息不足，暂无需压缩')
   })
 })

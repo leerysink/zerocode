@@ -151,6 +151,12 @@ async def delete_session(request: Request, session_id: int):
     await asyncio.to_thread(browser_shot_service.remove_session_dir, session_id)
     return {"ok": True}
 
+def _compaction_notice(mark) -> dict:
+    """把一条 compaction 投成聊天流里的 notice 行（文案由前端按 kind 单点定义，摘要正文不外泄）。"""
+    return {"id": None, "seq": mark["up_to_seq"], "role": "notice", "kind": "compacted",
+            "content": None, "created_at": mark["created_at"], "attachments": []}
+
+
 @router.get("/{session_id}/messages")
 async def get_messages(request: Request, session_id: int):
     uid = request.state.actor["id"]
@@ -159,9 +165,25 @@ async def get_messages(request: Request, session_id: int):
         rows = (await s.execute(text(
             "SELECT id, seq, role, content, reasoning, tool_call_id, tool_name, tool_args, tool_result, created_at "
             "FROM message WHERE session_id=:i ORDER BY seq"), {"i": session_id})).mappings().all()
+        # 压缩留痕只活在 compaction 表，读取时投成 notice 行插回水位之后：
+        # 往 message 表写一行固然更省事，但 rows_after/_history 都读那张表，
+        # 提示条会被当成对话内容喂给模型，还得处处排除它
+        marks = (await s.execute(text(
+            "SELECT up_to_seq, created_at FROM compaction WHERE session_id=:i ORDER BY id"),
+            {"i": session_id})).mappings().all()
     by_msg = await attachment_service.for_messages(
         request.app.state.session_factory, session_id, [r["id"] for r in rows])
-    return [{**dict(r), "attachments": by_msg.get(r["id"], [])} for r in rows]
+    out: list[dict] = []
+    rest = list(marks)
+    for r in rows:
+        # 水位 = 被摘要覆盖的最后一条消息序号，所以提示条要排在该条**之后**：
+        # 用 < 而非 <=，等于水位的消息自己还得先落进列表
+        while rest and rest[0]["up_to_seq"] < r["seq"]:
+            out.append(_compaction_notice(rest.pop(0)))
+        out.append({**dict(r), "attachments": by_msg.get(r["id"], [])})
+    for m in rest:
+        out.append(_compaction_notice(m))
+    return out
 
 @router.get("/{session_id}/file-changes")
 async def list_file_changes(request: Request, session_id: int):

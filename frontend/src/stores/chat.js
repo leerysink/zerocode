@@ -9,6 +9,8 @@
 // / interaction_expired(后端已无这次确认/回答的挂起点：把待答卡收口成已中断并解锁输入)；
 // 终态 = error / status(idle|error)，busy、status(running) 与 steering_done 都不是。
 // message_done 是**轮次收口**而非终态：工具轮在派发工具前也发一次，一次执行可以有多条。
+// compacting / compaction_done / notice 三者驱动聊天流里同一枚压缩标记：开始放一枚，终态就地定稿
+// （见 settleCompactMarker），刷新后由历史接口的投影补出（ADR 0034）。
 // 提问卡与确认卡都画在消息流的调用行上，但**待答**的那次调用在历史里没有 tool 行（工具行要等
 // 结果回来才落库），所以两类的待答态都还要 ask_user / confirm_request 事件：重连时 hub 补发
 // 同一份，reducer 找不到可附着的行就合成一条无结果调用行（ADR 0029 的「靠行重建」只覆盖已答态）。
@@ -18,12 +20,31 @@ import {
   fetchAttachmentBlob, uploadAttachment, wsUrl,
 } from '../api'
 import { newClientMsgId } from '../utils/imageAttachments'
-import { findOpenToolCall, DECLINE_ANSWER } from './messageModel'
+import { findOpenToolCall, DECLINE_ANSWER, NOTICE_TEXT } from './messageModel'
 
 // 「执行中被拦下」的三条文案：单点定义，本地拦截与后端 busy 回包共用同一口径
 const BUSY_HINT = '会话正在执行中：点右侧「停止」结束当前执行后即可继续发言'
 const COMPACT_HINT = '上下文压缩中，请稍候'
 const OFFLINE_HINT = '连接未就绪，正在重连，请稍候再发'
+
+// 聊天流里那枚未定稿的压缩标记（kind==='compacting'）在哪：从后往前找，同一时刻至多一枚。
+// 返回 -1 表示这轮的开始帧没收到（刷新/断线期间压缩跑完），定稿时就当没有标记处理。
+function findCompactMarker(store) {
+  for (let i = store.messages.length - 1; i >= 0; i--) {
+    const m = store.messages[i]
+    if (m.role === 'notice' && m.kind === 'compacting') return i
+  }
+  return -1
+}
+
+// 压缩终态：原地把「压缩中」换成定稿记录，而不是再追一条——两条说的是同一次压缩，
+// 叠在流里像压了两次。没有标记可换（开始帧没收到）才补一条，保证终态一定看得见。
+function settleCompactMarker(store, text, kind) {
+  const rec = kind ? { role: 'notice', kind, content: text } : { role: 'notice', content: text }
+  const i = findCompactMarker(store)
+  if (i >= 0) store.messages.splice(i, 1, rec)
+  else store.messages.push(rec)
+}
 
 // 本轮结束时要复位的执行态，单点定义：三个终态入口（error / status(idle|error) /
 // interaction_expired）共用同一集合。抄漏一项的后果是页面上留一个永远转圈的残块
@@ -36,6 +57,9 @@ function endRunState(store) {
   store.pendingOutbox = {}
   store.pendingEchoId = ''
   store.toolProgress = null
+  // 没定稿的压缩标记随本轮作废：失败原因已由 error 气泡说明，留一枚永远转圈的标记就是残块
+  const pending = findCompactMarker(store)
+  if (pending >= 0) store.messages.splice(pending, 1)
 }
 
 export function applyEvent(store, ev) {
@@ -130,16 +154,19 @@ export function applyEvent(store, ev) {
     case 'todo_sync': // 待办清单全量替换
       store.todoList = ev.todos || []
       break
-    case 'compacting': // 上下文压缩进行中
+    case 'compacting': // 上下文压缩进行中：按钮 loading + 聊天流里立刻放一枚「压缩中」标记
       store.compacting = true
+      if (findCompactMarker(store) < 0) {
+        store.messages.push({ role: 'notice', kind: 'compacting', content: NOTICE_TEXT.compacting })
+      }
       break
-    case 'compaction_done': // 压缩完成：复位 + 消息流提示条
+    case 'compaction_done': // 压缩完成：复位 + 标记原地定稿
       store.compacting = false
-      store.messages.push({ role: 'notice', content: '已压缩上下文：更早对话已替换为摘要；最近的对话与图片仍可查看' })
+      settleCompactMarker(store, NOTICE_TEXT.compacted, 'compacted')
       break
     case 'notice': // 系统提示（压缩 skip 终态等）：复位压缩态 + 居中灰字提示条
       store.compacting = false
-      store.messages.push({ role: 'notice', content: ev.text })
+      settleCompactMarker(store, ev.text)
       break
     case 'busy': {
       // 执行中被拒（并发发消息 / 压缩中发消息）的**非终态**提示：绝不得清 running/compacting。
@@ -360,8 +387,9 @@ export const useChatStore = defineStore('chat', {
         typeof payload === 'string' ? { text: payload } : (payload || {})
       const content = (text || '').trim()
       if (!content && !attachments.length) return false
-      // 压缩中没有"下一轮边界"可注入，后端也只会回 busy —— 本地先拦下，文本留在框里
-      if (this.compacting) {
+      // 手动压缩中没有"下一轮边界"可注入，后端也只会回 busy —— 本地先拦下，文本留在框里。
+      // running 为真时不拦：那是自动压缩（跑在 run 内部），插话本该进后端的插话队列。
+      if (this.compacting && !this.running) {
         this.rejectedDraft = content
         this.hint = COMPACT_HINT
         return false

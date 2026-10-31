@@ -140,9 +140,12 @@ onMounted(scrollToBottom)
             <MarkdownView v-if="m.content" class="zc-md" :content="m.content" />
           </div>
         </div>
-        <!-- notice：压缩完成等系统提示，居中灰字分隔 -->
+        <!-- notice：压缩进行中（转圈）与完成等系统提示（灰字），居中分隔 -->
         <div v-else-if="m.role === 'notice'" class="zc-msg is-notice">
-          <span class="zc-notice-text">{{ m.content }}</span>
+          <span class="zc-notice-text">
+            <a-spin v-if="m.kind === 'compacting'" size="small" class="zc-notice-spin" />
+            {{ m.content }}
+          </span>
         </div>
         <!-- tool：ask_user 渲染提问卡；需确认的调用渲染确认卡（待答可交互／已答只读留痕）；
              todo_write 渲染任务卡；preview_* 渲染预览卡（还要过 isPreviewCard 的闸——
@@ -239,6 +242,10 @@ onMounted(scrollToBottom)
   background: rgba(91, 122, 157, 0.06);
   border-radius: 999px;
   padding: 3px 12px;
+}
+.zc-notice-spin {
+  margin-right: 6px;
+  vertical-align: -2px;
 }
 
 /* user 浅蓝气泡 */

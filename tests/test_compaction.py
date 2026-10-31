@@ -58,6 +58,19 @@ async def test_compact_skips_when_few(test_engine, tmp_path):
     # skip 也是终态：必须下发 notice 事件，前端才能退出 compacting（fix-round Fix 1）
     assert [(e["type"], e.get("text")) for e in rec.events] == [("notice", "历史消息不足，暂无需压缩")]
 
+async def test_compact_announces_start(test_engine, tmp_path):
+    # 「压缩中」由 compact() 单点下发，手动（ws）与自动（loop）两条触发路径共用同一帧；
+    # 位置在 skip 判定之后：skip 不得先发开始再补终态，否则聊天流里闪一条永远不结束的压缩提示
+    sf = make_session_factory(test_engine)
+    sid = await mk_session(test_engine, tmp_path)
+    await _seed_messages(sf, sid, 12)
+    rec = _Rec()
+    llm = ScriptedLLM([[{"type": "done", "message": {"role": "assistant",
+                                                    "content": "目标：测试", "tool_calls": None}}]])
+    await comp.compact(sf, llm, sid, rec, keep_recent=8)
+    assert [e["type"] for e in rec.events] == ["compacting", "compaction_done"]
+
+
 async def test_compact_failure_emits_error_only(test_engine, tmp_path):
     sf = make_session_factory(test_engine)
     sid = await mk_session(test_engine, tmp_path)

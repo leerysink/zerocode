@@ -3,6 +3,7 @@
 - 摘要覆盖 up_to_seq 之前的所有消息；保留最近 keep_recent 条原文；
 - 摘要链式合并上一份摘要（ADR-0030），并封顶 SUMMARY_MAX_CHARS；
 - 摘要拼装在 loop._build_messages 中注入 system 尾部 <context_summary>；
+- 确定要压缩后先 send compacting 起始事件（手动/自动两条路径都经此处，前端据此在聊天流放标记）；
 - 消息不足（skip）send notice 终态事件后返回 None；失败只 send error 事件并返回 None；
   均不抛出、不改会话状态、不阻断对话。
 """
@@ -61,6 +62,9 @@ async def compact(sf, llm, session_id: int, send, keep_recent: int = 8) -> dict 
         # 压缩按钮卡死；notice 为前端已渲染的提示条角色消息
         await send({"type": "notice", "text": "历史消息不足，暂无需压缩"})
         return None
+    # 开始帧放在 skip 判定之后、由本服务单点下发：手动（ws）与自动（loop._build_messages）
+    # 两条触发路径共用，前端据此立刻在聊天流里放「压缩中」标记；skip 若先发这帧就永远收不干净
+    await send({"type": "compacting"})
     head, tail = rows[:-keep_recent], rows[-keep_recent:]
     lines = []
     for r in head:

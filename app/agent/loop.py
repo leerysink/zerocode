@@ -1,9 +1,9 @@
 """Agent 循环：流式对话 + 工具调度 + ask_user 挂起恢复 + 写入确认 + 取消。
 
 事件协议（send 下发）：token/tool_call/tool_result/tool_progress/file_change/message_done/error，
-另有 confirm_request（写入或重启预览的确认请求）、status（终态回执）、compaction_done（自动压缩完成）
-与 session_title（首条消息自动命名后的新标题，前端就地刷新侧栏）。tool_progress 由预览工具经
-同一个 send 下发，临时、不落库。
+另有 confirm_request（写入或重启预览的确认请求）、status（终态回执）、compacting 与 compaction_done
+（自动压缩的开始与完成，两帧都由 compaction_service 发出）与 session_title（首条消息自动命名后的新标题，
+前端就地刷新侧栏）。tool_progress 由预览工具经同一个 send 下发，临时、不落库。
 
 message_done 是**轮次收口**，不是执行终态：每个工具轮在派发工具之前也会发一次（content 为空则不发），
 把本轮已流式输出的文字固化成一条消息，所以一次执行可以发多次。执行终态只由 status/error 判定。

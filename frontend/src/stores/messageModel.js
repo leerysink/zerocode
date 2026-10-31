@@ -10,6 +10,13 @@
 // 归一化施加在渲染层（ChatMessages 的 computed）而非 store：store.messages 里的
 // client_msg_id / pendingEcho 是 busy 回滚要用的活字段，投影掉会打断它。
 
+// 提示条文案的单一真源。后端只给 `kind`（历史投影行连正文都不带），实时与刷新两条
+// 路径因此渲染同一句话；把文案抄到后端一份，改一处就会另一处对不上。
+export const NOTICE_TEXT = {
+  compacting: '正在压缩上下文…',
+  compacted: '已压缩上下文：更早对话已替换为摘要；最近的对话与图片仍可查看',
+}
+
 // 「同名、还没结果」的那条调用记录：tool_result / confirm_request 到达时就地并进去，
 // 而不是另起一条。找不到时返回 null，由调用方决定补一条。
 // 必须同时认两种形状：store.messages 里既有实时事件推进来的记录（name/result），也有
@@ -91,6 +98,12 @@ export function normalizeMessages(list) {
     put(rec, 'content', raw.content)
     put(rec, 'attachments', raw.attachments)
     if (raw.queued) rec.queued = true
+    if (raw.role === 'notice') {
+      put(rec, 'kind', raw.kind)
+      // 历史投影的压缩留痕只带 kind，文案在此补出；
+      // 后端自带正文的提示条（如压缩「历史消息不足」）原样保留，不被 kind 覆盖
+      if (!rec.content && NOTICE_TEXT[raw.kind]) rec.content = NOTICE_TEXT[raw.kind]
+    }
     out.push(rec)
   }
   return out

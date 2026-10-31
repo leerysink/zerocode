@@ -34,6 +34,12 @@ const ButtonStub = {
     return h('button', this.$slots.default ? this.$slots.default() : [])
   },
 }
+const SpinStub = {
+  name: 'a-spin',
+  render() {
+    return h('span', { class: 'stub-spin' })
+  },
+}
 
 function mountMessages(messages) {
   setActivePinia(createPinia())
@@ -42,6 +48,7 @@ function mountMessages(messages) {
     global: {
       stubs: {
         'a-image': ImageStub, 'a-image-preview-group': GroupStub, 'a-button': ButtonStub,
+        'a-spin': SpinStub,
         MarkdownView: true, ToolCallBlock: true, AskUserCard: true,
         ThinkingBlock: true, TodoCard: true,
       },
@@ -149,6 +156,7 @@ describe('预览工具在消息流里的渲染', () => {
       global: {
         stubs: {
           'a-image': ImageStub, 'a-image-preview-group': GroupStub, 'a-button': ButtonStub,
+        'a-spin': SpinStub,
           MarkdownView: true, ToolCallBlock: true, AskUserCard: true,
           ThinkingBlock: true, TodoCard: true,
         },
@@ -167,6 +175,7 @@ describe('预览工具在消息流里的渲染', () => {
       global: {
         stubs: {
           'a-image': ImageStub, 'a-image-preview-group': GroupStub, 'a-button': ButtonStub,
+        'a-spin': SpinStub,
           MarkdownView: true, ToolCallBlock: true, AskUserCard: true,
           ThinkingBlock: true, TodoCard: true,
         },
@@ -375,6 +384,7 @@ function mountWithRealAsk(messages) {
     global: {
       stubs: {
         'a-image': ImageStub, 'a-image-preview-group': GroupStub, 'a-button': ButtonStub,
+        'a-spin': SpinStub,
         MarkdownView: true, ToolCallBlock: true, ThinkingBlock: true, TodoCard: true,
       },
     },
@@ -548,4 +558,18 @@ describe('提问卡在消息流里', () => {
     ])
     expect(hist.find('.zc-ask').html()).toBe(live.find('.zc-ask').html())
   })
+})
+
+it('压缩提示条：进行中带转圈，定稿与历史投影都只留灰字', () => {
+  const live = mountMessages([{ role: 'notice', kind: 'compacting', content: '正在压缩上下文…' }])
+  expect(live.find('.zc-notice-spin').exists()).toBe(true)
+  expect(live.text()).toContain('正在压缩上下文')
+
+  const settled = mountMessages([{ role: 'notice', kind: 'compacted', content: '已压缩上下文：摘要已替换' }])
+  expect(settled.find('.zc-notice-spin').exists()).toBe(false)
+
+  // 历史投影行只带 kind（后端不硬编码文案），文案由 normalizeMessages 按 kind 补出
+  const projected = mountMessages([{ id: null, seq: 2, role: 'notice', kind: 'compacted', content: null }])
+  expect(projected.find('.zc-notice-spin').exists()).toBe(false)
+  expect(projected.text()).toContain('已压缩上下文')
 })
