@@ -21,9 +21,10 @@ vi.mock('ant-design-vue', () => ({
   message: { success: vi.fn(), error: vi.fn(), info: vi.fn(), warning: vi.fn() },
 }))
 
-import { tree, openFolder, listDir, getConfig, readFile, saveFile } from '../api'
+import { tree, openFolder, listDir, getConfig, readFile, saveFile, getFileChanges } from '../api'
 import { message } from 'ant-design-vue'
 import FilePanel from './FilePanel.vue'
+import DiffBlock from './DiffBlock.vue'
 import { useChatStore } from '../stores/chat'
 
 // 只渲染默认插槽的桩：让工具条与按钮在 happy-dom 下真实存在（无编译器，故用 h 而非 template）
@@ -297,5 +298,31 @@ describe('FilePanel 只读预览与在编辑器中打开', () => {
 
     expect(wrapper.find('.zc-fp-preview').exists()).toBe(false)
     expect(wrapper.find('.zc-fp-open-editor').exists()).toBe(false)
+  })
+})
+
+describe('FilePanel 变更记录的查看具体入口', () => {
+  const CHANGES = [
+    { id: 345, path: 'src/a.md', action: 'edit', diff: '--- a/src/a.md\n+++ b/src/a.md\n' },
+    { id: 346, path: 'src/b.md', action: 'create', diff: '--- a/src/b.md\n+++ b/src/b.md\n' },
+  ]
+
+  async function openChanges() {
+    getFileChanges.mockResolvedValue({ data: CHANGES })
+    const wrapper = await mountPanel('web')
+    useChatStore().currentSessionId = 12
+    await wrapper.vm.onTabClick('changes')
+    await flushPromises()
+    return wrapper
+  }
+
+  it('每条变更把会话 id 与记录 id 交给 DiffBlock，「查看具体」才知道要打开哪一条', async () => {
+    const wrapper = await openChanges()
+    const blocks = wrapper.findAllComponents(DiffBlock)
+
+    expect(blocks).toHaveLength(2)
+    expect(blocks[0].props('changeId')).toBe(345)
+    expect(blocks[0].props('sessionId')).toBe(12)
+    expect(blocks[1].props('changeId')).toBe(346)
   })
 })

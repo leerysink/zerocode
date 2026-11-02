@@ -253,6 +253,9 @@ export function applyEvent(store, ev) {
           store.messages[i].diff = ev.diff
           store.messages[i].diff_path = ev.path
           store.messages[i].diff_action = ev.action
+          // 记录行 id：聊天流里的内联 diff 靠它跳详情整页。不落库的调用点给 null，
+          // 那边就只画 diff 不给跳转入口（不给一个点了没反应的按钮）
+          store.messages[i].diff_change_id = ev.change_id ?? null
           break
         }
       }

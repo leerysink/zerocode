@@ -30,9 +30,14 @@ export function resolveOpenFolderMode(mode, hostname) {
 
 // 工作区 id 只认纯数字字符串。id 全链路按字符串走（BIGSERIAL 将来换雪花 ID 就不许 Number()），
 // 脏值一律判成「没有地址」：宁可不打开标签，也不开一个必然 404 的页面。
-export function normalizeWorkspaceId(id) {
+// 导出给整页视图做「该不该发请求」的判定用（地址栏是可以被手改的）。
+export function normalizeId(id) {
   const s = String(id ?? '')
   return /^\d+$/.test(s) ? s : ''
+}
+
+export function normalizeWorkspaceId(id) {
+  return normalizeId(id)
 }
 
 // name 与 file 都可选，按固定顺序拼 query；file 是工作区内相对路径，交给工作台开页签。
@@ -62,4 +67,21 @@ export function openWorkspaceFilesPage(id, name, file) {
   if (!ws) return false
   const url = `${workspaceFilesPath(ws)}${filesQuery(name, file)}`
   return Boolean(globalThis.open?.(url, `zerocode-files-${ws}`))
+}
+
+// 变更记录详情整页（/sessions/{会话}/changes/{记录}）：与文件管理器同为「独立标签」那一类页面，
+// 地址一样只在这里写一份，由 router/index.test.js 与路由表对拍。
+// 会话 id 也要带：详情接口挂在会话下面（归属校验复用会话链），单给记录号就只能另开一条鉴权路径。
+export function fileChangePath(sessionId, changeId) {
+  const sid = normalizeId(sessionId)
+  const cid = normalizeId(changeId)
+  return sid && cid ? `/sessions/${sid}/changes/${cid}` : ''
+}
+
+// 窗口名按记录固定：同一条反复点回到同一个标签，看不同条各开一个（不像文件管理器那样按工作区收敛，
+// 因为一次看多条变更是常态，叠在一个标签里反而看不见前面那条）。
+export function openFileChangePage(sessionId, changeId) {
+  const url = fileChangePath(sessionId, changeId)
+  if (!url) return false
+  return Boolean(globalThis.open?.(url, `zerocode-change-${normalizeId(changeId)}`))
 }

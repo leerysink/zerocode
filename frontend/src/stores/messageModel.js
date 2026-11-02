@@ -81,6 +81,8 @@ export function normalizeMessages(list) {
       put(rec, 'diff', raw.diff)
       put(rec, 'diff_path', raw.diff_path)
       put(rec, 'diff_action', raw.diff_action)
+      // 变更记录的行 id：渲染读的是归一化后的记录，这里漏传，聊天流里就没有跳转入口
+      put(rec, 'diff_change_id', raw.diff_change_id)
       out.push(rec)
       continue
     }

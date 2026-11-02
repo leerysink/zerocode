@@ -231,3 +231,19 @@ describe('压缩留痕的文案单点', () => {
     expect(m.content).toBe('历史消息不足，暂无需压缩')
   })
 })
+
+describe('变更详情的记录 id 随归一化留下', () => {
+  it('聊天流里那条内联 diff 的跳转入口只认这个 id（渲染走归一化后的记录，漏传就等于没有入口）', () => {
+    const [m] = normalizeMessages([{
+      role: 'tool', name: 'write_file', diff: '--- a/a.txt', diff_path: 'a.txt',
+      diff_action: 'create', diff_change_id: 345,
+    }])
+    expect(m.diff).toBe('--- a/a.txt')
+    expect(m.diff_change_id).toBe(345)
+  })
+
+  it('边界：没有 id（不落库的调用点）时不编造，跳转入口自然不出现', () => {
+    const [m] = normalizeMessages([{ role: 'tool', name: 'write_file', diff: '--- a/a.txt', diff_change_id: null }])
+    expect('diff_change_id' in m).toBe(false)
+  })
+})

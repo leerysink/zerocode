@@ -81,11 +81,21 @@ describe('chat store 事件流', () => {
   it('file_change 事件挂到最近 tool 消息，且保留 path/action 供 diff 渲染文件名', () => {
     const s = useChatStore()
     applyEvent(s, { type: 'tool_call', name: 'write_file', args: { path: 'a.txt' } })
-    applyEvent(s, { type: 'file_change', path: 'a.txt', action: 'create', diff: '--- a/a.txt' })
+    applyEvent(s, { type: 'file_change', path: 'a.txt', action: 'create', diff: '--- a/a.txt', change_id: 345 })
     const tool = s.messages.filter(m => m.role === 'tool').at(-1)
     expect(tool.diff).toBe('--- a/a.txt')
     expect(tool.diff_path).toBe('a.txt')
     expect(tool.diff_action).toBe('create')
+    // 详情整页的地址是 /sessions/{会话}/changes/{记录}：这条 id 是聊天流里那个跳转入口唯一的来源
+    expect(tool.diff_change_id).toBe(345)
+  })
+  it('边界：事件不带 change_id（不落库的调用点）时如实留空，不编造一个跳不过去的 id', () => {
+    const s = useChatStore()
+    applyEvent(s, { type: 'tool_call', name: 'write_file', args: { path: 'a.txt' } })
+    applyEvent(s, { type: 'file_change', path: 'a.txt', action: 'create', diff: '--- a/a.txt', change_id: null })
+    const tool = s.messages.filter(m => m.role === 'tool').at(-1)
+    expect(tool.diff).toBe('--- a/a.txt')      // diff 本身不能因为没 id 就被吞掉
+    expect(tool.diff_change_id).toBe(null)
   })
   it('上行失败（WS 非 OPEN）不发帧；两张卡都由消息流驱动，不随上行成败增删', () => {
     const s = useChatStore()

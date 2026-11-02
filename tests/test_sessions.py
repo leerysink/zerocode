@@ -90,6 +90,35 @@ async def test_file_changes_endpoint(client, tmp_path):
     rows = (await client.get(f"/api/sessions/{s['id']}/file-changes")).json()
     assert len(rows) == 1 and rows[0]["path"] == "a.txt"
 
+@pytest.mark.asyncio
+async def test_file_change_detail_endpoint(client, tmp_path):
+    """详情接口带 before/after 全文：列表只给 diff（侧栏一次拉几十条不该把两份全文拖回来），
+    整页对比才需要全文——行号、折叠段原文、以及「diff 与全文对不对得上」的回验都靠它。"""
+    from sqlalchemy import text as sql
+    ws = (await client.post("/api/workspaces", json={"root_path": str(tmp_path)})).json()
+    s = (await client.post("/api/sessions", json={"workspace_id": ws["id"]})).json()
+    async with client.app.state.session_factory() as db:
+        cid = (await db.execute(sql(
+            "INSERT INTO file_change (session_id, path, action, before_content, after_content, diff) "
+            "VALUES (:sid, 'a.txt', 'edit', 'x', 'y', '--- a/a.txt') RETURNING id"),
+            {"sid": s["id"]})).scalar()
+        await db.commit()
+
+    d = (await client.get(f"/api/sessions/{s['id']}/file-changes/{cid}")).json()
+    assert d["id"] == cid and d["path"] == "a.txt" and d["action"] == "edit"
+    assert d["before_content"] == "x" and d["after_content"] == "y"
+    assert d["diff"] == "--- a/a.txt"
+    # 整页顶栏要工作区名、要能跳回编辑器：页面在新标签里，没有聊天页的上下文可借
+    assert str(d["workspace_id"]) == str(ws["id"])
+    assert d["workspace_name"] == ws["name"]
+
+    # 记录不在这个会话下：同一个用户、另一个会话的地址也拿不到（不给按 id 直取全库的口子）
+    other = (await client.post("/api/sessions", json={"workspace_id": ws["id"]})).json()
+    assert (await client.get(f"/api/sessions/{other['id']}/file-changes/{cid}")).status_code == 404
+    assert (await client.get(f"/api/sessions/{s['id']}/file-changes/999999")).status_code == 404
+    # 脏 id 不能让 int() 炸成 500
+    assert (await client.get(f"/api/sessions/{s['id']}/file-changes/abc")).status_code in (404, 422)
+
 # ---------- 交互增强：会话详情 / 模型切换 / messages 带 reasoning ----------
 
 async def test_session_detail(client):

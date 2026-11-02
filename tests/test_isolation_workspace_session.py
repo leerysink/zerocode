@@ -50,6 +50,8 @@ async def test_B按id直取A的会话全部404(two_auth_clients, tmp_path):
     assert (await bob.patch(f"/api/sessions/{sid}", json={"title": "夺舍"})).status_code == 404
     assert (await bob.get(f"/api/sessions/{sid}/messages")).status_code == 404
     assert (await bob.get(f"/api/sessions/{sid}/file-changes")).status_code == 404
+    # 变更详情（整页对比取的那一条）走同一个会话闸门：B 连记录归属都问不到
+    assert (await bob.get(f"/api/sessions/{sid}/file-changes/1")).status_code == 404
     assert (await bob.delete(f"/api/sessions/{sid}")).status_code == 404
     # A 自己一切正常
     assert (await alice.get(f"/api/sessions/{sid}")).status_code == 200
