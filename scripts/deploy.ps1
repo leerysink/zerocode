@@ -1,6 +1,7 @@
 ﻿# zerocode 一键部署 —— Windows 侧的 WSL 皮（ADR-0035）
 #
-# 用法就这一条，没有任何命令行参数：
+# 用法两条，选哪条都行，没有任何命令行参数：
+#     双击同目录的 deploy.bat（它只做一件事：用下面的命令把本文件跑起来）
 #     powershell -ExecutionPolicy Bypass -File .\deploy.ps1
 #
 # 这个文件只做 Windows 侧才有的三件事：保证 WSL2 可用、保证发行版里开了 systemd、
@@ -21,7 +22,7 @@ try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 
 if ($args.Count -gt 0) {
     Write-Host '本脚本不接受命令行参数（已定决策 D-11，危险动作改为现场提问）。' -ForegroundColor Red
-    Write-Host '  以前 flag 的去处都在 Linux 侧的 deploy.sh 里，直接跑：powershell -File .\deploy.ps1' -ForegroundColor Red
+    Write-Host '  以前 flag 的去处都在 Linux 侧的 deploy.sh 里，不带参数重跑即可：双击 deploy.bat，或 powershell -File .\deploy.ps1' -ForegroundColor Red
     Write-Host '  只想在 Linux/WSL 里跑：bash deploy.sh（皮只是替你把包放进发行版）。' -ForegroundColor Red
     exit 2
 }
@@ -203,8 +204,10 @@ if (Test-Path $bundle -PathType Leaf) {
 foreach ($need in 'deploy.sh', 'deploy_lib.sh', 'README-deploy.md', '.env.example') {
     if (-not (Test-Path (Join-Path $bundle $need))) { Fail "包里没有 $need：$bundle（重跑 build-output.bat，别手往包里塞文件——它是生成目录）" }
 }
-$ps1InBundle = Test-Path (Join-Path $bundle 'deploy.ps1')
-if (-not $ps1InBundle) { Warn '包里缺 deploy.ps1（旧包？）：内核与判定层都在，可以继续，但下次重打包会补上' }
+# 皮与双击入口不进硬校验：老包本来就没有它们，缺了也只是少一个入口，而内核与判定层缺一都跑不动。
+foreach ($entry in 'deploy.ps1', 'deploy.bat') {
+    if (-not (Test-Path (Join-Path $bundle $entry))) { Warn "包里缺 $entry（旧包？）：内核与判定层都在，可以继续，但下次重打包会补上" }
+}
 
 $homeLinux = (Wsl $Distro @('bash', '-c', 'printf %s "$HOME"') -Capture).Trim()
 if (-not $homeLinux) { Fail "问不到 $Distro 的 HOME" }
@@ -243,4 +246,4 @@ $code = Wsl $Distro @('bash', '-c', "cd '$targetLinux' && ZC_GATEWAY_DEFAULT=n b
 if ($code -ne 0) { Fail "deploy.sh 退出码 $code：按它停下的那一句处理，然后重跑本脚本（同一条命令，不用从头再来）" }
 Ok '部署完成'
 Write-Host '  控制台在 Linux 侧给出的地址上打开即可；WSL 里起的端口默认能从 Windows 的 localhost 访问。'
-Write-Host "  再发一次版：powershell -File .\deploy.ps1，选「升级部署」，一路回车复用上次的答案。"
+Write-Host "  再发一次版：双击 deploy.bat（或 powershell -File .\deploy.ps1），选「升级部署」，一路回车复用上次的答案。"

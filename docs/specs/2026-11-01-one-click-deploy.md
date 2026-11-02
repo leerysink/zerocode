@@ -117,6 +117,12 @@ init.sql 里预置应用的 `root_path` 写成 `{{DEPLOY_ROOT}}/apps/<slug>` 由
   但我坚持要时不硬拦（ADR-0035 后果条）。
 - **US-26**　`deploy.ps1` 以 UTF-8 **带 BOM** 落盘且行尾为 LF：Windows PowerShell 5.1 在 GBK 代码页下
   读无 BOM 的中文脚本会解析失败。搬运规则与 `deploy.sh` 同口径（剥 CRLF、缺文件不出包）。
+- **US-27**　US-23 的「双击」由 `scripts/deploy.bat` 兑现：Explorer 双击 `.ps1` 只会用编辑器打开，
+  而不碰终端的部署者正是这条入口要服务的人。它是皮的一个启动器，**不是第三个入口**——只做
+  `chcp 65001`、拉起同目录 `deploy.ps1`、透传参数、回传退出码、结束时 `pause`（脚本驱动用
+  `--no-pause` 关掉，与 `build-output.bat` 同一条约定），一条部署判定都不许长在里面。
+  它自己的形态与 US-26 相反：**纯 ASCII 源 + CRLF 行尾**（cmd.exe 对只有 LF 的 `goto` 标签不可靠，
+  又在 cp65001 下把多字节行读坏），所以它不进 `test_generated_text_files_use_lf` 那份清单。
 
 ## 4. 已定决策
 
@@ -147,8 +153,9 @@ init.sql 里预置应用的 `root_path` 写成 `{{DEPLOY_ROOT}}/apps/<slug>` 由
   同一个值喂进去（两边取自同一变量是 ADR-0034 的唯一安全前提）；
 - init.sql 里预置应用 `root_path` 是 `{{DEPLOY_ROOT}}/apps/<slug>` 字面量，**绝不出现真实宿主路径**；
   重放安全审计（`audit_replay_safety`）不许把占位符判成残留标记；
-- `deploy.ps1` 与 `deploy_lib.sh` 的搬运：缺任一文件抛 `BuildError`；`.ps1` 带 UTF-8 BOM 且无 CRLF；
-  沿用 `test_generated_text_files_use_lf` 的清单式断言把两个新文件加进去。
+- `deploy.sh`、`deploy_lib.sh`、`deploy.ps1`、`deploy.bat` 四份的搬运：缺任一文件抛 `BuildError`；
+  `.ps1` 带 UTF-8 BOM 且无 CRLF，三份沿用 `test_generated_text_files_use_lf` 的清单式断言；
+  `.bat` 反过来必须 CRLF 且纯 ASCII，源里混进中文当场拒包（US-27）。
 
 **接缝 B：`deploy_lib.sh` 的桩测矩阵**。用 `bash` 起子进程、PATH 前置桩目录（`docker`/`ss`/`apt-get`/
 `systemctl`/`curl`/`wsl`），覆盖场景：缺 Docker / 缺 compose 插件 / daemon 不可达 / 端口被占（占用者是

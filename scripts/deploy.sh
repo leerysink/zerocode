@@ -573,7 +573,7 @@ else
     printf '  → 镜像同步 %s/（带 --delete，全场只有这三棵带）\n' "$d" >&2
     rsync -a --delete "$PKG/$d/" "$DEPLOY_ROOT/$d/" || fail "镜像 $d/ 失败"
   done
-  for f in docker-compose.yml init.sql apply-init.sh deploy.sh deploy_lib.sh deploy.ps1 \
+  for f in docker-compose.yml init.sql apply-init.sh deploy.sh deploy_lib.sh deploy.ps1 deploy.bat \
            .env.example README-deploy.md .dockerignore; do
     [ -f "$PKG/$f" ] || continue
     cp -- "$PKG/$f" "$DEPLOY_ROOT/$f" || fail "覆盖 $f 失败"

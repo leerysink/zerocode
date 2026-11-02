@@ -40,6 +40,9 @@ zc_busy() { # 0=被占 1=空闲 2=无法判定
 """
 # 源故意不带 BOM、行尾故意 CRLF：打包器要把它改成「BOM + LF」，US-26 才是可判定的。
 DEPLOY_PS1_STUB = "#!/usr/bin/env pwsh\r\nWrite-Host '皮：只保证 WSL，然后调用同一份 deploy.sh'\r\n"
+# .bat 桩与 .ps1 桩的期望相反：打包器要把行尾翻成「CRLF」，且必须保持纯 ASCII（cmd.exe 的脾气）。
+# 源故意只写 LF，这样「出包后是 CRLF」才是可判定的；一旦有人往源里塞中文，另一支用例当场拒包。
+DEPLOY_BAT_STUB = '@echo off\npowershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0deploy.ps1"\n'
 
 CHANGELOG_INIT = """-- V20260101_01_init.sql
 CREATE TABLE IF NOT EXISTS workspace (
@@ -166,6 +169,9 @@ def fake_repo(tmp_path) -> Path:
     (scripts / "deploy.sh").write_text(DEPLOY_SH_STUB, encoding="utf-8")
     (scripts / "deploy_lib.sh").write_text(DEPLOY_LIB_SH_STUB, encoding="utf-8")
     (scripts / "deploy.ps1").write_text(DEPLOY_PS1_STUB, encoding="utf-8")
+    # write_bytes 而不是 write_text：Windows 上 write_text 会把 "\n" 就地翻成 CRLF，
+    # 那这支「源是 LF、出包必须是 CRLF」的验证就自证自明了。
+    (scripts / "deploy.bat").write_bytes(DEPLOY_BAT_STUB.encode("utf-8"))
 
     dist = tmp_path / "frontend" / "dist"
     dist.mkdir(parents=True)
@@ -197,7 +203,7 @@ def test_build_produces_every_artifact(fake_repo):
     s = _build(fake_repo)
     out = s["out"]
     for rel in ("init.sql", "docker-compose.yml", ".env.example", ".dockerignore",
-                "apply-init.sh", "deploy.sh", "deploy_lib.sh", "deploy.ps1",
+                "apply-init.sh", "deploy.sh", "deploy_lib.sh", "deploy.ps1", "deploy.bat",
                 "README-deploy.md",
                 "backend/Dockerfile", "backend/requirements.txt", "backend/app/main.py",
                 "browser/Dockerfile", "browser/requirements.txt", "browser/app.py",
@@ -256,9 +262,10 @@ def test_deploy_script_strips_crlf(fake_repo):
     assert b"\r" not in (out / "deploy.sh").read_bytes()
 
 
-@pytest.mark.parametrize("name", ("deploy.sh", "deploy_lib.sh", "deploy.ps1"))
+@pytest.mark.parametrize("name", ("deploy.sh", "deploy_lib.sh", "deploy.ps1", "deploy.bat"))
 def test_missing_any_deploy_script_blocks_packaging(fake_repo, name):
-    """三份脚本缺一不出包：内核要 source 判定层，皮与内核互为左右手——少一份就是让服务器跑到一半才炸。"""
+    """四份脚本缺一不出包：内核要 source 判定层，皮与内核互为左右手，双击入口缺了等于把
+    不碰终端的人挡在门外——少一份就是让服务器（或部署者）跑到一半才发现。"""
     (fake_repo / "scripts" / name).unlink()
     with pytest.raises(bo.BuildError, match=name):
         _build(fake_repo)
@@ -417,6 +424,78 @@ def test_repo_powershell_skin_takes_no_command_line_flags():
     assert "deploy.sh" in ps, "皮没把参数问题指回内核"
     for flag in ("--takeover", "--fresh-db", "--no-build", "--check"):
         assert (flag + ")") not in ps, f"皮里长出了参数分支 {flag}"
+
+
+def test_repo_windows_forwarder_only_launches_the_skin():
+    """回归钉：deploy.bat 是启动器，不是第三个入口——切编码、拉起同目录的皮、回传退出码、
+    双击时把窗口停住。REM 注释里提 WSL/Docker 无所谓，可执行行里一旦出现 `wsl.exe` 或 `docker`，
+    Windows 侧就长出了第二条部署路径（ADR-0035 的「一条部署逻辑，两个入口」从此变成三个），
+    而第二条路径没人同步。
+    """
+    raw = (bo.REPO_ROOT / "scripts" / "deploy.bat").read_bytes()
+    assert b"\r\n" in raw, ("deploy.bat 源存成了 LF：cmd.exe 对只有 LF 的 goto 标签不可靠。"
+                            "打包器会翻回 CRLF，但双击仓库里这份的人不会")
+    assert all(byte < 128 for byte in raw), "deploy.bat 含非 ASCII：见文件开头那条 NOTE"
+    text = raw.decode("ascii")
+    code = "\n".join(l for l in text.splitlines()
+                     if not l.strip().upper().startswith("REM")).lower()
+    assert '-file "%~dp0deploy.ps1"' in code, "入口没把控制权交给同目录的皮"
+    assert "chcp 65001" in code, "没切控制台编码：皮透传的中文提示会成乱码"
+    assert "pause" in code, "双击的窗口不会自己停住：重启/wsl --shutdown 那种长指引读完就没了"
+    assert "--no-pause" in code, "缺脚本驱动用的 pause 开关（与 build-output.bat 同一条约定）"
+    assert "!pass_args!" in code, ("参数没透传给皮：`deploy.bat --fresh-db` 会吞掉 flag，"
+                                   "静默开始一次交互部署，而 D-11 的当场拒收正是为了拦这个")
+    assert "exit /b !rc!" in code, "退出码没回传：脚本驱动时看不出这次部署失败"
+    for own in ("wsl.exe", "docker", "systemd", "apt-get", "expand-archive"):
+        assert own not in code, "双击入口长出了自己的部署动作：" + own
+
+
+def test_repo_upgrade_copy_list_matches_the_merge_plan_text():
+    """回归钉：内核升级模式实际 cp 的顶层文件名单，必须和判定层打印给部署者看的那张「会动」表一致。
+
+    这张表是部署者在第 1 步之后唯一能看到「这次会动哪些文件」的地方。少一个名字，包里的
+    deploy.bat 之类就会被默默留在部署根上一版旧的（现场排障时最坑的那种）；多一个名字，
+    等于对着人吹了一张不存在的牛。两处各写一遍，所以必须钉住。
+    """
+    kernel = (bo.REPO_ROOT / "scripts" / "deploy.sh").read_text(encoding="utf-8")
+    lib = (bo.REPO_ROOT / "scripts" / "deploy_lib.sh").read_text(encoding="utf-8")
+    # 内核里有好几支 `for f in …; do`（CRLF 自检、网关覆盖都算），按顶层生成物独有的文件名认领
+    loops = re.findall(r"for f in ((?:[^\n]*\\\n)*[^\n]*?); do", kernel)
+    copied_body = next((b for b in loops if "apply-init.sh" in b), None)
+    assert copied_body, "内核里找不到顶层生成物的 cp 循环（改名了？那张表也得跟着改）"
+    copied = set(re.findall(r"[A-Za-z0-9._-]+", copied_body))
+    p = re.search(r"^\s*只覆盖不删的顶层生成物：(.*)$", lib, re.M)
+    assert p, "判定层的升级计划里找不到「只覆盖不删的顶层生成物」那一行"
+    listed = set(p.group(1).split())
+    assert copied == listed, (f"内核 cp 的与计划表列的不一致：只在内核 {sorted(copied - listed)}，"
+                              f"只在计划表 {sorted(listed - copied)}")
+    assert "deploy.bat" in copied, "双击入口没进升级搬运名单：升级后部署根里还是旧入口（或没有）"
+
+
+def test_windows_forwarder_ships_crlf_and_ascii_only(fake_repo):
+    """双击入口的出包形态：CRLF 行尾 + 纯 ASCII + 无 BOM。
+
+    两条都不是风格：cmd.exe 对只有 LF 的批处理里 goto 标签并不可靠，而在 cp65001 下读带多字节
+    字符的行会丢字节同步、把 echo 文本当命令执行。所以包里那份必须能直接双击，中文全部由它拉起
+    的 deploy.ps1 负责。桩源写的是 LF，出包必须是 CRLF——这条在 Linux 上跑也成立（夹具用
+    write_bytes 落桩）。
+    """
+    out = _build(fake_repo)["out"]
+    raw = (out / "deploy.bat").read_bytes()
+    assert b"\xef\xbb\xbf" not in raw, "bat 不该带 BOM：cmd.exe 会把开头那三个字节当成命令"
+    assert raw.count(b"\r\n") >= 2, "行尾没被翻成 CRLF"
+    assert raw.count(b"\r\n") == raw.count(b"\n"), "包里的 deploy.bat 有裸 LF"
+    assert all(byte < 128 for byte in raw), "bat 混进非 ASCII：cmd.exe 在 cp65001 下会读坏这一行"
+    assert b"deploy.ps1" in raw, "入口没转发给皮，那它就不是入口"
+
+
+def test_non_ascii_forwarder_source_blocks_packaging(fake_repo):
+    """边界：有人把中文提示写进 .bat 源里要当场拒包，而不是出一包双击就乱码的入口——
+    缺入口比含乱码的入口好查，且这条与 build-output.bat 开头那条 NOTE 同一个根因。"""
+    (fake_repo / "scripts" / "deploy.bat").write_text(
+        "@echo off\nREM 中文提示\necho hi\n", encoding="utf-8")
+    with pytest.raises(bo.BuildError, match="deploy.bat"):
+        _build(fake_repo)
 
 
 def test_repo_deploy_script_gates_the_browser_sidecar():

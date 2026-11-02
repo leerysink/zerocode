@@ -1266,14 +1266,15 @@ def readme_md(presets, deploy_root: str, generated_at: str, dist_stamp: str,
 > 本目录整体是**生成物**（由仓库根的 `build-output.bat` 产出），不要手改其中任何文件——
 > 下次打包会整目录重建。要改就改仓库里的 `changelog/`、`app/`、`frontend/`、`gateway/`、
 > `scripts/deploy.sh`（交互内核）、`scripts/deploy_lib.sh`（被内核 source 的判定层，桩测全打在它身上）、
-> `scripts/deploy.ps1`（Windows 侧的 WSL2 皮），或者改打包脚本——包里的这三份只是拷贝。
+> `scripts/deploy.ps1`（Windows 侧的 WSL2 皮）、`scripts/deploy.bat`（双击皮用的入口，只转发不判定），
+> 或者改打包脚本——包里的这四份只是拷贝。
 > `gateway/certs/`（TLS 私钥）与 `gateway/routes/routes.json`（运行期路由）是
 > 服务器现场产物，不在包内。
 
 ## 1. 前置条件
 
-- **一台 Linux 机器**，或一台能跑 WSL2 的 Windows 机器（走 §2 的 `deploy.ps1`：它把包推进发行版，
-  再调同一份 `deploy.sh`，部署判定一条都不留在 PowerShell 里，ADR-0035）。
+- **一台 Linux 机器**，或一台能跑 WSL2 的 Windows 机器（走 §2 的 `deploy.bat` / `deploy.ps1`：
+  皮把包推进发行版，再调同一份 `deploy.sh`，部署判定一条都不留在 PowerShell 里，ADR-0035）。
 - **Docker 不用预先装好**：`deploy.sh` 第 2 步「环境保障」缺什么装什么——Docker Engine、
   `docker compose` v2 插件、把 daemon 拉起来、（境内机）可选的 registry 镜像加速、把当前用户
   加进 `docker` 组，连 `rsync` 缺了也一并装。它**不装 Docker Desktop**（ADR-0035：它的 license
@@ -1316,11 +1317,18 @@ cd <包所在目录>
 bash deploy.sh          # 要 root：机器上有 sudo 会自己提权，没有就 su - 再跑
 ```
 
-Windows 上做同一件事（不需要预先装 Docker，也不需要预先有发行版）：
+Windows 上做同一件事（不需要预先装 Docker，也不需要预先有发行版）。两种方式等价：
 
 ```powershell
+# 双击：在资源管理器里双击包根的 deploy.bat（双击 .ps1 只会用编辑器打开，所以才需要这个 .bat）
+# 命令行：
 powershell -ExecutionPolicy Bypass -File .\\deploy.ps1
 ```
+
+`deploy.bat` 只是皮的一个启动器：切控制台编码、拉起同目录的 `deploy.ps1`、把退出码原样回传，
+结束时 `pause` 让双击的窗口停在能读完的地方。它自己只认 `--no-pause`（给脚本与 CI 用，
+与 `build-output.bat` 同一条约定），其余参数一律转给皮——皮按 D-11 当场拒收并说明每个旧 flag
+现在的去处，所以 `deploy.bat --fresh-db` 不会静默开始一次交互部署。
 
 皮只负责把环境弄成能跑 Linux 的样子：保证 WSL2 可用、要一个 v2 发行版（v1 没有 systemd，
 docker daemon 起不来）、保证发行版 `/etc/wsl.conf` 里 `[boot] systemd=true`、把包推进发行版，
@@ -1448,8 +1456,9 @@ bash deploy.sh          # 第 1 问选 upgrade
 - 只**镜像**三棵目录：`backend/`、`browser/`、`frontend/`——这三棵里没有服务器现场产生的东西，
   所以带 `--delete`；全场只有这三棵带 `--delete`。
 - 顶层生成物与 `gateway/` 的配置/脚本按文件名**覆盖**，不删别的：`docker-compose.yml`、`init.sql`、
-  `apply-init.sh`、`deploy.sh`、`deploy_lib.sh`、`deploy.ps1`、`.env.example`、`README-deploy.md`、
-  `.dockerignore`，以及 `gateway/nginx.conf`、`gateway/docker-compose.yml`、`gateway/make-cert.sh`、
+  `apply-init.sh`、`deploy.sh`、`deploy_lib.sh`、`deploy.ps1`、`deploy.bat`、`.env.example`、
+  `README-deploy.md`、`.dockerignore`，以及
+  `gateway/nginx.conf`、`gateway/docker-compose.yml`、`gateway/make-cert.sh`、
   `gateway/make-cert.ps1`、`gateway/404.html`、`gateway/lua/router.lua`、`gateway/.env.example`。
 - 八项现场产物一个不碰（下表）。
 - `.env` 合并写：只动本次问到的键，既有键与注释原样保留；动之前静默备份 `.env.bak-<UTC>`（留 5 份）。
@@ -1721,25 +1730,34 @@ def copy_gateway(repo_root: Path, dst: Path, gateway_domain: str) -> int:
 
 
 def copy_deploy_scripts(repo_root: Path, out: Path) -> None:
-    """把仓库里的三份部署脚本原样搬进包根：deploy.sh（内核）、deploy_lib.sh（判定层）、deploy.ps1（WSL 皮）。
+    """把仓库里的四份部署脚本搬进包根：deploy.sh（内核）、deploy_lib.sh（判定层）、
+    deploy.ps1（WSL 皮）、deploy.bat（Windows 侧双击入口）。
 
-    它们与 apply-init.sh 相反：那个是生成物，这三个是交付物的**源**——要在服务器上手改排障，
+    它们与 apply-init.sh 相反：那个是生成物，这几份是交付物的**源**——要在服务器上手改排障，
     所以住在仓库里（`scripts/`），包只是搬运工。缺任一文件不出包，理由同网关配置：
     deploy.sh 会 source deploy_lib.sh，缺一份就是让服务器上跑到一半才炸；皮与内核缺一份，
     另一份就是废纸。
 
-    `\r` 一律剥掉：脚本自带一条 CRLF 自检，带着 \r 出包等于把失败推迟到服务器上才炸。
-    `.ps1` 反过来必须带 UTF-8 BOM——Windows PowerShell 5.1 在 GBK 代码页下读无 BOM 的中文
-    脚本会解析失败（US-26），所以这里补 BOM 而不是剥它。
+    行尾与编码按扩展名分道，三类各有各的理由（US-26 / US-27）：
+    - `.sh` 剥 `\\r`：内核自带一条 CRLF 自检，带着 \\r 出包等于把失败推迟到服务器上才炸。
+    - `.ps1` 补 UTF-8 BOM 且用 LF：Windows PowerShell 5.1 在 GBK 代码页下读无 BOM 的中文
+      脚本会解析失败。
+    - `.bat` 出 CRLF 且必须纯 ASCII：cmd.exe 对只有 LF 的 goto 标签并不可靠，而在 cp65001
+      下读带多字节字符的批处理会丢字节同步、把 echo 文本当成命令执行（build-output.bat 同条
+      NOTE）。所以这里不放宽成 UTF-8，而是非 ASCII 直接不出包——中文提示交给 deploy.ps1。
     """
-    for name in ("deploy.sh", "deploy_lib.sh", "deploy.ps1"):
+    for name in ("deploy.sh", "deploy_lib.sh", "deploy.ps1", "deploy.bat"):
         src = repo_root / "scripts" / name
         if not src.is_file():
             raise BuildError(f"缺部署脚本 {src}：{name} 已纳入交付包，缺文件不出包")
         text = src.read_text(encoding="utf-8").replace("\r\n", "\n").lstrip("\ufeff")
+        dst = out / name
         if name.endswith(".ps1"):
-            text = "\ufeff" + text
-        _write(out / name, text)
+            _write(dst, "\ufeff" + text)
+        elif name.endswith(".bat"):
+            _write_bat(dst, text)
+        else:
+            _write(dst, text)
 
 
 def check_frontend_dist(repo_root: Path, allow_stale: bool = False) -> tuple[Path, str]:
@@ -1779,6 +1797,24 @@ def _write(path: Path, content: str) -> None:
     """统一写盘：UTF-8 + LF。CRLF 会让 apply-init.sh 在 bash 下直接报错，SQL 里也不该有 \\r。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8", newline="\n")
+
+
+def _write_bat(path: Path, content: str) -> None:
+    """Windows 侧 .bat 的写盘：CRLF 行尾 + 纯 ASCII，非 ASCII 直接拒包。
+
+    两条都是 cmd.exe 的脾气，不是风格偏好：只有 LF 的批处理里 goto 标签解析不可靠，而控制台切到
+    cp65001 后 cmd.exe 读多字节行会丢字节同步，把 echo 的文本拆成假命令去执行。同一份搬运代码
+    对 `.sh` 反向要求 LF，正是因为这条不对称——判据不是「哪种行尾好」，而是「谁来读这个文件」。
+    所以中文提示一律住在 deploy.ps1 里，这里遇到非 ASCII 就停下——出包含乱码的入口脚本，
+    比缺一个入口脚本更难诊断。
+    """
+    bad = sorted({c for c in content if ord(c) > 127})
+    if bad:
+        raise BuildError(
+            f"{path.name} 含非 ASCII 字符 {bad[:6]}：cmd.exe 在 cp65001 下会把这一行读坏。"
+            f"入口脚本只负责转发，中文提示请写进 scripts/deploy.ps1")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content.replace("\n", "\r\n").encode("ascii"))
 
 
 # Windows 上目录改名会被杀软、Windows Search 索引器、资源管理器预览窗格和 IDE 的文件监听

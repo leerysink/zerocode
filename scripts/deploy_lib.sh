@@ -189,7 +189,7 @@ EOF
   rsync -a --delete  backend/  →  ${root}/backend/
   rsync -a --delete  browser/  →  ${root}/browser/
   rsync -a --delete  frontend/ →  ${root}/frontend/
-  只覆盖不删的顶层生成物：docker-compose.yml  init.sql  apply-init.sh  deploy.sh  deploy_lib.sh  deploy.ps1  .env.example  README-deploy.md  .dockerignore
+  只覆盖不删的顶层生成物：docker-compose.yml  init.sql  apply-init.sh  deploy.sh  deploy_lib.sh  deploy.ps1  deploy.bat  .env.example  README-deploy.md  .dockerignore
   网关侧只覆盖 gateway/ 下的配置与脚本；容器重建与否现场问
 不会动：八项现场产物，一项都不进上面的清单（术语见 CONTEXT.md「现场产物」）
   ${root}/.env            —— 本脚本只往里合并被问到的键，且动笔前先备份

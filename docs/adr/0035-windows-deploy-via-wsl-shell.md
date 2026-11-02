@@ -24,3 +24,7 @@ PowerShell 只是 WSL 的皮、平台裸跑 Windows（venv + uvicorn + 静态 di
 - Docker 引擎随发行版生命周期：Windows 重启后需要再跑一次脚本（或另配开机任务）把栈拉起。
 - 中央网关在 Windows 上默认不建：宿主 80/443 常被占用，通配 DNS 也指不到本机；
   需要 HTTPS 域名时仍按 README 手工起。
+- 双击入口是 `scripts/deploy.bat`，**不算第三个入口**：它只做 `chcp 65001` → 拉起同目录
+  `deploy.ps1` → 回传退出码 → `pause`，一条判定都没有（理由见本 ADR「一条部署逻辑，两个入口」）。
+  加它的原因是 Explorer 双击 `.ps1` 只会用编辑器打开，而规格 US-23 承诺的是「双击或 PowerShell」。
+  它与 `build-output.bat` 同一条约定：纯 ASCII 源码 + CRLF 行尾，自动化驱动时用 `--no-pause`。
