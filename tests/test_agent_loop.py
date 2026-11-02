@@ -667,6 +667,104 @@ async def test_error_path_still_closes_the_browser_session(test_engine, tmp_path
     assert deleted == ["sid-err"]
 
 
+async def _fill_env(test_engine, tmp_path, monkeypatch, bst, *, slug, dev_port, prod_port):
+    """跑起来的预览应用 + sidecar 替身：open 回一份含 sensitive 元素的清单，step 记下发的载荷。
+
+    返回 `(会话 id, 应用 id, session_factory, 打到 sidecar 的载荷)`。清单里 e2 是密码框
+    （sensitive:true）、e3 是备注框（false）——两条参数侧遮断的用例只差这个 ref。
+    """
+    sid, aid, sf = await mk_app_session(test_engine, tmp_path, status="running", slug=slug,
+                                        dev_port=dev_port, prod_port=prod_port)
+    refs = [{"ref": "e2", "role": "textbox", "name": "密码", "sensitive": True},
+            {"ref": "e3", "role": "textbox", "name": "备注", "sensitive": False}]
+    seen = []
+
+    async def fake_open(url, **kw):
+        return {"ok": True, "session_id": "sid-secret", "title": "登录", "text": "",
+                "url": f"http://192.168.65.254:{dev_port}/", "interactive": refs,
+                "console": [], "failed_requests": [], "page_errors": [], "elapsed_ms": 1}, ""
+
+    async def fake_step(session_id, payload):
+        seen.append((session_id, payload))
+        return {"ok": True, "title": "登录", "text": "",
+                "url": f"http://192.168.65.254:{dev_port}/", "interactive": refs,
+                "interactive_truncated": False, "dialog": None, "console_new": [],
+                "failed_requests_new": [], "page_errors_new": [], "truncated": False,
+                "timed_out": False, "steps_charged": True, "elapsed_ms": 1}, ""
+
+    monkeypatch.setattr(bst, "_sidecar_open", fake_open)
+    monkeypatch.setattr(bst, "_sidecar_step", fake_step)
+    return sid, aid, sf, seen
+
+
+@pytest.mark.asyncio
+async def test_sensitive_fill_value_is_masked_before_persisting_the_args(test_engine, tmp_path,
+                                                                         monkeypatch):
+    """US-19 的参数侧（裁定 R-33）：走一遍真 loop，钉住「落库/推送遮、sidecar 与当轮回注不遮」。
+
+    通用规则表按凭据**形态**匹配（`password=xxx`、`sk-…`），`hunter2` 这种用户自己应用里的
+    口令一个字符都不成形态，抓不住 —— 它会原样进 `message.tool_args`，并被通用折叠块明文打印。
+    Task 4/5 只遮了结果侧的 `browser_log`，参数侧这半边在两轮审查里都没进 diff。
+    """
+    from app.agent import browser_session_tools as bst
+
+    sid, aid, sf, seen = await _fill_env(test_engine, tmp_path, monkeypatch, bst, slug="pvsens1",
+                                         dev_port=8301, prod_port=8300)
+    turns = [done(None, [tool_call("c1", "browser_open", path="/")]),
+             done(None, [tool_call("c2", "browser_step", action="fill", target="e2",
+                                   value="hunter2")]),
+             done("填好了")]
+    rec = Recorder()
+    llm = ScriptedLLM(turns)
+    await mk_runner(sf, llm, rec, tasks={}).run(sid, "登录一遍", asyncio.Event())
+
+    # ① 落库那一份：口令不在，但参数结构（action/target）照旧读得出这一步做了什么
+    async with sf() as s:
+        rows = (await s.execute(sql(
+            "SELECT tool_args FROM message WHERE session_id=:i AND role='assistant' "
+            "AND tool_args IS NOT NULL ORDER BY seq"), {"i": sid})).scalars().all()
+    blob = json.dumps(list(rows), ensure_ascii=False)
+    assert "hunter2" not in blob
+    step_tc = rows[1]["tool_calls"][0]
+    assert step_tc["id"] == "c2" and step_tc["function"]["name"] == "browser_step"
+    masked = json.loads(step_tc["function"]["arguments"])
+    assert masked["value"] == "<redacted:sensitive_input>"
+    assert masked["action"] == "fill" and masked["target"] == "e2"
+    # ② WS 推送那一份：前端通用折叠块打印的就是它
+    ev = next(e for e in rec.events if e["type"] == "tool_call" and e["name"] == "browser_step")
+    assert ev["args"]["value"] == "<redacted:sensitive_input>"
+    # ③ 原值必须送达 sidecar，否则 US-08 的登录根本填不进去
+    assert seen[0][1]["value"] == "hunter2"
+    # ④ 当轮回注模型仍是原值：下一步重试同一个表单时读回占位符就会把占位符真填进去
+    #    （跨轮从净化库重建，那时才是遮断版——与 tool_result 那条同一个口径）
+    back = [m for m in llm.received[2] if m["role"] == "assistant" and m.get("tool_calls")]
+    assert json.loads(back[-1]["tool_calls"][0]["function"]["arguments"])["value"] == "hunter2"
+
+
+@pytest.mark.asyncio
+async def test_non_sensitive_fill_value_stays_plain_in_the_persisted_args(test_engine, tmp_path,
+                                                                          monkeypatch):
+    """一刀切全遮会毁掉可读性：非 sensitive 目标的 value（备注、地址）照旧明文进历史。"""
+    from app.agent import browser_session_tools as bst
+
+    sid, aid, sf, seen = await _fill_env(test_engine, tmp_path, monkeypatch, bst, slug="pvsens2",
+                                        dev_port=8303, prod_port=8302)
+    turns = [done(None, [tool_call("c1", "browser_open", path="/")]),
+             done(None, [tool_call("c2", "browser_step", action="fill", target="e3",
+                                   value="第一单")]),
+             done("填好了")]
+    rec = Recorder()
+    await mk_runner(sf, ScriptedLLM(turns), rec, tasks={}).run(sid, "填个备注", asyncio.Event())
+    async with sf() as s:
+        rows = (await s.execute(sql(
+            "SELECT tool_args FROM message WHERE session_id=:i AND role='assistant' "
+            "AND tool_args IS NOT NULL ORDER BY seq"), {"i": sid})).scalars().all()
+    assert json.loads(rows[1]["tool_calls"][0]["function"]["arguments"])["value"] == "第一单"
+    ev = next(e for e in rec.events if e["type"] == "tool_call" and e["name"] == "browser_step")
+    assert ev["args"]["value"] == "第一单"
+    assert seen[0][1]["value"] == "第一单"
+
+
 @pytest.fixture
 def pv_seams(monkeypatch):
     """预览重启链路的 Docker 侧替身：预检放行、探针 200、起栈像真引擎那样把终态写进库。"""

@@ -18,7 +18,9 @@ import httpx
 from app.agent.browser_tools import (_checks_left, _clean, _error, _int_cfg, _redact,
                                      browser_service_url, browser_target_host, normalize_path)
 from app.agent.preview_tools import fetch_app
+from app.agent.redact import contains_redaction_marker, rewrite_tool_calls_args
 from app.services import browser_shot_service as shots
+from app.services.memory_service import REDACTED_TEMPLATE
 
 logger = logging.getLogger(__name__)
 
@@ -655,16 +657,89 @@ def _step_failure(ctx, data: dict, *, target_netloc: str, display_netloc: str,
     return {**out, **extra}
 
 
-def _step_echo(action: str, shown_target: str, expect) -> dict:
+# ------------------------------------------------------ 「动作之前」清单（browser_refs）的三种读法
+# `run_state["browser_refs"]` 存的是 sidecar 的**原始**清单，语义是「上一次返回给模型的那一份」，
+# 对本步而言就是**动作之前**的清单。下面三个读法都只认它：
+#   · `_step` 写 `browser_log` 时对 sensitive 目标的 value 遮断（Task 5）；
+#   · `redact_sensitive_step_args` 对落库/推送的同一份 value 遮断（裁定 R-33）；
+#   · `ref_display_name` 回显这一步的元素名（裁定 R-32，US-22）。
+# 不拿动作之后的新快照做后两件：ref 是按采集顺序现编的、每次重渲染全部作废（规格 §6.2），
+# 用新快照反查 `e7` 会标到另一个元素上——名字画错比不画更糟，遮断遮错对象就是明文泄漏。
+def is_sensitive_ref(refs, ref: str) -> bool:
+    """sensitive 判定的**唯一口径**：两处 value 遮断（结果侧与参数侧）共用它，不许各写一遍。"""
+    if not ref:
+        return False
+    return any(isinstance(item, dict) and str(item.get("ref") or "") == ref
+               and item.get("sensitive") for item in list(refs or []))
+
+
+def ref_display_name(refs, ref: str) -> str:
+    """按「动作之前」那份清单查 ref 的元素名，取不到就返回空串（卡片自行回落「句柄 e7」）。
+
+    名字是页面派生文本，过与清单同一条遮断闸（`_interactive_items` 用的就是 `_redact` +
+    `REF_NAME_MAX_CHARS`）：`run_state["browser_refs"]` 存的是未遮断的原始清单，直接 echo
+    出去等于在唯一闸口旁边开第二条路。
+    """
+    if not ref:
+        return ""
+    for item in list(refs or []):
+        if isinstance(item, dict) and str(item.get("ref") or "") == ref:
+            return _redact(item.get("name"), REF_NAME_MAX_CHARS)[0]
+    return ""
+
+
+def _step_echo(action: str, shown_target: str, expect, target_name: str = "") -> dict:
     """把「这一步是对谁做的」写回结果：步骤卡（Task 7）与收口报告都按步读它。
 
     少了这几个字段，「这一步动的哪个 ref」只能回头翻上一条消息记录；`expect` 只在真的给了
     时出现，没判定就不假装判过（同 `_shape_state` 对 `passed` 的处理）。
+    `target_name` 同理只在查得到时出现（裁定 R-32，US-22 的「目标元素名」）：元素名缺席时
+    卡片回落显示「句柄 e7」，比编一个名字诚实。
     """
     out = {"action": action, "target": shown_target}
+    if target_name:
+        out["target_name"] = target_name
     if expect is not None:
         out["expect"] = expect
     return out
+
+
+# 参数侧遮断的占位符：与通用规则表同形（`<redacted:kind>`），kind 用新词而不是复用 `password`——
+# 这一步填进敏感框的不一定真是口令（可能是身份证号、卡号），编成 password 就是说假话。
+SENSITIVE_VALUE_PLACEHOLDER = REDACTED_TEMPLATE.format("sensitive_input")
+
+
+def redact_sensitive_step_args(tool_calls, refs) -> tuple[list[dict], int]:
+    """落库 / WS 推送那一份 `browser_step` 参数：指向 sensitive 元素的 `value` 换成占位符。
+
+    为什么通用遮断不够（裁定 R-33，US-19 的「我在应用里输入的口令不会明文留在聊天记录里」）：
+    `redact_tool_calls_args` 走的是按**凭据形态**匹配的规则表，`admin123`、`hunter2` 这类
+    不成形态的字符串它一个都抓不住，于是 `{"action":"fill","target":"e2","value":"hunter2"}`
+    会原样进 `message.tool_args`，并被通用的 ToolCallBlock 明文打印出来。Task 4/5 只遮了
+    结果侧的 `browser_log`，参数侧这半边的缺口在两轮审查里都没进 diff。
+
+    判定与 `browser_log` 那一处**同源同口径**：同一个 `is_sensitive_ref`、同一份「动作之前」
+    的清单（`refs` 由调用方从 `ctx.run_state["browser_refs"]` 取，一轮内不变）。一处遮一处不遮
+    就是漏，所以两处共用一个函数，不在这里重写规则。
+
+    只影响落库/推送那一份：工具执行与 sidecar 载荷走的是 loop 的 `original_calls`，
+    原值照样送达（US-08 的登录要真填进去），当轮回注模型的 assistant tool_calls 也保留原值，
+    否则模型下一步重试时会把占位符当口令填进表单。
+    """
+    def rewrite(args):
+        if not isinstance(args, dict):
+            return args, 0
+        value = args.get("value")
+        if not isinstance(value, str) or not value:
+            return args, 0
+        if not is_sensitive_ref(refs, str(args.get("target") or "")):
+            return args, 0
+        if contains_redaction_marker(value):
+            # 已被通用规则表遮过一轮：幂等，不重复计数也不套娃
+            return args, 0
+        return {**args, "value": SENSITIVE_VALUE_PLACEHOLDER}, 1
+
+    return rewrite_tool_calls_args(tool_calls, rewrite, ("browser_step",))
 
 
 def _append_log(ctx, entry: dict) -> None:
@@ -728,9 +803,11 @@ async def _step(ctx, args: dict) -> dict:
 
     # sensitive 判定用**动作之前**那份清单（`browser_refs` = 上一次返回给模型的清单）：
     # 事后按新清单查，元素可能已经跟着重渲染换过人，这一步填进去的口令就会明文落进消息历史（US-19）。
-    sensitive = any(isinstance(item, dict) and str(item.get("ref") or "") == payload_ref
-                    and item.get("sensitive")
-                    for item in list(ctx.run_state.get("browser_refs") or []))
+    # 同一个判定也供 loop 的参数侧遮断使用（`redact_sensitive_step_args`），两处必须一起遮。
+    sensitive = is_sensitive_ref(ctx.run_state.get("browser_refs"), payload_ref)
+    # 元素名同样取动作之前那份清单（裁定 R-32）：新快照里的 `e7` 已经是另一个元素，
+    # 拿它标「这一步动的谁」会画出假目标。
+    target_name = ref_display_name(ctx.run_state.get("browser_refs"), payload_ref)
 
     payload = {"action": action, "ref": payload_ref, "value": value, "path": payload_path,
                "expect": args.get("expect"),
@@ -738,7 +815,8 @@ async def _step(ctx, args: dict) -> dict:
                                       STEP_TIMEOUT_MS_MIN, STEP_TIMEOUT_MS_MAX),
                "interactive_max": _interactive_max(ctx)}
     # 「这一步是什么」的自述字段，成功与失败两支共用同一份裁剪过的写法（规格 §5.2）。
-    echo = _step_echo(action, _redact(target, TARGET_MAX_CHARS)[0], payload["expect"])
+    echo = _step_echo(action, _redact(target, TARGET_MAX_CHARS)[0], payload["expect"],
+                      target_name)
     data, transport_err = await _sidecar_step(sid, payload)
     if data is None:
         # 传输/拒绝分支的原因同样是 sidecar 自由文本（`validate_target` 的 detail 会回显我们

@@ -828,6 +828,135 @@ async def test_sensitive_value_still_reaches_the_sidecar_verbatim(monkeypatch):
     assert seen[0][0] == "abc"                       # 会话由后端绑定，模型参数面里没有它
 
 
+def _tool_call(name, **args):
+    """OpenAI 协议形状的一条 tool_call（参数侧遮断的靶子）。"""
+    return {"id": "c1", "type": "function",
+            "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}}
+
+
+async def test_sensitive_step_args_masks_only_the_sensitive_target():
+    """参数侧遮断（裁定 R-33，US-19）：通用规则表按凭据**形态**匹配，`hunter2` 不成形态。
+
+    loop 在落库/推送前调这一刀，钉四种情形：sensitive 目标遮、非 sensitive 目标照旧明文
+    （一刀切会把「这一步填了什么备注」一起毁掉）、别的工具不碰、已过一遍不重复计数。
+    """
+    refs = [{"ref": "e2", "role": "textbox", "name": "密码", "sensitive": True},
+            {"ref": "e3", "role": "textbox", "name": "备注", "sensitive": False}]
+    calls = [_tool_call("browser_step", action="fill", target="e2", value="hunter2"),
+             _tool_call("browser_step", action="fill", target="e3", value="第一单"),
+             _tool_call("browser_step", action="click", target="e2"),
+             _tool_call("fs_write", path="a.txt", content="hunter2")]
+    out, hits = bst.redact_sensitive_step_args(calls, refs)
+    assert hits == 1
+    masked = json.loads(out[0]["function"]["arguments"])
+    assert masked["value"] == "<redacted:sensitive_input>"
+    # 只改 value 这一个值：动作、ref、协议结构（id/type/name）一个字不动
+    assert masked["action"] == "fill" and masked["target"] == "e2"
+    assert out[0]["id"] == "c1" and out[0]["function"]["name"] == "browser_step"
+    assert json.loads(out[1]["function"]["arguments"])["value"] == "第一单"
+    assert out[2] is calls[2] and out[3] is calls[3]     # 没 value 与别的工具：原条目原样返回
+    again, hits2 = bst.redact_sensitive_step_args(out, refs)
+    assert (hits2, json.loads(again[0]["function"]["arguments"])["value"]) == (
+        0, "<redacted:sensitive_input>")                # 幂等：不套娃也不重复计数
+
+
+async def test_the_two_value_masks_share_one_sensitive_verdict(monkeypatch):
+    """「一处遮一处不遮就是漏」的钉法（裁定 R-33）：结果侧与参数侧必须过同一个判定。
+
+    把判定本身换成探针，钉三件事：两处都调用它（不是各自内联一份 `any(...)`）、对同一个 ref
+    给出同一个结论、非 sensitive 的那一半两处都照旧明文（一刀切全遮也算不一致）。
+    """
+    refs = [{"ref": "e2", "role": "textbox", "name": "密码", "sensitive": True},
+            {"ref": "e3", "role": "textbox", "name": "备注", "sensitive": False}]
+    checked = []
+    real = bst.is_sensitive_ref
+
+    def spy(refs_, ref):
+        verdict = real(refs_, ref)
+        checked.append((ref, verdict))
+        return verdict
+
+    monkeypatch.setattr(bst, "is_sensitive_ref", spy)
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    monkeypatch.setattr(bst, "_sidecar_step",
+                        lambda sid, payload: _aget((_step_data(interactive=[]), "")))
+    for target, secret in (("e2", "hunter2"), ("e3", "第一单")):
+        ctx = Ctx()
+        ctx.run_state["browser_session"] = "abc"
+        ctx.run_state["browser_refs"] = refs
+        args = {"action": "fill", "target": target, "value": secret}
+        await bst.run_browser_session_tool(ctx, "browser_step", args)
+        out, hits = bst.redact_sensitive_step_args([_tool_call("browser_step", **args)], refs)
+        logged = ctx.run_state["browser_log"][-1]
+        # 两本账互为镜像：log 侧的 value_redacted == 参数侧遮没遮 == 判定本身
+        assert bool(hits) is logged["value_redacted"] is checked[-1][1] is checked[-2][1]
+        assert checked[-1] == checked[-2]          # 同一个 ref 打到同一个判定源（动作前那份清单）
+        if target == "e2":
+            assert "hunter2" not in str(logged)
+            assert "<redacted:sensitive_input>" in out[0]["function"]["arguments"]
+        else:
+            assert logged["value"] == "第一单"
+            assert json.loads(out[0]["function"]["arguments"])["value"] == "第一单"
+    assert checked == [("e2", True), ("e2", True), ("e3", False), ("e3", False)]
+
+
+async def test_step_echo_target_name_comes_from_the_pre_action_refs(monkeypatch):
+    """US-22「目标元素名」的取法（裁定 R-32）：只认**动作之前**那份清单。
+
+    动作之后的 `interactive` 是新快照，而 ref 每次重渲染全部作废（规格 §6.2）——拿新快照反查
+    `e7` 会把「这一步点的是谁」标成另一个元素，画出一个假目标比不画更糟。
+    这条测试就是给下一个想改成读新清单的人准备的。
+    """
+    ctx = Ctx()
+    ctx.run_state["browser_session"] = "abc"
+    ctx.run_state["browser_refs"] = [{"ref": "e7", "role": "button", "name": "结算",
+                                      "sensitive": False}]
+    fresh = [{"ref": "e7", "role": "button", "name": "退出登录", "sensitive": False}]
+    _step_env(monkeypatch, _step_data(interactive=fresh))
+    out = await bst.run_browser_session_tool(
+        ctx, "browser_step", {"action": "click", "target": "e7"})
+    assert out["target_name"] == "结算"
+    assert out["target"] == "e7"
+    assert [i["name"] for i in out["interactive"]] == ["退出登录"]     # 新快照仍照常附回，只是不拿来标名
+
+
+async def test_step_echo_target_name_and_failure_shape(monkeypatch):
+    """点不动那一步也要有名字（卡片两种形状读同一个字段），且名字过既有遮断闸。"""
+    ctx = Ctx()
+    ctx.run_state["browser_session"] = "abc"
+    ctx.run_state["browser_refs"] = [{"ref": "e7", "role": "textbox",
+                                      "name": "密码 token=abc123def456ghi 输入框",
+                                      "sensitive": True}]
+
+    async def blocked(sid, payload):
+        return {"ok": False, "error": "元素不可点击或动作失败: timeout",
+                "interactive": [], "steps_charged": True}, ""
+
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    monkeypatch.setattr(bst, "_sidecar_step", blocked)
+    _no_shot(monkeypatch)
+    out = await bst.run_browser_session_tool(
+        ctx, "browser_step", {"action": "click", "target": "e7"})
+    assert out["ok"] is False
+    assert "abc123def456ghi" not in out["target_name"]      # 页面派生文本，同清单一个口径
+    assert "输入框" in out["target_name"]
+
+
+async def test_step_echo_omits_target_name_when_it_cannot_be_known(monkeypatch):
+    """查不到就不编一个名字：ref 不在动作前的清单里、navigate 的 target 是 path 都不带这字段。"""
+    ctx = Ctx()
+    ctx.run_state["browser_session"] = "abc"
+    ctx.run_state["browser_refs"] = [{"ref": "e1", "role": "button", "name": "出牌",
+                                      "sensitive": False}]
+    _step_env(monkeypatch, _step_data())
+    out = await bst.run_browser_session_tool(
+        ctx, "browser_step", {"action": "click", "target": "e9"})
+    assert "target_name" not in out
+    nav = await bst.run_browser_session_tool(
+        ctx, "browser_step", {"action": "navigate", "target": "/orders"})
+    assert "target_name" not in nav and nav["target"] == "/orders"
+
+
 async def test_action_failure_is_ok_false_and_expect_failure_is_passed_false(monkeypatch):
     ctx = Ctx()
     ctx.run_state["browser_session"] = "abc"

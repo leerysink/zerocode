@@ -14,7 +14,8 @@ from pathlib import Path
 from app.agent.preview_tools import (build_preview_prompt, confirm_summary, fetch_app,
                                      need_confirm, resolve_session_app)
 from app.agent.browser_tools import build_browser_prompt
-from app.agent.browser_session_tools import build_browser_session_prompt, close_browser_session
+from app.agent.browser_session_tools import (build_browser_session_prompt, close_browser_session,
+                                            redact_sensitive_step_args)
 from app.agent.db_tools import build_db_prompt, db_confirm_summary
 from app.agent.prompts import build_clarify_prompt, build_system_prompt
 from app.agent import clarify as _cl
@@ -502,10 +503,20 @@ class AgentRunner:
                 # 泄露 ≠ 破坏工具本意，fs_write 之类得能把用户真正要写的凭据落盘。
                 original_calls = final["tool_calls"]
                 sanitized_calls, _ = redact_tool_calls_args(original_calls)
-                final["tool_calls"] = sanitized_calls
+                # 参数侧的 sensitive 遮断（裁定 R-33，US-19）：规则表只认凭据**形态**，
+                # `{"action":"fill","target":"e2","value":"hunter2"}` 里那种不成形态的口令它抓不住，
+                # 于是它会原样进 message.tool_args 并被通用折叠块明文打印出来。判定与 `_step`
+                # 写 browser_log 时同源（同一个 is_sensitive_ref、同一份「动作之前」的清单），
+                # 一处遮一处不遮就是漏。
+                # 只改落库/推送那一份（与下面 tool_result 那条同一个形状）：工具执行收
+                # original_calls（原值必须送达 sidecar，否则登录根本填不进去），当轮回注模型的
+                # assistant tool_calls 也留原值——模型下一步重试同一个表单时不能读回占位符。
+                persisted_calls, _ = redact_sensitive_step_args(
+                    sanitized_calls, ctx.run_state.get("browser_refs"))
+                final["tool_calls"] = persisted_calls
                 await add_message(self.sf, session_id, "assistant", content=final.get("content"),
                                   reasoning=final.get("reasoning"),
-                                  tool_args={"tool_calls": sanitized_calls})
+                                  tool_args={"tool_calls": persisted_calls})
                 messages.append({"role": "assistant", "content": final.get("content"),
                                  "tool_calls": sanitized_calls})
                 # 轮次收口：本轮的文字必须在派发工具**之前**固化下发。上面那行已经把它存进库了，
@@ -514,12 +525,12 @@ class AgentRunner:
                 # content 为空则不发：发了前端会 push 一条空 assistant 消息，实时与历史条数就此叉开。
                 if final.get("content"):
                     await self.send({"type": "message_done", "content": final["content"]})
-                # 结构被 redact 原样保留（id/type/name 不变、只改 arguments），按位次配对：
+                # 结构被遮断原样保留（id/type/name 不变、只改 arguments），按位次配对：
                 # exec_tc 供工具真实执行，push_tc 供前端事件展示。等长同序是配对成立的前提，
-                # 加一道廉价护栏：万一将来给 redact 加了过滤分支致列表变短，在这里显式炸，
+                # 加一道廉价护栏：万一将来给遮断加了过滤分支致列表变短，在这里显式炸，
                 # 不要静默丢一个工具调用 / 错位 tool_call_id 配对（OpenAI 兼容 API 会 400）。
-                assert len(sanitized_calls) == len(original_calls)
-                pairs = list(zip(original_calls, sanitized_calls))
+                assert len(persisted_calls) == len(original_calls)
+                pairs = list(zip(original_calls, persisted_calls))
                 for idx, (exec_tc, push_tc) in enumerate(pairs):
                     if cancel.is_set():
                         await self._pair_undispatched(session_id, pairs[idx:])
