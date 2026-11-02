@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -24,12 +25,21 @@ from scripts import build_output as bo      # noqa: E402
 STAMP = "2026-10-16T00:00:00Z"
 ROOT = "/opt/zerocode"
 
-# 假仓库里的部署脚本桩：打包器只负责原样搬运，不解释内容；真文件的自检见
-# test_repo_deploy_script_busy_is_a_real_predicate。
+# 假仓库里的部署脚本桩：打包器只负责原样搬运（外加 .ps1 补 BOM），不解释内容；真文件的
+# 自检见 test_deploy_lib.py 与这里的「回归钉」几支。
 DEPLOY_SH_STUB = r"""#!/usr/bin/env bash
-set -euo pipefail
-busy() { ss -ltnH 2>/dev/null | awk '{print $4}' | grep -qE ":$1\$"; }
+set -uo pipefail
+. "$(dirname "$0")/deploy_lib.sh" || exit 1
+check_port() { zc_busy "$1"; }
 """
+DEPLOY_LIB_SH_STUB = """# 判定层桩
+zc_busy() { # 0=被占 1=空闲 2=无法判定
+  command -v ss >/dev/null 2>&1 || return 2
+  ss -ltnH 2>/dev/null | awk -v pat=":${port}\\$" '$4 ~ pat { f = 1 } END { exit !f }'
+}
+"""
+# 源故意不带 BOM、行尾故意 CRLF：打包器要把它改成「BOM + LF」，US-26 才是可判定的。
+DEPLOY_PS1_STUB = "#!/usr/bin/env pwsh\r\nWrite-Host '皮：只保证 WSL，然后调用同一份 deploy.sh'\r\n"
 
 CHANGELOG_INIT = """-- V20260101_01_init.sql
 CREATE TABLE IF NOT EXISTS workspace (
@@ -151,8 +161,11 @@ def fake_repo(tmp_path) -> Path:
     (tmp_path / "app" / "__pycache__" / "main.cpython-312.pyc").write_bytes(b"\x00")
     (tmp_path / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
     _make_browser(tmp_path)
-    (tmp_path / "scripts").mkdir()
-    (tmp_path / "scripts" / "deploy.sh").write_text(DEPLOY_SH_STUB, encoding="utf-8")
+    scripts = (tmp_path / "scripts")
+    scripts.mkdir()
+    (scripts / "deploy.sh").write_text(DEPLOY_SH_STUB, encoding="utf-8")
+    (scripts / "deploy_lib.sh").write_text(DEPLOY_LIB_SH_STUB, encoding="utf-8")
+    (scripts / "deploy.ps1").write_text(DEPLOY_PS1_STUB, encoding="utf-8")
 
     dist = tmp_path / "frontend" / "dist"
     dist.mkdir(parents=True)
@@ -184,7 +197,8 @@ def test_build_produces_every_artifact(fake_repo):
     s = _build(fake_repo)
     out = s["out"]
     for rel in ("init.sql", "docker-compose.yml", ".env.example", ".dockerignore",
-                "apply-init.sh", "deploy.sh", "README-deploy.md",
+                "apply-init.sh", "deploy.sh", "deploy_lib.sh", "deploy.ps1",
+                "README-deploy.md",
                 "backend/Dockerfile", "backend/requirements.txt", "backend/app/main.py",
                 "browser/Dockerfile", "browser/requirements.txt", "browser/app.py",
                 "browser/inspect_core.py", "browser/__init__.py",
@@ -220,6 +234,7 @@ def test_generated_text_files_use_lf(fake_repo):
     """边界：CRLF 会让 apply-init.sh 在 bash 下直接报错，SQL 里也不该有 \\r。"""
     out = _build(fake_repo)["out"]
     for rel in ("init.sql", "docker-compose.yml", "apply-init.sh", "deploy.sh",
+                "deploy_lib.sh", "deploy.ps1",
                 "README-deploy.md", ".env.example", "backend/Dockerfile",
                 "browser/Dockerfile", "browser/docker-compose.yml", "browser/app.py"):
         raw = (out / rel).read_bytes()
@@ -241,20 +256,167 @@ def test_deploy_script_strips_crlf(fake_repo):
     assert b"\r" not in (out / "deploy.sh").read_bytes()
 
 
-def test_missing_deploy_script_blocks_packaging(fake_repo):
-    """缺文件不出包：与网关配置同一套闸门，宁可不打也不发一个没有部署脚本的包。"""
-    (fake_repo / "scripts" / "deploy.sh").unlink()
-    with pytest.raises(bo.BuildError, match="部署脚本"):
+@pytest.mark.parametrize("name", ("deploy.sh", "deploy_lib.sh", "deploy.ps1"))
+def test_missing_any_deploy_script_blocks_packaging(fake_repo, name):
+    """三份脚本缺一不出包：内核要 source 判定层，皮与内核互为左右手——少一份就是让服务器跑到一半才炸。"""
+    (fake_repo / "scripts" / name).unlink()
+    with pytest.raises(bo.BuildError, match=name):
         _build(fake_repo)
 
 
-def test_repo_deploy_script_busy_is_a_real_predicate():
-    """回归钉：busy() 末尾挂 `|| true` 会让它恒返回 0，端口预检于是恒报「已被占」，
-    真占用者永远查不到（2026-10-29 在演示机上撞过一次）。"""
-    text = (bo.REPO_ROOT / "scripts" / "deploy.sh").read_text(encoding="utf-8")
-    line = next((l for l in text.splitlines() if l.strip().startswith("busy() {")), None)
-    assert line is not None, "scripts/deploy.sh 里找不到 busy() 判定函数"
-    assert "|| true" not in line, f"busy() 又挂上 || true 了：{line}"
+def test_deploy_lib_ships_verbatim_from_repo(fake_repo):
+    """判定层与内核同一套搬运规则：源里改了什么包里就是什么，行尾必须是 LF。"""
+    marker = "改过的判定层"
+    (fake_repo / "scripts" / "deploy_lib.sh").write_text(
+        "# " + marker + "\nzc_busy() { return 1; }\n", encoding="utf-8")
+    out = _build(fake_repo)["out"]
+    assert marker in (out / "deploy_lib.sh").read_text(encoding="utf-8")
+    assert b"\r" not in (out / "deploy_lib.sh").read_bytes(), "判定层行尾被换成了 CRLF"
+
+
+def test_powershell_skin_ships_as_bom_plus_lf(fake_repo):
+    """US-26：皮必须 UTF-8 带 BOM、行尾 LF。源故意不带 BOM 又是 CRLF（假仓库的桩就这么写的），
+    打包器要把两头都修正——Windows PowerShell 5.1 在 GBK 代码页下读无 BOM 的中文脚本直接解析失败。"""
+    out = _build(fake_repo)["out"]
+    raw = (out / "deploy.ps1").read_bytes()
+    assert raw.startswith(b"\xef\xbb\xbf"), "包里 deploy.ps1 没带 UTF-8 BOM"
+    assert b"\r" not in raw, "包里 deploy.ps1 含 CRLF/CR"
+    assert raw.count(b"\xef\xbb\xbf") == 1, "BOM 被重复写了一次"
+    assert "deploy.sh" in raw.decode("utf-8-sig"), "皮里没有调用同一份 deploy.sh（那它就不是皮）"
+
+
+def test_repo_deploy_kernel_delegates_predicates_to_the_lib():
+    """回归钉：判定逻辑只能住在 deploy_lib.sh（那才有桩测）。内核里再长出一份 busy 判定，
+    就等于多一条没人测的分支——2026-10-29 那次 `|| true` 恒真的教训就在这类复制粘贴里。"""
+    kernel = (bo.REPO_ROOT / "scripts" / "deploy.sh").read_text(encoding="utf-8")
+    lib = (bo.REPO_ROOT / "scripts" / "deploy_lib.sh").read_text(encoding="utf-8")
+    assert '. "$LIB"' in kernel, "内核没 source 判定层：包里两份脚本会各自漂移"
+    assert "zc_busy" in kernel, "内核不再问端口占用判定"
+    assert "\nzc_busy() {" not in kernel, "内核里又长出一份 busy() 判定"
+    line = next((l for l in lib.splitlines() if l.strip().startswith("zc_busy() {")), None)
+    assert line is not None, "deploy_lib.sh 里找不到 zc_busy() 判定函数"
+    assert "|| true" not in line, "zc_busy() 又挂上 || true 了：" + line
+
+
+def test_repo_deploy_kernel_takes_no_command_line_flags():
+    """回归钉（D-11）：参数全部取消，危险动作改成现场提问。哪天有人加回 --takeover 这类 flag，
+    「敲错参数跑错分支」就回来了——那正是本次改造要消掉的东西。"""
+    kernel = (bo.REPO_ROOT / "scripts" / "deploy.sh").read_text(encoding="utf-8")
+    assert 'if [ "$#" -gt 0 ]; then' in kernel, "内核不再拒收命令行参数了"
+    for flag in ("--check)", "--no-build)", "--gateway)", "--takeover)", "--fresh-db)"):
+        assert flag not in kernel, f"内核里又出现了参数分支 {flag}"
+    assert "exit 2" in kernel, "拒收参数时要有明确的退出码"
+
+
+def test_repo_deploy_kernel_still_gates_the_old_flags_for_the_user():
+    """老用法的 flag 要一个个点名去处——只说「不认识这个参数」等于让人回去翻 README。"""
+    kernel = (bo.REPO_ROOT / "scripts" / "deploy.sh").read_text(encoding="utf-8")
+    for old in ("--takeover", "--fresh-db", "--gateway", "--no-build", "--check"):
+        assert old in kernel, f"拒收提示里没交代 {old} 现在的去处"
+
+
+def test_repo_deploy_kernel_warms_only_pullable_images():
+    """回归钉：`docker compose config --images` 把 backend/browser 两个**构建目标**
+    （zerocode-platform:demo 这类本地 tag）也列进清单，照单 pull 的话一台干净机器会死在自己的
+    预检上，症状看起来跟「网络不通」一模一样（本地实测：config --images 三项里有两项拉不到）。
+    预热因此分两条腿：Dockerfile 的 FROM 基础镜像逐个拉，服务镜像交给 compose 自己按
+    --ignore-buildable 跳过构建目标。"""
+    kernel = (bo.REPO_ROOT / "scripts" / "deploy.sh").read_text(encoding="utf-8")
+    code = "\n".join(l for l in kernel.splitlines() if not l.lstrip().startswith("#"))
+    assert "config --images" not in code, "又拿 compose config --images 当 pull 清单了"
+    assert "构建目标" in kernel, "那段「为什么不能照单 pull」的说明没了"
+    assert "--ignore-buildable" in code, "服务镜像预热没让 compose 跳过构建目标"
+    assert "pull_bases" in code and "FROM" in code, "构建期基础镜像的预热退化了（境内机真卡点）"
+
+
+def test_repo_deploy_kernel_waits_for_the_daemon_it_just_started():
+    """回归钉：`systemctl enable --now docker` / 换 daemon.json 后的 restart 都是异步的，立刻判缺口
+    会把「刚装好」报成「环境仍缺 daemon」，新装机器每次死在 2/9。等待必须有界——无界就是卡死。"""
+    kernel = (bo.REPO_ROOT / "scripts" / "deploy.sh").read_text(encoding="utf-8")
+    assert "wait_docker_ready || fail" in kernel, "最终的环境判定没走有界等待"
+    body = kernel[kernel.index("wait_docker_ready() {"):kernel.index("ensure_docker() {")]
+    assert "zc_env_gaps" in body and "sleep 1" in body, "就绪等待既没查缺口也没退避"
+    assert "while" in body and "n - 1" in body, "等待没了界限"
+
+
+def test_repo_deploy_kernel_gates_the_gateway_domain_charset():
+    """网关域名会被拼进第 9 步 `docker run … sh -c "… '$DOMAIN'"` 的单引号里。不设字符集闸门就是
+    让一次输入决定 root 执行什么命令——顺带挡住带空格的粘贴。"""
+    kernel = (bo.REPO_ROOT / "scripts" / "deploy.sh").read_text(encoding="utf-8")
+    assert 'case "$DOMAIN" in' in kernel, "域名没做字符集校验"
+    assert "*[!A-Za-z0-9._-]*)" in kernel, "域名闸门没在越界时直接失败"
+
+
+def test_repo_deploy_kernel_gates_every_lib_function_it_calls():
+    """内核开头那份 declare -F 名单是「包里的 lib 比内核旧」的唯一早停机。漏一支的症状是跑到一半
+    才 command not found，而那时系统已经被改过了。"""
+    kernel = (bo.REPO_ROOT / "scripts" / "deploy.sh").read_text(encoding="utf-8")
+    lib = (bo.REPO_ROOT / "scripts" / "deploy_lib.sh").read_text(encoding="utf-8")
+    gate = kernel[kernel.index("for want in"):kernel.index("declare -F")]
+    named = [f for f in re.findall(r"^(zc_[a-z_]+)\(\)", lib, re.M) if f in kernel]
+    missing = [f for f in named if f not in gate]
+    assert not missing, f"内核用到这些判定函数却没进版本闸门名单：{missing}"
+
+
+def test_repo_powershell_skin_defers_deployment_to_the_linux_kernel():
+    """皮不许长出自己的部署判定：它只管 WSL2 / systemd / 推包，然后调用同一份 deploy.sh（ADR-0035）。
+    哪天有人在 ps1 里直接写 compose 或 apt-get，两台机器的部署逻辑就开始各走各的。"""
+    ps = (bo.REPO_ROOT / "scripts" / "deploy.ps1").read_text(encoding="utf-8-sig")
+    assert "bash deploy.sh" in ps, "皮没有把部署交给 Linux 内核"
+    assert "ZC_GATEWAY_DEFAULT=n" in ps, "皮没按 US-25 把 Windows 侧的网关默认值设成不起"
+    assert "systemd=true" in ps, "皮没保证发行版里的 systemd（docker daemon 靠它）"
+    assert "Docker Desktop" in ps, "皮里该留一句为什么不装 Docker Desktop（ADR-0035）"
+    code = "\n".join(l for l in ps.splitlines() if not l.strip().startswith("#")).lower()
+    for own in ("docker compose", "apt-get", "systemctl"):
+        assert own not in code, "皮里长出了自己的部署动作：" + own
+
+
+POWERSHELL = (shutil.which("pwsh") or shutil.which("powershell")
+              or shutil.which("powershell.exe"))
+
+
+@pytest.mark.skipif(POWERSHELL is None, reason="机器上没有 PowerShell：接缝 D 只剩文本断言")
+def test_repo_powershell_skin_parses_under_a_real_parser(tmp_path):
+    """接缝 D：皮必须过一遍**真解析器**，不能只过我自己的字符串断言。
+
+    找 pwsh（7+），没有就退到 powershell.exe（5.1）——5.1 恰好就是 US-26 那台机器的解析器，
+    它对无 BOM 的中文脚本会按 GBK 代码页解码，直接把中文注释读成语法错误。所以这支测的是
+    「打包器补的那颗 BOM 真管用」，而不只是「字节里有 EF BB BF」。
+    两个都找不到时整支 skip，交付说明要写明皮只做过文本层面的检查。
+    """
+    src = (bo.REPO_ROOT / "scripts" / "deploy.ps1").read_bytes()
+    assert src.startswith(b"\xef\xbb\xbf"), "源文件自己就没 BOM，解析器测出来再红也来不及解释"
+    probe = tmp_path / "parse-probe.ps1"          # 用真临时名，别把仓库路径交给 shell
+    probe.write_bytes(src)
+    cmd = (
+        "$t=$null; $e=$null; "
+        "[void][System.Management.Automation.Language.Parser]::ParseFile("
+        "$env:ZC_PS_FILE, [ref]$t, [ref]$e); "
+        "if ($e.Count -gt 0) { Write-Output ('PARSE_ERRORS=' + $e.Count); "
+        "$e | ForEach-Object { Write-Output ($_.Extent.StartLineNumber.ToString() + ': ' + $_.Message) }; "
+        "exit 1 } "
+        "Write-Output ('AST_OK tokens=' + $t.Count)"
+    )
+    env = dict(os.environ, ZC_PS_FILE=str(probe))
+    r = subprocess.run([POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", cmd],
+                       capture_output=True, text=True, env=env, encoding="utf-8", errors="replace")
+    out = (r.stdout or "") + (r.stderr or "")
+    assert r.returncode == 0, f"PowerShell 解析失败（{POWERSHELL}）：{out}"
+    m = re.search(r"tokens=(\d+)", out)
+    assert m and int(m.group(1)) > 200, f"解析器没真读到这份脚本：{out!r}"
+
+
+def test_repo_powershell_skin_takes_no_command_line_flags():
+    """回归钉（D-11）：皮与内核同一条规矩——不认参数。皮收参数就等于给「敲错 flag 跑错分支」
+    重新开门，而那条门正是本次改造要焊死的。逐条 flag 的去处只写在内核里：皮指过去就行，
+    在两处各列一遍必漂移。"""
+    ps = (bo.REPO_ROOT / "scripts" / "deploy.ps1").read_text(encoding="utf-8-sig")
+    assert "if ($args.Count -gt 0)" in ps, "皮不再拒收命令行参数了"
+    assert "exit 2" in ps, "拒收参数时要有明确的退出码"
+    assert "D-11" in ps, "拒收提示要交代这是已定决策，不然下一个人会当成遗漏加回来"
+    assert "deploy.sh" in ps, "皮没把参数问题指回内核"
+    for flag in ("--takeover", "--fresh-db", "--no-build", "--check"):
+        assert (flag + ")") not in ps, f"皮里长出了参数分支 {flag}"
 
 
 def test_repo_deploy_script_gates_the_browser_sidecar():
@@ -300,9 +462,15 @@ def test_init_sql_guards_unguarded_vector_alter(fake_repo):
 
 
 def test_init_sql_seed_rewrites_root_path_and_leaves_owner_null(fake_repo):
-    """预置应用种子行：root_path 用部署根、owner_user_id 留 NULL 交给创始人事务承接。"""
+    """预置应用种子行：root_path 走部署根占位符、owner_user_id 留 NULL 交给创始人事务承接。
+
+    ADR-0034 之前这里钉的是 `{ROOT}/apps/demo1` 那个真实路径；现在打包期不知道部署根最终
+    是什么，写死会让换目录的服务器上预置应用集体失联。渲染时机见
+    test_apply_init_sh_renders_placeholder_without_touching_the_file。
+    """
     sql = (_build(fake_repo)["out"] / "init.sql").read_text(encoding="utf-8")
-    assert f"{ROOT}/apps/demo1" in sql and f"{ROOT}/apps/demo2" in sql
+    assert f"{PLACEHOLDER}/apps/demo1" in sql and f"{PLACEHOLDER}/apps/demo2" in sql
+    assert f"{ROOT}/apps/demo" not in sql                        # 打包期真实路径不许进产物
     assert "8212" in sql and "8221" in sql
     assert "owner_user_id" not in sql.split("预置应用种子")[1]     # 种子段不许显式写归属列
     assert "$zcpreset$" in sql and "IF NOT EXISTS (SELECT 1 FROM app_project WHERE slug = 'demo1')" in sql
@@ -735,49 +903,50 @@ def test_deploy_root_rejects_bad_forms(raw, why):
 
 def test_deploy_root_flows_into_every_artifact(fake_repo):
     out = _build(fake_repo, deploy_root="/srv/zc")["out"]
-    assert "/srv/zc/apps/demo1" in (out / "init.sql").read_text(encoding="utf-8")
+    assert "${DEPLOY_ROOT:-/srv/zc}/apps:${DEPLOY_ROOT:-/srv/zc}/apps" in (
+        (out / "docker-compose.yml").read_text(encoding="utf-8"))
     assert "/srv/zc" in (out / ".env.example").read_text(encoding="utf-8")
-    compose = (out / "docker-compose.yml").read_text(encoding="utf-8")
-    assert "/srv/zc/apps:/srv/zc/apps" in compose
+    assert "/srv/zc" in (out / "backend/Dockerfile").read_text(encoding="utf-8")
     assert "/srv/zc" in (out / "README-deploy.md").read_text(encoding="utf-8")
+    # 种子段是唯一不走「打包期真实路径」的地方：它带占位符，见 ADR-0034
+    assert "{{DEPLOY_ROOT}}/apps/demo1" in (out / "init.sql").read_text(encoding="utf-8")
 
 
-def test_backend_dockerfile_workdir_equals_deploy_root(fake_repo):
+def test_backend_dockerfile_workdir_follows_the_deploy_root_arg(fake_repo):
     """回归：WORKDIR 必须等于部署根，否则 REPO_ROOT 与同路径挂载点对不上。
 
     settings.py 的 REPO_ROOT 由自身文件位置推出（镜像里就是 WORKDIR），deploy.apps_root
-    留空时的兜底是 REPO_ROOT/apps。WORKDIR 写死 /opt/zerocode 而部署根是 /srv/zc 的话，
-    新建应用会落进容器可写层，宿主 docker daemon 找不到那个路径 → 起预览必挂。
+    留空时的兜底是 REPO_ROOT/apps。WORKDIR 与部署根分家时，新建应用会落进容器可写层，
+    宿主 docker daemon 找不到那个路径 → 起预览必挂。ADR-0034 之后这条同源性由 build arg
+    保证：ARG 的默认值是打包时那个根，compose 再把运行期 .env 的同一个变量喂进来。
     """
     out = _build(fake_repo, deploy_root="/srv/zc")["out"]
-    dockerfile = (out / "backend" / "Dockerfile").read_text(encoding="utf-8")
-    assert "WORKDIR /srv/zc\n" in dockerfile
+    dockerfile = (out / "backend/Dockerfile").read_text(encoding="utf-8")
+    assert "ARG DEPLOY_ROOT=/srv/zc" in dockerfile
+    assert "WORKDIR ${DEPLOY_ROOT}" in dockerfile
     assert "/opt/zerocode" not in dockerfile
 
 
-def test_deploy_root_is_pinned_not_overridable_at_runtime(fake_repo):
-    """边界：部署根一旦打包就钉死，不得留 ${DEPLOY_ROOT:-…} 这种运行期覆盖口子。
+def test_deploy_root_is_overridable_at_runtime_but_single_sourced(fake_repo):
+    """边界（ADR-0034 推翻 ADR-0013 的取值时机）：部署根可由运行期 .env 换，但只能有一个来源。
 
-    WORKDIR 是构建期烘进镜像的，运行期改 .env 只会让挂载点与 REPO_ROOT 分家：
-    新建应用落进容器可写层、宿主 daemon 找不到路径，且全程没有任何报错。
-    宁可让「改 .env 换部署根」明确无效，也不留一类静默故障。
+    挂载两侧、ZEROCODE_DATA_DIR/ROUTES、镜像 build.args 必须引用**同一个** `${DEPLOY_ROOT:-默认}`：
+    少一处就说明又把它烘回了字面量，换根时会静默分家。默认值必须是打包时那个根，
+    否则服务器上没填 .env 时会退回一个谁都没选过的路径。
     """
     out = _build(fake_repo, deploy_root="/srv/zc")["out"]
     doc = yaml.safe_load((out / "docker-compose.yml").read_text(encoding="utf-8"))
     backend = doc["services"]["backend"]
-    # 按 YAML 结构断言而不是文本包含：compose 的注释里会解释「为什么刻意不写成
-    # ${DEPLOY_ROOT:-…}」，文本级断言会被这段说明自己误伤。
-    assert all("${" not in v for v in backend["volumes"]), "挂载路径留了运行期覆盖口子"
-    assert backend["volumes"][1:] == ["/srv/zc/apps:/srv/zc/apps",
-                                     "/srv/zc/data:/srv/zc/data",
-                                     "/srv/zc/store:/srv/zc/store",
-                                     "/srv/zc/gateway/routes:/srv/zc/gateway/routes"]
-    # ZEROCODE_DATA_DIR 同样不得取 .env（而 DATABASE_URL 里的口令占位符是合法的，另论）
-    assert backend["environment"]["ZEROCODE_DATA_DIR"] == "/srv/zc/data"
+    var = "${DEPLOY_ROOT:-/srv/zc}"
+    assert backend["volumes"][1:] == [f"{var}/apps:{var}/apps",
+                                      f"{var}/data:{var}/data",
+                                      f"{var}/store:{var}/store",
+                                      f"{var}/gateway/routes:{var}/gateway/routes"]
+    assert backend["environment"]["ZEROCODE_DATA_DIR"] == f"{var}/data"
+    assert backend["build"]["args"]["DEPLOY_ROOT"] == var, "镜像 WORKDIR 与挂载不再是同一个取值"
     env = (out / ".env.example").read_text(encoding="utf-8")
-    assert not re.search(r"^DEPLOY_ROOT=", env, re.MULTILINE), \
-        ".env 里留一个改了就会静默坏掉的 DEPLOY_ROOT，等于留陷阱"
-    assert "/srv/zc" in env                            # 但要写清这个包是按哪个根打的
+    assert re.search(r"^DEPLOY_ROOT=/srv/zc$", env, re.MULTILINE), \
+        ".env 必须提供 DEPLOY_ROOT，且默认值是打包时那个根"
 
 
 def test_missing_dist_refuses(fake_repo):
@@ -1022,7 +1191,7 @@ def test_readme_documents_replay_semantics_and_founder(fake_repo):
     """README 必须把两条最容易踩的语义写清：重放只补不覆盖、首注册者承接预置应用。"""
     readme = (_build(fake_repo)["out"] / "README-deploy.md").read_text(encoding="utf-8")
     assert "只补不覆盖" in readme and "创始人" in readme
-    assert "apply-init.sh" in readme and "docker compose up -d --build" in readme
+    assert "apply-init.sh" in readme and "--build" in readme
     assert "demo1" in readme and "demo2" in readme
 
 
@@ -1074,43 +1243,52 @@ def test_readme_publish_steps_never_mirror_the_whole_package(fake_repo):
 
     # 反向断言：解释「为什么不能用」的那段正文必须在场，否则下一个人会把它简化回去。
     assert "为什么不能用一条" in readme
-    # 后果表说 `.env` 会被删——那它得先存在：首次部署那节必须确实建了它，否则那段警告是空的。
-    assert "cp .env.example .env" in blocks[0], "§2 里没建 .env，后果表的第一行就没了前提"
+    # 一条命令之后，§2 的第一个 bash 块必须就是 deploy.sh——别再退回去数五步 rsync。
+    assert "bash deploy.sh" in blocks[0], "§2 的首个 bash 块不再是 deploy.sh"
+    # 后果表说 `.env` 会被删——那得先交代它从哪儿来，否则那一行没有前提。
+    assert "起步生成" in readme, "README 没说清 .env 是怎么来的，后果表第一行没了前提"
 
 
-def test_readme_publish_steps_are_split_per_directory(fake_repo):
-    """发布四步必须逐字落在 bash 块里：各自的 --delete / --exclude 组合就是安全边界本身。
-
-    逐字断言而不是「大概有 rsync」：少一个 --delete，被删的文件会在服务器上留成僵尸；
-    --exclude 少一个前导斜杠，就会顺带排掉任何深度下叫 deploy 的目录（应用工程里也可能
-    有 backend/app/deploy），镜像里少了它是**静默失效**——不报错，只是发布出来少一块。
+def test_readme_keeps_per_slug_app_sync_anchored(fake_repo):
+    """预置应用源码不在升级模式的镜像范围内（`apps/` 整棵在保护名单里），README 给的手动逐 slug
+    同步命令必须逐字落在 bash 块里。逐字而不是「大概有 rsync」：少一个 `--delete`，被删掉的文件
+    会在服务器上留成僵尸；`--exclude` 少一个前导斜杠，就会顺带排掉任何深度下叫 deploy 的目录
+    （应用工程里也可能有 backend/app/deploy），镜像里少了它是**静默失效**——不报错，只是同步少一块。
     """
     readme = (_build(fake_repo)["out"] / "README-deploy.md").read_text(encoding="utf-8")
     cmd = "\n".join(_bash_blocks(readme))
-
     for required in (
-            f"rsync -a --delete build-output/backend/  {ROOT}/backend/",
-            f"rsync -a --delete build-output/browser/  {ROOT}/browser/",
-            f"rsync -a --delete build-output/frontend/ {ROOT}/frontend/",
             f"rsync -a --delete --exclude '/deploy/' build-output/apps/demo1/ {ROOT}/apps/demo1/",
             f"rsync -a --delete --exclude '/deploy/' build-output/apps/demo2/ {ROOT}/apps/demo2/",
     ):
-        assert required in cmd, f"发布步骤缺了：{required}"
+        assert required in cmd, f"预置应用同步步骤缺了：{required}"
     assert "--exclude 'deploy/'" not in cmd, "deploy/ 的排除没锚在传输根上，会误伤同名子目录"
 
-    # 顶层文件那一条必须**不带** --delete：.env 就在这一层。
-    top = [ln for ln in cmd.splitlines() if "build-output/init.sql" in ln]
-    assert top, "顶层文件的同步命令不见了"
-    assert "--delete" not in top[0], f"顶层文件同步带了 --delete，会删掉 .env：{top[0]}"
+
+def test_repo_deploy_kernel_mirrors_only_the_three_platform_dirs():
+    """回归（D-06）：全场只有 `backend/`、`browser/`、`frontend/` 三棵带 `--delete`，
+    `apps/`、`data/`、`store/` 一概不镜像。这条安全边界原先写在 README §4 的命令里，
+    现在住进内核——钉得跟着搬：哪天有人「顺手把 apps/ 也加上」，八项现场产物立刻就没护栏了。
+    """
+    kernel = (bo.REPO_ROOT / "scripts" / "deploy.sh").read_text(encoding="utf-8")
+    rsyncs = [l.strip() for l in kernel.splitlines()
+              if l.strip().startswith("rsync ")]
+    assert rsyncs, "内核里一条 rsync 都没有：搬运改了别的路，这条钉要跟着改"
+    assert 'for d in backend browser frontend; do' in kernel, "镜像范围不再是三棵平台目录"
+    assert any(l.startswith('rsync -a --delete "$PKG/$d/"') for l in rsyncs), "三棵平台目录不再是镜像同步"
+    assert any(l.startswith('rsync -a "$PKG"/') for l in rsyncs), "新增模式不再整体铺包（不带 --delete）"
+    for l in rsyncs:
+        assert not ("--delete" in l and "/apps" in l), f"apps/ 被带 --delete 镜像了：{l}"
+        assert "--delete" not in l or "$PKG/$d/" in l, f"多出一棵带 --delete 的目录：{l}"
 
 
 def test_readme_bash_blocks_keep_line_continuations(fake_repo):
     """回归：多行命令的行尾反斜杠必须活着进产物，且不得带尾随空白。
 
     这些文本写在 Python 字符串字面量里，而字面量中行尾的单个 `\\` 是**续行符**：它与后面的
-    换行一起被解释器吃掉，产物里的三行 rsync 会静默拼成一行。拼成一行恰好仍是合法 shell，
-    所以打包不报错、别的断言也全绿——只有人对着 README 逐条核对同步范围时才发现命令糊成
-    了一坨。带尾随空白的 `\\ ` 则相反，那是真的 shell 语法错误，一并守住。
+    换行一起被解释器吃掉，产物里的多行命令会静默拼成一行。拼成一行恰好仍是合法 shell，
+    所以打包不报错、别的断言也全绿——只有人对着 README 逐条核对时才发现问题。带尾随空白的
+    `\\ ` 则相反，那是真的 shell 语法错误，一并守住。
     """
     readme = (_build(fake_repo)["out"] / "README-deploy.md").read_text(encoding="utf-8")
     cmd = "\n".join(_bash_blocks(readme))
@@ -1118,10 +1296,12 @@ def test_readme_bash_blocks_keep_line_continuations(fake_repo):
     dangling = [ln for ln in cmd.splitlines() if re.search(r"\\\s+$", ln)]
     assert dangling == [], f"反斜杠后面还有空白，shell 会当成语法错误：{dangling}"
 
-    top = [ln for ln in cmd.splitlines() if "build-output/init.sql" in ln]
-    assert top, "顶层文件那条 rsync 整条不见了"
-    assert top[0].endswith("\\"), f"续行反斜杠被字符串字面量吃掉了：{top[0]}"
-    assert "build-output/README-deploy.md \\" in cmd, "第二行的续行同样丢了"
+    lines = cmd.splitlines()
+    cont = [n for n, ln in enumerate(lines) if ln.endswith("\\")]
+    assert cont, "bash 块里没有一行以反斜杠结尾——续行被字符串字面量吃掉了"
+    following = lines[cont[0] + 1]
+    assert following.lstrip().startswith("openresty/openresty:alpine"), \
+        f"续行的下一行不对（自签证书那条命令被拆错了）：{following}"
 
 
 def test_package_really_omits_server_side_artifacts(fake_repo):
@@ -1789,9 +1969,10 @@ def test_platform_compose_shares_gateway_routes_directory_with_backend(fake_repo
     """
     out = _build(fake_repo)["out"]
     backend = yaml.safe_load((out / "docker-compose.yml").read_text(encoding="utf-8"))["services"]["backend"]
-    routes_file = f"{ROOT}/gateway/routes/routes.json"
+    var = f"${{DEPLOY_ROOT:-{ROOT}}}"          # 部署根取自运行期 .env（ADR-0034），两侧同源
+    routes_file = f"{var}/gateway/routes/routes.json"
     assert backend["environment"]["ZEROCODE_GATEWAY_ROUTES"] == routes_file
-    assert f"{ROOT}/gateway/routes:{ROOT}/gateway/routes" in backend["volumes"]
+    assert f"{var}/gateway/routes:{var}/gateway/routes" in backend["volumes"]
     assert routes_file + ":" + routes_file not in backend["volumes"], "单文件挂载会被原子替换坑死"
     # 网关读的是 gateway/ 下的 ./routes —— 同一个宿主目录
     assert "./routes:/etc/nginx/routes:ro" in _gateway_service(out)["volumes"]
@@ -2140,3 +2321,79 @@ def test_requirements_declare_greenlet_for_the_async_engine():
     req = (bo.REPO_ROOT / "requirements.txt").read_text(encoding="utf-8")
     assert re.search(r"^sqlalchemy\[[^\]]*\basyncio\b[^\]]*\]", req, re.MULTILINE), (
         "requirements.txt 里的 sqlalchemy 必须带 [asyncio] extra，否则新装环境拿不到 greenlet")
+
+
+# ---------------------------------------------------------------- 部署根运行期取值（ADR-0034）
+
+PLACEHOLDER = "{{DEPLOY_ROOT}}"
+
+
+def test_compose_mounts_read_deploy_root_from_env(fake_repo):
+    """挂载两侧同路径不变，变的只是取值时机：两侧都由运行期 .env 的 DEPLOY_ROOT 插值。
+
+    ADR-0034 推翻的是「打包期烘死」，不是 ADR-0013 的同路径挂载——所以断言的形状是
+    「两侧字符串完全相同」而不是「两侧等于某个字面量」。打包默认值留在 `:-` 之后，
+    服务器上没填 DEPLOY_ROOT 时行为与改动前一致。
+    """
+    text = (_build(fake_repo)["out"] / "docker-compose.yml").read_text(encoding="utf-8")
+    var = f"${{DEPLOY_ROOT:-{ROOT}}}"
+    for sub in ("apps", "data", "store", "gateway/routes"):
+        assert f"- {var}/{sub}:{var}/{sub}" in text, f"{sub} 挂载两侧不同源或缺变量"
+    assert f"ZEROCODE_DATA_DIR: {var}/data" in text
+    assert f"ZEROCODE_GATEWAY_ROUTES: {var}/gateway/routes/routes.json" in text
+    assert f"{ROOT}/apps:{ROOT}/apps" not in text, "残留打包期字面量挂载"
+
+
+def test_backend_dockerfile_workdir_is_a_build_arg(fake_repo):
+    """WORKDIR 必须吃构建参数：它是 REPO_ROOT→apps 兜底的唯一来源，写死就等于换根必挂。"""
+    out = _build(fake_repo)["out"]
+    dockerfile = (out / "backend" / "Dockerfile").read_text(encoding="utf-8")
+    assert f"ARG DEPLOY_ROOT={ROOT}" in dockerfile
+    assert "WORKDIR ${DEPLOY_ROOT}" in dockerfile
+    assert f"WORKDIR {ROOT}" not in dockerfile, "WORKDIR 仍是打包期字面量"
+
+
+def test_compose_feeds_the_same_deploy_root_to_the_image_build(fake_repo):
+    """build.args 必须把同一个 DEPLOY_ROOT 喂进镜像：挂载与 WORKDIR 分家是全静默的故障。"""
+    compose = (_build(fake_repo)["out"] / "docker-compose.yml").read_text(encoding="utf-8")
+    assert "      args:" in compose
+    assert f"DEPLOY_ROOT: ${{DEPLOY_ROOT:-{ROOT}}}" in compose
+
+
+def test_deploy_root_becomes_the_default_in_every_rendered_place(fake_repo):
+    """--deploy-root 仍在，但语义降级成「默认值」：三处默认值同步跟着它变。"""
+    out = _build(fake_repo, deploy_root="/srv/zc")["out"]
+    compose = (out / "docker-compose.yml").read_text(encoding="utf-8")
+    dockerfile = (out / "backend" / "Dockerfile").read_text(encoding="utf-8")
+    assert "${DEPLOY_ROOT:-/srv/zc}" in compose
+    assert "ARG DEPLOY_ROOT=/srv/zc" in dockerfile
+
+
+def test_env_example_offers_deploy_root_again(fake_repo):
+    """`.env` 重新提供 DEPLOY_ROOT：旧注释「改它换不了部署根」随 ADR-0034 一起作废。"""
+    text = (_build(fake_repo)["out"] / ".env.example").read_text(encoding="utf-8")
+    assert re.search(rf"^DEPLOY_ROOT={ROOT}$", text, re.MULTILINE), ".env.example 缺 DEPLOY_ROOT 位"
+    assert "换不了部署根" not in text
+
+
+def test_init_sql_seed_carries_the_placeholder_not_a_real_root(fake_repo):
+    """预置应用的 root_path 在产物里必须是占位符——打包期不知道部署根最终是什么。"""
+    sql = (_build(fake_repo)["out"] / "init.sql").read_text(encoding="utf-8")
+    assert f"{PLACEHOLDER}/apps/demo1" in sql
+    assert f"{PLACEHOLDER}/apps/demo2" in sql
+    assert f"{ROOT}/apps/demo" not in sql, "种子段残留打包期真实路径"
+
+
+def test_apply_init_sh_renders_placeholder_without_touching_the_file(fake_repo):
+    """渲染只发生在进 psql 的管道上：包内 init.sql 必须与源逐字一致，否则下次升级没法比对。"""
+    text = (_build(fake_repo)["out"] / "apply-init.sh").read_text(encoding="utf-8")
+    assert PLACEHOLDER in text, "apply-init.sh 不认占位符，预置应用会带着 {{…}} 进库"
+    assert "psql" in text
+    assert "sed -i" not in text, "不许就地改写包内文件"
+
+
+def test_placeholder_survives_the_replay_safety_audits(fake_repo):
+    """占位符不得被合成期审计判成残留标记，也不得被幂等改写碰坏（种子段在审计之后追加）。"""
+    sql = (_build(fake_repo)["out"] / "init.sql").read_text(encoding="utf-8")
+    assert sql.count(f"{PLACEHOLDER}/apps/") == 2                 # 两个预置应用，一处一行
+    assert "INSERT INTO workspace (name, root_path)" in sql

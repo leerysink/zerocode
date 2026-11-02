@@ -250,6 +250,15 @@ build-output 里的单一 SQL 交付物：由 `changelog/V*.sql` 按日期顺序
 换部署根**不需要重打包**，但要重跑 `up -d --build`（镜像 `WORKDIR` 由 build arg 决定）。
 Windows 侧的部署根是 WSL2 发行版内部的 Linux 路径，不是 `D:\`——后者落在跨系统慢盘上。
 
+## 现场产物（server-local artifacts）
+
+部署根下**由部署之后的运行期产生、任何发布动作都不得覆盖或删除**的那组路径：`.env`、`apps/`
+（含服务器新建的应用与 `apps/<slug>/deploy/` 里的明文口令）、`data/`、`store/`、`gateway/certs/`、
+`gateway/routes/`、`gateway/.env`，以及 `pgdata` 卷。它们不在交付包里，因此「包比目标目录新」
+不等于「可以整目录镜像」——判定标准是**这个目录里有没有现场产生的东西**，而不是它像不像源码。
+升级部署的护栏就是这份名单本身；名单之外的 `backend/`、`browser/`、`frontend/` 三个纯源码目录
+才可以带 `--delete` 镜像。
+
 ## 同路径挂载（same-path mount）
 
 后端容器把 `<部署根>/apps`、`<部署根>/data`、`<部署根>/store` 三个目录**挂载到容器内的同一条

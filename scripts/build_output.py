@@ -34,6 +34,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # 又拖慢出包。要预置就显式点名：build-output.bat --slugs test1,sqlc002
 DEFAULT_SLUGS = ()
 DEFAULT_DEPLOY_ROOT = "/opt/zerocode"
+# init.sql 种子段里部署根的占位符：打包期不知道部署根最终是什么（ADR-0034），
+# 由 apply-init.sh 在执行前按 .env 的 DEPLOY_ROOT 渲染。两侧字面量在 tests 里各自钉死。
+DEPLOY_ROOT_PLACEHOLDER = "{{DEPLOY_ROOT}}"
 DEFAULT_OUT_NAME = "build-output"
 
 # 网关域名的默认值必须与 app/deploy/nics.py 里 os.environ.get 的回退值、以及
@@ -697,9 +700,11 @@ def _q(value: str) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
-def preset_seed_sql(presets, deploy_root: str) -> str:
-    """预置应用的元数据种子段：workspace + app_project，root_path 重写为部署根下的路径。
+def preset_seed_sql(presets) -> str:
+    """预置应用的元数据种子段：workspace + app_project，root_path 写成部署根占位符。
 
+    - `root_path` 是 `{{DEPLOY_ROOT}}/apps/<slug>` 而非打包期那个真实路径（ADR-0034）：部署根
+      现在由部署现场输入，打包期写死会让换目录后的预置应用集体失联。渲染归 apply-init.sh。
     - `owner_user_id` 刻意不写（留 NULL）：服务器上第一个注册的账号按 register 的创始人事务
       自动承接这些行，所以演示账号不需要进 SQL（ADR-0014）。
     - 每个应用包在一个 DO 块里，以 slug 是否已存在为总闸：已存在就整段跳过，不会留下
@@ -716,7 +721,7 @@ def preset_seed_sql(presets, deploy_root: str) -> str:
              "-- owner_user_id 留 NULL：首个注册账号按创始人事务自动承接（ADR-0014）",
              "-- 重放安全：以 slug 存在性为总闸，已存在则整段跳过"]
     for p in presets:
-        root_path = f"{deploy_root}/apps/{p.slug}"
+        root_path = f"{DEPLOY_ROOT_PLACEHOLDER}/apps/{p.slug}"
         parts.append(f"""DO $zcpreset$
 DECLARE
     wsid BIGINT;
@@ -754,7 +759,9 @@ def synth_init_sql(changelog_dir: Path, presets, deploy_root: str,
         sources += " + 预置应用种子段"
     header = f"""-- init.sql —— zerocode 平台库全量初始化脚本（生成物，勿手改）
 -- 合成自：{sources}
--- 生成时间：{stamp}    部署根：{deploy_root}    预置应用：{slugs}
+-- 生成时间：{stamp}    预置应用：{slugs}
+-- 部署根：本文件里的 root_path 写成 {DEPLOY_ROOT_PLACEHOLDER} 占位符，由 apply-init.sh 按
+--         .env 的 DEPLOY_ROOT 在执行前渲染（ADR-0034）；打包默认值是 {deploy_root}。
 -- 重放语义：只补不覆盖（结构段幂等 DDL；数据段一律 ON CONFLICT DO NOTHING 或存在性门，
 --           服务器既有数据永不被洗）。为达此语义，合成时对 changelog 原文做了四处等价改写：
 --           1) 给 CREATE TABLE/INDEX/SEQUENCE/EXTENSION 与 ADD COLUMN 补 IF NOT EXISTS
@@ -763,9 +770,8 @@ def synth_init_sql(changelog_dir: Path, presets, deploy_root: str,
 --           4) 会覆盖服务器既有值的裸 UPDATE 按处置表改写（仅当仍是旧默认值时才生效）
 --           四处均只存在于本生成物，changelog/ 原文不动（它是增量轨的历史，且
 --           app/db.py 的语句切分器不认 $$）。无法自动幂等化的语句会在打包期直接拒包。
--- 执行方式：只能用 psql（本文件含 DO $$ 块）；**禁止**放进 changelog/——
---           app/db.py 的语句切分器不认 $$，会把后端启动迁移拖挂。
---   docker compose exec -T pg psql -U "$POSTGRES_USER" -d zerocode -v ON_ERROR_STOP=1 < init.sql
+-- 执行方式：只能 `bash apply-init.sh`（本文件含 DO $$ 块，且占位符要在那里渲染）；
+--           **禁止**放进 changelog/——app/db.py 的语句切分器不认 $$，会把后端启动迁移拖挂。
 """
 
     problems: list[str] = []
@@ -820,7 +826,7 @@ def synth_init_sql(changelog_dir: Path, presets, deploy_root: str,
                 "  常见原因：该句在 changelog 里的写法与处置表登记的形状已不一致"
                 "（行内注释、缺结尾分号、引号风格等）。请重新评审并更新 _UPDATE_DISPOSITIONS。")
 
-    seed = preset_seed_sql(presets, deploy_root)
+    seed = preset_seed_sql(presets)
     if seed:
         merged += "\n" + seed
     merged += (f"\n-- 合成完成：结构段 {len(files)} 个来源文件，幂等守卫补齐 {idem} 处，"
@@ -834,10 +840,10 @@ def synth_init_sql(changelog_dir: Path, presets, deploy_root: str,
 def _compose_override(key: str, value: str) -> str:
     """compose 的 environment 行形态：`${VAR:-打包值}`——打包值只是默认，不是终值。
 
-    与部署根相反的处置是刻意的，两边都得钉住（tests 里有同名用例）：部署根被 compose 挂载、
-    镜像 WORKDIR、init.sql 的 root_path 三处同源共用，运行期改它会让他们对不上且全程不报错，
-    所以钉死；域名与镜像源相反——它们是单点值，而 README §4 承诺后续发布不覆盖服务器上的
-    `.env`，只有落在那里才活得过下一次发布。写成裸值就等于在服务器上永远改不动它。
+    部署根（见 compose_yaml）与域名/镜像源用的是同一种形态，但改生效的**动作**不同：
+    域名与镜像源是单点值，改完 `up -d` 就生效；部署根还喂着镜像的 `WORKDIR`，改完必须
+    `up -d --build` 才不会让挂载点与容器内路径分家（ADR-0034）。两者都落在 `.env` 里，
+    因为 README §4 承诺后续发布不覆盖服务器上的 `.env`——写成裸值就等于永远改不动它。
     """
     return f"{key}: ${{{key}:-{value}}}"
 
@@ -972,12 +978,14 @@ def compose_yaml(deploy_root: str, gateway_domain: str = DEFAULT_GATEWAY_DOMAIN,
       `<部署根>/gateway/routes` 同路径挂进 backend，并让 `ZEROCODE_GATEWAY_ROUTES` 指过去。
       挂目录而不是单个文件：后端用 `.tmp + os.replace` 原子替换 routes.json，单文件 bind mount
       在替换后仍钉着旧 inode，网关会一直读到第一次的内容。
-    - 挂载路径**烘死**、不走 `${DEPLOY_ROOT:-…}` 运行期覆盖：WORKDIR 是构建期定下来的，
-      运行期改 .env 只会让挂载点与 REPO_ROOT 分家（新建应用落进容器可写层，宿主 daemon
-      找不到路径），而且全程不报错。换部署根的唯一正确做法是重跑打包。
+    - 部署根走 `${DEPLOY_ROOT:-打包值}` 运行期插值（ADR-0034）：挂载两侧是同一个变量，
+      镜像 `WORKDIR` 由同名 build arg 决定，两者都取自同一份 `.env`——所以运行期改它不再会让
+      挂载点与 REPO_ROOT 分家。代价是**换根必须重跑 `up -d --build`**（WORKDIR 是构建期的），
+      只 `up -d` 会让镜像停在旧根，症状仍是「新建应用落进容器可写层」。
     - 前端 dist 由后端直接托管（app/main.py 的 SPA 挂载），不再起 nginx 容器。
     - backend 的 environment 段尾部追加 `ZEROCODE_*` 运行期覆盖位（见 _backend_overlay_env）。
     """
+    dr = f"${{DEPLOY_ROOT:-{deploy_root}}}"
     extra_env = _backend_overlay_env(gateway_domain, mirrors)
     browser_apt = mirrors.apt or ""
     browser_pypi = mirrors.pypi or ""
@@ -1009,6 +1017,10 @@ services:
     build:
       context: .                      # 上下文取整包，Dockerfile 才能同时 COPY backend/ 与 frontend/dist
       dockerfile: backend/Dockerfile
+      args:
+        # WORKDIR 与下面的挂载点同源（都取 .env 的 DEPLOY_ROOT，ADR-0034）。换部署根必须重跑
+        # `up -d --build`——只 up -d 不重建，镜像的 WORKDIR 还停在旧根，新建应用会落进可写层。
+        DEPLOY_ROOT: {dr}
     image: zerocode-platform:demo
     container_name: zerocode-backend
     restart: unless-stopped
@@ -1020,23 +1032,23 @@ services:
     environment:
       # 平台库连接账号需具备建库建角色权限（要供给应用分库）；镜像默认用户即超级用户
       ZEROCODE_DATABASE_URL: postgresql+asyncpg://${{POSTGRES_USER:-zerocode}}:${{POSTGRES_PASSWORD}}@zerocode-pg16:5432/zerocode
-      ZEROCODE_DATA_DIR: {deploy_root}/data
+      ZEROCODE_DATA_DIR: {dr}/data
       ZEROCODE_LOG_LEVEL: INFO
       # 网关路由表：与 gateway 容器共用的宿主目录（见上）。app/deploy/gateway_routes.py
       # 往这里写 {{slug: prod_port}}，网关只读它；写不进去时业务照常，只是域名访问 404。
-      ZEROCODE_GATEWAY_ROUTES: {deploy_root}/gateway/routes/routes.json
+      ZEROCODE_GATEWAY_ROUTES: {dr}/gateway/routes/routes.json
 {extra_env}
     ports:
       - "${{PLATFORM_PORT:-8100}}:8100"      # 控制台：http://<服务器IP>:8100
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock   # 平台要在宿主起应用 dev/prod 栈
-      # 下面四个挂载点与镜像的 WORKDIR 逐字相同（ADR-0013）。刻意不写成 ${{DEPLOY_ROOT:-…}}：
-      # WORKDIR 是构建期烘死的，运行期改 .env 只会把两者弄得不一致，且没有任何报错。
-      - {deploy_root}/apps:{deploy_root}/apps
-      - {deploy_root}/data:{deploy_root}/data
-      - {deploy_root}/store:{deploy_root}/store
+      # 下面四个挂载点与镜像的 WORKDIR 逐字相同（ADR-0013），两侧同一个变量、同一次插值
+      # （ADR-0034）：换部署根改 .env 即可，但要配 `up -d --build` 让 WORKDIR 跟上。
+      - {dr}/apps:{dr}/apps
+      - {dr}/data:{dr}/data
+      - {dr}/store:{dr}/store
       # 挂目录不是挂文件：routes.json 由后端原子替换，单文件 bind mount 会钉在旧 inode 上
-      - {deploy_root}/gateway/routes:{deploy_root}/gateway/routes
+      - {dr}/gateway/routes:{dr}/gateway/routes
     # 应用栈把 dev/prod 端口发布在宿主上，平台容器要探得到它们（网关用同一条 host-gateway）。
     # 没有这行的时候 host.docker.internal 在 Linux 上根本不解析，探针只能连不到任何地址。
     extra_hosts:
@@ -1093,8 +1105,11 @@ def backend_dockerfile(deploy_root: str, mirrors: Mirrors = DEFAULT_MIRRORS) -> 
 
     WORKDIR 必须等于部署根：settings.py 的 REPO_ROOT 由本文件自身位置推出，在镜像里就是
     WORKDIR，于是 `deploy.apps_root` 留空时的兜底恰好就是同路径挂载点，新建应用直接落到
-    共享目录里。写死 /opt/zerocode 而部署根是别的值时，兜底会指向容器可写层里一个宿主
-    根本不存在的路径，新建的应用看起来成功了、起预览时却必挂。
+    共享目录里。写死而部署根是别的值时，兜底会指向容器可写层里一个宿主根本不存在的路径，
+    新建的应用看起来成功了、起预览时却必挂。
+
+    部署根经 `ARG DEPLOY_ROOT` 传入（ADR-0034）：默认值是打包时那个，compose 的 build.args
+    又把运行期 `.env` 里的同一个变量喂进来，于是挂载与 WORKDIR 只有一个取值来源。
 
     `mirrors` 只影响两处构建期换源（Debian 源 + docker CE 仓库地址）与 pip 的 index-url；
     三个都不传时本文件与加这个功能之前**逐字一致**。apt 不进 compose 的容器 env：
@@ -1123,8 +1138,10 @@ RUN apt-get update \\
  && apt-get install -y --no-install-recommends docker-ce-cli docker-compose-plugin docker-buildx-plugin \\
  && rm -rf /var/lib/apt/lists/*
 
-# 与 compose 的同路径挂载点逐字相同；换部署根请重跑打包（它是构建期烘死的）
-WORKDIR {deploy_root}
+# 部署根由 compose 的 build.args 传入（ADR-0034）；默认值是打包时烘的那个，
+# 与 compose 的同路径挂载取自同一个变量，两边不会分家。换根后要重跑 `up -d --build`。
+ARG DEPLOY_ROOT={deploy_root}
+WORKDIR ${{DEPLOY_ROOT}}
 
 {pip_block}COPY backend/requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
@@ -1163,18 +1180,20 @@ README-deploy.md
 def env_example(deploy_root: str, gateway_domain: str = DEFAULT_GATEWAY_DOMAIN,
                 mirrors: Mirrors = DEFAULT_MIRRORS,
                 playwright_download_host: str = PLAYWRIGHT_DOWNLOAD_HOST_BAKED) -> str:
-    """`.env` 模板：口令位、端口位，以及打包值可覆盖的 `ZEROCODE_*` 运行期位。
+    """`.env` 模板：部署根、口令位、端口位，以及打包值可覆盖的 `ZEROCODE_*` 运行期位。
 
-    刻意**不**给 DEPLOY_ROOT（见正文注释）：改它换不了部署根，只会让挂载点与 WORKDIR 分家。
+    `DEPLOY_ROOT` 是运行期输入项（ADR-0034）：compose 挂载与镜像 WORKDIR 都读它，所以改这里
+    真的能换目录——前提是跟着重跑一次 `up -d --build`。打包时的值只是这里的默认值。
     """
     overlay = _env_example_overlay(gateway_domain, mirrors, playwright_download_host)
     return f"""# 复制成 .env 后按需修改（docker compose 会自动读取同目录 .env）
 #   cp .env.example .env
 
-# 本包的部署根已在打包时烘死为：{deploy_root}
-# compose 的挂载路径、镜像的 WORKDIR、init.sql 里预置应用的 root_path 三处都由它算出，
-# 所以这里刻意**不提供** DEPLOY_ROOT 变量：改 .env 换不了部署根，只会让三者对不上。
-# 要换目录请在开发机上重跑打包：build-output.bat --deploy-root /新的/绝对路径
+# 部署根：本目录实际所在的绝对路径，同时是容器内路径（同路径挂载，ADR-0013）。
+# 打包时烘进去的默认值是 {deploy_root}；改它就能换目录，但**必须重跑 `up -d --build`**
+# ——镜像的 WORKDIR 是构建期取的，只 up -d 会让它停在旧根，症状是新建应用落进容器可写层。
+# Windows 上走 WSL 部署时，这里填的是 WSL 发行版内部的 Linux 路径，不要填 D:\\（跨系统慢盘）。
+DEPLOY_ROOT={deploy_root}
 
 # 平台库口令。POSTGRES_USER 必须是超级用户——平台要建库建角色来供给各应用的分库。
 # 口令请只用字母、数字与 - _ ：它会被原样拼进 asyncpg 连接串
@@ -1189,22 +1208,38 @@ PG_PORT=5433
 {overlay}"""
 
 
-def apply_init_sh() -> str:
-    """init.sql 执行脚本：LF 行尾（bash 不认 CRLF），ON_ERROR_STOP=1 让失败当场可见。"""
-    return """#!/usr/bin/env bash
+def apply_init_sh(deploy_root: str = DEFAULT_DEPLOY_ROOT) -> str:
+    """init.sql 执行脚本：LF 行尾（bash 不认 CRLF），ON_ERROR_STOP=1 让失败当场可见。
+
+    它在把 SQL 送进 psql 之前渲染 `{{DEPLOY_ROOT}}` 占位符（ADR-0034），且**只在管道里渲染**——
+    包内的 init.sql 必须与源逐字一致，否则下次升级时「包 vs 现场」的差异比对就失去意义。
+    """
+    token = DEPLOY_ROOT_PLACEHOLDER
+    return f"""#!/usr/bin/env bash
 # 执行全量 init.sql（可重复执行：只补不覆盖）。用法：bash apply-init.sh
 set -euo pipefail
 cd "$(dirname "$0")"
 
-: "${POSTGRES_USER:=zerocode}"
+: "${{POSTGRES_USER:=zerocode}}"
+# 打包时的那个根只作为兜底；真正生效的是部署根 .env 里的 DEPLOY_ROOT（ADR-0034）。
+DEPLOY_ROOT="{deploy_root}"
 if [ -f .env ]; then
-  # 只取 POSTGRES_USER，不 source 整个 .env（避免把口令带进本进程环境）
-  POSTGRES_USER="$(grep -E '^POSTGRES_USER=' .env | tail -n1 | cut -d= -f2- || echo zerocode)"
+  # 只取需要的两个键，绝不 source 整个 .env（那会把明文口令带进本进程环境）
+  POSTGRES_USER="$(grep -E '^POSTGRES_USER=' .env | tail -n1 | cut -d= -f2- | tr -d '\\r' || echo zerocode)"
+  DR="$(grep -E '^DEPLOY_ROOT=' .env | tail -n1 | cut -d= -f2- | tr -d '\\r' || true)"
+  [ -n "$DR" ] && DEPLOY_ROOT="$DR"
 fi
+DEPLOY_ROOT="${{DEPLOY_ROOT%/}}"
+case "$DEPLOY_ROOT" in
+  /*) ;;
+  *) printf '✗ DEPLOY_ROOT 必须是 Linux 绝对路径（收到 %s）：它是 init.sql 里 root_path 的唯一来源\\n' "$DEPLOY_ROOT" >&2; exit 1 ;;
+esac
 
-echo "→ 对 zerocode 库执行 init.sql（用户 ${POSTGRES_USER}）"
-docker compose exec -T pg psql -U "${POSTGRES_USER}" -d zerocode -v ON_ERROR_STOP=1 < init.sql
-echo "✓ init.sql 执行完成"
+printf '→ 对 zerocode 库执行 init.sql（用户 %s，部署根 %s）\\n' "$POSTGRES_USER" "$DEPLOY_ROOT"
+# 占位符只在这条管道里渲染，不回写包内文件。sed 用 | 作分隔符：路径里不会出现竖线，斜杠则到处都是。
+sed "s|{token}|$DEPLOY_ROOT|g" init.sql \\
+  | docker compose exec -T pg psql -U "${{POSTGRES_USER}}" -d zerocode -v ON_ERROR_STOP=1
+printf '✓ init.sql 执行完成\\n'
 """
 
 
@@ -1224,73 +1259,116 @@ def readme_md(presets, deploy_root: str, generated_at: str, dist_stamp: str,
         for p in presets) or "# （本次未预置应用，跳过这一步）"
     return f"""# zerocode 演示部署包
 
-生成时间：{generated_at}　前端 dist 构建时间：{dist_stamp}　部署根：`{deploy_root}`
+生成时间：{generated_at}　前端 dist 构建时间：{dist_stamp}
+打包时的建议部署根：`{deploy_root}`（真正的部署根在第 1 问里输入，见 §1）
 预置应用：{slug_list}　网关域名：`{gateway_domain}`
 
 > 本目录整体是**生成物**（由仓库根的 `build-output.bat` 产出），不要手改其中任何文件——
 > 下次打包会整目录重建。要改就改仓库里的 `changelog/`、`app/`、`frontend/`、`gateway/`、
-> `scripts/deploy.sh`（服务器端部署脚本的源，包里的只是拷贝）或打包脚本。
+> `scripts/deploy.sh`（交互内核）、`scripts/deploy_lib.sh`（被内核 source 的判定层，桩测全打在它身上）、
+> `scripts/deploy.ps1`（Windows 侧的 WSL2 皮），或者改打包脚本——包里的这三份只是拷贝。
 > `gateway/certs/`（TLS 私钥）与 `gateway/routes/routes.json`（运行期路由）是
 > 服务器现场产物，不在包内。
 
 ## 1. 前置条件
 
-- Linux 服务器 + Docker 24+（含 `docker compose` v2 插件）
+- **一台 Linux 机器**，或一台能跑 WSL2 的 Windows 机器（走 §2 的 `deploy.ps1`：它把包推进发行版，
+  再调同一份 `deploy.sh`，部署判定一条都不留在 PowerShell 里，ADR-0035）。
+- **Docker 不用预先装好**：`deploy.sh` 第 2 步「环境保障」缺什么装什么——Docker Engine、
+  `docker compose` v2 插件、把 daemon 拉起来、（境内机）可选的 registry 镜像加速、把当前用户
+  加进 `docker` 组，连 `rsync` 缺了也一并装。它**不装 Docker Desktop**（ADR-0035：它的 license
+  与「`docker` CLI 指向谁」都会跟这条路打架）。
+- **脚本不认任何命令行参数**（D-11）：`--check`、`--no-build`、`--gateway`、`--takeover`、
+  `--fresh-db` 全部改成了屏幕上的问题，敲进去会被当场拒收并逐条说明现在去哪儿答。代价是
+  三台机器要答三遍题——`.deploy-answers` 只让后两遍变成一路回车，那是默认值复用，不是无人值守。
+- **部署根在部署时输入**（ADR-0034）：上面那行 `{deploy_root}` 只是打包时的建议默认值，
+  第 1 问就能改成别的路径。compose 的同路径挂载、`.env` 的 `DEPLOY_ROOT`、init.sql 里预置应用的
+  `root_path` 三处跟着这一次输入走（种子段带的是 `{{DEPLOY_ROOT}}` 占位符，起栈前才换成真值）。
+  换根的代价不是重打包，而是**重建镜像**（镜像 `WORKDIR` 变了）——脚本自己判定并强制 `--build`；
+  这台机器上已经跑过应用时，还要人工核对新根 `apps/` 里既有工程的位置与库里的 `root_path`
+  一致（ADR-0013）。
 - 服务器能访问 Docker Hub 与 **PyPI**：平台与应用栈的基础镜像（`pgvector/pgvector:pg16`、
   `python:3.12-slim`、`node:20-alpine`、`maven`、`openresty` 等）**在服务器上在线拉取**，
   本包不含镜像 tar；`docker compose build` 还要在镜像里跑 `pip install -r requirements.txt`。
-  网络受限时先配镜像源再打包（`build-output.bat --apt-mirror mirrors.aliyun.com`
+  网络受限时可以在打包时就配好镜像源（`build-output.bat --apt-mirror mirrors.aliyun.com`
   `--pypi-mirror https://mirrors.aliyun.com/pypi/simple`
-  `--npm-registry https://registry.npmmirror.com`，三个可只给其一、默认全不给；
-  docker-ce 仓库走镜像站的 `/docker-ce/linux/debian` 约定路径），否则首次 build
-  会卡在拉依赖。浏览器 sidecar 镜像还要在构建期下载 Chromium（约数百 MB），默认走
-  npmmirror；服务器访问不了时用 `--playwright-download-host` 或 `PLAYWRIGHT_DOWNLOAD_HOST`
-  环境变量指到可达的地址（apt / pip 换源沿用上面两个参数）。
-- 本目录必须放在 `{deploy_root}`。这个路径在打包时已烘死到三处（compose 的同路径挂载、
-  镜像的 `WORKDIR`、init.sql 里预置应用的 `root_path`），`.env` 里改不了它；要换目录请重跑
-  打包（`build-output.bat --deploy-root /新的路径`）。路径不一致会导致预置应用失联、新建应用
-  落进容器可写层（见 ADR-0013）。
+  `--npm-registry https://registry.npmmirror.com`，三个可只给其一、默认全不给；docker-ce 仓库
+  走镜像站的 `/docker-ce/linux/debian` 约定路径），那只是**默认值**：pypi 与 npm 两个源在 `deploy.sh`
+  第 4 步还能现场改，改一次 `.env` 就同时管住平台自己与它起出来的每个应用栈；apt 那一项只作用于
+  浏览器 sidecar 镜像的**构建期**（compose 里 `browser` 服务的 `build.args`），改了必须重建那个镜像
+  才看得见（`docker compose build browser && docker compose up -d browser`）。第 7 步的预热 `docker pull`
+  只保平台基础镜像，应用构建期的 pip/npm 依赖是另一条通道。浏览器 sidecar 镜像还要在构建期下载
+  Chromium（约数百 MB），默认走 npmmirror；服务器访问不了时用 `--playwright-download-host`
+  或 `PLAYWRIGHT_DOWNLOAD_HOST` 环境变量指到可达的地址。
 - 网关要用真域名访问时，DNS 里必须有 `*.<域名>`（以及裸域名）的 A/AAAA 记录指向这台服务器，
   且宿主 **80/443 空闲**——中央网关占用它们（ADR-0018）。只用 `http://<IP>:8100` 直连控制台
-  时，网关可以先不起。
+  时，网关可以先不起（第 4 步回答 n 即可，Windows 侧的建议默认值就是 n）。
 - 平台库账号需具备建库建角色权限（镜像默认的 `zerocode` 就是超级用户）。
 - 口令请只用字母、数字与 `- _`：它会被原样拼进 asyncpg 连接串，含 `@ : / # % & ?` 会把它截断。
-- TLS 证书**不在包里**（私钥绝不进包）：启动网关前要按 §2 把 `gateway.crt` / `gateway.key`
-  放到 `gateway/certs/`。生产用 acme.sh 签泛域名；内网演示可用包内的 `make-cert.sh` 自签。
+- TLS 证书**不在包里**（私钥绝不进包）：选了起网关，第 9 步缺证书会用包内 `make-cert.sh` 自签；
+  生产请换成 acme.sh 签的泛域名真证书（§2 末尾「网关」小节）。
 
-## 2. 首次部署
+## 2. 首次部署：一条命令
 
 ```bash
-cd {deploy_root}
-cp .env.example .env          # 改掉 POSTGRES_PASSWORD
-mkdir -p apps data store      # 同路径挂载点（compose 也会自动建，先建可避免属主是 root）
-docker compose up -d --build  # 起 pg + backend + browser（首次要 build 平台与浏览器镜像）
-docker compose ps             # 等 pg healthy、backend running
-bash apply-init.sh            # 执行全量 init.sql（结构 + 默认配置 + 预置应用行）
+# 把整个包传到目标机器（放哪儿都行，deploy.sh 以「当前目录就是包目录」为前提）
+cd <包所在目录>
+bash deploy.sh          # 要 root：机器上有 sudo 会自己提权，没有就 su - 再跑
 ```
 
-打开控制台：`http://<服务器IP>:8100`
+Windows 上做同一件事（不需要预先装 Docker，也不需要预先有发行版）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\\deploy.ps1
+```
+
+皮只负责把环境弄成能跑 Linux 的样子：保证 WSL2 可用、要一个 v2 发行版（v1 没有 systemd，
+docker daemon 起不来）、保证发行版 `/etc/wsl.conf` 里 `[boot] systemd=true`、把包推进发行版，
+然后调用同一份 `deploy.sh`。要重启 Windows 功能或 `wsl --shutdown` 才能生效时，它**只给指令、
+不代劳**（D-10：不自动重启你的机器）。
+
+`deploy.sh` 一共九步，问题按这个顺序问，每步都先把要动什么说出来再动：
+
+| 步 | 问什么 | 你该知道什么 |
+|---|---|---|
+| 1 新增/升级 | 这次是新增还是升级；部署根（Linux 绝对路径） | 不做自动探测（D-05），误选也不拦（D-07）；唯一后路是写 `.env` 前静默备份 `.env.bak-<UTC>`，只留最近 5 份 |
+| 2 环境保障 | 装 Docker Engine + compose v2（境内机再问要不要 registry 镜像加速）、要不要把你加进 `docker` 组 | 每条安装命令都先原样打印再执行；组变更要**重新登录**才生效（本次部署已以 root 在跑，不受影响） |
+| 3 腾地方 | 新增模式下机器上已有 `pgdata` 卷：要连库一起重做吗 | 要删得逐字输入 `yes`（老 `--fresh-db` 的去处）。升级模式不问、也永不删卷 |
+| 4 运行参数 | `POSTGRES_USER`、`POSTGRES_PASSWORD`、`PLATFORM_PORT`、`PG_PORT`、`ZEROCODE_PREVIEW_HOST`、PyPI / npm / apt 三个镜像源、要不要起中央网关（答「起」才接着问网关域名与 `ZEROCODE_SSL_ENABLE`） | 口令**只进 `.env`**，不进 `.deploy-answers`；升级时直接回车就沿用 `.env` 里的既有值。`ZEROCODE_PREVIEW_HOST` 的打包默认值是 `localhost`（本机演示用的），脚本发现它没被改就换成探测到的宿主 IP |
+| 5 宿主端口 | 控制台端口（起网关时还有 80/443）被占了怎么办 | 占用者是**容器**才问「stop 它腾地方？」（只 stop 不删，`docker start <名字>` 可恢复）；是**宿主进程**就报 PID 让你自己确认再 kill。脚本不代劳 kill，也不劝你改 `PLATFORM_PORT` 买单 |
+| 6 落盘 | 不问：合并 `.env`、铺包或按升级合并、把答案写进 `.deploy-answers` | 升级模式只镜像 `backend/`、`browser/`、`frontend/` 三棵，八项现场产物一个不碰（§4） |
+| 7 起平台栈 | 不问 | 先核 compose 里声明了 `browser` 服务，再预热 `docker pull` 基础镜像——拉不动就当场停，不等 build 卡二十分钟；`DEPLOY_ROOT` 变了自动带 `--build` |
+| 8 重放与自检 | 不问：`bash apply-init.sh`，然后从后端容器实探探针与 sidecar | `compose 里有 browser 服务` 不等于 `Chromium 起得来`，自检探的是 `$ZEROCODE_BROWSER_URL/healthz` |
+| 9 中央网关 | 升级时问「要按新的 `gateway/docker-compose.yml` 重建吗」 | 缺证书就自签（生产换 acme.sh）；`gateway/certs/`、`gateway/routes/`、`gateway/.env` 是现场产物，不覆盖也不删 |
+
+`.env` 由脚本从包里的 `.env.example` 起步生成、再合并本次答案，既有键与注释一律保留——**不要**
+手工 `cp .env.example .env`，那等于把服务器现场填的配置顶掉（第 3 步的删库闸门也救不了你，
+因为 pgdata 卷里的口令不会跟着 `.env` 改）。
+
+跑完最后打印控制台地址、预览地址基座、本次部署根与应答文件位置。打开控制台：
+`http://<服务器IP>:<PLATFORM_PORT>`（默认 8100）。
 
 浏览器 sidecar 是 Agent 的 `preview_page` 工具的执行环境：它**不发布宿主端口**，只有
 compose 网络里的 backend 能访问（`ZEROCODE_BROWSER_URL`，打包默认 `http://browser:8101`）；
 它再经 `host-gateway` 访问宿主上发布的应用 dev 端口（`ZEROCODE_BROWSER_TARGET_HOST`，
 默认 `host.docker.internal`；这个 host 必须同时在 sidecar 的 `BROWSER_ALLOWED_HOSTS` 白名单里）。
 sidecar 未启动或崩溃时，`preview_page` 会返回「浏览器检查服务不可用」，
-预览的启动/日志/重启不受影响。截图落在 `{deploy_root}/data/browser_shots/`（运行期数据，
-不在包里，也不要被发布命令的 `--delete` 扫掉）。
+预览的启动/日志/重启不受影响。截图落在 `<部署根>/data/browser_shots/`（运行期数据，
+不在包里，也不要被同步命令的 `--delete` 扫掉）。
 
 ### 网关（通配域名 HTTPS）
 
-本包在 `gateway/` 下带一个**独立的 OpenResty compose 项目**：终止 TLS，并按
-`https://<slug>.<域名>` 反代到应用的 prod 宿主端口。它不在上面那条 `docker compose up` 的
-范围内，要单独起。
+包的 `gateway/` 下是一个**独立的 OpenResty compose 项目**：终止 TLS，并按
+`https://<slug>.<域名>` 反代到应用的 prod 宿主端口。第 4 步回答「起」就会把它带上，
+下面是它单独成立时的手工路径（以及换证书时的操作）。
 
 先签证书，输出必须是 `gateway/certs/gateway.crt` 与 `gateway/certs/gateway.key`（文件名与
 域名无关，换域名/换 CA 都不用改 nginx 配置）：
 
 - **生产（推荐）**：用 acme.sh 走 DNS-01 签泛域名，再用 `--install-cert` 写到上面这对文件名。
   通配证书要同时申请 `-d '<域名>' -d '*.<域名>'`，DNS 里也要有对应的 `*` 解析。
-- **内网/本机自签**：用包内的脚本（在 openresty 镜像里跑 openssl；自签 CA 需要客户端手动信任）：
+- **内网/本机自签**：第 9 步缺证书时脚本就跑的这条命令（在 openresty 镜像里跑 openssl；
+  自签 CA 需要客户端手动信任）：
   ```bash
   docker run --rm -v "$PWD/gateway/certs:/out" -v "$PWD/gateway/make-cert.sh:/mk.sh" \\
     openresty/openresty:alpine sh -c "tr -d '\\r' < /mk.sh > /tmp/mk.sh; sh /tmp/mk.sh '{gateway_domain}'"
@@ -1300,6 +1378,7 @@ sidecar 未启动或崩溃时，`preview_page` 会返回「浏览器检查服务
 证书就位后启动网关：
 
 ```bash
+cd <部署根>
 docker compose -f gateway/docker-compose.yml up -d
 docker compose -f gateway/docker-compose.yml ps
 ```
@@ -1325,17 +1404,18 @@ docker compose -f gateway/docker-compose.yml ps
 是「控制台显示的地址看着正常、点进去全 404」（ADR-0016），日志里没有一行指向真因。
 
 路由表是平台写给网关的唯一契约：后端把 `status_prod=='running'` 的应用投影成
-`{{slug: prod_port}}` 写进 `{deploy_root}/gateway/routes/routes.json`。平台 compose 已把该目录
+`{{slug: prod_port}}` 写进 `<部署根>/gateway/routes/routes.json`。平台 compose 已把该目录
 同路径挂进 backend（`ZEROCODE_GATEWAY_ROUTES` 指向文件），网关以只读方式挂同一个宿主目录，
 所以发布/停机后路由自动生效，不需要重启网关。包里的初值是空对象 `{{}}`。
 
 网关或证书没就位之前，控制台里应用地址看着正常、点进去全 404。
 
 域名暂时不能对外提供时（例如境内服务器上域名还没备案、443 的 TLS 握手被中间设备重置），
-**不必拆网关**：把部署根 `.env` 的 `ZEROCODE_SSL_ENABLE` 设成 `false` 再 `docker compose up -d`，
-控制台、发布记录与应用 README 里的地址就改成 `http://<ZEROCODE_PREVIEW_HOST>:<prod 端口>`
-直连（宿主防火墙要放行应用端口段，默认 8210-8399）。它只改地址投影，网关照常跑；
-备案或证书就绪后改回 `true` 即恢复域名地址。dev 预览地址本来就是 IP 直连，不受这个开关影响。
+**不必拆网关**：把部署根 `.env` 的 `ZEROCODE_SSL_ENABLE` 设成 `false` 再 `docker compose up -d`
+（第 4 步也会问这一项），控制台、发布记录与应用 README 里的地址就改成
+`http://<ZEROCODE_PREVIEW_HOST>:<prod 端口>`直连（宿主防火墙要放行应用端口段，默认 8210-8399）。
+它只改地址投影，网关照常跑；备案或证书就绪后改回 `true` 即恢复域名地址。
+dev 预览地址本来就是 IP 直连，不受这个开关影响。
 
 **第一个注册的账号自动成为创始人**，并接管所有预置应用（它们的 `owner_user_id` 在 init.sql 里
 刻意留 NULL）。演示就注册 `tsadmin` / `tsadmin`。
@@ -1355,80 +1435,65 @@ docker compose -f gateway/docker-compose.yml ps
 
 ## 4. 以后每次发布
 
-在开发机上重跑打包，再**分目录**上传、重建、重放 init.sql。
-
-传输落点：包内容必须直接落在 `{deploy_root}` 本身（compose 的同路径挂载、镜像
-`WORKDIR`、init.sql 的 `root_path` 三处都依赖这个约定）。`build-output/*` 的 `*`
-**不匹配点开头的文件**——`scp -r build-output/*` 会静默漏掉 `.env.example` 与
-`.dockerignore`，首次部署就会缺文件。稳妥写法是 `build-output/.`（或
-`rsync -a build-output/ {{deploy_root}}/`，末尾斜杠成对）：
+开发机重跑打包，把新的 `build-output/` 传到部署根的**同级**目录（或随便一个新目录），然后
+在服务器上只做一件事：
 
 ```bash
-# 开发机（Windows）：打包，并把整个目录传到部署根的**同级**
-build-output.bat
-scp -r build-output <user>@<server>:{deploy_root}/../
-
-# 服务器：下面五步都在部署根的同级目录里执行
-cd {deploy_root}/..
-
-# ① 平台代码、浏览器 sidecar 与前端 dist：这些目录里没有服务器现场产生的东西，可以整目录镜像
-rsync -a --delete build-output/backend/  {deploy_root}/backend/
-rsync -a --delete build-output/browser/  {deploy_root}/browser/
-rsync -a --delete build-output/frontend/ {deploy_root}/frontend/
-
-# ② 顶层文件：只覆盖、不删（{deploy_root}/.env 是服务器现场填的，绝不能删）
-rsync -a build-output/init.sql build-output/docker-compose.yml build-output/.dockerignore \\
-         build-output/.env.example build-output/apply-init.sh build-output/deploy.sh \\
-         build-output/README-deploy.md \\
-         {deploy_root}/
-
-# ③ 网关配置：certs/（私钥）、routes/（运行期路由表）与 .env（现场域名覆盖）必须排除，
-#    否则 --delete 会把服务器现场产物删掉；被排除的项也不会被传输/覆盖
-rsync -a --delete --exclude '/certs/' --exclude '/routes/' --exclude '/.env' \\
-         build-output/gateway/ {deploy_root}/gateway/
-docker compose -f {deploy_root}/gateway/docker-compose.yml up -d
-
-# ④ 预置应用源码：按 slug 镜像，deploy/ 排除（里面是服务器现场生成的 dev/prod 口令）
-{preset_rsync}
-
-# ⑤ 重建并全量重放
-cd {deploy_root}
-docker compose up -d --build                       # 平台代码走镜像重建
-bash apply-init.sh                                 # 新表自动建上，既有数据不动
+cd <新包所在目录>
+bash deploy.sh          # 第 1 问选 upgrade
 ```
 
-**为什么不能用一条 `rsync -a --delete build-output/ {deploy_root}/` 搞定**：`--delete` 的语义是
-「删掉目标里源没有的东西」，而本包**刻意不含**下面几类服务器现场产物，一条命令就会在
-**每次发布**时把它们全删掉。这不是理论风险：`.env`、`apps/<slug>/deploy/`、`data/`、`store/`
-与 `gateway/certs/` 里的内容在首次部署跑完后就已经存在，所以**第一次**执行本节命令就会全部
-中招；只有「服务器上新建的应用」那一项取决于你到底建没建：
+升级模式的动作是**收敛过的**（D-06），逐条列在这里，方便你核对它到底动了什么：
+
+- 只**镜像**三棵目录：`backend/`、`browser/`、`frontend/`——这三棵里没有服务器现场产生的东西，
+  所以带 `--delete`；全场只有这三棵带 `--delete`。
+- 顶层生成物与 `gateway/` 的配置/脚本按文件名**覆盖**，不删别的：`docker-compose.yml`、`init.sql`、
+  `apply-init.sh`、`deploy.sh`、`deploy_lib.sh`、`deploy.ps1`、`.env.example`、`README-deploy.md`、
+  `.dockerignore`，以及 `gateway/nginx.conf`、`gateway/docker-compose.yml`、`gateway/make-cert.sh`、
+  `gateway/make-cert.ps1`、`gateway/404.html`、`gateway/lua/router.lua`、`gateway/.env.example`。
+- 八项现场产物一个不碰（下表）。
+- `.env` 合并写：只动本次问到的键，既有键与注释原样保留；动之前静默备份 `.env.bak-<UTC>`（留 5 份）。
+- 起栈：`DEPLOY_ROOT` 没变就 `docker compose up -d`，变了自动 `--build`；随后 `bash apply-init.sh`
+  重放全量 init.sql（只补不覆盖）。
+
+`apps/`、`data/`、`store/`、`gateway/certs/`、`gateway/routes/`、`gateway/.env`、`.env`、
+`.deploy-answers` 加 `pgdata` 卷，**任何一步都不许带 `--delete` 去碰**：包里刻意不含它们。
+这也回答了「为什么不能用一条 `rsync -a --delete build-output/ <部署根>/` 搞定」——`--delete` 的语义是
+「删掉目标里源没有的东西」，一条命令就会在**每次发布**时把这八类现场产物全删掉。这不是理论风险：
+`.env`、`apps/<slug>/deploy/`、`data/`、`store/` 与 `gateway/certs/` 里的内容在首次部署跑完后就已经
+存在，所以**第一次**执行就会全部中招；只有「服务器上新建的应用」那一项取决于你到底建没建：
 
 | 会被删掉的 | 后果 |
 |---|---|
-| `{deploy_root}/.env` | 里面是 `POSTGRES_PASSWORD`；紧接着的 `docker compose up` 会被 `${{POSTGRES_PASSWORD:?}}` 当场拒收。若照 §2 重新 `cp .env.example .env` 并填了**新**口令，pgdata 卷里仍是旧口令 → 后端连不上库，且现象与「口令写错」无法区分 |
-| `{deploy_root}/apps/<服务器上新建的应用>/` | 控制台建的应用工程整棵消失，而 `workspace.root_path` 行还在库里（init.sql 只补不覆盖），列表里点进去全挂 |
-| `{deploy_root}/apps/<slug>/deploy/` | dev/prod 的 `.env` 明文口令与已渲染 compose；丢了之后预览/发布会静默走偏 |
-| `{deploy_root}/data/`、`{deploy_root}/store/` 下的内容 | 运行期落盘的技能库与商店包（本包这两个目录只有 `.gitkeep`） |
-| `{deploy_root}/gateway/certs/` | 网关的 TLS 证书与私钥；删了网关下次重启直接起不来，重签期间 HTTPS 全断 |
-| `{deploy_root}/gateway/routes/` | 运行期路由表；删了要等下一次发布/停机动作才会重建，期间所有应用域名 404 |
-| `{deploy_root}/gateway/.env` | 网关侧域名覆盖；丢了会退回打包默认域名，与平台不一致时全 404 |
+| `<部署根>/.env` | 里面是 `POSTGRES_PASSWORD`；紧接着的 `docker compose up` 会被 `${{POSTGRES_PASSWORD:?}}` 当场拒收。若照 §2 重新生成 `.env` 并填了**新**口令，pgdata 卷里仍是旧口令 → 后端连不上库，且现象与「口令写错」无法区分 |
+| `<部署根>/apps/<服务器上新建的应用>/` | 控制台建的应用工程整棵消失，而 `workspace.root_path` 行还在库里（init.sql 只补不覆盖），列表里点进去全挂 |
+| `<部署根>/apps/<slug>/deploy/` | dev/prod 的 `.env` 明文口令与已渲染 compose；丢了之后预览/发布会静默走偏 |
+| `<部署根>/data/`、`<部署根>/store/` 下的内容 | 运行期落盘的技能库与商店包（本包这两个目录只有 `.gitkeep`） |
+| `<部署根>/gateway/certs/` | 网关的 TLS 证书与私钥；删了网关下次重启直接起不来，重签期间 HTTPS 全断 |
+| `<部署根>/gateway/routes/` | 运行期路由表；删了要等下一次发布/停机动作才会重建，期间所有应用域名 404 |
+| `<部署根>/gateway/.env` | 网关侧域名覆盖；丢了会退回打包默认域名，与平台不一致时全 404 |
+| `<部署根>/.deploy-answers` | 下次部署的默认值没了一整份，一路回车变成逐题重答（不致命，但你会以为是新机器） |
 
-一句话：`.env`、`data/`、`store/`、`gateway/certs/`、`gateway/routes/`、`gateway/.env`、
-以及服务器上新建的应用，**上面五步里任何一步都不要碰**。
+预置应用的源码**不在**升级模式的镜像范围内——`apps/` 整棵在保护名单里，脚本不替你做这个决定。
+只有当你确实改了预置应用、要把它推上服务器时，才手动逐 slug 同步，并把现场生成的 `deploy/`
+锚在传输根上排除（应用工程里也可能有别处叫 `deploy` 的目录，少一个前导斜杠就是两种语义）：
+
+```bash
+{preset_rsync}
+```
 
 `init.sql` 每次都是**全量**的（由 `changelog/` 全部迁移按序合成），所以不需要记「上次发到哪了」；
 它的语义是「只补不覆盖」——服务器上现场产生的对话、新建的应用、改过的配置都不会被洗掉。
-上面这套分目录上传，就是让**文件层**也遵守同一条语义。
+上面这套合并动作，就是让**文件层**也遵守同一条语义。
 
 ## 5. 已知代价（不是 bug）
 
-- **`bash apply-init.sh` 是每次发布不可省的唯一 schema 通道**：镜像里根本没有 `changelog/`
+- **`apply-init.sh`（第 8 步会跑它）是每次发布不可省的唯一 schema 通道**：镜像里根本没有 `changelog/`
   （`docker compose build` 只 COPY 了 `backend/app` 与 `frontend/dist`），所以 backend 首启时
   `app/db.py::run_migrations` 面对不存在的目录会拿空迭代器**静默空转**，不报错也不建表。
-  忘了跑 apply-init.sh 的后果是「新表没出现、但日志里一切正常」。刻意不把 `changelog/`
-  烘进镜像：原始迁移没有幂等守卫（守卫是合成期补的），在 init.sql 已建好的库上重放
-  会因 `CREATE TABLE` 撞名而让 backend 启动失败（ADR-0014）。同理，`schema_migration` 表
-  在演示部署上永远是空的，这是预期行为。
+  忘了跑它的后果是「新表没出现、但日志里一切正常」。刻意不把 `changelog/` 烘进镜像：原始迁移
+  没有幂等守卫（守卫是合成期补的），在 init.sql 已建好的库上重放会因 `CREATE TABLE` 撞名而让
+  backend 启动失败（ADR-0014）。同理，`schema_migration` 表在演示部署上永远是空的，这是预期行为。
 - **`llm.*` 会补回一条属主为空的平台默认行**：为使重放不依赖「诞生当时」的唯一约束，合成时把
   `ON CONFLICT (列…) DO NOTHING` 归一成无目标形态；而 `app_config` 的仲裁索引后来变成了
   `(owner_user_id, key)`，创始人事务把 `llm.*` 划归自己后，NULL 属主那一行就「缺失」了，
@@ -1438,13 +1503,19 @@ bash apply-init.sh                                 # 新表自动建上，既有
 - **浏览器 sidecar 运行 headless Chromium**：镜像约 1GB，compose 限 1g 内存 / 1 CPU；
   它没有 docker.sock、没有平台库凭据、根文件系统只读。页面文本、控制台与失败请求在进模型前
   会做凭据遮断，但**截图是像素，无法可靠遮断**——演示机仍只应开给可信工作区。
-- **网关是独立 compose 项目**：`docker compose up -d` 只管平台，网关要 `-f gateway/docker-compose.yml`
-  单独启停；它占用宿主 80/443，且证书/私钥只在服务器现场生成（`gateway/certs/` 不进包）。
-  acme.sh 续期后要重启（或 reload）网关让 nginx 读到新证书。
-- **部署根被钉死**：换目录要重打包（`root_path`、同路径挂载、镜像 `WORKDIR` 与
-  `ZEROCODE_GATEWAY_ROUTES` 都依赖它）。
+- **网关是独立 compose 项目**：平台起栈只管平台，网关要 `-f gateway/docker-compose.yml`
+  单独启停（第 9 步会做，升级时是否重建会问你）；它占用宿主 80/443，且证书/私钥只在服务器
+  现场生成（`gateway/certs/` 不进包）。acme.sh 续期后要重启（或 reload）网关让 nginx 读到新证书。
+- **部署根可以现场输入，但换根有代价**：镜像 `WORKDIR` 与 `ZEROCODE_GATEWAY_ROUTES` 在构建期定值，
+  换根必然触发一次 `--build`（脚本自动判定，见第 7 步）；机器上已经跑过应用时还要人工核对
+  `apps/` 里既有工程与库里的 `root_path` 一致。
+- **没有无人值守入口**（D-11 的代价）：批量部署几台机器就要答几遍题。`bash deploy.sh < /dev/null` 也变不出无人值守——一路回车取的是默认值，而平台库口令没有默认值可取，读不到就停（这是刻意的：口令只认现场输入）。将来真需要非交互，
+  给 `deploy.sh` 一个 `--answers` 文件重放入口，别往回加行为 flag。
+- **Windows 侧有两处未验证的赌注**：WSL 发行版内 `systemd` 拉起 docker daemon 的可用性，以及
+  `/var/run/docker.sock` 与 external 网络 `zcnet` 在 WSL2 里的行为。脚本的分支逻辑有桩测，这两条只有
+  实跑才算数——第一次用 `deploy.ps1` 时请留人在旁边。
 - `deploy.apps_root` 留空时兜底为 `REPO_ROOT/apps`，而镜像的 `WORKDIR` 就是部署根，故兜底值
-  恰好等于同路径挂载点 `{deploy_root}/apps`，不需要在控制台里额外设。只有当你把应用工程
+  恰好等于同路径挂载点 `<部署根>/apps`，不需要在控制台里额外设。只有当你把应用工程
   放到部署根之外时，才需要去「设置 → 部署环境」里显式指定应用根目录。
 
 ## 6. 排障
@@ -1454,25 +1525,30 @@ bash apply-init.sh                                 # 新表自动建上，既有
 | 控制台打得开但应用列表空 | 还没注册账号，或注册的不是第一个账号（预置应用归创始人） |
 | 点预览报「dev 分库供给失败」 | 平台库账号无建库权限，或 pg 容器没起：`docker compose logs pg` |
 | 点预览长时间无响应 | 首次要在容器内装 npm/pip 依赖；看控制台「查看日志」 |
-| 预览等满健康窗口报「未就绪」，而容器日志里前端明明已 ready | 探针连的是 `.env` 的 `ZEROCODE_PREVIEW_PROBE_HOST`（默认 `host.docker.internal`，需要 compose 里 backend 的 `extra_hosts: host-gateway`）。改成 `127.0.0.1` 或删掉 extra_hosts 就会全轮连接拒绝 |
-| 控制台里「打开/复制预览地址」指向 localhost | 那是 `ZEROCODE_PREVIEW_HOST` 的打包默认值。服务器上把它改成服务器 IP 或域名并 `docker compose up -d`；另外宿主防火墙要放行应用端口（默认 8210-8399） |
-| 应用栈起不来、报路径不存在 | 部署根与容器内路径不一致（ADR-0013）：核对本目录是否就在 `{deploy_root}` |
-| 发布后新表/新列没出现 | 忘了跑 `bash apply-init.sh`——镜像里没有 changelog，backend 不会自己补 schema |
-| 拉镜像超时 | 服务器访问不了 Docker Hub：配 registry mirror 后 `docker compose up -d --build` 重试 |
-| 发布报 `docker compose -f …prod-compose.yml… 超时（600s）`、记账停在 build 步 | 应用的 prod 镜像要在**构建期**装依赖（`pip install` / `npm install`），境内机直连官方源会等到超时——dev 预览正常不代表发布能过，两条通道不同。重打包时给 `--pypi-mirror` 与 `--npm-registry`，平台会把同一份源经 `build.args` 注进每个应用的 prod 构建（ADR-0025）；`deploy.build_timeout` 调大只是把 10 分钟换成 30 分钟，不是修法 |
+| 预览等满健康窗口报「未就绪」，而容器日志里前端明明已 ready | 探针连的是 `.env` 的 `ZEROCODE_PREVIEW_PROBE_HOST`（默认 `host.docker.internal`，需要 compose 里 backend 的 `extra_hosts: host-gateway`）。改成 `127.0.0.1` 或删掉 extra_hosts 就会全轮连接拒绝——`deploy.sh` 第 4 步会把这两种填法当场拦下 |
+| 控制台里「打开/复制预览地址」指向 localhost | 那是 `ZEROCODE_PREVIEW_HOST` 的打包默认值（本机演示用的）。第 4 步改成服务器 IP 或域名；另外宿主防火墙与安全组要放行应用端口（默认 8210-8399） |
+| 应用栈起不来、报路径不存在 | 部署根与容器内路径不一致（ADR-0013）：核对 `.env` 的 `DEPLOY_ROOT`、实际目录、容器里 `printenv DEPLOY_ROOT` 三者；第 7 步的自检会打印这一项 |
+| 发布后新表/新列没出现 | 没跑 `apply-init.sh`（升级/新增的第 8 步会自动跑）——镜像里没有 changelog，backend 不会自己补 schema |
+| 拉镜像超时 / 第 7 步报「基础镜像拉不动」 | 服务器访问不了 Docker Hub。第 7 步停下来后会**当场问**要不要配 registry mirror（写 `/etc/docker/daemon.json` 并重启 docker，然后重拉）；机器上早就装着 docker 时也要走这一步——环境保障那步的加速提问只在真的要装 docker 时才出现。也可以手工写 daemon.json 后 `systemctl restart docker` 再重跑，或换可达网络。这里停下来是刻意的：让它跑到 build 里卡二十分钟不报错更难查 |
+| 发布报 `docker compose -f …prod-compose.yml… 超时（600s）`、记账停在 build 步 | 应用的 prod 镜像要在**构建期**装依赖（`pip install` / `npm install`），境内机直连官方源会等到超时——dev 预览正常不代表发布能过，两条通道不同。在第 4 步改 `ZEROCODE_PYPI_MIRROR` 与 `ZEROCODE_NPM_REGISTRY`，平台会把同一份源经 `build.args` 注进每个应用的 prod 构建（ADR-0025）；`deploy.build_timeout` 调大只是把 10 分钟换成 30 分钟，不是修法 |
 | 控制台里应用地址点进去全 404 | 逐项核对：① 网关起了吗（`docker compose -f gateway/docker-compose.yml ps`）；② 平台 `.env` 与 `gateway/.env` 的域名是否一致；③ 应用 prod 是否 `running`（进没进 `gateway/routes/routes.json`）；④ 浏览器是否信任了自签 CA |
 | 域名打不开（未备案 / 443 被拦），想先走 IP | 把部署根 `.env` 的 `ZEROCODE_SSL_ENABLE` 设成 `false` 并 `docker compose up -d`：控制台、发布记录、应用 README 的应用地址一起改成 `http://<ZEROCODE_PREVIEW_HOST>:<prod 端口>`，网关不用停；宿主防火墙要放行应用端口段（默认 8210-8399）。备案或证书就绪后改回 `true` |
 | Agent 报「浏览器检查服务不可用」 | 九成是 sidecar 根本没部署：宿主的 `docker-compose.yml` 比包旧（只重传 `backend/` 时的常态），整块没有 `browser` 服务，后端于是回落连容器自己的 `127.0.0.1:8101`。先 `grep -c browser docker-compose.yml`——为 0 就是这一种。已在跑的用 `docker compose ps browser` 看是否反复重启、`docker compose logs browser` 看 Chromium 启动错误。sidecar 不发布宿主端口，别从宿主访问 8101；若改过 `ZEROCODE_BROWSER_TARGET_HOST`，确认同一 host 已加进 `.env` 的 `BROWSER_ALLOWED_HOSTS`（默认只放行 `host.docker.internal,127.0.0.1,localhost`）。`bash deploy.sh` 现在两道都拦：预检要求 compose 声明 `browser` 服务，自检要求后端容器里探得通 `/healthz` |
-| `preview_page` 能开页面但截图为空 / 视觉诊断为「未启用」 | 图像缺失是截图落盘失败（看后端日志与 `{deploy_root}/data/browser_shots/` 权限）；「未启用」表示当前会话模型没有声明视觉能力，属正常降级 |
+| `preview_page` 能开页面但截图为空 / 视觉诊断为「未启用」 | 图像缺失是截图落盘失败（看后端日志与 `<部署根>/data/browser_shots/` 权限）；「未启用」表示当前会话模型没有声明视觉能力，属正常降级 |
 | 应用域名 502 Bad Gateway | 先看 `docker compose -f gateway/docker-compose.yml logs gateway`：出现 `host.docker.internal could not be resolved` 就是上游地址在 Linux 上解析不了（nginx 不读 `/etc/hosts`），把 `gateway/.env` 的 `ZEROCODE_GATEWAY_UPSTREAM` 设成宿主 docker0 网关（默认 `172.17.0.1`）后重建网关；若日志是 `connection refused`，核对应用 prod 栈与 `routes.json` 的端口是否一致 |
 | 网关容器起不来 / 反复重启 | `docker compose -f gateway/docker-compose.yml logs gateway`：多为 `gateway/certs/gateway.crt|key` 缺失，或 80/443 被占用 |
-| 发布成功但域名仍是 404 | 检查 `{deploy_root}/gateway/routes/routes.json` 里有没有该 slug；没有就看 backend 日志里 `gateway routes.json 刷新失败` 一行（该失败只告警、不阻断发布） |
-| 端口被占用 | `deploy.sh --takeover` 会 stop 掉占端口的旧容器（控制台端口与网关的 80/443 都算；宿主进程仍要你手工 kill，脚本不代劳）。不建议改 `PLATFORM_PORT`：它是对外的控制台地址，还要与云安全组放行的端口一致；应用端口在控制台改不了，需重打包 |
+| 发布成功但域名仍是 404 | 检查 `<部署根>/gateway/routes/routes.json` 里有没有该 slug；没有就看 backend 日志里 `gateway routes.json 刷新失败` 一行（该失败只告警、不阻断发布） |
+| 端口被占用 | 第 5 步会点名占用者并给出处置：是**容器**就问你要不要 stop（只 stop 不删，`docker start <名字>` 可恢复，老 `--takeover` 的去处）；是**宿主进程**只报 PID，要你确认它不是别的服务后自己 kill。stop 完端口仍被占说明占用者不止一个，按它打印的 PID 手工腾。不建议改 `PLATFORM_PORT`：它是对外的控制台地址，还要与云安全组放行的一致；应用端口在控制台改不了，需重打包 |
+| 想连库一起重做（换口令 / 清数据） | 选**新增**：第 3 步发现已有 `pgdata` 卷时会要求逐字输入 `yes` 才删（老 `--fresh-db` 的去处）。升级模式不问也不删卷——只改 `.env` 里的口令是**无效**的，卷里仍是旧口令 |
+| `deploy.sh` 说「缺 xx——这份 lib 比 deploy.sh 旧」 | 只传了内核没传判定层（或反之）。三份脚本必须整套上传：包里那份是仓库 `scripts/` 的拷贝，别手改 |
+| Windows 侧：发行版里 docker daemon 起不来 | `/etc/wsl.conf` 缺 `[boot] systemd=true`。跑 `deploy.ps1` 会代劳追加，但改完要**你手工**执行 `wsl --shutdown` 再重跑（脚本不自动重启机器，D-10） |
+| Windows 侧：部署根填了 `D:\\...` | 皮把包推进 **WSL 发行版内部**，部署根要 Linux 绝对路径（如 `/opt/zerocode`）。想从 Windows 资源管理器看那些文件，用 `\\\\wsl.localhost\\<发行版>\\opt\\zerocode` |
 
 > 打包期的端口检测只管两件事：预置应用之间不得互撞 `prod_port`/`dev_port`（它们是 UNIQUE 列），
 > 且同一个应用的 prod 与 dev 不得相同。它**不**探测服务器上已占用的端口，也不管预置应用与
-> `PLATFORM_PORT`/`PG_PORT` 是否相撞（默认值 8210+ 与 8100/5433 差得够远）。真撞上了会在
-> `docker compose up` 时报 `port is already allocated`，按上表处置。
+> `PLATFORM_PORT`/`PG_PORT` 是否相撞（默认值 8210+ 与 8100/5433 差得够远）。真撞上了会由
+> 第 5 步的宿主端口预检点名，或最终在 `docker compose up` 时报 `port is already allocated`。
+
 """
 
 
@@ -1644,17 +1720,26 @@ def copy_gateway(repo_root: Path, dst: Path, gateway_domain: str) -> int:
     return _count_files(dst)
 
 
-def copy_deploy_script(repo_root: Path, dst: Path) -> None:
-    """把仓库里的服务器端一键部署脚本原样搬进包根。
+def copy_deploy_scripts(repo_root: Path, out: Path) -> None:
+    """把仓库里的三份部署脚本原样搬进包根：deploy.sh（内核）、deploy_lib.sh（判定层）、deploy.ps1（WSL 皮）。
 
-    它与 apply-init.sh 相反：那个是生成物，这个是交付物的**源**——要在服务器上手改排障，
-    所以住在仓库里（`scripts/deploy.sh`），包只是搬运工。缺文件不出包，理由同网关配置。
+    它们与 apply-init.sh 相反：那个是生成物，这三个是交付物的**源**——要在服务器上手改排障，
+    所以住在仓库里（`scripts/`），包只是搬运工。缺任一文件不出包，理由同网关配置：
+    deploy.sh 会 source deploy_lib.sh，缺一份就是让服务器上跑到一半才炸；皮与内核缺一份，
+    另一份就是废纸。
+
     `\r` 一律剥掉：脚本自带一条 CRLF 自检，带着 \r 出包等于把失败推迟到服务器上才炸。
+    `.ps1` 反过来必须带 UTF-8 BOM——Windows PowerShell 5.1 在 GBK 代码页下读无 BOM 的中文
+    脚本会解析失败（US-26），所以这里补 BOM 而不是剥它。
     """
-    src = repo_root / "scripts" / "deploy.sh"
-    if not src.is_file():
-        raise BuildError(f"缺部署脚本 {src}：deploy.sh 已纳入交付包，缺文件不出包")
-    _write(dst, src.read_text(encoding="utf-8").replace("\r\n", "\n"))
+    for name in ("deploy.sh", "deploy_lib.sh", "deploy.ps1"):
+        src = repo_root / "scripts" / name
+        if not src.is_file():
+            raise BuildError(f"缺部署脚本 {src}：{name} 已纳入交付包，缺文件不出包")
+        text = src.read_text(encoding="utf-8").replace("\r\n", "\n").lstrip("\ufeff")
+        if name.endswith(".ps1"):
+            text = "\ufeff" + text
+        _write(out / name, text)
 
 
 def check_frontend_dist(repo_root: Path, allow_stale: bool = False) -> tuple[Path, str]:
@@ -1855,8 +1940,8 @@ def _assemble(repo_root: Path, staging: Path, presets, root: str,
     _write(staging / ".dockerignore", dockerignore())
     _write(staging / ".env.example",
            env_example(root, gateway_domain, mirrors, playwright_download_host))
-    _write(staging / "apply-init.sh", apply_init_sh())
-    copy_deploy_script(repo_root, staging / "deploy.sh")
+    _write(staging / "apply-init.sh", apply_init_sh(root))
+    copy_deploy_scripts(repo_root, staging)
     _write(staging / "README-deploy.md",
            readme_md(presets, root, stamp, dist_stamp, gateway_domain, mirrors))
 
@@ -1911,7 +1996,8 @@ def main(argv=None) -> int:
                     help=f"预置应用 slug，逗号分隔；空串表示只打平台"
                          f"（默认 {'、'.join(DEFAULT_SLUGS) or '只打平台，不带预置应用'}）")
     ap.add_argument("--deploy-root", default=DEFAULT_DEPLOY_ROOT,
-                    help=f"服务器部署根，须为 Linux 绝对路径（默认 {DEFAULT_DEPLOY_ROOT}）")
+                    help=f"写进包里的部署根**默认值**，须为 Linux 绝对路径（默认 {DEFAULT_DEPLOY_ROOT}）；"
+                         f"部署时可由 deploy 脚本现场输入覆盖（ADR-0034），不必为此重打包")
     ap.add_argument("--allow-stale-dist", action="store_true",
                     help="允许前端 dist 比 src 旧（默认拒绝，避免打出旧界面）")
     ap.add_argument("--gateway-domain", default=None,
