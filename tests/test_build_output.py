@@ -1063,7 +1063,10 @@ def test_repo_browser_dockerfile_is_non_root_with_local_context():
     """
     dk = (bo.REPO_ROOT / "browser" / "Dockerfile").read_text(encoding="utf-8")
     assert "USER 10001" in dk
-    assert "COPY app.py inspect_core.py session_core.py __init__.py /service/browser/" in dk
+    # COPY 白名单整串钉死（等价替换，不是改松）：app.py 在 import 期就依赖后面那几个模块，
+    # 少拷一个的表现是容器起来即崩、preview_page 恒回「浏览器检查服务不可用」，离根因很远。
+    assert ("COPY app.py inspect_core.py session_core.py sessions.py __init__.py "
+            "/service/browser/") in dk
     assert "COPY browser/" not in dk
     local = (bo.REPO_ROOT / "browser" / "docker-compose.yml").read_text(encoding="utf-8")
     assert "context: ." in local
