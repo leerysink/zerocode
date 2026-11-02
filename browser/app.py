@@ -209,6 +209,10 @@ async def collect_page_state(page, collectors: Collectors, *, started: float,
     快检与 session 走查共用这一个采集器：各写一遍「title + innerText + INTERACTIVE_JS +
     shape_interactive」的组合，同一页的同一眼状态就会在两条路径里给出两种裁剪口径。
     截图策略的分歧（`/inspect` 必给、step 默认不给）用参数表达，不靠复制函数。
+
+    返回的 `url` 是重写后的 connect_url（`host.docker.internal` 已被换成容器可达 IP，
+    见 `_connect_url`），不是给用户看的地址：要展示得另转 display_url。把它原样进模型
+    上下文就是内部 IP 泄漏。
     """
     title = await page.title()
     text = await page.evaluate("document.body ? document.body.innerText : ''")
@@ -223,6 +227,7 @@ async def collect_page_state(page, collectors: Collectors, *, started: float,
     # 交互清单的截断另开一个字段：`truncated` 是 preview_page 的既有语义（文本/控制台/请求
     # 触顶），把元素触顶并进去会让快检在元素多、其余没超限时凭空报「结果已按预算截断」。
     result["interactive_truncated"] = inter_truncated
+    # connect_url（重写后的地址，含容器可达 IP），非 display_url：对外展示前必须再转一次。
     result["url"] = page.url
     if shot is not None:
         result["screenshot_b64"] = base64.b64encode(shot).decode("ascii")
