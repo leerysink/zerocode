@@ -259,6 +259,43 @@ describe('BrowserFlowCard', () => {
     expect(zero.text()).toContain('点不动 0')
   })
 
+  it('旧历史行缺 steps_action_failed 时整卡也不说「一切正常」（M-3 同族的另一张嘴：tone）', () => {
+    // 上一轮只收了文案那一张嘴：`closeActionFailed` 缺字段时为 null，`tone` 那行照旧
+    // `(closeFailed || closeActionFailed) ? 'warn' : 'ok'` —— null 是 falsy，于是卡片头画成绿色
+    // 「本次走查收口」，而同一张卡正文里就摆着红色的 `ok:false` report 行，两张嘴说反话。
+    // 缺字段时回落到「report 里有没有 ok:false」：那份账前端手上就有，不必靠后端补字段。
+    const legacy = mountCard({
+      name: 'browser_close',
+      result: {
+        ok: true, steps_total: 2, steps_failed: 0,
+        hint: '本次走查未声明任何断言（各步只做了动作，结论要自己读页面文本判断）',
+        report: [
+          { seq: 0, action: 'open', target: '/orders', ok: true, passed: null },
+          { seq: 1, action: 'click', target: 'e1', ok: false, passed: null, error: '元素不可点击' },
+        ],
+      },
+    })
+    const legacyRows = legacy.findAll('[data-test="report-row"]')
+    expect(legacyRows[1].classes()).toContain('is-action')   // 红行还在（这一张嘴上一轮已收）
+    expect(legacy.find('.zc-page').classes()).toContain('is-warn')
+    expect(legacy.find('.zc-page').classes()).not.toContain('is-ok')
+    // 回落不是把 close 卡一律判黄：旧行里 report 全绿（真的一次都没坏）仍照旧 is-ok
+    const legacyClean = mountCard({
+      name: 'browser_close',
+      result: {
+        ok: true, steps_total: 1, steps_failed: 0,
+        report: [{ seq: 0, action: 'open', target: '/orders', ok: true, passed: null }],
+      },
+    })
+    expect(legacyClean.find('.zc-page').classes()).toContain('is-ok')
+    // 字段在的时候走字段那条路（report 已被裁掉/为空的行也一样，不重复判定）
+    const freshZero = mountCard({
+      name: 'browser_close',
+      result: { ok: true, steps_total: 2, steps_failed: 0, steps_action_failed: 0, report: [] },
+    })
+    expect(freshZero.find('.zc-page').classes()).toContain('is-ok')
+  })
+
   it('close 的 report 行也带元素名，查不到才回落句柄（M-6）', () => {
     // 按规格 §6.2 那些 ref 早就作废，读报告的人手上没有任何一份清单能对回 `e7` 是谁，
     // 只印一个句柄就是噪声。名字取 report 项的 `target_name`（后端 `_step` 按动作前清单算好的）。

@@ -839,11 +839,12 @@ async def test_sensitive_step_args_masks_only_the_sensitive_target():
 
     loop 在落库/推送前调这一刀，钉四种情形：sensitive 目标遮、非 sensitive 目标照旧明文
     （一刀切会把「这一步填了什么备注」一起毁掉）、别的工具不碰、已过一遍不重复计数。
+    「非 sensitive 照旧明文」那一条单独用**一条调用**去钉：同轮第 2 条起另有位次从严规则
+    （裁定 R-35），混在一份多调用列表里就分不清遮是遮在哪条规则上了。
     """
     refs = [{"ref": "e2", "role": "textbox", "name": "密码", "sensitive": True},
             {"ref": "e3", "role": "textbox", "name": "备注", "sensitive": False}]
     calls = [_tool_call("browser_step", action="fill", target="e2", value="hunter2"),
-             _tool_call("browser_step", action="fill", target="e3", value="第一单"),
              _tool_call("browser_step", action="click", target="e2"),
              _tool_call("fs_write", path="a.txt", content="hunter2")]
     out, hits = bst.redact_sensitive_step_args(calls, refs)
@@ -853,11 +854,14 @@ async def test_sensitive_step_args_masks_only_the_sensitive_target():
     # 只改 value 这一个值：动作、ref、协议结构（id/type/name）一个字不动
     assert masked["action"] == "fill" and masked["target"] == "e2"
     assert out[0]["id"] == "c1" and out[0]["function"]["name"] == "browser_step"
-    assert json.loads(out[1]["function"]["arguments"])["value"] == "第一单"
-    assert out[2] is calls[2] and out[3] is calls[3]     # 没 value 与别的工具：原条目原样返回
+    assert out[1] is calls[1] and out[2] is calls[2]     # 没 value 与别的工具：原条目原样返回
     again, hits2 = bst.redact_sensitive_step_args(out, refs)
     assert (hits2, json.loads(again[0]["function"]["arguments"])["value"]) == (
         0, "<redacted:sensitive_input>")                # 幂等：不套娃也不重复计数
+    # 已知非 sensitive 的目标在位次 1 照旧明文（否则正常走查全被遮成占位符）
+    plain, plain_hits = bst.redact_sensitive_step_args(
+        [_tool_call("browser_step", action="fill", target="e3", value="第一单")], refs)
+    assert plain_hits == 0 and json.loads(plain[0]["function"]["arguments"])["value"] == "第一单"
 
 
 async def test_the_two_value_masks_share_one_sensitive_verdict(monkeypatch):
@@ -910,19 +914,69 @@ async def test_an_unknown_handle_is_masked_like_a_sensitive_one():
     第一步返回的新清单、照常遮断——正是 R-33 禁止的那种分家。模型不必猜中 ref：登录页
     e1=用户名、e2=口令这类编号本来就可预测。
     只认句柄形态：navigate 的 target 是 path，不是 ref，不进这条规则。
+    每一种都单独用**只含一条调用**的列表去钉（位次 1）：位次 2 起另有位次从严规则（裁定 R-35），
+    两条规则叠在同一条上就分不出各自的红。
     """
     refs = [{"ref": "e2", "role": "textbox", "name": "用户名", "sensitive": False}]
-    calls = [_tool_call("browser_step", action="fill", target="e9", value="hunter2"),
-             _tool_call("browser_step", action="fill", target="e2", value="alice"),
-             _tool_call("browser_step", action="navigate", target="/login", value="hunter2")]
-    out, hits = bst.redact_sensitive_step_args(calls, refs)
+    out, hits = bst.redact_sensitive_step_args(
+        [_tool_call("browser_step", action="fill", target="e9", value="hunter2")], refs)
     assert hits == 1
     assert json.loads(out[0]["function"]["arguments"])["value"] == "<redacted:sensitive_input>"
-    assert json.loads(out[1]["function"]["arguments"])["value"] == "alice"   # 已知非 sensitive 照旧
-    assert out[2] is calls[2]                        # path 形态：未知也不等于「可能是敏感框」
+    # path 形态（navigate）不进这条规则：不是句柄，无从判定也谈不上风险
+    kept, kept_hits = bst.redact_sensitive_step_args(
+        [_tool_call("browser_step", action="navigate", target="/login", value="hunter2")], refs)
+    assert kept_hits == 0 and "hunter2" in kept[0]["function"]["arguments"]
+    # 已知非 sensitive 的 ref 在位次 1 照旧放行——一刀切会把备注/地址的可读性一起毁掉
+    listed, listed_hits = bst.redact_sensitive_step_args(
+        [_tool_call("browser_step", action="fill", target="e2", value="alice")], refs)
+    assert listed_hits == 0 and json.loads(listed[0]["function"]["arguments"])["value"] == "alice"
     # 清单为空（本 run 还没 open 过 / open 前就被裁掉）是「未知」的极端形状，同样遮
-    lonely, lonely_hits = bst.redact_sensitive_step_args(calls[:1], [])
+    lonely, lonely_hits = bst.redact_sensitive_step_args(
+        [_tool_call("browser_step", action="fill", target="e9", value="hunter2")], [])
     assert lonely_hits == 1 and "hunter2" not in lonely[0]["function"]["arguments"]
+
+
+async def test_every_step_after_the_first_is_masked_even_on_a_listed_plain_ref():
+    """位次从严（裁定 R-35，C-1 残留）：同一条消息里第 2 个及以后的 `browser_step` 一律按 sensitive 遮。
+
+    「未知即遮」只覆盖「轮初清单里查无此 ref」，可真实形状是**索引被复用**的那一半：ref 每次
+    重渲染都从头重编（规格 §6.2），`click` 展开出来的口令框编号通常正落在旧清单已有的索引上。
+    轮初 `e2=搜索框`（非 sensitive）→ 同轮第一步 click 之后 `e2=口令`（sensitive）→
+    紧接着 `fill e2 value=hunter2`。「存在即信任」在这种形状下仍然放行，因为参数侧只能看到
+    轮初那一份，而那份说的已经不是当步的事实。
+
+    轮初清单只对**第 1 条** `browser_step` 权威：那之前本 run 没有别的步改写过页面。
+    第 2 条起面对的是「已被前几条改写、但落库行写不出来」的清单——与其猜它长什么样，不如从严。
+    代价只是同轮多调用时非口令的 fill 也显示成占位符（每次走查 0–2 条的量级），
+    sidecar 拿的仍是原值，功能不断。
+    """
+    refs = [{"ref": "e2", "role": "textbox", "name": "搜索框", "sensitive": False},
+            {"ref": "e3", "role": "textbox", "name": "备注", "sensitive": False}]
+    calls = [_tool_call("browser_step", action="fill", target="e2", value="订单号"),
+             _tool_call("browser_step", action="click", target="e3"),
+             _tool_call("browser_step", action="fill", target="e3", value="第一单"),
+             _tool_call("browser_step", action="fill", target="e2", value="hunter2")]
+    out, hits = bst.redact_sensitive_step_args(calls, refs)
+    assert hits == 2
+    # 位次 1：轮初清单权威，已知非 sensitive 就放行（否则正常走查全被遮成占位符）
+    assert out[0] is calls[0]
+    # 位次也数「不带 value 的步」：click 本身不遮（没 value 可遮），但它占掉一个位次，
+    # 排在它后面的 fill 不能因为它而退回「第一条」
+    assert out[1] is calls[1]
+    assert json.loads(out[2]["function"]["arguments"])["value"] == "<redacted:sensitive_input>"
+    assert json.loads(out[3]["function"]["arguments"])["value"] == "<redacted:sensitive_input>"
+    # 位次 1 之外不看清单：连 navigate 带 value 也一并遮——结果侧 `_step` 遮 value 时同样不问动作
+    # （它对任何带 value 的步按 target 判 sensitive），两侧口径保持一致
+    tail, tail_hits = bst.redact_sensitive_step_args(
+        [_tool_call("browser_step", action="click", target="e3"),
+         _tool_call("browser_step", action="navigate", target="/login", value="hunter2")], refs)
+    assert tail_hits == 1
+    assert json.loads(tail[1]["function"]["arguments"])["value"] == "<redacted:sensitive_input>"
+    # 位次是按**传进来的那份列表**数的（loop 传的是整条 assistant 消息的全部调用）：
+    # 同一条 fill 单独喂进来就是位次 1、照旧放行——这条规则整个挂在「同一份列表里有前序调用」上
+    alone, alone_hits = bst.redact_sensitive_step_args(calls[2:3], refs)
+    assert alone_hits == 0
+    assert json.loads(alone[0]["function"]["arguments"])["value"] == "第一单"
 
 
 async def test_a_numeric_pin_is_masked_on_both_sides(monkeypatch):

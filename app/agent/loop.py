@@ -505,9 +505,14 @@ class AgentRunner:
                 sanitized_calls, _ = redact_tool_calls_args(original_calls)
                 # 参数侧的 sensitive 遮断（裁定 R-33，US-19）：规则表只认凭据**形态**，
                 # `{"action":"fill","target":"e2","value":"hunter2"}` 里那种不成形态的口令它抓不住，
-                # 于是它会原样进 message.tool_args 并被通用折叠块明文打印出来。判定与 `_step`
-                # 写 browser_log 时同源（同一个 is_sensitive_ref、同一份「动作之前」的清单），
-                # 一处遮一处不遮就是漏。
+                # 于是它会原样进 message.tool_args 并被通用折叠块明文打印出来。
+                # 判定与 `_step` 写 browser_log 时同口径，但参数侧多两条从严（C-1，裁定 R-34/R-35）：
+                # ① 未知句柄也遮（`is_sensitive_ref_or_unknown`）；② 位次从严——`browser_refs`
+                # 这一份是**本轮开始时**的清单（下面取一次就整轮不变），只有**第一条**
+                # `browser_step` 能拿它当权威；第 2 条及以后的 ref 可能已被前几条改写过
+                # （新出现的 ref、或复用旧索引的 ref：旧 e2 是搜索框、click 展开后 e2 是口令框），
+                # 而落库这行写在派发之前，那份中途清单永远写不出来，所以一律按 sensitive 遮。
+                # 一处遮一处不遮就是漏，验收口径是「两侧对同一个 value 给同一个结论」。
                 # 只改落库/推送那一份（与下面 tool_result 那条同一个形状）：工具执行收
                 # original_calls（原值必须送达 sidecar，否则登录根本填不进去），当轮回注模型的
                 # assistant tool_calls 也留原值——模型下一步重试同一个表单时不能读回占位符。

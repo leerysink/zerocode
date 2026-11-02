@@ -665,8 +665,11 @@ def _step_failure(ctx, data: dict, *, target_netloc: str, display_netloc: str,
 #   · `ref_display_name` 回显这一步的元素名（裁定 R-32，US-22）。
 # 不拿动作之后的新快照做后两件：ref 是按采集顺序现编的、每次重渲染全部作废（规格 §6.2），
 # 用新快照反查 `e7` 会标到另一个元素上——名字画错比不画更糟，遮断遮错对象就是明文泄漏。
-# 参数侧还多一条「未知句柄也遮」（`is_sensitive_ref_or_unknown`，Critical C-1）：它在派发之前跑，
-# 天生只能拿到本轮开始时那份清单，一条消息里发两个 step 时第二步的 ref 还没进过任何清单。
+# 参数侧还多两条「清单说了也不算」的从严（`is_sensitive_ref_or_unknown` 与位次规则，Critical C-1
+# 的裁定 R-34 / R-35）：它在派发之前跑，天生只能拿到本轮开始时那份清单，而一条消息里发两个 step 时
+# 第二步面对的是「已经被第一步改写过、但这一行写不出来」的页面——第二步的 ref 既可能全新（旧清单
+# 查无此号），也可能复用旧索引（每次重渲染从头重编，规格 §6.2：旧清单里的 `e2` 是搜索框，
+# 展开表单后的 `e2` 是口令框）。两条合起来的效果是：只有**第一条** step 按轮初清单判。
 def is_sensitive_ref(refs, ref: str) -> bool:
     """sensitive 判定的**唯一口径**：两处 value 遮断（结果侧与参数侧）共用它，不许各写一遍。"""
     if not ref:
@@ -702,6 +705,11 @@ def is_sensitive_ref_or_unknown(refs, target: str) -> bool:
     未知即遮的代价只是「一个查不到名字的 ref 填的内容不落明文」，反向的代价是凭据进库（US-19）。
     已知且非 sensitive 的仍然放行——一刀切会把「这一步填了什么备注」一起毁掉。
     结果侧不套这条：它读的就是各步动作前的那份清单，ref 恒在清单里，语义保持不变。
+
+    但「存在即信任」本身仍有残留：ref 每次重渲染从头重编（规格 §6.2），`click` 展开出来的口令框
+    常常正落在旧清单已有的索引上（旧 `e2` 搜索框 → 新 `e2` 口令框），这一支在这里判 False、
+    却该遮。收口它的是调用方的位次规则（`redact_sensitive_step_args`，裁定 R-35），
+    本函数只看清单、管不到「这条调用是本轮第几条」，所以不在这里判。
     """
     if not target:
         return False
@@ -759,8 +767,17 @@ def redact_sensitive_step_args(tool_calls, refs) -> tuple[list[dict], int]:
 
     判定与 `browser_log` 那一处**同源同口径**：同一个 `is_sensitive_ref`、同一份「动作之前」
     的清单（`refs` 由调用方从 `ctx.run_state["browser_refs"]` 取，一轮内不变）。一处遮一处不遮
-    就是漏，所以两处共用一个判定，不在这里重写规则。参数侧额外多一条「未知句柄也遮」
-    （`is_sensitive_ref_or_unknown`，Critical C-1）——它拿到的清单天生可能是旧的一份。
+    就是漏，所以两处共用一个判定，不在这里重写规则。参数侧额外多两条从严（Critical C-1）：
+    「未知句柄也遮」（`is_sensitive_ref_or_unknown`），以及**位次从严**（裁定 R-35，见下）。
+
+    位次从严（R-35，收 C-1 残留）：`refs` 是**本轮开始时**那份清单，它只对**第一条**
+    `browser_step` 权威——那之前本 run 没有别的步改写过页面。第 2 条及以后面对的是「已经被
+    前几条 step 换过一遍、但落库这行写在派发之前、写不出来它长什么样」的清单，而两种失效形状
+    都在这份旧清单上判不出来：新出现的 ref（旧清单查无此号，由「未知即遮」兜），以及
+    **复用旧索引**的 ref（旧 `e2=搜索框`、`click` 展开后 `e2=口令框`，未知即遮兜不到，
+    因为它在清单里）。与其猜那份清单长什么样，不如一律按 sensitive 处理。
+    代价是同轮多调用时非口令的 fill 也显示成占位符（每次走查 0–2 条的量级），
+    而 sidecar 拿的仍是原值，功能不断。结果侧不需要同这条：它逐步读各自动作前的清单，恒是新的。
 
     value 的口径也与结果侧对齐（I-1）：先 `str(value or "")` 再判空再遮。改前那句
     `isinstance(value, str)` 会让数值型 PIN（`{"value": 123456}`）整条绕过参数侧，而结果侧
@@ -770,13 +787,22 @@ def redact_sensitive_step_args(tool_calls, refs) -> tuple[list[dict], int]:
     原值照样送达（US-08 的登录要真填进去），当轮回注模型的 assistant tool_calls 也保留原值，
     否则模型下一步重试时会把占位符当口令填进表单。
     """
+    # `rewrite_tool_calls_args` 只把带**可解析 arguments 的 browser_step**交给 `rewrite`，
+    # 且按列表原顺序逐条调用——正好是 loop 的派发顺序，所以这个计数器读得出的就是
+    # 「这是本轮第几条真会被派发的 step」。带不了 value 的畸形条目也占一个位次：
+    # 它排在前面时后面的 fill 更该从严，不是更该被信任。
+    ordinal = 0
+
     def rewrite(args):
+        nonlocal ordinal
+        ordinal += 1
         if not isinstance(args, dict):
             return args, 0
         value = str(args.get("value") or "")      # 与结果侧同一个转换：非字符串（PIN）也算填了
         if not value:
             return args, 0
-        if not is_sensitive_ref_or_unknown(refs, str(args.get("target") or "")):
+        if ordinal == 1 and not is_sensitive_ref_or_unknown(refs, str(args.get("target") or "")):
+            # 只有位次 1 才按轮初清单放行；位次 2 起清单不作权威（R-35）
             return args, 0
         if contains_redaction_marker(value):
             # 已被通用规则表遮过一轮：幂等，不重复计数也不套娃（检查排在转换之后）

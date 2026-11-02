@@ -57,7 +57,9 @@ const tone = computed(() => {
   if (!r) return 'info'
   if (r.ok === false) return r.status && r.status !== 'running' ? 'muted' : 'error'
   if (r.passed === false) return 'warn'
-  if (name.value === 'browser_close') return (closeFailed.value || closeActionFailed.value) ? 'warn' : 'ok'
+  if (name.value === 'browser_close') {
+    return (closeFailed.value || closeActionFailureShown.value) ? 'warn' : 'ok'
+  }
   if (r.timed_out || issues.value) return 'warn'
   return 'ok'
 })
@@ -164,6 +166,13 @@ const closeFailed = computed(() => Number(result.value?.steps_failed || 0))
 const closeActionFailed = computed(() => (result.value?.steps_action_failed === undefined
   ? null : Number(result.value.steps_action_failed || 0)))
 const report = computed(() => (name.value === 'browser_close' ? result.value?.report || [] : []))
+// M-3 同族的另一张嘴：tone。缺 `steps_action_failed` 的旧历史行里 closeActionFailed 是 null，
+// 而 null 是 falsy，`tone` 那行就把整卡判成 'ok'（绿色），同一张卡正文里却摆着红色的 `ok:false`
+// report 行——文案上一轮收了，卡片头还在说「一切正常」。缺字段时回落到 report 本身：
+// 那份账前端手上就有，不必等后端补字段。字段在时照旧走字段（不重复判定，也不把真 0 判成坏）。
+const closeActionFailureShown = computed(() => (closeActionFailed.value === null
+  ? report.value.some((item) => item?.ok === false)
+  : closeActionFailed.value > 0))
 const hint = computed(() => result.value?.hint || '')
 const quotaLine = computed(() => {
   const r = result.value
