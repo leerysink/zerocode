@@ -747,6 +747,8 @@ def test_limits_are_the_ones_the_spec_pinned():
     assert bst.DEFAULT_INTERACTIVE_MAX == 40
     assert bst.DEFAULT_STEP_TIMEOUT_MS == 3000
     assert bst.TEXT_MAX_CHARS == 8000
+    assert bst.PAGE_ERRORS_MAX == 10           # 裁定 R-27 暴露给模型的那份增量账
+    assert (bst.LIST_ITEM_MAX, bst.LIST_ITEM_CHARS) == (40, 1000)
     assert bst.INTERACTIVE_CFG_KEY == "agent.browser_interactive_max"     # 规格 §10 的键名逐字
     assert (bst.INTERACTIVE_MAX_MIN, bst.INTERACTIVE_MAX_MAX) == (1, 200)
 
@@ -756,13 +758,14 @@ def test_limits_are_the_ones_the_spec_pinned():
 def _step_data(**extra):
     """Task 3 的 `POST /sessions/{sid}/step` 200 体形状（`_step_state` 的产物）。
 
-    console / failed_requests 在 step 响应里是**全量**且已被 sidecar 换成 `*_new` 两键，
-    这份替身保留那个差异：把两边写成同形会放过「重播旧错误」这个 bug（US-04）。
+    console / failed_requests / page_errors 在 step 响应里都已经被 sidecar 换成 `*_new` 三键
+    （全量那份留在同一份快照里会被 `_step_state` 摘掉），这份替身保留那个差异：把两边写成
+    同形会放过「重播旧错误」这个 bug（US-04，page_errors 那一半是裁定 R-27 补的）。
     """
     data = {"ok": True, "title": "订单管理", "text": "订单列表\n共 3 条",
             "text_truncated": False, "url": "http://192.168.65.254:8241/orders",
             "interactive": _interactive(), "interactive_truncated": False,
-            "console_new": [], "failed_requests_new": [], "page_errors": [],
+            "console_new": [], "failed_requests_new": [], "page_errors_new": [],
             "truncated": False, "timed_out": False, "dialog": None,
             "steps_charged": True, "elapsed_ms": 900}
     data.update(extra)
@@ -837,6 +840,7 @@ async def test_action_failure_is_ok_false_and_expect_failure_is_passed_false(mon
                 "steps_charged": True}, ""
 
     monkeypatch.setattr(bst, "_sidecar_step", blocked)
+    _no_shot(monkeypatch)
     out = await bst.run_browser_session_tool(
         ctx, "browser_step", {"action": "click", "target": "e1"})
     assert out["ok"] is False
@@ -846,6 +850,7 @@ async def test_action_failure_is_ok_false_and_expect_failure_is_passed_false(mon
     ctx2 = Ctx()
     ctx2.run_state["browser_session"] = "abc"
     _step_env(monkeypatch, _step_data(passed=False, note="页面文本未包含「订单已创建」"))
+    _no_shot(monkeypatch)
     got = await bst.run_browser_session_tool(
         ctx2, "browser_step", {"action": "click", "target": "e1",
                                "expect": {"type": "text_contains", "value": "订单已创建"}})
@@ -906,6 +911,11 @@ async def test_session_gone_charges_nothing_and_unbinds(monkeypatch):
     ctx = Ctx()
     ctx.run_state["browser_session"] = "abc"
     ctx.run_state["browser_refs"] = [{"ref": "e1", "role": "button", "name": "出牌"}]
+
+    async def no_shot(sid):
+        raise AssertionError("页面物理上已经没了，§5.3 那一行不带 screenshot，不该去补图")
+
+    monkeypatch.setattr(bst, "_sidecar_screenshot", no_shot)
     _step_env(monkeypatch, {"ok": False, "error": "浏览器会话已结束，请重新 browser_open",
                             "session_gone": True, "steps_charged": False})
     out = await bst.run_browser_session_tool(ctx, "browser_step",
@@ -959,6 +969,7 @@ async def test_action_failure_charges_and_refreshes_the_ref_list(monkeypatch):
 
     monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
     monkeypatch.setattr(bst, "_sidecar_step", gone)
+    _no_shot(monkeypatch)
     out = await bst.run_browser_session_tool(ctx, "browser_step",
                                              {"action": "click", "target": "e9"})
     assert out["ok"] is False
@@ -991,6 +1002,7 @@ async def test_action_failure_error_is_scrubbed_and_reports_the_dialog(monkeypat
 
     monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
     monkeypatch.setattr(bst, "_sidecar_step", failed)
+    _no_shot(monkeypatch)
     out = await bst.run_browser_session_tool(
         ctx, "browser_step", {"action": "navigate", "target": "/x"})
     blob = json.dumps(out, ensure_ascii=False)
@@ -1142,8 +1154,24 @@ def _shot_env(monkeypatch, *, replies=None, shot=None):
     return shots_seen
 
 
+def _no_shot(monkeypatch):
+    """把补图那条面钉成「不真去取图」。
+
+    裁定 R-26 之后动作失败也会自动补图，不验截图的失败测试若不替它，就会打真 httpx、
+    并把一张 PNG 落进真的 data 目录——测试要的只是那一步的形状与账。
+    """
+    seen: list[str] = []
+
+    async def skip(sid):
+        seen.append(sid)
+        return None, "本测试不验截图"
+
+    monkeypatch.setattr(bst, "_sidecar_screenshot", skip)
+    return seen
+
+
 async def test_failed_assertion_attaches_a_scene_shot(monkeypatch, tmp_path):
-    """US-05：断言不过的那一刻是唯一值得看现场的时刻，落盘沿用 preview_page 那套服务（US-23）。"""
+    """US-05：断言不过的那一刻要看现场，落盘沿用 preview_page 那套服务（US-23）。"""
     monkeypatch.setenv("ZEROCODE_DATA_DIR", str(tmp_path))
     ctx = Ctx()
     ctx.run_state["browser_session"] = "abc"
@@ -1185,28 +1213,54 @@ async def test_explicit_screenshot_attaches_even_without_an_assertion(monkeypatc
     assert seen == ["abc"]
 
 
-async def test_screenshot_on_action_failure_only_when_asked(monkeypatch, tmp_path):
-    """其余情况不附图（token 成本）：点不动自带新清单，图只是可选补充。"""
+async def test_action_failure_attaches_a_scene_shot(monkeypatch, tmp_path):
+    """裁定 R-26：`ok:false`（点不到 / 被遮挡 / 动作执行失败）同样自动附一张现场图。
+
+    规格 §5.3 的表格里「元素不可点击，可能被遮挡」那一行本来就带 `screenshot`——被遮挡这件事
+    只有看图才说得清，新清单说不出「是谁盖住了它」。与上面那条断言失败的测试分开钉：
+    两个形状各管各的，一条测试不该同时管两件事。
+    """
     monkeypatch.setenv("ZEROCODE_DATA_DIR", str(tmp_path))
     ctx = Ctx()
     ctx.run_state["browser_session"] = "abc"
     ctx.run_state["browser_refs"] = [{"ref": "e1", "role": "button", "name": "出牌"}]
     seen = _shot_env(monkeypatch, replies={"ok": False, "error": "元素不可点击，可能被遮挡",
-                                           "steps_charged": True})
+                                           "interactive": _interactive(), "steps_charged": True})
     out = await bst.run_browser_session_tool(
         ctx, "browser_step", {"action": "click", "target": "e1"})
-    assert out["ok"] is False and "screenshot" not in out
+    assert out["ok"] is False
+    assert out["screenshot"]["url"].startswith("/api/browser/shots/7/")
+    assert out["screenshot"]["bytes"] == len(_png())
+    assert seen == ["abc"]
+    # 补图仍然不是形状的一部分：`ok:false` 该有的账与清单都还在
+    assert out["steps_charged"] is True and out["interactive"]
+
+
+async def test_a_plain_successful_step_attaches_no_shot(monkeypatch):
+    """「其余情况不附」仍在（token 成本）：没给 expect、也没要 screenshot 的普通一步不带图。"""
+    ctx = Ctx()
+    ctx.run_state["browser_session"] = "abc"
+    ctx.run_state["browser_refs"] = [{"ref": "e1", "role": "button", "name": "出牌"}]
+    seen = _shot_env(monkeypatch)
+    out = await bst.run_browser_session_tool(
+        ctx, "browser_step", {"action": "click", "target": "e1"})
+    assert out["ok"] is True and "passed" not in out
+    assert "screenshot" not in out
     assert seen == []
 
-    ctx2 = Ctx()
-    ctx2.run_state["browser_session"] = "abc"
-    ctx2.run_state["browser_refs"] = [{"ref": "e1", "role": "button", "name": "出牌"}]
-    seen2 = _shot_env(monkeypatch, replies={"ok": False, "error": "元素不可点击，可能被遮挡",
-                                            "steps_charged": True})
+
+async def test_screenshot_asked_on_action_failure_still_attaches(monkeypatch, tmp_path):
+    """`screenshot: true` 显式要求时仍附——这一条在 R-26 之后与自动补图重叠，仍单独钉住。"""
+    monkeypatch.setenv("ZEROCODE_DATA_DIR", str(tmp_path))
+    ctx = Ctx()
+    ctx.run_state["browser_session"] = "abc"
+    ctx.run_state["browser_refs"] = [{"ref": "e1", "role": "button", "name": "出牌"}]
+    seen = _shot_env(monkeypatch, replies={"ok": False, "error": "元素不可点击，可能被遮挡",
+                                          "steps_charged": True})
     got = await bst.run_browser_session_tool(
-        ctx2, "browser_step", {"action": "click", "target": "e1", "screenshot": True})
+        ctx, "browser_step", {"action": "click", "target": "e1", "screenshot": True})
     assert got["ok"] is False and got["screenshot"]["bytes"] == len(_png())
-    assert seen2 == ["abc"]
+    assert seen == ["abc"]
 
 
 async def test_capturing_the_shot_costs_no_step(monkeypatch, tmp_path):
@@ -1300,6 +1354,63 @@ async def test_open_without_console_new_reports_its_full_console(monkeypatch):
     assert [i["text"] for i in out["console_new"]] == ["首屏报错"]
 
 
+async def test_page_errors_new_reaches_the_tool_result_through_the_gate(monkeypatch):
+    """裁定 R-27：`page_errors_new` 必须出现在工具返回值里，且过同一道清洗闸。
+
+    它是「我这一步把页面点崩了」这个最重要的失败信号（未捕获异常），此前对模型完全不可见；
+    异常原文内嵌 `_connect_url` 重写后的容器 IP 与栈里的凭据，所以 host 清洗、遮断、裁剪
+    三样一样不能少——少一样就是给模型上下文开了一条旁路。
+    """
+    ctx = Ctx()
+    ctx.run_state["browser_session"] = "abc"
+    ctx.run_state["browser_refs"] = [{"ref": "e1", "role": "button", "name": "出牌"}]
+    monkeypatch.setattr(bst, "browser_target_host", lambda: "host.docker.internal")
+    _step_env(monkeypatch, _step_data(page_errors_new=[
+        "Uncaught TypeError: 点崩了 at http://192.168.65.254:8241/app.js:1:9",
+        "Uncaught Error: token=abc123def456ghi 泄漏在栈里"]))
+    out = await bst.run_browser_session_tool(ctx, "browser_step",
+                                             {"action": "click", "target": "e1"})
+    assert len(out["page_errors_new"]) == 2
+    blob = json.dumps(out, ensure_ascii=False)
+    assert "192.168.65.254" not in blob and "abc123def456ghi" not in blob
+    assert "localhost:8241" in out["page_errors_new"][0]
+    assert out["redacted"] >= 1
+    assert "点崩了" in out["page_errors_new"][0]        # 清洗之后原文仍读得懂
+
+
+async def test_page_errors_new_is_capped_at_ten_items(monkeypatch):
+    """上限值不许漂：page_errors 10 条（与 sidecar 的 shape_result 同一条尺）。"""
+    ctx = Ctx()
+    ctx.run_state["browser_session"] = "abc"
+    ctx.run_state["browser_refs"] = [{"ref": "e1", "role": "button", "name": "出牌"}]
+    _step_env(monkeypatch, _step_data(page_errors_new=[f"boom {i}" for i in range(30)]))
+    out = await bst.run_browser_session_tool(ctx, "browser_step",
+                                             {"action": "click", "target": "e1"})
+    assert out["page_errors_new"] == [f"boom {i}" for i in range(10)]
+
+
+async def test_step_does_not_replay_page_errors_from_the_full_snapshot(monkeypatch):
+    """与 console 同一头：step 带空 `page_errors_new` 时不许退回全量 `page_errors` 重播首屏崩溃。"""
+    ctx = Ctx()
+    ctx.run_state["browser_session"] = "abc"
+    ctx.run_state["browser_refs"] = [{"ref": "e1", "role": "button", "name": "出牌"}]
+    _step_env(monkeypatch, _step_data(page_errors_new=[],
+                                      page_errors=["Uncaught TypeError: 首屏就崩了"]))
+    out = await bst.run_browser_session_tool(ctx, "browser_step",
+                                             {"action": "click", "target": "e1"})
+    assert out["page_errors_new"] == []
+    assert "首屏就崩了" not in json.dumps(out, ensure_ascii=False)
+
+
+async def test_open_reports_its_full_page_errors_under_the_new_key(monkeypatch):
+    """两条路径字段名不同是 sidecar 那一侧的事；后端给模型的仍是同一族键，open 读全量当基线。"""
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    monkeypatch.setattr(bst, "_sidecar_open", lambda url, **kw: _aget(
+        (_session_ok(page_errors=["Uncaught TypeError: 首屏报错"]), "")))
+    out = await bst.run_browser_session_tool(Ctx(), "browser_open", {})
+    assert out["page_errors_new"] == ["Uncaught TypeError: 首屏报错"]
+
+
 async def test_step_result_describes_the_step_it_just_ran(monkeypatch):
     """规格 §5.2：step 的返回值自带 `action` / `target`（/ 给了就带 `expect`）。
 
@@ -1332,6 +1443,7 @@ async def test_step_result_describes_the_step_it_just_ran(monkeypatch):
     monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
     monkeypatch.setattr(bst, "_sidecar_step", lambda sid, payload: _aget(
         ({"ok": False, "error": "元素不可点击或动作失败: timeout", "steps_charged": True}, "")))
+    _no_shot(monkeypatch)
     bad = await bst.run_browser_session_tool(failed, "browser_step",
                                              {"action": "click", "target": "e7"})
     assert bad["ok"] is False and bad["action"] == "click" and bad["target"] == "e7"

@@ -116,9 +116,12 @@ class FakePage:
         self.screenshot_error: Exception | None = None
         self.screenshot_calls: list[dict] = []
         self.waited: list = []
-        # 页面自己「制造」外部事件的三个钩子：真浏览器里它们发生在 goto / click 期间，
+        # 页面自己「制造」外部事件的几个钩子：真浏览器里它们发生在 goto / click 期间，
         # 替身只能在同一时刻把事件灌回 attach_listeners 注册的处理器。
         self.console_on_goto: list[tuple[str, str]] = []
+        # 与 console 同形：真浏览器里 pageerror 给的是一个 Error 对象，收集器只做 str(err)，
+        # 替身因此也得传一个异常而不是裸字符串。
+        self.pageerror_on_goto: list[str] = []
         self.dialog_on_click: str | None = None
         self.redirect_to: str | None = None
 
@@ -158,6 +161,8 @@ class FakePage:
         self.url = self.redirect_to or url
         for level, text in self.console_on_goto:
             self.handlers["console"](FakeMsg(level, text))
+        for message in self.pageerror_on_goto:
+            self.handlers["pageerror"](RuntimeError(message))
 
     async def route(self, pattern, handler):
         self.handlers["route"] = handler
@@ -602,8 +607,9 @@ def test_open_registers_a_session_and_returns_the_state_contract(client):
     body = r.json()
     assert r.status_code == 200
     # 契约字段一个不许少（Task 4 的 browser_open 按名字取值，改名就是静默 None）
+    # page_errors 也在契约里：裁定 R-27 之后后端要读它（open 全量 / step 增量 `page_errors_new`）
     assert {"ok", "session_id", "title", "text", "url", "interactive",
-            "console", "failed_requests", "elapsed_ms"} <= set(body)
+            "console", "page_errors", "failed_requests", "elapsed_ms"} <= set(body)
     assert body["ok"] is True and body["elapsed_ms"] >= 0
     s = sessions.SESSIONS[body["session_id"]]
     assert s.origin == "http://127.0.0.1:8210"      # origin 在创建时固化，不跟着 path 走
@@ -726,12 +732,55 @@ def test_step_new_items_respect_the_shaping_budget(client):
     s = sessions.SESSIONS[sid]
     s.collectors.console.extend({"level": "error", "text": f"e{i} " + "x" * 1200}
                                for i in range(45))
+    # page_errors 的同一条尺（裁定 R-27）：10 条 / 单条 1000 字，预算只在 shape_result 定义一次
+    s.collectors.page_errors.extend(f"e{i} " + "x" * 1200 for i in range(12))
     body = _step(client, sid, action="click", ref="e1").json()
     assert len(body["console_new"]) == 40
     assert body["truncated"] is True
     assert all(i["truncated"] is True for i in body["console_new"])
     # 1000 字正文 + 「…（已截断）」这 6 字标记，就是 _clip 的形状；多一个字符都是预算漂了
     assert all(len(i["text"]) == 1006 for i in body["console_new"])
+    assert len(body["page_errors_new"]) == 10
+    assert all(len(e) == 1006 for e in body["page_errors_new"])
+
+
+def test_page_errors_new_replays_nothing_already_reported(client):
+    """裁定 R-27：`page_errors` 是与 console 同款的**增量**账，不是每步重播的全量。
+
+    未捕获异常（`pageerror`）比 console.error 更能说明「我这一步把页面点崩了」，而全量累积
+    会让首屏那一次崩溃在之后每一步都以旧账的模样出现——模型分不清是自己点崩的还是页面本来就崩的。
+    """
+    sid = _opened(client, lambda: FakePage(url=OPEN_URL, nodes=NODES))
+    s = sessions.SESSIONS[sid]
+    s.collectors.page_errors.append("Uncaught TypeError: 这一步崩的")
+    first = _step(client, sid, action="click", ref="e1").json()
+    assert first["page_errors_new"] == ["Uncaught TypeError: 这一步崩的"]
+    # 与 console 同一口径：全量那份已经被增量取代，别两份一起发
+    assert "page_errors" not in first
+
+    second = _step(client, sid, action="click", ref="e1").json()
+    assert second["page_errors_new"] == []      # 上一步报过的不在本步
+
+    s.collectors.page_errors.append("Uncaught ReferenceError: 这一步才崩")
+    third = _step(client, sid, action="click", ref="e1").json()
+    assert third["page_errors_new"] == ["Uncaught ReferenceError: 这一步才崩"]
+
+
+def test_open_bills_the_first_screen_page_errors(client):
+    """首屏的崩溃整份报过一次，账就要从这里开始记：不记的话第二步会把它当「本步新增」重播。"""
+    def factory():
+        page = FakePage(url=OPEN_URL, nodes=NODES)
+        page.pageerror_on_goto = ["Uncaught TypeError: 首屏就崩了"]
+        return page
+
+    client.fake_browser.page_factory = factory
+    opened = _open(client).json()
+    # open 那一面仍是全量 `page_errors`（Task 2 起的既有契约，与 step 的增量键名刻意不同）
+    assert opened["page_errors"] == ["Uncaught TypeError: 首屏就崩了"]
+    body = _step(client, opened["session_id"], action="click", ref="e1").json()
+    assert body["page_errors_new"] == []
+    assert sessions.SESSIONS[opened["session_id"]].page_errors_seen == {
+        ("", "Uncaught TypeError: 首屏就崩了")}
 
 
 def test_step_with_expect_marks_passed_and_note(client):

@@ -29,8 +29,8 @@ class Session:
     """一个 run 一个活页面。
 
     `origin` 在创建时固化（规格 §6.2 第三条不变式）：`navigate` 只能回到这个 origin，
-    而 `console_seen` / `failed_seen` 是**增量账**——监听器收集的是全量，每步要报的
-    是「自上次以来新增」，账必须跟着会话走，不能跟着一次采集走。
+    而 `console_seen` / `failed_seen` / `page_errors_seen` 是**增量账**——监听器收集的是全量，
+    每步要报的是「自上次以来新增」，账必须跟着会话走，不能跟着一次采集走。
     """
 
     session_id: str
@@ -40,6 +40,9 @@ class Session:
     collectors: object = None
     console_seen: set = field(default_factory=set)
     failed_seen: set = field(default_factory=set)
+    # 未捕获异常（pageerror）与 console 同款记账（裁定 R-27）：它是「这一步把页面点崩了」
+    # 最强的信号，Vue 运行时抛的异常多半只进这里、不进 console，不记账就每步重播首屏崩溃。
+    page_errors_seen: set = field(default_factory=set)
     last_used: float = field(default_factory=time.monotonic)
     steps: int = 0
     dialog: dict | None = None
@@ -198,19 +201,24 @@ def pending_console(s: Session) -> list[dict]:
     return fresh
 
 
-def take_new_items(s: Session) -> tuple[list[dict], list[dict]]:
-    """算出本步新增的 console / 失败请求**并记账**，返回两者。
+def take_new_items(s: Session) -> tuple[list[dict], list[dict], list[str]]:
+    """算出本步新增的 console / 失败请求 / 未捕获异常**并记账**，返回三者。
 
     只有 step 收尾（以及 open 首轮报完全量之后）走这里：账记的是收集器里的**原始条目**
     指纹，不是 `shape_result` 裁剪后的形状——两边同一份口径才能对上（裁定 R-11）。
     open 调它但丢掉返回值，作用是「首轮已经整份报给模型了，别再在第二步重播一遍」。
+
+    `page_errors` 收集器里是裸字符串，而 `new_only` 按 dict 取字段做指纹，所以套一层
+    `{"text": e}` 的薄壳记账、取完摊平回字符串——返回形状与 `/inspect` 那份 `page_errors`
+    一致，后端与前端两条路径看到的都是 list[str]。
     """
     c = s.collectors
     if c is None:
-        return [], []
+        return [], [], []
     console, s.console_seen = new_only(s.console_seen, list(c.console))
     failed, s.failed_seen = new_only(s.failed_seen, list(c.failed))
-    return console, failed
+    wrapped, s.page_errors_seen = new_only(s.page_errors_seen, [{"text": e} for e in c.page_errors])
+    return console, failed, [str(i["text"]) for i in wrapped]
 
 
 def take_dialog(s: Session) -> dict | None:

@@ -494,17 +494,25 @@ async def _idle_wait(s: Session, timeout_ms: int) -> None:
 
 
 def _step_state(s: Session, snap: dict) -> dict:
-    """step 响应的状态部分：与 open 同形，但 console / 失败请求换成「本步新增」（US-04）。
+    """step 响应的状态部分：与 open 同形，但 console / 失败请求 / 未捕获异常换成「本步新增」（US-04）。
 
-    增量条目也过 `shape_result` 那把尺：预算（40 条 / 单条 1000 字 / 失败请求 30 条）只在
-    那里定义一处，绕开它自己裁就等于允许增量把整页 console 灌进模型上下文。
+    增量条目也过 `shape_result` 那把尺：预算（40 条 / 单条 1000 字 / 失败请求 30 条 /
+    page_errors 10 条）只在那里定义一处，绕开它自己裁就等于允许增量把整页 console 灌进模型上下文。
+
+    字段名的不对称是有意的，别「统一」掉它（裁定 R-27）：`/inspect`（`preview_page`）是
+    一次性全量检查，它的既有契约叫 `page_errors`（Task 2 起前端与后端都在读这个名字）；
+    session 路径每步只报新增，所以叫 `page_errors_new`——与同一条响应里的 `console_new` /
+    `failed_requests_new` 成族。把这里改回 `page_errors` 会让后端的存在性判定退回全量，
+    每一步都重播首屏那次崩溃。
     """
-    console_new, failed_new = take_new_items(s)
-    shaped = shape_result(title="", text="", console=console_new, page_errors=[],
+    console_new, failed_new, page_errors_new = take_new_items(s)
+    shaped = shape_result(title="", text="", console=console_new, page_errors=page_errors_new,
                           failed_requests=failed_new, elapsed_ms=0)
-    state = {k: v for k, v in snap.items() if k not in ("console", "failed_requests")}
+    state = {k: v for k, v in snap.items()
+             if k not in ("console", "failed_requests", "page_errors")}
     state["console_new"] = shaped["console"]
     state["failed_requests_new"] = shaped["failed_requests"]
+    state["page_errors_new"] = shaped["page_errors"]
     # 截断有两个来源：整份采集触顶（快照带来的 truncated）与本步增量触顶。前者不覆盖后者
     # 的话，「本步 900 条错误只报了 40 条」会被读成一份完整清单。
     state["truncated"] = bool(state.get("truncated")) or bool(shaped["truncated"])
