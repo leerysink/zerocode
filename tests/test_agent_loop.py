@@ -765,6 +765,96 @@ async def test_non_sensitive_fill_value_stays_plain_in_the_persisted_args(test_e
     assert seen[0][1]["value"] == "第一单"
 
 
+@pytest.mark.asyncio
+async def test_two_steps_in_one_round_mask_the_same_value_on_both_sides(test_engine, tmp_path,
+                                                                        monkeypatch):
+    """Critical C-1：一条 assistant 消息里发两个 browser_step 时，参数侧只能用「本轮开始时」那份清单。
+
+    形状是登录页最常见的那种：先 `click` 展开带口令框的表单，紧接着 `fill` 那个**新出现**的 ref。
+    loop 落库那行写在派发**之前**（`loop.py`），用的只能是轮初的 `browser_refs`；而 `_step` 的结果侧
+    读的是各步**动作前**的清单，第二步已经能看到第一步返回的新清单。旧口径下 `is_sensitive_ref`
+    对不在轮初清单里的 ref 返回 False（没有「未知」这第三态），于是同一个 value 一侧明文、
+    一侧遮断——`message.tool_args` 与 WS `tool_call` 里是 `hunter2`，`browser_log` 里是占位符。
+    一轮多调用是结构性支持的（`llm.py` 按 index 累加并输出全部调用，loop 顺序派发，没有任何地方
+    关掉它），所以这条不是理论路径。
+
+    这里走真 loop 钉「两侧对同一个 value 给同一个结论」：落库、WS 事件、`browser_log` 三处都必须
+    遮，而 sidecar 与当轮回注必须拿到原值（否则 US-08 的登录根本填不进去）。
+    """
+    from app.agent import browser_session_tools as bst
+
+    sid, aid, sf, seen = await _fill_env(test_engine, tmp_path, monkeypatch, bst, slug="pvsens3",
+                                         dev_port=8305, prod_port=8304)
+    # 轮初清单只有 e2（密码）与 e3（备注）；click 之后 sidecar 返回的新清单里才出现 e9（口令框）
+    fresh = [{"ref": "e9", "role": "textbox", "name": "支付密码", "sensitive": True},
+             {"ref": "e3", "role": "textbox", "name": "备注", "sensitive": False}]
+
+    async def fake_step(session_id, payload):
+        seen.append((session_id, payload))
+        return {"ok": True, "title": "登录", "text": "",
+                "url": "http://192.168.65.254:8305/", "interactive": fresh,
+                "interactive_truncated": False, "dialog": None, "console_new": [],
+                "failed_requests_new": [], "page_errors_new": [], "truncated": False,
+                "timed_out": False, "steps_charged": True, "elapsed_ms": 1}, ""
+
+    monkeypatch.setattr(bst, "_sidecar_step", fake_step)
+    # 抓住真 handler 的 ctx：结果侧那份账（browser_log）只在 run_state 里，别处读不到
+    captured = {}
+    real_run = bst.run_browser_session_tool
+
+    async def spy_run(ctx, name, args):
+        captured["ctx"] = ctx
+        return await real_run(ctx, name, args)
+
+    monkeypatch.setattr(bst, "run_browser_session_tool", spy_run)
+
+    turns = [done(None, [tool_call("c1", "browser_open", path="/")]),
+             done(None, [tool_call("c2", "browser_step", action="click", target="e1"),
+                         tool_call("c3", "browser_step", action="fill", target="e9",
+                                   value="hunter2")]),
+             done("填好了")]
+    rec = Recorder()
+    llm = ScriptedLLM(turns)
+    await mk_runner(sf, llm, rec, tasks={}).run(sid, "登录一遍", asyncio.Event())
+
+    # ① 落库那一份：轮初清单里没有 e9，未知即遮——同一个 value 与结果侧给出同一个结论
+    async with sf() as s:
+        rows = (await s.execute(sql(
+            "SELECT role, tool_args, tool_result FROM message WHERE session_id=:i ORDER BY seq"),
+            {"i": sid})).all()
+    blob = json.dumps([list(r) for r in rows], ensure_ascii=False)
+    assert "hunter2" not in blob, "口令明文进了消息表（tool_args 或 tool_result）"
+    step_row = next(list(r)[1] for r in rows
+                    if isinstance(list(r)[1], dict)
+                    and len(list(r)[1].get("tool_calls") or []) == 2)
+    calls = step_row["tool_calls"]
+    assert [c["function"]["name"] for c in calls] == ["browser_step", "browser_step"]
+    fill_tc = calls[1]
+    assert fill_tc["id"] == "c3"
+    masked = json.loads(fill_tc["function"]["arguments"])
+    assert masked["value"] == "<redacted:sensitive_input>"
+    assert masked["action"] == "fill" and masked["target"] == "e9"   # 结构照旧读得出做了什么
+    assert "value" not in json.loads(calls[0]["function"]["arguments"])  # click 没有 value，不动
+
+    # ② WS 推送那一份（前端通用折叠块打印的就是它）
+    evs = [e for e in rec.events if e["type"] == "tool_call" and e["name"] == "browser_step"]
+    assert len(evs) == 2
+    assert evs[1]["args"]["value"] == "<redacted:sensitive_input>"
+    assert "hunter2" not in json.dumps(evs, ensure_ascii=False)
+
+    # ③ 结果侧那份账：browser_log 对同一个 value 给出同一个结论（遮）
+    logged = [s for s in captured["ctx"].run_state["browser_log"] if s.get("action") == "fill"]
+    assert len(logged) == 1
+    assert logged[0]["value_redacted"] is True and "hunter2" not in str(logged[0])
+
+    # ④ 原值照样送达 sidecar（两次调用都在），否则 US-08 的登录填不进去
+    assert [p["value"] for _sid, p in seen if p["action"] == "fill"] == ["hunter2"]
+
+    # ⑤ 当轮回注模型仍是原值（跨轮从净化库重建才是遮断版）
+    back = [m for m in llm.received[2] if m["role"] == "assistant" and m.get("tool_calls")]
+    assert json.loads(back[-1]["tool_calls"][1]["function"]["arguments"])["value"] == "hunter2"
+
+
 @pytest.fixture
 def pv_seams(monkeypatch):
     """预览重启链路的 Docker 侧替身：预检放行、探针 200、起栈像真引擎那样把终态写进库。"""

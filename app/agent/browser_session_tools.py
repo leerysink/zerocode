@@ -665,12 +665,51 @@ def _step_failure(ctx, data: dict, *, target_netloc: str, display_netloc: str,
 #   · `ref_display_name` 回显这一步的元素名（裁定 R-32，US-22）。
 # 不拿动作之后的新快照做后两件：ref 是按采集顺序现编的、每次重渲染全部作废（规格 §6.2），
 # 用新快照反查 `e7` 会标到另一个元素上——名字画错比不画更糟，遮断遮错对象就是明文泄漏。
+# 参数侧还多一条「未知句柄也遮」（`is_sensitive_ref_or_unknown`，Critical C-1）：它在派发之前跑，
+# 天生只能拿到本轮开始时那份清单，一条消息里发两个 step 时第二步的 ref 还没进过任何清单。
 def is_sensitive_ref(refs, ref: str) -> bool:
     """sensitive 判定的**唯一口径**：两处 value 遮断（结果侧与参数侧）共用它，不许各写一遍。"""
     if not ref:
         return False
     return any(isinstance(item, dict) and str(item.get("ref") or "") == ref
                and item.get("sensitive") for item in list(refs or []))
+
+
+# 句柄形态：`e` + 数字，sidecar 按采集顺序现编的 ref。参数侧的「未知即遮」只认这个形态，
+# 于是 navigate 的 path（`/login`）天然被排除在外——它不是 ref，无从判定也谈不上风险。
+_REF_HANDLE_RE = re.compile(r"^e\d+$")
+
+
+def _ref_is_listed(refs, ref: str) -> bool:
+    """这个 ref 在不在清单里（不看 sensitive，只看有没有这一条）。"""
+    return any(isinstance(item, dict) and str(item.get("ref") or "") == ref
+               for item in list(refs or []))
+
+
+def is_sensitive_ref_or_unknown(refs, target: str) -> bool:
+    """参数侧专用的判定：已知的 sensitive 遮，**未知的句柄也遮**（Critical C-1 的裁定）。
+
+    `is_sensitive_ref` 只有「在清单里且 sensitive」一个 True 分支，对不在清单里的 ref 返回
+    False——它没有「未知」这第三态。而参数侧天生可能拿不到那一份清单：loop 落库那行写在派发
+    **之前**，只能用本轮开始时的 `browser_refs`，而一条 assistant 消息里发多个 `browser_step`
+    是本项目结构性支持的（`llm.py` 按 index 累加并输出全部调用、loop 顺序派发，没有任何地方关掉
+    并行调用）。第二步的 target 只能来自第一步的返回值——那份清单参数侧永远看不到。旧口径下
+    「click 展开带口令框的表单 + 紧接着 fill 那个新 ref」这一路，value 会明文进
+    `message.tool_args` 与 WS `tool_call` 事件，而结果侧（读各步动作前的清单）照常遮断，
+    正是「一处遮一处不遮就是漏」。而且模型不必猜中 ref：登录页 e1=用户名、e2=口令这种编号
+    本来就可预测。
+
+    未知即遮的代价只是「一个查不到名字的 ref 填的内容不落明文」，反向的代价是凭据进库（US-19）。
+    已知且非 sensitive 的仍然放行——一刀切会把「这一步填了什么备注」一起毁掉。
+    结果侧不套这条：它读的就是各步动作前的那份清单，ref 恒在清单里，语义保持不变。
+    """
+    if not target:
+        return False
+    if not _REF_HANDLE_RE.match(target):
+        return False                      # path 或自由文本：不是句柄，不进未知即遮
+    if is_sensitive_ref(refs, target):
+        return True
+    return not _ref_is_listed(refs, target)
 
 
 def ref_display_name(refs, ref: str) -> str:
@@ -720,7 +759,12 @@ def redact_sensitive_step_args(tool_calls, refs) -> tuple[list[dict], int]:
 
     判定与 `browser_log` 那一处**同源同口径**：同一个 `is_sensitive_ref`、同一份「动作之前」
     的清单（`refs` 由调用方从 `ctx.run_state["browser_refs"]` 取，一轮内不变）。一处遮一处不遮
-    就是漏，所以两处共用一个函数，不在这里重写规则。
+    就是漏，所以两处共用一个判定，不在这里重写规则。参数侧额外多一条「未知句柄也遮」
+    （`is_sensitive_ref_or_unknown`，Critical C-1）——它拿到的清单天生可能是旧的一份。
+
+    value 的口径也与结果侧对齐（I-1）：先 `str(value or "")` 再判空再遮。改前那句
+    `isinstance(value, str)` 会让数值型 PIN（`{"value": 123456}`）整条绕过参数侧，而结果侧
+    `value = str(args.get("value") or "")` 兜住了它——同一个 ref 一边遮一边不遮。
 
     只影响落库/推送那一份：工具执行与 sidecar 载荷走的是 loop 的 `original_calls`，
     原值照样送达（US-08 的登录要真填进去），当轮回注模型的 assistant tool_calls 也保留原值，
@@ -729,13 +773,13 @@ def redact_sensitive_step_args(tool_calls, refs) -> tuple[list[dict], int]:
     def rewrite(args):
         if not isinstance(args, dict):
             return args, 0
-        value = args.get("value")
-        if not isinstance(value, str) or not value:
+        value = str(args.get("value") or "")      # 与结果侧同一个转换：非字符串（PIN）也算填了
+        if not value:
             return args, 0
-        if not is_sensitive_ref(refs, str(args.get("target") or "")):
+        if not is_sensitive_ref_or_unknown(refs, str(args.get("target") or "")):
             return args, 0
         if contains_redaction_marker(value):
-            # 已被通用规则表遮过一轮：幂等，不重复计数也不套娃
+            # 已被通用规则表遮过一轮：幂等，不重复计数也不套娃（检查排在转换之后）
             return args, 0
         return {**args, "value": SENSITIVE_VALUE_PLACEHOLDER}, 1
 
@@ -854,6 +898,10 @@ async def _step(ctx, args: dict) -> dict:
             # 「报告里出现的步」恒等于「真的花掉额度的步」，steps_total 才是可信的数。
             _append_log(ctx, {"action": failure.get("action") or "",
                               "target": failure.get("target") or "",
+                              # 动作前的元素名也进账（M-6）：点不动那一步在报告里同样只留一个
+                              # 作废句柄就是噪声，两支都要有名字才读得出「卡在谁身上」。
+                              **({"target_name": echo["target_name"]}
+                                 if echo.get("target_name") else {}),
                               "ok": False, "error": failure["error"], "passed": None,
                               "url": (_display_url_for(info["display_base"], data["url"])
                                       if data.get("url") else _last_logged_url(ctx))})
@@ -865,6 +913,10 @@ async def _step(ctx, args: dict) -> dict:
     ctx.run_state["browser_refs"] = list(data.get("interactive") or [])
     display_url = _display_url_for(info["display_base"], data.get("url"))
     entry = {"action": action, "target": echo["target"],
+             # 动作之前那份清单里的元素名一并进账（M-6）：`_close` 的报告项据此把「这一行是
+             # 谁」写给读报告的人——按规格 §6.2 那些 ref 早就作废，只留句柄就是噪声。
+             # 查不到就不写这个键（同 `_step_echo` 的规矩：不编名字）。
+             **({"target_name": echo["target_name"]} if echo.get("target_name") else {}),
              # `ok` 恒 True（`passed` 是另一件事）：与上面那条 `ok:false` 的形状一一对应，
              # Task 7 的步骤卡按同一个字段分色，不必再按「有没有 error 键」猜。
              "ok": True, "passed": data.get("passed"), "url": display_url}
@@ -914,6 +966,11 @@ async def _close(ctx, _args: dict) -> dict:
                 # 缺 ok 键的旧条目（open 那一条）按「推进了」读。
                 "ok": bool(s.get("ok", True)),
                 "passed": s.get("passed")}
+        # 元素名同理（M-6）：句柄按规格 §6.2 早已作废，读报告的人手上没有清单能对回 `e7` 是谁。
+        # log 里存的那份已过 `ref_display_name` 的遮断闸，这里照 error/note 的形状再过一遍
+        # `_redact`——报告是会被原样贴进消息历史的那一份，纵深防御。
+        if s.get("target_name"):
+            item["target_name"] = _redact(s["target_name"], REF_NAME_MAX_CHARS)[0]
         # 点不动那一步的原因也要进报告：只给一个 ok:false，读报告的人仍然不知道卡在哪儿。
         # error 在写 log 时已经过 `_sidecar_text`（先 host 清洗、再遮断、再裁剪），这里再过一遍
         # `_redact` 是纵深防御——报告是会被原样贴进消息历史的那一份。

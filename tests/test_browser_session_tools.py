@@ -900,6 +900,63 @@ async def test_the_two_value_masks_share_one_sensitive_verdict(monkeypatch):
     assert checked == [("e2", True), ("e2", True), ("e3", False), ("e3", False)]
 
 
+async def test_an_unknown_handle_is_masked_like_a_sensitive_one():
+    """未知即遮（Critical C-1）：target 是句柄形态、却不在清单里时，参数侧按 sensitive 处理。
+
+    `is_sensitive_ref` 只有「在清单里且 sensitive」一个 True 分支，对不在清单里的 ref 返回
+    False——它没有「未知」这第三态。而 loop 落库那行写在派发**之前**，只能用本轮开始时那份清单，
+    于是「同一条消息里先 click 展开带口令框的表单、紧接着 fill 那个新出现的 ref」这两步，
+    第二步的 value 会明文进 `message.tool_args` 与 WS `tool_call` 事件，而结果侧读到的已经是
+    第一步返回的新清单、照常遮断——正是 R-33 禁止的那种分家。模型不必猜中 ref：登录页
+    e1=用户名、e2=口令这类编号本来就可预测。
+    只认句柄形态：navigate 的 target 是 path，不是 ref，不进这条规则。
+    """
+    refs = [{"ref": "e2", "role": "textbox", "name": "用户名", "sensitive": False}]
+    calls = [_tool_call("browser_step", action="fill", target="e9", value="hunter2"),
+             _tool_call("browser_step", action="fill", target="e2", value="alice"),
+             _tool_call("browser_step", action="navigate", target="/login", value="hunter2")]
+    out, hits = bst.redact_sensitive_step_args(calls, refs)
+    assert hits == 1
+    assert json.loads(out[0]["function"]["arguments"])["value"] == "<redacted:sensitive_input>"
+    assert json.loads(out[1]["function"]["arguments"])["value"] == "alice"   # 已知非 sensitive 照旧
+    assert out[2] is calls[2]                        # path 形态：未知也不等于「可能是敏感框」
+    # 清单为空（本 run 还没 open 过 / open 前就被裁掉）是「未知」的极端形状，同样遮
+    lonely, lonely_hits = bst.redact_sensitive_step_args(calls[:1], [])
+    assert lonely_hits == 1 and "hunter2" not in lonely[0]["function"]["arguments"]
+
+
+async def test_a_numeric_pin_is_masked_on_both_sides(monkeypatch):
+    """非字符串 value 不许绕过参数侧（I-1）：数值型 PIN 正是这个形状，单步轮也漏。
+
+    结果侧 `value = str(args.get("value") or "")` 主动兜住了非字符串，参数侧改前是
+    `if not isinstance(value, str)` 就 return——同一个 sensitive ref、同一个 123456，一边遮
+    一边原样落库。修法是与结果侧对齐口径：先 `str(value or "")` 再判空再遮，
+    占位符检查排在转换之后。
+    """
+    refs = [{"ref": "e2", "role": "textbox", "name": "密码", "sensitive": True}]
+    ctx = Ctx()
+    ctx.run_state["browser_session"] = "abc"
+    ctx.run_state["browser_refs"] = refs
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    monkeypatch.setattr(bst, "_sidecar_step",
+                        lambda sid, payload: _aget((_step_data(interactive=[]), "")))
+    await bst.run_browser_session_tool(
+        ctx, "browser_step", {"action": "fill", "target": "e2", "value": 123456})
+    logged = ctx.run_state["browser_log"][-1]
+    assert logged["value_redacted"] is True and "123456" not in str(logged)
+    out, hits = bst.redact_sensitive_step_args(
+        [_tool_call("browser_step", action="fill", target="e2", value=123456)], refs)
+    assert hits == 1
+    assert json.loads(out[0]["function"]["arguments"])["value"] == "<redacted:sensitive_input>"
+    # 判空口径也与结果侧一致：0 在两侧都算「没填」，不计数也不遮（结果侧连 value 键都不写）
+    zero = _tool_call("browser_step", action="fill", target="e2", value=0)
+    kept, zero_hits = bst.redact_sensitive_step_args([zero], refs)
+    assert zero_hits == 0 and kept[0] is zero
+    # 转换后才查标记：已经是占位符的那一份不重复计数、不套娃
+    again, again_hits = bst.redact_sensitive_step_args(out, refs)
+    assert again_hits == 0
+
+
 async def test_step_echo_target_name_comes_from_the_pre_action_refs(monkeypatch):
     """US-22「目标元素名」的取法（裁定 R-32）：只认**动作之前**那份清单。
 
@@ -955,6 +1012,50 @@ async def test_step_echo_omits_target_name_when_it_cannot_be_known(monkeypatch):
     nav = await bst.run_browser_session_tool(
         ctx, "browser_step", {"action": "navigate", "target": "/orders"})
     assert "target_name" not in nav and nav["target"] == "/orders"
+
+
+async def test_close_report_carries_the_target_name(monkeypatch):
+    """M-6：收口报告的行不能只留一个作废的句柄。
+
+    按规格 §6.2，每次重渲染后旧 ref 全部作废——读报告的人手上没有任何一份清单能对回 `e7`
+    是谁，那一个句柄实际是噪声。`_step` 早就算好了 `target_name`（裁定 R-32），这次把它写进
+    log，`_close` 再照 `error` / `note` 的同一个 `_redact` 形状带进 report 项（报告是会被原样
+    贴进消息历史的那一份，纵深防御）。成功与点不动两支都记账，所以两支都带名字。
+    """
+    async def fake_step(sid, payload):
+        if payload["ref"] == "e7":
+            return {"ok": False, "error": "元素不可点击或动作失败: timeout",
+                    "interactive": [], "steps_charged": True}, ""
+        return _step_data(), ""
+
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    monkeypatch.setattr(bst, "browser_target_host", lambda: "host.docker.internal")
+    monkeypatch.setattr(bst, "_sidecar_open", lambda url, **kw: _aget((_session_ok(), "")))
+    monkeypatch.setattr(bst, "_sidecar_delete", lambda sid: _aget(True))
+    monkeypatch.setattr(bst, "_sidecar_step", fake_step)
+    _no_shot(monkeypatch)
+
+    # 成功两支：第一步点 e1（动作前清单里叫「按钮1」），第二步点 e9——清单里没有的 ref 不编名字
+    ctx = Ctx()
+    await bst.run_browser_session_tool(ctx, "browser_open", {"path": "/orders"})
+    await bst.run_browser_session_tool(ctx, "browser_step", {"action": "click", "target": "e1"})
+    await bst.run_browser_session_tool(ctx, "browser_step", {"action": "click", "target": "e9"})
+    report = (await bst.run_browser_session_tool(ctx, "browser_close", {}))["report"]
+    assert report[0]["action"] == "open" and "target_name" not in report[0]
+    assert report[1]["target_name"] == "按钮1"
+    assert "target_name" not in report[2]            # 查不到就没有这个键（同 echo 的规矩）
+    assert [s.get("target_name") for s in ctx.run_state["browser_log"]] == [None, "按钮1", None]
+
+    # 点不动那一支同样带名字，且名字已过遮断闸（页面派生文本，与清单同一个口径）
+    ctx2 = Ctx()
+    ctx2.run_state["browser_session"] = "abc"
+    ctx2.run_state["browser_refs"] = [{"ref": "e7", "role": "button",
+                                       "name": "提交 token=abc123def456ghi", "sensitive": False}]
+    await bst.run_browser_session_tool(
+        ctx2, "browser_step", {"action": "click", "target": "e7"})
+    row = (await bst.run_browser_session_tool(ctx2, "browser_close", {}))["report"][0]
+    assert row["ok"] is False and row["target_name"]
+    assert "abc123def456ghi" not in row["target_name"] and "提交" in row["target_name"]
 
 
 async def test_action_failure_is_ok_false_and_expect_failure_is_passed_false(monkeypatch):
