@@ -15,6 +15,7 @@ import ThinkingBlock from './ThinkingBlock.vue'
 import TodoCard from './TodoCard.vue'
 import PreviewCard from './PreviewCard.vue'
 import PageInspectCard from './PageInspectCard.vue'
+import BrowserFlowCard from './BrowserFlowCard.vue'
 
 const props = defineProps({
   messages: { type: Array, default: () => [] },
@@ -35,6 +36,10 @@ const PREVIEW_TOOL_NAMES = ['preview_status', 'preview_logs', 'preview_restart']
 // preview_page 有自己的结果卡（页面文本/截图/视觉诊断）；名单与后端 BROWSER_TOOL_NAMES 同名，
 // 漏改的后果是落回通用折叠块，不会静默出错。
 const PAGE_TOOL_NAMES = ['preview_page']
+// 交互浏览器三件套（规格 2026-11-02）：open / step / close 共用一张步骤卡。
+// 名单与后端 llm.BROWSER_SESSION_TOOL_NAMES 同名同序（这里刻意不 import 后端常量，前端拿不到），
+// 增删交互工具时两处一起改——名字对不上的后果是卡片落回通用折叠块，不会静默出错。
+const BROWSER_SESSION_TOOL_NAMES = ['browser_open', 'browser_step', 'browser_close']
 
 // 渲染前统一归一化：实时事件形状与历史行形状都过这一个函数，组件只认归一化后的字段。
 // 归一化后一次工具调用恒为一条记录（args 与 result 同体），所以「call 行/result 行」的
@@ -47,6 +52,10 @@ function isPreviewTool(m) {
 
 function isPageTool(m) {
   return PAGE_TOOL_NAMES.includes(m.name || '')
+}
+
+function isBrowserTool(m) {
+  return BROWSER_SESSION_TOOL_NAMES.includes(m.name || '')
 }
 
 // 提问卡：ask_user 调用行一律渲染成卡片，待答/已答由有没有结果行决定（见 AskUserCard）。
@@ -65,6 +74,13 @@ function isPreviewCard(m, i) {
 // 与 isPreviewCard 同一道闸：归一化后一次调用恒为一条记录，只看有没有结果
 function isPageCard(m, i) {
   return isPageTool(m) && !!(m.result || i === view.value.length - 1)
+}
+
+// 同一个去重闸的第三份用法（有结果或仍是最后一条），不另造判定：
+// 实时流里一次调用是 call + result 两条记录，不设闸会常驻一张「正在执行」的假卡，
+// 刷新后同一件事又画两张。三张卡的闸门写成同一形状，将来只有一处语义要改。
+function isBrowserCard(m, i) {
+  return isBrowserTool(m) && !!(m.result || i === view.value.length - 1)
 }
 
 // 进度只给「消息流最后一条、还没有结果」的那张卡：历史卡片复活进度条会让人以为又在重启
@@ -148,14 +164,16 @@ onMounted(scrollToBottom)
           </span>
         </div>
         <!-- tool：ask_user 渲染提问卡；需确认的调用渲染确认卡（待答可交互／已答只读留痕）；
-             todo_write 渲染任务卡；preview_* 渲染预览卡（还要过 isPreviewCard 的闸——
-             只有「有结果」或「仍在进行」的那条画卡）；其余落回通用折叠块。
+             todo_write 渲染任务卡；preview_* 渲染预览卡；preview_page 渲染检查卡；
+             browser_open/step/close 渲染步骤流卡（三张卡都要过「有结果或仍是最后一条」那道闸）；
+             其余落回通用折叠块。
              字段一律是归一化后的 name/args/result，实时与历史同形（见 messageModel.js）。 -->
         <div v-else-if="m.role === 'tool'" class="zc-msg is-tool">
           <AskUserCard v-if="isAskCard(m)" :questions="m.questions" :result="m.result" />
           <ConfirmCard v-else-if="confirmCardState(m)" :msg="m" :state="confirmCardState(m)" />
           <TodoCard v-else-if="m.name === 'todo_write' && m.args && m.args.todos" :todos="m.args.todos" />
           <PageInspectCard v-else-if="isPageCard(m, i)" :msg="m" :progress="liveProgress(m, i)" />
+          <BrowserFlowCard v-else-if="isBrowserCard(m, i)" :msg="m" :progress="liveProgress(m, i)" />
           <PreviewCard v-else-if="isPreviewCard(m, i)" :msg="m" :progress="liveProgress(m, i)" />
           <ToolCallBlock v-else :msg="m" />
         </div>
