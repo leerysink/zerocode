@@ -6,3 +6,4 @@ if errorlevel 1 (
   exit /b 1
 )
 echo [browser] sidecar 已启动：http://127.0.0.1:8101/healthz
+echo [browser] 可交互会话上限 2 个、空闲 120 秒回收（改 docker-compose.yml 的 ZEROCODE_BROWSER_MAX_SESSIONS / ZEROCODE_BROWSER_SESSION_TTL_SECONDS）

@@ -20,6 +20,10 @@ services:
     environment:
       BROWSER_ALLOWED_HOSTS: host.docker.internal,127.0.0.1,localhost
       PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
+      # 可交互会话的资源闸（ADR-0037）：超限拒绝新会话而不是排队，空闲超时回收 context。
+      # 与交付包 compose、browser/sessions.py 的代码默认值是同一组数字，本地别单独改这里。
+      ZEROCODE_BROWSER_MAX_SESSIONS: 2
+      ZEROCODE_BROWSER_SESSION_TTL_SECONDS: 120
     extra_hosts:
       - "host.docker.internal:host-gateway"
     read_only: true

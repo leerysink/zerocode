@@ -84,6 +84,13 @@ BROWSER_TARGET_HOST_BAKED = "host.docker.internal"
 # 都会被 sidecar 以「host 不在白名单」拒绝——后端只会看到一句 unavailable。
 BROWSER_ALLOWED_HOSTS_ENV = "BROWSER_ALLOWED_HOSTS"
 BROWSER_ALLOWED_HOSTS_BAKED = "host.docker.internal,127.0.0.1,localhost"
+# 可交互会话的资源闸（ADR-0037）：活页面留在 sidecar 进程内存里，没有上限与空闲回收就会在
+# mem_limit 1g 的容器里攒僵尸 context 直到 OOM。必须在交付包里显式写出来，而不靠代码默认值——
+# 默认值漂了没有任何地方看得见，而这两个数就是运维要看得见的那两个数。
+BROWSER_MAX_SESSIONS_ENV = "ZEROCODE_BROWSER_MAX_SESSIONS"
+BROWSER_MAX_SESSIONS_BAKED = "2"
+BROWSER_SESSION_TTL_ENV = "ZEROCODE_BROWSER_SESSION_TTL_SECONDS"
+BROWSER_SESSION_TTL_BAKED = "120"
 # Chromium 在**镜像构建期**下载；只进 browser 服务的 build args，不进容器运行期 env。
 PLAYWRIGHT_DOWNLOAD_HOST_ENV = "PLAYWRIGHT_DOWNLOAD_HOST"
 PLAYWRIGHT_DOWNLOAD_HOST_BAKED = "https://cdn.npmmirror.com/binaries/playwright"
@@ -127,7 +134,11 @@ GATEWAY_REQUIRED = ("docker-compose.yml", "nginx.conf", "lua/router.lua", "404.h
 
 # 浏览器 sidecar 入包必须齐全的文件：compose 会在服务器上按这个目录 build 镜像，
 # 少任何一个都以「镜像构建失败」的形式推迟到部署时才炸，所以打包期直接拒。
-BROWSER_REQUIRED = ("Dockerfile", "requirements.txt", "app.py", "inspect_core.py", "__init__.py")
+# 名单必须盖住 browser/ 下每一个 .py 源文件（tests/test_build_output.py 遍历目录钉这条）：
+# `browser/Dockerfile` 按文件名逐个 COPY，改名或删一个源文件的表现是容器起来即崩、
+# preview_page 与 browser_step 恒回「浏览器检查服务不可用」，离根因很远。
+BROWSER_REQUIRED = ("Dockerfile", "requirements.txt", "app.py", "inspect_core.py",
+                    "session_core.py", "sessions.py", "__init__.py")
 
 # 网关 compose 里两个默认值的形态（与平台 compose 的 ${VAR:-打包值} 同一副面孔）：
 # 域名 fallback 换成实际域名，上游 fallback 换成 Linux 可用的 IP。
@@ -951,6 +962,10 @@ def _env_example_overlay(gateway_domain: str, mirrors: Mirrors,
         "# sidecar 只检查白名单里的 host。若把上一行改成 IP/域名，必须把它加进这里，",
         "# 否则 preview_page 会固定返回「浏览器检查服务不可用」。",
         f"{BROWSER_ALLOWED_HOSTS_ENV}={BROWSER_ALLOWED_HOSTS_BAKED}",
+        "# 可交互会话（Agent 的 browser_step）的资源闸：同时能留几个活页面、空闲多久回收。",
+        "# 超限的新会话是被直接拒绝而不是排队；调大要同步看 sidecar 的 mem_limit（默认 1g）。",
+        f"{BROWSER_MAX_SESSIONS_ENV}={BROWSER_MAX_SESSIONS_BAKED}",
+        f"{BROWSER_SESSION_TTL_ENV}={BROWSER_SESSION_TTL_BAKED}",
         "# browser 镜像构建期的 Chromium 下载源；改完要 docker compose build browser 才生效。",
         f"{PLAYWRIGHT_DOWNLOAD_HOST_ENV}={playwright_download_host}",
     ]
@@ -1073,6 +1088,10 @@ services:
     environment:
       # 只接受这些 host 的检查目标；改了 ZEROCODE_BROWSER_TARGET_HOST 要同步加进来。
       BROWSER_ALLOWED_HOSTS: ${{BROWSER_ALLOWED_HOSTS:-{BROWSER_ALLOWED_HOSTS_BAKED}}}
+      # 可交互会话的资源闸（ADR-0037）：超限直接拒绝新会话而不是排队，空闲超时回收 context。
+      # 显式写出来而不是靠代码默认值——默认值漂了这里看不见，而容器只有 mem_limit 1g。
+      ZEROCODE_BROWSER_MAX_SESSIONS: ${{ZEROCODE_BROWSER_MAX_SESSIONS:-{BROWSER_MAX_SESSIONS_BAKED}}}
+      ZEROCODE_BROWSER_SESSION_TTL_SECONDS: ${{ZEROCODE_BROWSER_SESSION_TTL_SECONDS:-{BROWSER_SESSION_TTL_BAKED}}}
     # sidecar 在容器里，应用 dev 端口发布在宿主上：host-gateway 是它唯一的出口。
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -1624,7 +1643,7 @@ def copy_browser(repo_root: Path, dst: Path) -> int:
     missing = [rel for rel in BROWSER_REQUIRED if not (src / rel).is_file()]
     if missing:
         raise BuildError(f"浏览器 sidecar 源码缺 {missing}（{src}）："
-                         f"preview_page 依赖它，缺文件不出包")
+                         f"preview_page 与可交互走查都依赖它，缺文件不出包")
     if dst.exists():
         shutil.rmtree(dst)
     shutil.copytree(src, dst, ignore=_ignore_names(BROWSER_EXCLUDE_DIRS))
