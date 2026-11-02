@@ -10,6 +10,7 @@ import { Modal, message } from 'ant-design-vue'
 import { CheckCircleOutlined, CloseCircleOutlined, CopyOutlined, LoadingOutlined } from '@ant-design/icons-vue'
 import { appUrls, publishApp, rollbackApp, scaffoldBackfill } from '../api'
 import { useDeploy } from '../composables/useDeploy'
+import { copyText } from '../utils/clipboard'
 
 const props = defineProps({
   app: { type: Object, required: true },
@@ -85,16 +86,25 @@ async function loadUrls() {
     urls.value = (await appUrls(props.app.id)).data
   } catch { urls.value = null }
 }
-async function copyText(t) {
-  try { await navigator.clipboard.writeText(t); message.success('已复制') }
-  catch { message.error('复制失败') }
+async function copyAndTell(t) {
+  // 复制只走 utils/clipboard.js：http + IP 直连控制台时 navigator.clipboard 是 undefined，
+  // 裸调它在这条访问路径上恒失败，而本地开发（localhost 算安全上下文）看不出来。
+  if (await copyText(t)) {
+    message.success('已复制')
+    return true
+  }
+  message.error('复制失败：浏览器没给剪贴板权限，请手动选中文本后按 Ctrl+C')
+  return false
 }
+
 // 失败路径「把错误日志发给 AI」：本波 ChatView 未接 zc_publish_error 消费通道，
 // 按 brief 的退路口径只做复制剪贴板 + 引导粘贴（不跳转、不落 localStorage 死键）。
-function copyError() {
+async function copyError() {
   const tail = dep.buildTail.value.slice(-80).map((t) => t.line).join(String.fromCharCode(10))
-  copyText(`发布失败：${failText.value}${String.fromCharCode(10)}${tail}`)
-  message.info('错误日志已复制，粘贴到聊天会话即可让 AI 排查')
+  // 「已复制」只能在真复制上之后说：这句话是让用户去粘贴的，先说了就是让他粘一个空剪贴板。
+  if (await copyAndTell(`发布失败：${failText.value}${String.fromCharCode(10)}${tail}`)) {
+    message.info('错误日志已复制，粘贴到聊天会话即可让 AI 排查')
+  }
 }
 async function publishWith(force, confirmDestructive = false) {
   dep.reset()
@@ -172,9 +182,9 @@ async function start() {
       <p class="zc-pub-done">已上线 ✓</p>
       <template v-if="mainUrl">
         <a class="zc-pub-url" :href="mainUrl" target="_blank"
-           @click.prevent="copyText(mainUrl)">{{ mainUrl }} <copy-outlined /></a>
+           @click.prevent="copyAndTell(mainUrl)">{{ mainUrl }} <copy-outlined /></a>
         <a-space style="margin: 6px 0">
-          <a-button size="middle" @click="copyText(`访问地址：${mainUrl}`)">复制给同事</a-button>
+          <a-button size="middle" @click="copyAndTell(`访问地址：${mainUrl}`)">复制给同事</a-button>
         </a-space>
       </template>
       <p v-else class="zc-pub-nourl">

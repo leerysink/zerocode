@@ -12,6 +12,7 @@ import { deployWsUrl, devLogs } from '../api'
 import {
   appendRows, formatRow, lineKind, rowFromEvent, statusText, tsShort,
 } from '../utils/deployLog'
+import { copyText } from '../utils/clipboard'
 
 const props = defineProps({
   appId: { type: [Number, String], default: null },
@@ -126,13 +127,14 @@ function disconnect() {
 }
 
 async function copyAll() {
-  try {
-    await navigator.clipboard.writeText(asText.value)
+  // 走统一工具：http + IP 直连控制台时 navigator.clipboard 是 undefined，只有 execCommand 这条路。
+  if (await copyText(asText.value)) {
     copied.value = true
     setTimeout(() => { copied.value = false }, 1500)
-  } catch {
-    note.value = '复制失败：浏览器拒绝了剪贴板权限'
+    return
   }
+  // 日志本身在面板里就是可选中正文，所以兜底是「教用户怎么手选」，不是让人干等权限
+  note.value = '复制失败：浏览器没给剪贴板权限，请在下方日志区手动选中后按 Ctrl+C'
 }
 
 function clearView() {

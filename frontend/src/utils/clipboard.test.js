@@ -67,6 +67,51 @@ describe('copyText', () => {
     expect(document.querySelectorAll('textarea').length).toBe(0)
   })
 
+  it('边界：降级时整段文本都在选区里（iOS Safari 的 select() 只选第一个字符）', async () => {
+    setClipboard(undefined)
+    const exec = stubExecCommand(() => {
+      const ta = document.querySelector('textarea')
+      expect(ta.selectionStart).toBe(0)
+      expect(ta.selectionEnd).toBe('https://aaa.example.test'.length)
+      return true
+    })
+
+    await expect(copyText('https://aaa.example.test')).resolves.toBe(true)
+
+    expect(exec).toHaveBeenCalledWith('copy')
+  })
+
+  it('边界：临时节点留在视口内而不是甩到视口外（跑偏的节点在 iOS 上选不中）', async () => {
+    setClipboard(undefined)
+    stubExecCommand(() => {
+      const ta = document.querySelector('textarea')
+      expect(ta.style.position).toBe('fixed')
+      expect(ta.style.top).toBe('0px')
+      expect(ta.style.left).toBe('0px')
+      return true
+    })
+
+    await expect(copyText('https://aaa.example.test')).resolves.toBe(true)
+  })
+
+  it('边界：降级复制不吞掉用户自己已经选中的文字', async () => {
+    setClipboard(undefined)
+    const host = document.createElement('p')
+    host.textContent = '这段是用户正在看的文字'
+    document.body.appendChild(host)
+    const selection = document.getSelection()
+    const range = document.createRange()
+    range.setStart(host.firstChild, 0)
+    range.setEnd(host.firstChild, 5)
+    selection.removeAllRanges()
+    selection.addRange(range)
+    stubExecCommand(() => true)
+
+    await expect(copyText('https://aaa.example.test')).resolves.toBe(true)
+
+    expect(selection.toString()).toBe('这段是用户')
+  })
+
   it('边界：两条路都不通 → 返回 false，不抛异常', async () => {
     setClipboard({ writeText: vi.fn().mockRejectedValue(new Error('NotAllowedError')) })
     stubExecCommand(() => false)

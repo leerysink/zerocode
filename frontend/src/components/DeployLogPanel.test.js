@@ -147,6 +147,41 @@ describe('DeployLogPanel', () => {
     expect(w.text()).toContain('暂无日志')
   })
 
+  it('边界：http + IP 访问控制台（navigator.clipboard 不存在）→ 复制全部降级仍能成', async () => {
+    // 面板原先裸调 navigator.clipboard，用 http://<服务器 IP>:8100 看日志时每次点都是「复制失败」，
+    // 而 execCommand 这条路在 http 下是通的（utils/clipboard.js 的降级）。
+    Object.defineProperty(globalThis.navigator, 'clipboard', { value: undefined, configurable: true })
+    const exec = vi.fn(() => {
+      expect(document.querySelector('textarea').value).toContain('| [zerocode] ✓ 预览已就绪')
+      return true
+    })
+    Object.defineProperty(document, 'execCommand', { value: exec, configurable: true })
+    try {
+      const w = await mountPanel()
+      await w.findAll('button')[1].trigger('click')
+      await flushPromises()
+      expect(exec).toHaveBeenCalledWith('copy')
+      expect(w.text()).toContain('已复制')
+      expect(w.find('.zc-dlog-note').exists()).toBe(false)
+    } finally {
+      delete document.execCommand
+    }
+  })
+
+  it('边界：两条路都不通 → note 教用户手选，不谎称已复制', async () => {
+    Object.defineProperty(globalThis.navigator, 'clipboard', { value: undefined, configurable: true })
+    Object.defineProperty(document, 'execCommand', { value: vi.fn(() => false), configurable: true })
+    try {
+      const w = await mountPanel()
+      await w.findAll('button')[1].trigger('click')
+      await flushPromises()
+      expect(w.text()).not.toContain('已复制')
+      expect(w.find('.zc-dlog-note').text()).toContain('手动选中')
+    } finally {
+      delete document.execCommand
+    }
+  })
+
   it('关闭抽屉即断开 WS；重新打开会再拉一次并续上', async () => {
     const w = await mountPanel()
     const first = FakeWS.instances[0]

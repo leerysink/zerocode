@@ -228,6 +228,41 @@ describe('PublishModal 完成态', () => {
     expect(writeText).toHaveBeenCalledWith('https://todo8.example.test')
   })
 
+  it('边界：http + IP 访问控制台（navigator.clipboard 不存在）→ 点地址降级 execCommand 仍复制成功', async () => {
+    // 真机现场：控制台走 http://<服务器 IP>:8100 时 Clipboard API 根本不存在，裸调它的结果是
+    // 每次点地址都「复制失败」；localhost 开发时反而看不出来。这里锁的是「降级这条路真的通」。
+    const { wrapper } = await doneOk()
+    Object.defineProperty(window.navigator, 'clipboard', { value: undefined, configurable: true })
+    const exec = vi.fn(() => {
+      expect(document.querySelector('textarea').value).toBe('https://todo8.example.test')
+      return true
+    })
+    Object.defineProperty(document, 'execCommand', { value: exec, configurable: true })
+    try {
+      await wrapper.find('.zc-pub-url').trigger('click')
+      await flushPromises()
+      expect(exec).toHaveBeenCalledWith('copy')
+      expect(mocks.antd.message.success).toHaveBeenCalledWith('已复制')
+      expect(mocks.antd.message.error).not.toHaveBeenCalled()
+    } finally {
+      delete document.execCommand
+    }
+  })
+
+  it('边界：两条路都不通 → 如实报失败，不谎称已复制', async () => {
+    const { wrapper } = await doneOk()
+    Object.defineProperty(window.navigator, 'clipboard', { value: undefined, configurable: true })
+    Object.defineProperty(document, 'execCommand', { value: vi.fn(() => false), configurable: true })
+    try {
+      await wrapper.find('.zc-pub-url').trigger('click')
+      await flushPromises()
+      expect(mocks.antd.message.success).not.toHaveBeenCalled()
+      expect(mocks.antd.message.error).toHaveBeenCalledWith(expect.stringContaining('手动选中'))
+    } finally {
+      delete document.execCommand
+    }
+  })
+
   it('无 done.url 时回退到 appUrls 域名', async () => {
     const ctx = mountModal()
     ctx.dep.lastDone.value = { type: 'publish_done', ok: true, version: 'b20260921120000' }
@@ -317,3 +352,51 @@ describe('PublishModal 回滚模式', () => {
     expect(wrapper.emitted('update:open')?.at(-1)).toEqual([false])
   })
 })
+
+// ---------- 「把错误日志发给 AI」：那句「已复制」是让用户去粘贴的指令，说早了就是骗人 ----------
+describe('PublishModal 错误日志复制', () => {
+  function doneFail() {
+    const ctx = mountModal()
+    ctx.dep.lastDone.value = { type: 'publish_done', ok: false, error: '镜像构建失败' }
+    ctx.dep.buildTail.value = [{ kind: 'build', line: 'ERROR: npm run build exited 1' }]
+    return ctx
+  }
+
+  const aiBtn = (wrapper) => wrapper.findAll('.stub-btn')
+    .find((b) => b.text().includes('把错误日志发给 AI'))
+
+  it('http + IP 下降级复制成功 → 才提示可以粘贴给 AI', async () => {
+    const { wrapper } = doneFail()
+    await flushPromises()
+    Object.defineProperty(window.navigator, 'clipboard', { value: undefined, configurable: true })
+    const exec = vi.fn(() => {
+      expect(document.querySelector('textarea').value).toContain('ERROR: npm run build exited 1')
+      return true
+    })
+    Object.defineProperty(document, 'execCommand', { value: exec, configurable: true })
+    try {
+      await aiBtn(wrapper).trigger('click')
+      await flushPromises()
+      expect(exec).toHaveBeenCalledWith('copy')
+      expect(mocks.antd.message.info).toHaveBeenCalledWith(expect.stringContaining('粘贴到聊天会话'))
+    } finally {
+      delete document.execCommand
+    }
+  })
+
+  it('两条路都不通 → 只报复制失败，不播「已复制」这句会让人去粘空剪贴板的话', async () => {
+    const { wrapper } = doneFail()
+    await flushPromises()
+    Object.defineProperty(window.navigator, 'clipboard', { value: undefined, configurable: true })
+    Object.defineProperty(document, 'execCommand', { value: vi.fn(() => false), configurable: true })
+    try {
+      await aiBtn(wrapper).trigger('click')
+      await flushPromises()
+      expect(mocks.antd.message.info).not.toHaveBeenCalled()
+      expect(mocks.antd.message.error).toHaveBeenCalledWith(expect.stringContaining('手动选中'))
+    } finally {
+      delete document.execCommand
+    }
+  })
+})
+
