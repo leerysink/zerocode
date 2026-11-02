@@ -130,6 +130,23 @@ async def test_session_tool_names_match_the_schema():
     assert [t["function"]["name"] for t in BROWSER_SESSION_TOOLS] == list(BROWSER_SESSION_TOOL_NAMES)
 
 
+async def test_the_ordinal_list_is_the_same_object_as_the_dispatch_list():
+    """工具名单只有一个来源（复查者判 Important）：位次名单不许是抄出来的第二份字面量。
+
+    现状的三份名单：分派闸用 `tools.py` 的 `BROWSER_SESSION_TOOL_NAMES`（定义在 `llm.py`，与 schema
+    同源），handler 里另有三处 `if name == "browser_open" / "browser_step" / "browser_close"`，而
+    位次计数器读的是 `browser_session_tools.SESSION_TOOL_NAMES` 这**第二个字面量**。三份今天内容
+    相同纯属抄写一致，此前没有任何测试钉它们相等。将来加第四个交互工具时，作者必然改 schema、
+    `BROWSER_SESSION_TOOL_NAMES` 与 handler 分支，而漏改这条旧常量**不会红任何测试**——漏的方向
+    正好是「少遮」（新工具改写了清单却不进口径，口令明文落库），是危险方向上的一份漂移点。
+
+    断 `is` 而不是 `==`：内容相同的那份独立字面量正是本条要防的形状，`==` 对它恰好是瞎的。
+    """
+    from app.agent.llm import BROWSER_SESSION_TOOLS, BROWSER_SESSION_TOOL_NAMES
+    assert bst.SESSION_TOOL_NAMES is BROWSER_SESSION_TOOL_NAMES
+    assert list(bst.SESSION_TOOL_NAMES) == [t["function"]["name"] for t in BROWSER_SESSION_TOOLS]
+
+
 # --------------------------------------------------------------------------- browser_open
 
 async def test_open_requires_running_preview(monkeypatch):
@@ -945,7 +962,8 @@ async def test_every_step_after_the_first_is_masked_even_on_a_listed_plain_ref()
     紧接着 `fill e2 value=hunter2`。「存在即信任」在这种形状下仍然放行，因为参数侧只能看到
     轮初那一份，而那份说的已经不是当步的事实。
 
-    轮初清单只对**第 1 条** `browser_step` 权威：那之前本 run 没有别的步改写过页面。
+    轮初清单只对**位次 1** 那条权威：本条消息在这一步之前没有别的**浏览器调用**改写过页面
+    （改写者含 `_open`，裁定 R-36；args 畸形/为空却照样被派发的 open 也算，裁定 R-38）。
     第 2 条起面对的是「已被前几条改写、但落库行写不出来」的清单——与其猜它长什么样，不如从严。
     代价只是同轮多调用时非口令的 fill 也显示成占位符（每次走查 0–2 条的量级），
     sidecar 拿的仍是原值，功能不断。
@@ -1020,6 +1038,75 @@ async def test_open_and_close_hold_an_ordinal_but_other_tools_do_not():
     # 非浏览器调用不占位次：单条 step 仍是位次 1、轮初清单照旧权威（反向钉）
     kept, kept_hits = bst.redact_sensitive_step_args([write_call, fill], refs)
     assert kept_hits == 0 and kept[0] is write_call and kept[1] is fill
+
+
+def _raw_call(id_, name, raw_args):
+    """`arguments` 是**原样字符串**的一条 tool_call：复现「无参数调用」与流式截断的真实形状。
+
+    `llm.py` 把 slot 的 arguments 初始化成 `""`、只在 delta 带 args 时才往后追加，所以模型对一个
+    schema 里 `"required": []` 的 `browser_open`（或一条被截断的流）产出的就是空串/半截 JSON。
+    """
+    return {"id": id_, "type": "function",
+            "function": {"name": name, "arguments": raw_args}}
+
+
+# 形状 ⑤ 的共同前提（三轮复查之后仍然成立的那句「一处遮一处不遮就是漏」）：
+# `redact.py` 的 `rewrite_tool_calls_args` 对「名字命中名单、但 arguments 为空 / 非字符串 /
+# JSON 不可解析」的条目直接 continue——不调 `rewrite`、不占位次；而 `loop.py` 派发时把同一份
+# 畸形 args 换成 `{}` **照样执行**（`json.loads(...) or "{}"`，`JSONDecodeError` → `{}`）。
+# `browser_open` 的 schema 是 `"required": []`（path 缺省合法），`_open(ctx, {})` 在
+# `normalize_path(None)` 拿到 `("/", "")`，于是它真的开了一页并把 `run_state["browser_refs"]`
+# 覆写成新页清单——上一轮的「畸形条目不占位次，因为它确实没改写过页面」这条论证就是错在这里。
+# 下面两支各自独立钉一种畸形形状（分成两条测试，是为了让「只挡畸形 JSON、不挡空串」这种修法红）。
+async def test_a_malformed_json_open_before_a_step_still_holds_an_ordinal():
+    """位次按**名字**数（裁定 R-38，形状 ⑤ 之一）：`arguments` 是不可解析 JSON 的 open 也占位次。
+
+    `[browser_open arguments='{"/path"', browser_step fill e2 value=hunter2]`：旧口径下那条 open
+    进不了 `rewrite`、不占位次 → fill 被数成位次 1 → 判「轮初清单里已知非 sensitive」→ 原值进
+    `message.tool_args` 与 WS `tool_call`；而派发端 `_open({})` 真开了 `/`、`_step` 读到新页的
+    `e2=口令` → 结果侧遮断，值还真被填进口令框。参数侧那份清单就此不再权威，位次必须算上它。
+    """
+    refs = [{"ref": "e2", "role": "textbox", "name": "搜索框", "sensitive": False},
+            {"ref": "e3", "role": "textbox", "name": "备注", "sensitive": False}]
+    fill = _tool_call("browser_step", action="fill", target="e2", value="hunter2")
+    broken_open = _raw_call("c1", "browser_open", '{"/path"')
+
+    out, hits = bst.redact_sensitive_step_args([broken_open, fill], refs)
+    assert hits == 1
+    assert json.loads(out[1]["function"]["arguments"])["value"] == "<redacted:sensitive_input>"
+    # 遮的仍只有 fill 的 value；畸形那条 open 原样保留（`redact.py` 的既有语义，本轮不碰它一个字节）
+    assert json.loads(out[1]["function"]["arguments"])["target"] == "e2"
+    assert out[0] is broken_open and out[0]["function"]["arguments"] == '{"/path"'
+    # 名字没命中的畸形条目不占位次：`fs_write` 改不动清单，派发它也一样（反向钉）
+    broken_write = _raw_call("c2", "fs_write", "")
+    kept, kept_hits = bst.redact_sensitive_step_args([broken_write, fill], refs)
+    assert kept_hits == 0 and kept[0] is broken_write and kept[1] is fill
+
+
+async def test_an_open_with_empty_arguments_before_a_step_still_holds_an_ordinal():
+    """位次按**名字**数（裁定 R-38，形状 ⑤ 之二）：`arguments == ""` 的 open 也占位次。
+
+    这一支比畸形 JSON **更日常**：空串不是畸形，是 `llm.py` 对「无参数的 `browser_open`」的正常产物
+    （slot 初始化成 `""`，delta 不带 args 就一直是 `""`），而 `browser_open` 的 `"required": []` 让它
+    是个完全合法的调用——既有 `test_open_binds_session_to_run_state_only` 就是用 `{}` 打开一页的。
+    `redact.py:if not raw_args` 把它跳过（不占位次），`loop.py` 的 `arguments or "{}"` 却把它换成 `{}`
+    真执行：于是「一条默认的 open + 一条 fill」这条天天会走的路径上，fill 被数成位次 1、按已经作废的
+    轮初清单放行，明文进库与 WS。必须独立钉住，不能靠上面那条畸形 JSON 的测试兜。
+    """
+    refs = [{"ref": "e2", "role": "textbox", "name": "搜索框", "sensitive": False},
+            {"ref": "e3", "role": "textbox", "name": "备注", "sensitive": False}]
+    fill = _tool_call("browser_step", action="fill", target="e2", value="hunter2")
+    empty_open = _raw_call("c1", "browser_open", "")
+
+    out, hits = bst.redact_sensitive_step_args([empty_open, fill], refs)
+    assert hits == 1
+    assert json.loads(out[1]["function"]["arguments"])["value"] == "<redacted:sensitive_input>"
+    assert json.loads(out[1]["function"]["arguments"])["action"] == "fill"
+    # 空串条目原样保留：`redact.py` 不替它补 `{}`，本轮也不改它（身份与结构都不动）
+    assert out[0] is empty_open and out[0]["function"]["arguments"] == ""
+    # 位次 1 的豁免仍然成立：fill 前面没有任何浏览器调用时照旧按轮初清单放行（反向钉）
+    alone, alone_hits = bst.redact_sensitive_step_args([fill], refs)
+    assert alone_hits == 0 and alone[0] is fill
 
 
 async def test_a_numeric_pin_is_masked_on_both_sides(monkeypatch):

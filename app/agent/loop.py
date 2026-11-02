@@ -506,13 +506,16 @@ class AgentRunner:
                 # 参数侧的 sensitive 遮断（裁定 R-33，US-19）：规则表只认凭据**形态**，
                 # `{"action":"fill","target":"e2","value":"hunter2"}` 里那种不成形态的口令它抓不住，
                 # 于是它会原样进 message.tool_args 并被通用折叠块明文打印出来。
-                # 判定与 `_step` 写 browser_log 时同口径，但参数侧多两条从严（C-1，裁定 R-34/R-35/R-36）：
+                # 判定与 `_step` 写 browser_log 时同口径，但参数侧多两条从严（C-1，裁定 R-34/R-35/R-36/R-38）：
                 # ① 未知句柄也遮（`is_sensitive_ref_or_unknown`）；② 位次从严——`browser_refs`
                 # 这一份是**本轮开始时**的清单（下面取一次就整轮不变），只有**本条消息在这一步之前
                 # 没有别的浏览器调用改写过页面**的那条 `browser_step` 能拿它当权威。改写者不止
                 # `_step`：`_open` 同样往 `browser_refs` 写新页清单（旧 `e2=搜索框` → /login 的
                 # `e2=口令`），`_close` 之后的 step 填不进表单却照样明文落库，所以同一条消息里排在
-                # 前面的 open / close 也占位次（R-36）。位次 2 起的 ref 可能已被前几条改写过
+                # 前面的 open / close 也占位次（R-36）；位次按 `function.name` 命中名单就数，
+                # **不看它的 `arguments` 能不能解析**（R-38）：下面那行 `exec_args` 把空串与畸形 JSON
+                # 一律换成 `{}` 照样派发，而 `browser_open` 的 `"required": []` 让 `_open(ctx, {})`
+                # 真的开了一页、真的换了清单。位次 2 起的 ref 可能已被前几条改写过
                 # （新出现的 ref、复用旧索引的 ref：旧 e2 是搜索框、click 展开后 e2 是口令框），
                 # 而落库这行写在派发之前，那份中途清单永远写不出来，所以一律按 sensitive 遮。
                 # 一处遮一处不遮就是漏，验收口径是「两侧对同一个 value 给同一个结论」。

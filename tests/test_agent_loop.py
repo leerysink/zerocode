@@ -14,6 +14,15 @@ def done(content, tool_calls=None):
 def tool_call(id_, name, **args):
     return {"id": id_, "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}}
 
+def raw_tool_call(id_, name, raw_args):
+    """与 `tool_call` 同形，但 `arguments` 是**原样字符串**：复现「无参数调用」与流式截断的形状。
+
+    `llm.py` 把 slot 的 arguments 初始化成 `""`、只在 delta 带 args 时才往后追加，所以模型对一个
+    schema 里 `"required": []` 的 `browser_open` 产出的就是空串——`arguments == ""` 不是畸形调用，
+    是日常可达路径（`browser_open` 缺省 path 就是打开 `/`）。
+    """
+    return {"id": id_, "type": "function", "function": {"name": name, "arguments": raw_args}}
+
 def cfg_provider(write_confirm=False, ask_timeout=0, max_rounds=30, clarify=False, **over):
     async def _p():
         # clarify 缺省关：本夹具服务的是与澄清无关的用例，而门禁的代码默认是「缺行即开」，
@@ -872,7 +881,8 @@ async def test_two_steps_in_one_round_mask_a_ref_that_was_plain_at_round_start(t
     遮断。同一个 value 两侧两个结论，就是 R-33 禁止的分家。
 
     修法不是去猜那份中途清单长什么样（落库行写在派发之前，天生写不出来），而是**位次从严**：
-    只有第 1 条 `browser_step` 的轮初清单是权威的，第 2 条及以后一律按 sensitive 处理。
+    只有位次 1 那条的轮初清单是权威的——本条消息在这一步之前没有别的**浏览器调用**改写过页面
+    （改写者含 `_open`，裁定 R-36）；第 2 条及以后一律按 sensitive 处理。
     这里同样钉「两侧对同一个 value 给同一个结论」，并顺手钉住第 ① 步那条 click 不被改坏。
     """
     from app.agent import browser_session_tools as bst
@@ -1160,6 +1170,127 @@ async def test_a_close_before_a_step_in_one_round_holds_the_ordinal(test_engine,
     assert [s_.get("action") for s_ in captured["ctx"].run_state["browser_log"]] == ["open"]
 
     # ④ 当轮回注模型仍是原值（这一支没执行成功，模型要靠它重开会话再填一遍）
+    back = [m for m in llm.received[2] if m["role"] == "assistant" and m.get("tool_calls")]
+    assert json.loads(back[-1]["tool_calls"][1]["function"]["arguments"])["value"] == "hunter2"
+
+
+@pytest.mark.asyncio
+async def test_an_open_with_empty_arguments_in_one_round_holds_the_ordinal(test_engine, tmp_path,
+                                                                           monkeypatch):
+    """形状 ⑤（裁定 R-38）：`arguments` 为空串的 `browser_open` 不占位次，却**真的开了一页**。
+
+    前三轮把「args 畸形、进不了 `rewrite` 因而不占位次」判成安全，理由是那种调用执行不下去。
+    这一条把它证伪：`redact.py` 对 `arguments` 为空/不可解析的条目直接 continue（不调 `rewrite`、
+    不占位次），而 `loop.py` 派发时把同一份 args 换成 `{}` **照样执行**。`browser_open` 的 schema
+    是 `"required": []`，`_open(ctx, {})` 在 `normalize_path(None)` 拿到 `("/", "")`——path 缺省就是
+    合法调用（既有 `test_open_binds_session_to_run_state_only` 正是用 `{}` 打开一页的）。于是
+
+    ```
+    轮 2 = [browser_open arguments="", browser_step fill e2 value=hunter2]
+    ```
+
+    空串 open 被 skip → fill 被数成位次 1 → 判「轮初清单里已知非 sensitive」（那份是首页的
+    `e2=搜索框`）→ 原值进 `message.tool_args` 与 WS `tool_call`；而派发端 `_open({})` 真开了 `/`
+    并把 `browser_refs` 覆写成新页清单（`e2=口令`，sensitive）→ `_step` 读到它 → 结果侧遮断，
+    值还真被填进了口令框。与前三轮同一个根因（两侧看到不同时点的清单）、同一条验收违反
+    （「两侧对同一个 value 给同一个结论」），而这一支不是攻击面，是模型发一次无参数 open 就会走到的
+    日常路径。修法：位次按 `function.name` 命中名单就计数，与 args 能否解析无关。
+    """
+    from app.agent import browser_session_tools as bst
+
+    sid, aid, sf, seen = await _fill_env(test_engine, tmp_path, monkeypatch, bst, slug="pvsens7",
+                                         dev_port=8313, prod_port=8312)
+    home = [{"ref": "e1", "role": "button", "name": "搜索", "sensitive": False},
+            {"ref": "e2", "role": "textbox", "name": "搜索框", "sensitive": False},
+            {"ref": "e3", "role": "textbox", "name": "备注", "sensitive": False}]
+    reloaded = [{"ref": "e1", "role": "textbox", "name": "用户名", "sensitive": False},
+                {"ref": "e2", "role": "textbox", "name": "口令", "sensitive": True},
+                {"ref": "e3", "role": "textbox", "name": "备注", "sensitive": False}]
+    opened = []
+
+    async def fake_open(url, **kw):
+        # 两次 open 之间页面重渲染，同一个 `e2` 换了人（规格 §6.2：ref 按采集顺序现编）。
+        # 第二次就是那条空 args 的调用：`normalize_path(None)` → "/"，真开了一页。
+        opened.append(url)
+        interactive = reloaded if len(opened) > 1 else home
+        return {"ok": True, "session_id": f"sid-{len(opened)}", "title": "页面", "text": "",
+                "url": "http://192.168.65.254:8313/", "interactive": interactive,
+                "console": [], "failed_requests": [], "page_errors": [], "elapsed_ms": 1}, ""
+
+    async def fake_step(session_id, payload):
+        seen.append((session_id, payload))
+        return {"ok": True, "title": "登录", "text": "",
+                "url": "http://192.168.65.254:8313/", "interactive": reloaded,
+                "interactive_truncated": False, "dialog": None, "console_new": [],
+                "failed_requests_new": [], "page_errors_new": [], "truncated": False,
+                "timed_out": False, "steps_charged": True, "elapsed_ms": 1}, ""
+
+    deleted = []
+
+    async def fake_delete(sid_):
+        deleted.append(sid_)
+        return True
+
+    monkeypatch.setattr(bst, "_sidecar_open", fake_open)
+    monkeypatch.setattr(bst, "_sidecar_step", fake_step)
+    monkeypatch.setattr(bst, "_sidecar_delete", fake_delete)
+    captured = {}
+    real_run = bst.run_browser_session_tool
+
+    async def spy_run(ctx, name, args):
+        captured["ctx"] = ctx
+        return await real_run(ctx, name, args)
+
+    monkeypatch.setattr(bst, "run_browser_session_tool", spy_run)
+
+    turns = [done(None, [tool_call("c1", "browser_open", path="/")]),
+             done(None, [raw_tool_call("c2", "browser_open", ""),
+                         tool_call("c3", "browser_step", action="fill", target="e2",
+                                   value="hunter2")]),
+             done("填好了")]
+    rec = Recorder()
+    llm = ScriptedLLM(turns)
+    await mk_runner(sf, llm, rec, tasks={}).run(sid, "登录一遍", asyncio.Event())
+
+    # ① 消息表全表（tool_args + tool_result 一起 dump）不含明文——这条就是形状 ⑤ 本身
+    async with sf() as s:
+        rows = (await s.execute(sql(
+            "SELECT role, tool_args, tool_result FROM message WHERE session_id=:i ORDER BY seq"),
+            {"i": sid})).all()
+    blob = json.dumps([list(r) for r in rows], ensure_ascii=False)
+    assert "hunter2" not in blob, "口令明文进了消息表：空 args 的 open 照样被派发、照样换了清单"
+    pair_row = next(list(r)[1] for r in rows
+                    if isinstance(list(r)[1], dict)
+                    and len(list(r)[1].get("tool_calls") or []) == 2)
+    calls = pair_row["tool_calls"]
+    assert [c["function"]["name"] for c in calls] == ["browser_open", "browser_step"]
+    assert calls[0]["id"] == "c2" and calls[0]["function"]["arguments"] == ""   # 原条目原样落库
+    assert calls[1]["id"] == "c3"
+    masked = json.loads(calls[1]["function"]["arguments"])
+    assert masked["value"] == "<redacted:sensitive_input>"
+    assert masked["action"] == "fill" and masked["target"] == "e2"              # 结构读得出做了什么
+
+    # ② WS 推送那一份：空 args 的 open 在推送侧被换成 `{}`（它确实被执行了），fill 是占位符
+    evs = [e for e in rec.events if e["type"] == "tool_call"]
+    assert [e["name"] for e in evs] == ["browser_open", "browser_open", "browser_step"]
+    assert evs[1]["args"] == {}
+    assert evs[2]["args"]["value"] == "<redacted:sensitive_input>"
+    assert "hunter2" not in json.dumps(evs, ensure_ascii=False)
+
+    # ③ 结果侧同一份账：`_step` 读到的是空 args 那次 open 换上的新清单，所以它遮
+    logged = [s_ for s_ in captured["ctx"].run_state["browser_log"] if s_.get("action") == "fill"]
+    assert len(logged) == 1
+    assert logged[0]["value_redacted"] is True and "hunter2" not in str(logged[0])
+    # 元素名取自动作前的清单，而它已经是重渲染后的「口令」——证据链闭合：
+    # 那条空 args 的 open 确实改了 `browser_refs`，轮初那份（搜索框）在它之后不再权威
+    assert logged[0]["target_name"] == "口令"
+
+    # ④ 那条 open 真的打到了 sidecar（两次导航），且原值照样送达口令框（US-08 的登录填得进去）
+    assert len(opened) == 2
+    assert deleted == ["sid-1", "sid-2"]
+    assert [p["value"] for _sid, p in seen if p["action"] == "fill"] == ["hunter2"]
+
+    # ⑤ 当轮回注模型仍是原值（跨轮从净化库重建才是遮断版）
     back = [m for m in llm.received[2] if m["role"] == "assistant" and m.get("tool_calls")]
     assert json.loads(back[-1]["tool_calls"][1]["function"]["arguments"])["value"] == "hunter2"
 
