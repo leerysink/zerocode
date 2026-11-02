@@ -549,19 +549,25 @@ def _step_result(passed, note, s: Session, snap: dict) -> dict:
 
 async def _action_failure(s: Session, limit: int, started: float, error: str,
                           exc: Exception | None = None) -> dict:
-    """动作层面的失败（ref 失效 / 点不动 / 导航被阻断）：扣步数，并附最新交互清单。
+    """动作层面的失败（ref 失效 / 点不动 / 导航被阻断）：扣步数，并附最新交互清单与本步增量。
 
     进来先分一次诊：异常原文说明「page/context/browser 已经没了」时原样往上抛，由端点收口成
     `session_gone`。把这当成「点不动」的后果是 Agent 被告知换个 ref 再试，而那个会话早就死了。
+
+    裁定 R-29：失败响应复用 `_step_state`，所以也带 `console_new` / `page_errors_new` /
+    `failed_requests_new`。「点下去把页面点崩了、但动作本身报失败」是真机里最常见的一格
+    （点击触发的脚本抛异常，Playwright 等不到那一步的稳定态）——只给一张图和一句原因，
+    模型只能靠图猜；文字信号缺席的话它还要多走一步才浮出，而那一步会把这次的崩溃算成
+    「本步新增」，归因就错位了。
+    形状仍是 `ok:false` 且**没有 `passed` 键**：`_step_state` 里不产生 passed/note（那是
+    `_step_result` 的事），所以这里不会把「点不动」写成「断言未通过」，两本账天然分家。
+    增量在这里就记账（`take_new_items`），下一步不重播。
     """
     if exc is not None and _page_is_gone(exc):
         raise exc
     fresh = await _rescan(s, limit, started)
     charge(s)
-    return {"ok": False, "error": error,
-            "interactive": fresh["interactive"],
-            "interactive_truncated": fresh["interactive_truncated"],
-            "dialog": take_dialog(s), "steps_charged": True}
+    return {**_step_state(s, fresh), "ok": False, "error": error, "steps_charged": True}
 
 
 async def _do_navigate(s: Session, req: StepRequest, limit: int, timeout_ms: int,

@@ -906,6 +906,39 @@ async def test_bad_navigate_path_and_missing_target_reject_without_sidecar(monke
     assert ctx.run_state.get("browser_steps_used") in (None, 0)
 
 
+async def test_every_step_rejection_exit_says_steps_charged(monkeypatch):
+    """每条拒绝出口都显式回 `steps_charged: false`：模型与前端按字段读，缺字段就是第三种状态。
+
+    「没开会话」与「步数用尽」这两条最早出口原先没有这个字段，而 path 非法、缺 target、
+    传输失败三条都有——同一个「什么都没做成」的类别里出现两种写法，读的人只能猜。
+    """
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+
+    async def boom(*_a, **_k):
+        raise AssertionError("被拒绝的调用不该打到 sidecar（R-24 零副作用）")
+
+    monkeypatch.setattr(bst, "_sidecar_step", boom)
+    exhausted = Ctx(cfg={"agent.browser_max_steps_per_run": 1})
+    exhausted.run_state["browser_session"] = "abc"
+    exhausted.run_state["browser_steps_used"] = 1
+    has_session = Ctx()
+    has_session.run_state["browser_session"] = "abc"
+    outs = [await bst.run_browser_session_tool(Ctx(), "browser_step",
+                                               {"action": "click", "target": "e1"}),
+            await bst.run_browser_session_tool(exhausted, "browser_step",
+                                               {"action": "click", "target": "e1"}),
+            await bst.run_browser_session_tool(has_session, "browser_step",
+                                               {"action": "navigate", "target": "//evil.example"}),
+            await bst.run_browser_session_tool(has_session, "browser_step",
+                                               {"action": "click", "target": ""})]
+    for out in outs:
+        assert out["ok"] is False
+        assert "steps_charged" in out, out
+        assert out["steps_charged"] is False, out
+    assert exhausted.run_state["browser_steps_used"] == 1      # 拒绝仍不留副作用
+    assert "browser_log" not in exhausted.run_state
+
+
 async def test_session_gone_charges_nothing_and_unbinds(monkeypatch):
     """US-12 / US-14：会话没了不扣步数，且要解绑——留着绑定会让每一步都重打那个死 id。"""
     ctx = Ctx()
@@ -1013,6 +1046,98 @@ async def test_action_failure_error_is_scrubbed_and_reports_the_dialog(monkeypat
     assert out["dialog"]["handled"] == "dismissed"
 
 
+async def test_action_failure_carries_the_incremental_signals_of_the_broken_step(monkeypatch):
+    """裁定 R-29：`ok:false` 也带 console_new / page_errors_new / failed_requests_new。
+
+    「点下去把页面点崩了、动作本身却报失败」是真机里最常见的一格。R-26 之后这条路径必然附一张
+    崩页图，但只有图没有字——模型只能猜「这个崩是我点的还是页面本来就崩的」。sidecar 现在把
+    `_step_state` 也接给了失败响应，后端这一头必须把它过同一道清洗闸再送进模型上下文。
+    形状仍是 `ok:false` 且没有 `passed`：加信号不许把「点不动」写成「断言未通过」。
+    """
+    ctx = Ctx()
+    ctx.run_state["browser_session"] = "abc"
+    ctx.run_state["browser_refs"] = [{"ref": "e1", "role": "button", "name": "出牌"}]
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+
+    async def broken(sid, payload):
+        return {"ok": False, "error": "元素不可点击或动作失败: timeout",
+                "interactive": _interactive(),
+                "console_new": [{"level": "error",
+                                 "text": "Uncaught 崩了 at http://192.168.65.254:8241/a.js"}],
+                "page_errors_new": ["Uncaught TypeError: 点崩了 at "
+                                    "http://192.168.65.254:8241/app.js:1:9",
+                                    "Uncaught Error: token=abc123def456ghi 在栈里"],
+                "failed_requests_new": [{"method": "GET", "status": 500,
+                                         "url": "http://192.168.65.254:8241/api/orders"}],
+                "steps_charged": True}, ""
+
+    monkeypatch.setattr(bst, "_sidecar_step", broken)
+    _no_shot(monkeypatch)
+    out = await bst.run_browser_session_tool(
+        ctx, "browser_step", {"action": "click", "target": "e1"})
+    assert out["ok"] is False and "passed" not in out        # 两形不混：失败步没有断言结论
+    assert out["page_errors_new"], "动作失败必须把「这一步点崩了」的文字信号带给模型"
+    assert "localhost:8241" in out["page_errors_new"][0] and "点崩了" in out["page_errors_new"][0]
+    assert [i["text"] for i in out["console_new"]] == [
+        "Uncaught 崩了 at http://localhost:8241/a.js"]
+    assert out["failed_requests_new"][0]["url"] == "http://localhost:8241/api/orders"
+    assert out["failed_requests_new"][0]["status"] == 500    # 非文本字段原样保留
+    blob = json.dumps(out, ensure_ascii=False)
+    assert "192.168.65.254" not in blob and "abc123def456ghi" not in blob
+    assert out["redacted"] >= 1
+    assert out["steps_charged"] is True and bool(out["interactive"])
+
+
+async def test_action_failure_without_collected_state_claims_nothing(monkeypatch):
+    """缺 `*_new` 键的失败（sidecar「动作后读不回页面」那条出口）就不报增量：空列表会被读成「没崩」。"""
+    ctx = Ctx()
+    ctx.run_state["browser_session"] = "abc"
+    ctx.run_state["browser_refs"] = [{"ref": "e1", "role": "button", "name": "出牌"}]
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+
+    async def unreadable(sid, payload):
+        return {"ok": False,
+                "error": "步骤执行后页面读取失败: Execution context was destroyed",
+                "steps_charged": True}, ""
+
+    monkeypatch.setattr(bst, "_sidecar_step", unreadable)
+    _no_shot(monkeypatch)
+    out = await bst.run_browser_session_tool(
+        ctx, "browser_step", {"action": "click", "target": "e1"})
+    assert out["ok"] is False and out["steps_charged"] is True
+    for key in ("console_new", "page_errors_new", "failed_requests_new"):
+        assert key not in out
+
+
+async def test_sidecar_reported_urls_are_scrubbed_while_page_text_is_not(monkeypatch):
+    """裁定 R-28 的边界：凡 sidecar 报告的 URL 一律清洗，凡页面自身的内容一律不清洗。
+
+    清洗是 `target_netloc → display_netloc` 的等价改写（同一个资源、同一条 path），证据一个字没少；
+    而 `title`/`text` 是被检查的对象本身，改写它就是篡改走查对象。原来那句「页面数据不清洗」把
+    console 与失败请求也算进去了——`browser/app.py` 明写 sidecar 回的是重写后的 connect_url，
+    所以那两处带的正是内部拓扑。
+    """
+    ctx = Ctx()
+    ctx.run_state["browser_session"] = "abc"
+    ctx.run_state["browser_refs"] = [{"ref": "e1", "role": "button", "name": "出牌"}]
+    internal = "http://192.168.65.254:8241"
+    _step_env(monkeypatch, _step_data(
+        title=f"订单管理 {internal}", text=f"正文里也有 {internal}/keep 这句原话",
+        console_new=[{"level": "error", "text": f"脚本报错 {internal}/app.js:1:1",
+                      "truncated": False}],
+        failed_requests_new=[{"method": "GET", "url": f"{internal}/api/orders", "status": 500,
+                              "type": "fetch", "blocked": False}]))
+    _no_shot(monkeypatch)
+    out = await bst.run_browser_session_tool(ctx, "browser_step",
+                                             {"action": "click", "target": "e1"})
+    # 洗：sidecar 报出的两处 URL
+    assert out["console_new"][0]["text"] == "脚本报错 http://localhost:8241/app.js:1:1"
+    assert out["failed_requests_new"][0]["url"] == "http://localhost:8241/api/orders"
+    # 不洗：页面正文原样（被检查的对象不许被改写）
+    assert out["title"] == f"订单管理 {internal}"
+    assert out["text"] == f"正文里也有 {internal}/keep 这句原话"
+
+
 async def test_step_never_leaks_the_bound_session_or_the_internal_url(monkeypatch):
     """ADR-0037 + R-16 的合并锚：返回值与 browser_log 里既没有 session_id 也没有容器 IP。
 
@@ -1032,6 +1157,88 @@ async def test_step_never_leaks_the_bound_session_or_the_internal_url(monkeypatc
         assert "sid-123" not in blob
         assert internal not in blob
         assert "session_id" not in blob
+
+
+async def test_failed_action_is_written_into_the_browser_log(monkeypatch):
+    """发现项 I-1：点不动的步也进 `browser_log`——章程里的「步数记账」要求账与报告一致。
+
+    形状与断言失败刻意不同：`ok:false` + `passed:null` + 一句已清洗的原因 + 位置（display_url）。
+    只涨 `browser_steps_used` 而不写日志的话，「12 次点不动 + 1 次成功」的收口报告会说
+    steps_total:1、steps_failed:0、hint「所有已声明的断言均通过」——最贵的失败信号被洗掉了。
+    """
+    ctx = Ctx()
+    ctx.run_state["browser_session"] = "abc"
+    ctx.run_state["browser_log"] = [{"seq": 0, "action": "open", "target": "/", "passed": None,
+                                     "url": "http://localhost:8241/"}]
+    ctx.run_state["browser_refs"] = [{"ref": "e1", "role": "button", "name": "出牌"}]
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+
+    async def blocked(sid, payload):
+        return {"ok": False,
+                "error": "元素不可点击或动作失败: http://192.168.65.254:8241/x 超时",
+                "url": "http://192.168.65.254:8241/orders", "interactive": _interactive(),
+                "steps_charged": True}, ""
+
+    monkeypatch.setattr(bst, "_sidecar_step", blocked)
+    _no_shot(monkeypatch)
+    out = await bst.run_browser_session_tool(
+        ctx, "browser_step", {"action": "click", "target": "e1"})
+    assert out["ok"] is False
+    entry = ctx.run_state["browser_log"][-1]
+    assert entry["ok"] is False and entry["passed"] is None   # 不与断言失败混成一个形状
+    assert entry["seq"] == 1 and entry["action"] == "click" and entry["target"] == "e1"
+    assert entry["url"] == "http://localhost:8241/orders"     # 失败在哪一页，读报告的人要的
+    assert "超时" in entry["error"]
+    blob = json.dumps(ctx.run_state["browser_log"], ensure_ascii=False)
+    assert "192.168.65.254" not in blob                       # 原因在写日志之前就已清洗
+
+
+async def test_failed_action_without_a_page_url_keeps_the_last_known_one(monkeypatch):
+    """sidecar 没带地址的失败（path 非法那条出口）不许在日志里编一个「当前页」出来。"""
+    ctx = Ctx()
+    ctx.run_state["browser_session"] = "abc"
+    ctx.run_state["browser_log"] = [{"seq": 0, "action": "open", "target": "/orders",
+                                     "passed": None, "url": "http://localhost:8241/orders"}]
+    ctx.run_state["browser_refs"] = [{"ref": "e1", "role": "button", "name": "出牌"}]
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    monkeypatch.setattr(bst, "_sidecar_step", lambda sid, payload: _aget(
+        ({"ok": False, "error": "path 必须是同源相对路径（以 / 开头）", "steps_charged": True}, "")))
+    _no_shot(monkeypatch)
+    await bst.run_browser_session_tool(ctx, "browser_step",
+                                       {"action": "navigate", "target": "/x"})
+    assert len(ctx.run_state["browser_log"]) == 2        # 这一步确实进了账
+    assert ctx.run_state["browser_log"][-1]["url"] == "http://localhost:8241/orders"
+
+
+async def test_uncharged_step_does_not_enter_the_report(monkeypatch):
+    """没扣费的失败步（sidecar 的未知动作那条）不进报告：报告里的步恒等于「花掉额度的步」。"""
+    ctx = Ctx()
+    ctx.run_state["browser_session"] = "abc"
+    ctx.run_state["browser_log"] = [{"seq": 0, "action": "open", "target": "/", "passed": None,
+                                     "url": "http://localhost:8241/"}]
+    ctx.run_state["browser_refs"] = [{"ref": "e1", "role": "button", "name": "出牌"}]
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    monkeypatch.setattr(bst, "_sidecar_step", lambda sid, payload: _aget(
+        ({"ok": False, "error": "未知动作: teleport", "steps_charged": False}, "")))
+    _no_shot(monkeypatch)
+    out = await bst.run_browser_session_tool(ctx, "browser_step",
+                                             {"action": "teleport", "target": "e1"})
+    assert out["ok"] is False and out["steps_charged"] is False
+    assert len(ctx.run_state["browser_log"]) == 1
+    assert ctx.run_state.get("browser_steps_used", 0) == 0
+
+
+async def test_action_is_trimmed_before_the_sidecar(monkeypatch):
+    """`"click "` 这种尾空格会被 sidecar 判成未知动作：那条出口不记账、不回清单，
+    模型只剩一句它解释不了的重试指引。后端在发载荷之前就该把动作名 trim 掉。"""
+    ctx = Ctx()
+    ctx.run_state["browser_session"] = "abc"
+    ctx.run_state["browser_refs"] = [{"ref": "e1", "role": "button", "name": "出牌"}]
+    seen = _step_env(monkeypatch, _step_data())
+    out = await bst.run_browser_session_tool(ctx, "browser_step",
+                                             {"action": " click ", "target": "e1"})
+    assert seen[0][1]["action"] == "click"
+    assert out["action"] == "click"
 
 
 async def test_step_transport_rejection_scrubs_the_internal_host(monkeypatch):
@@ -1470,6 +1677,50 @@ async def test_open_then_steps_report_continuous_seq_in_the_close_report(monkeyp
     assert out["steps_failed"] == 1
     assert "2" in out["hint"]                          # 说得出失败在第几步
     assert deleted == ["sid-123"]
+
+
+async def test_close_report_counts_failed_actions_without_calling_them_assertions(monkeypatch):
+    """发现项 I-1 的收口那一头：点不动进步数账、也进报告，但不进 `steps_failed`。
+
+    `steps_failed` 只数 `passed is False`（断言未通过），report 项另带 `ok` 供 Task 7 分色——
+    两个数各管各的账，读报告的人因此能区分「12 次点不动」与「12 次断言不过」，
+    而这两件事在修复前的报告里都只体现为「这一步没进报告」。
+    """
+    replies = [{"ok": False, "error": "元素不可点击或动作失败: timeout",
+                "url": "http://192.168.65.254:8241/orders", "interactive": _interactive(),
+                "steps_charged": True},
+               {"ok": False, "error": "ref 无效或页面已变化，请用最新清单里的 ref",
+                "url": "http://192.168.65.254:8241/orders", "interactive": _interactive(),
+                "steps_charged": True},
+               _step_data(passed=False, note="页面文本未包含「已创建」")]
+
+    async def fake_step(sid, payload):
+        return replies.pop(0), ""
+
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    monkeypatch.setattr(bst, "_sidecar_open", lambda url, **kw: _aget((_session_ok(), "")))
+    monkeypatch.setattr(bst, "_sidecar_delete", lambda sid: _aget(True))
+    monkeypatch.setattr(bst, "_sidecar_step", fake_step)
+    monkeypatch.setattr(bst, "_sidecar_screenshot", lambda sid: _aget((None, "本测试不验截图")))
+    ctx = Ctx()
+    await bst.run_browser_session_tool(ctx, "browser_open", {"path": "/orders"})
+    for args in ({"action": "click", "target": "e1"}, {"action": "click", "target": "e9"},
+                 {"action": "click", "target": "e1",
+                  "expect": {"type": "text_contains", "value": "已创建"}}):
+        await bst.run_browser_session_tool(ctx, "browser_step", args)
+    out = await bst.run_browser_session_tool(ctx, "browser_close", {})
+    assert out["steps_used"] == 3 == ctx.run_state["browser_steps_used"]
+    assert out["steps_total"] == 4                      # open 那条 + 三步全部走过
+    assert out["steps_failed"] == 1                     # 只有断言未通过那一步
+    assert [s["seq"] for s in out["report"]] == [0, 1, 2, 3]
+    assert [s["ok"] for s in out["report"]] == [True, False, False, True]
+    assert [s["passed"] for s in out["report"]] == [None, None, None, False]
+    assert [s["target"] for s in out["report"]] == ["/orders", "e1", "e9", "e1"]
+    assert "timeout" in out["report"][1]["error"]       # 失败原因到了读报告的人手上
+    assert "ref" in out["report"][2]["error"]
+    assert "error" not in out["report"][0] and "error" not in out["report"][3]
+    assert "均通过" not in out["hint"] and "3" in out["hint"]
+    assert "192.168.65.254" not in json.dumps(out, ensure_ascii=False)
 
 
 # --------------------------------------------------------------------------- browser_close

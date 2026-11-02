@@ -102,9 +102,16 @@ def scrub_known_host(text, *, target_netloc: str, display_netloc: str) -> str:
     写成「参数化 target/display」的纯函数是为了让 `preview_page` 那侧也能复用同一口径；本轮不动
     它的调用点（既有行为，另有测试面，已登记给 Task 8）。
 
-    清洗范围只限**错误/提示类自由文本**（`error`、`note`、传输与拒绝原因）：页面正文
-    `title`/`text`/`console`/`failed_requests` 一律不清洗——那是被检查的数据本身，洗它等于篡改
-    走查对象（修复轮 1 顾虑 3 的裁定）。
+    边界规则（裁定 R-28，无例外）：**凡 sidecar 报告的 URL 一律清洗，凡页面自身的内容一律
+    不清洗**。这条不是「删证据」——`scrub_known_host` 做的是 `target_netloc → display_netloc` 的
+    **等价改写**：同一个资源、同一条 path、同一端口语义，把 `http://192.168.65.254:8241/api/orders`
+    写成 `http://localhost:8241/api/orders`，模型该知道的一个字没少，内部拓扑反而不漏。而
+    `innerText` 是被检查的对象本身，改写它就是篡改证据。
+    清洗的出口因此是「sidecar 报出的地址」那一类：`error`、`note`、传输与拒绝原因、
+    `page_errors_new`（异常原文内嵌抛错脚本的地址）、`console_new[].text`、
+    `failed_requests_new[].url`；`data["url"]` 走的是同一口径的 `_display_url_for`（裁定 R-16，
+    整条地址换成展示 base 加 path）。
+    不清洗的只有页面自己的正文：`title` 与 `text`（含 `dialog.message`，那是页面原话）。
     """
     if not isinstance(text, str) or not text or not display_netloc:
         return text if isinstance(text, str) else ""
@@ -118,15 +125,22 @@ def scrub_known_host(text, *, target_netloc: str, display_netloc: str) -> str:
     return out
 
 
-def _sidecar_text(raw, limit: int, *, target_netloc: str, display_netloc: str) -> tuple[str, int]:
+def _sidecar_text(raw, limit: int, *, target_netloc: str,
+                  display_netloc: str) -> tuple[str, int, bool]:
     """sidecar 自由文本进模型上下文的两道闸：先换内部 host，再过凭据遮断与裁剪。
+
+    返回值与 `_redact` 同形（`(文本, 遮断处数, 是否裁过)`），多出来的「换 host」一步不改这三处
+    语义，调用方只当 `_redact` 用即可。
 
     顺序是刻意的：`_redact` 末尾会按 limit 裁断，裁在 URL 中间会留下 `192.168.65.254:82` 这种
     端口不完整的片段，换不掉又泄了半截——所以清洗必须在裁剪之前。
+
+    任何一个**新**的模型可见出口都从这里走（裁定 R-28 的清洗边界写在 `scrub_known_host`）：
+    页面正文 `title`/`text` 只过 `_redact`，其余带 URL 的字段一律过这里。少一处就是开旁路。
     """
     scrubbed = scrub_known_host(raw, target_netloc=target_netloc, display_netloc=display_netloc)
-    text, hits, _cut = _redact(scrubbed, limit)
-    return text, hits
+    text, hits, cut = _redact(scrubbed, limit)
+    return text, hits, cut
 
 
 def _steps_left(ctx) -> int:
@@ -260,22 +274,32 @@ async def _sidecar_delete(sid: str) -> bool:
         return False
 
 
-def _redact_list(items, key: str = "text") -> tuple[list[dict], int]:
-    """console / 失败请求这类条目列表：逐条遮断自由文本字段，返回 `(条目, 遮断处数)`。
+def _redact_list(items, key: str, *, target_netloc: str,
+                 display_netloc: str) -> tuple[list[dict], int]:
+    """console / 失败请求这类条目列表进模型上下文的那道闸：逐条过 `_sidecar_text`。
 
     预算（40 条 / 单条 1000 字）与 sidecar 的 `shape_result` 同量级：sidecar 已经裁过一道，
     这里是进模型上下文前的第二道，也是唯一带凭据遮断的一道。
+
+    裁定 R-28 之后这里过的是含 host 清洗的 `_sidecar_text`，不是裸 `_redact`：
+    `console_new[].text` 里那句「脚本 http://192.168.65.254:8241/app.js 报的错」与
+    `failed_requests_new[].url` 整条都是 **sidecar 报出的地址**（`browser/app.py::collect_page_state`
+    的注释写明它回的是重写后的 connect_url），与 `error`/`note` 同性质；等价改写不删证据，
+    少一次清洗就是内部拓扑的第三个出口。`key` 做成必填参数是为了让调用方点名清洗哪个字段——
+    「整条都不洗」在这个函数里没有写法。
     """
     hits_total = 0
     out = []
     for item in list(items or [])[:LIST_ITEM_MAX]:
         if not isinstance(item, dict):
-            body, hits, cut = _redact(item, LIST_ITEM_CHARS)
+            body, hits, cut = _sidecar_text(item, LIST_ITEM_CHARS, target_netloc=target_netloc,
+                                            display_netloc=display_netloc)
             hits_total += hits
             out.append({"text": body, "truncated": bool(cut)})
             continue
         merged = dict(item)
-        body, hits, cut = _redact(item.get(key), LIST_ITEM_CHARS)
+        body, hits, cut = _sidecar_text(item.get(key), LIST_ITEM_CHARS, target_netloc=target_netloc,
+                                        display_netloc=display_netloc)
         hits_total += hits
         merged[key] = body
         if cut:
@@ -287,15 +311,14 @@ def _redact_list(items, key: str = "text") -> tuple[list[dict], int]:
 def _page_errors(items, *, target_netloc: str, display_netloc: str) -> tuple[list[str], int]:
     """未捕获异常（`pageerror`）进模型上下文的那道闸：10 条封顶，逐条过 `_sidecar_text`。
 
-    为什么这里过的是 `_sidecar_text`（含 host 清洗）而不是 `_redact_list`（只遮断凭据）：
     异常原文是「哪儿炸了」的叙述，通常内嵌抛错脚本的地址——那正是 `_connect_url` 重写后的
-    内部 `IP:端口`，与 `error`/`note` 同性质，不是页面正文那种「被检查的数据」（裁定 R-27）。
+    内部 `IP:端口`，按裁定 R-28 归「sidecar 报告的 URL」那一类，与 `console_new` 同一把尺。
     形状保持 sidecar 与 `/inspect` 的 list[str]，后端不替它套 dict 让前端再拆一次。
     """
     out, hits_total = [], 0
     for raw in list(items or [])[:PAGE_ERRORS_MAX]:
-        body, hits = _sidecar_text(raw, LIST_ITEM_CHARS, target_netloc=target_netloc,
-                                   display_netloc=display_netloc)
+        body, hits, _cut = _sidecar_text(raw, LIST_ITEM_CHARS, target_netloc=target_netloc,
+                                         display_netloc=display_netloc)
         hits_total += hits
         out.append(body)
     return out, hits_total
@@ -357,8 +380,12 @@ def _shape_state(ctx, data: dict, *, opened: bool, url: str, status: str,
     # page_errors 同理（裁定 R-27）：step 的响应带增量 `page_errors_new`，open 只带全量
     # `page_errors`。给模型的键名恒为 `page_errors_new`，与 console_new / failed_requests_new 成族。
     page_key = "page_errors_new" if "page_errors_new" in data else "page_errors"
-    console_new, hits_console = _redact_list(data.get(console_key))
-    failed_new, hits_failed = _redact_list(data.get(failed_key), key="url")
+    console_new, hits_console = _redact_list(data.get(console_key), "text",
+                                             target_netloc=target_netloc,
+                                             display_netloc=display_netloc)
+    failed_new, hits_failed = _redact_list(data.get(failed_key), "url",
+                                           target_netloc=target_netloc,
+                                           display_netloc=display_netloc)
     page_errors_new, hits_pages = _page_errors(
         data.get(page_key), target_netloc=target_netloc, display_netloc=display_netloc)
     dialog, hits_dialog = _shape_dialog(data.get("dialog"))
@@ -482,9 +509,9 @@ async def _open(ctx, args: dict) -> dict:
     if data.get("ok") is not True:
         # error 里内嵌的是 Playwright 的原话（导航异常自带被 `_connect_url` 重写后的 URL），
         # redact_sensitive 只认凭据形态、管不到 host——这里是拓扑泄漏的第二出口（R-22）。
-        error_text, _hits = _sidecar_text(data.get("error"), ERROR_MAX_CHARS,
-                                          target_netloc=target_netloc,
-                                          display_netloc=display_netloc)
+        error_text, _hits, _cut = _sidecar_text(data.get("error"), ERROR_MAX_CHARS,
+                                                target_netloc=target_netloc,
+                                                display_netloc=display_netloc)
         return {"ok": False, "error": error_text,
                 "status": status, "url": display_url,
                 "session_gone": bool(data.get("session_gone")),
@@ -571,29 +598,60 @@ async def _attach_shot(ctx, sid: str, args: dict, data: dict, result: dict) -> d
     return result
 
 
+def _new_items(data: dict, *, target_netloc: str, display_netloc: str) -> tuple[dict, int]:
+    """sidecar 一步响应里的三段「本步新增」进模型上下文：`*_new` 键缺失就不出现。
+
+    走的是与成功形状（`_shape_state`）同一对闸（`_redact_list` / `_page_errors`），只是取法更严：
+    只认增量键名，不认 open 那一面的全量键——失败形状里塞一份全量 console 就是重播首屏旧错误。
+    「点不动」那一步的文字信号此前只在成功形状里发得出，模型因此看到崩页画面却只能靠图猜
+    （裁定 R-29）。缺字段就是「sidecar 没采到」（页面读不回那一类出口），比报一个空列表诚实：
+    空列表会被读成「本步没有新错误」。
+    """
+    out: dict = {}
+    hits_total = 0
+    for key, field in (("console_new", "text"), ("page_errors_new", None),
+                       ("failed_requests_new", "url")):
+        if key not in data:
+            continue
+        if field is None:
+            items, hits = _page_errors(data.get(key), target_netloc=target_netloc,
+                                       display_netloc=display_netloc)
+        else:
+            items, hits = _redact_list(data.get(key), field, target_netloc=target_netloc,
+                                       display_netloc=display_netloc)
+        out[key] = items
+        hits_total += hits
+    return out, hits_total
+
+
 def _step_failure(ctx, data: dict, *, target_netloc: str, display_netloc: str,
                   charged: bool, fallback: str = "浏览器步骤未执行成功", **extra) -> dict:
     """`ok:false` 的失败形状（规格 §5.3）：原因、当场附回的新清单、弹窗与这一步是否扣了额度。
 
     这是「点不动」，与 `ok:true, passed:false`（「点了但结果不对」）刻意不同形——模型对两者的
-    下一步动作不一样，混在一个字段里它就分不清该换 ref 还是该改断言。
+    下一步动作不一样，混在一个字段里它就分不清该换 ref 还是该改断言。这条不变量对下面新加的
+    三段增量信号同样成立：这里没有 `passed` 键，`ok` 恒 False，`page_errors_new` 只是「这一步
+    把页面点崩了」的旁证，不是断言结论（裁定 R-29 只加信号，不改形状）。
 
     `fallback` 不是装饰：sidecar 偶尔回一句空 error（异常原文被裁没了），此时那句可行动的
     指引必须还在，否则模型拿到 `ok:false` 加一个空字符串，只能盲目重试。
     """
     interactive, hits_refs = _interactive_items(ctx, data.get("interactive"))
     dialog, hits_dialog = _shape_dialog(data.get("dialog"))
-    error_text, hits_error = _sidecar_text(data.get("error"), ERROR_MAX_CHARS,
-                                           target_netloc=target_netloc,
-                                           display_netloc=display_netloc)
+    error_text, hits_error, _cut = _sidecar_text(data.get("error"), ERROR_MAX_CHARS,
+                                                 target_netloc=target_netloc,
+                                                 display_netloc=display_netloc)
+    signals, hits_signals = _new_items(data, target_netloc=target_netloc,
+                                       display_netloc=display_netloc)
     out = {"ok": False,
            "error": error_text or fallback,
            "interactive": interactive,
            "interactive_truncated": bool(data.get("interactive_truncated")),
            "dialog": dialog,
-           "redacted": hits_refs + hits_dialog + hits_error,
+           "redacted": hits_refs + hits_dialog + hits_error + hits_signals,
            "steps_charged": charged,
-           "steps_left": _steps_left(ctx)}
+           "steps_left": _steps_left(ctx),
+           **signals}
     return {**out, **extra}
 
 
@@ -609,20 +667,45 @@ def _step_echo(action: str, shown_target: str, expect) -> dict:
     return out
 
 
+def _append_log(ctx, entry: dict) -> None:
+    """把一步写进 `browser_log`（`seq` 由这里统一往后编）。
+
+    `seq` 跟着最后一条往后编，不是 `len(log) + 1`：open 那条恒为 0，用长度算的话第一步会跳到 2，
+    收口报告里「失败在哪步」就成了一个对不上的编号（规格 §5.2 / US-07）。
+    """
+    log = list(ctx.run_state.get("browser_log") or [])
+    last_seq = max((int(s.get("seq") or 0) for s in log if isinstance(s, dict)), default=0)
+    log.append({**entry, "seq": last_seq + 1})
+    ctx.run_state["browser_log"] = log
+
+
+def _last_logged_url(ctx) -> str:
+    """失败步拿不到页面地址时沿用上一条：动作没成功，页面确实还停在原地。"""
+    for item in reversed(list(ctx.run_state.get("browser_log") or [])):
+        if isinstance(item, dict) and item.get("url"):
+            return str(item["url"])
+    return ""
+
+
 async def _step(ctx, args: dict) -> dict:
     """US-02 / US-03：在绑定的会话里执行一个动作，回一份与 open 同形的新状态。
 
     拒绝出口全部排在 `_sidecar_step` 之前且不写 run_state——同 `_open` 的裁定 R-24
     （一次被拒绝的调用不许留下副作用）：会话不存在、本 run 步数用尽、navigate 的 path 非法、
     非 navigate 少了 target、应用/预览不可用，五条都是「什么都没发生」，模型手上的会话照旧。
+    前四条与传输失败那条都显式带 `steps_charged: false`（「预览不可用」走 `_resolve_preview`
+    那份与 open 共用的形状，那里没有步数概念）：按字段读的前端遇到缺字段就会当成第三种状态。
     """
     sid = str(ctx.run_state.get("browser_session") or "")
     if not sid:
-        return _error("还没有浏览器会话，先 browser_open")
+        return _error("还没有浏览器会话，先 browser_open", steps_charged=False)
     if _steps_left(ctx) == 0:
-        return _error("本 run 步数已用完，请 browser_close 收口", steps_left=0)
+        return _error("本 run 步数已用完，请 browser_close 收口", steps_left=0,
+                      steps_charged=False)
 
-    action = _clean(args.get("action"))[:40]
+    # `.strip()` 不是美观问题：模型常写出 `"click "`，带尾空格的 action 会在 sidecar 那一侧
+    # 落进「未知动作」——而那条出口不记账、不回清单，模型只拿到一句它解释不了的重试指引。
+    action = _clean(args.get("action")).strip()[:40]
     target = _clean(args.get("target"))
     # value 不做清洗也不裁剪：它是要真的填进表单的数据，裁剪会把口令尾部吃掉。
     value = str(args.get("value") or "")
@@ -660,9 +743,9 @@ async def _step(ctx, args: dict) -> dict:
     if data is None:
         # 传输/拒绝分支的原因同样是 sidecar 自由文本（`validate_target` 的 detail 会回显我们
         # 发出去的 host），过同一把清洗闸（R-22）。这条什么都没做成：不解绑、不扣步数。
-        reason, _hits = _sidecar_text(transport_err, ERROR_MAX_CHARS,
-                                      target_netloc=target_netloc,
-                                      display_netloc=display_netloc)
+        reason, _hits, _cut = _sidecar_text(transport_err, ERROR_MAX_CHARS,
+                                            target_netloc=target_netloc,
+                                            display_netloc=display_netloc)
         return _error(reason or "浏览器服务不可用", steps_charged=False,
                       steps_left=_steps_left(ctx), **echo)
     if data.get("session_gone"):
@@ -681,29 +764,38 @@ async def _step(ctx, args: dict) -> dict:
         if data.get("interactive"):
             # 重渲染后旧 ref 物理作废（规格 §6.2）：当场把新清单认作下一步的判定源（US-09）。
             ctx.run_state["browser_refs"] = list(data["interactive"])
-        return await _attach_shot(
-            ctx, sid, args, data,
-            _step_failure(ctx, data, target_netloc=target_netloc,
-                          display_netloc=display_netloc, charged=charged, **echo))
+        failure = _step_failure(ctx, data, target_netloc=target_netloc,
+                                display_netloc=display_netloc, charged=charged, **echo)
+        if charged:
+            # 发现项 I-1：点不动的步也是走过的一步。只涨账不进报告的话，「12 次点不动 + 1 次成功」
+            # 的收口报告会说 steps_total:1、hint「所有已声明的断言均通过」——本任务章程里的
+            # 「步数记账」正是为了让读报告的人数得出这 12 次。
+            # 形状与断言失败严格分开：`ok:false` + `passed:null` + 一句已清洗的原因，
+            # `_close` 的 steps_failed 只数 `passed is False`，所以两本账不会串。
+            # 未扣费的步（sidecar 明确回 steps_charged:false）不进报告：那与拒绝出口同性质，
+            # 「报告里出现的步」恒等于「真的花掉额度的步」，steps_total 才是可信的数。
+            _append_log(ctx, {"action": failure.get("action") or "",
+                              "target": failure.get("target") or "",
+                              "ok": False, "error": failure["error"], "passed": None,
+                              "url": (_display_url_for(info["display_base"], data["url"])
+                                      if data.get("url") else _last_logged_url(ctx))})
+        return await _attach_shot(ctx, sid, args, data, failure)
 
     steps_charged = bool(data.get("steps_charged", True))
     if steps_charged:
         _charge_step(ctx)
     ctx.run_state["browser_refs"] = list(data.get("interactive") or [])
-    log = list(ctx.run_state.get("browser_log") or [])
     display_url = _display_url_for(info["display_base"], data.get("url"))
-    # seq 跟着最后一条往后编，不是 `len(log) + 1`：open 那条恒为 0，用长度算的话第一步会跳到 2，
-    # 收口报告里「失败在哪步」就成了一个对不上的编号（规格 §5.2 / US-07）。
-    last_seq = max((int(s.get("seq") or 0) for s in log if isinstance(s, dict)), default=0)
-    entry = {"seq": last_seq + 1, "action": action, "target": echo["target"],
-             "passed": data.get("passed"), "url": display_url}
+    entry = {"action": action, "target": echo["target"],
+             # `ok` 恒 True（`passed` 是另一件事）：与上面那条 `ok:false` 的形状一一对应，
+             # Task 7 的步骤卡按同一个字段分色，不必再按「有没有 error 键」猜。
+             "ok": True, "passed": data.get("passed"), "url": display_url}
     if value:
         # 落库那份才遮断：sidecar 拿到的是原值（US-08 的登录要真填进去），
         # 而 browser_log 会经 `browser_close` 与步骤卡进消息历史（US-19）。
         entry.update({"value": "" if sensitive else _redact(value, VALUE_MAX_CHARS)[0],
                       "value_redacted": sensitive})
-    log.append(entry)
-    ctx.run_state["browser_log"] = log
+    _append_log(ctx, entry)
 
     result = _shape_state(ctx, data, opened=False, url=display_url, status=info["status"],
                           target_netloc=target_netloc, display_netloc=display_netloc)
@@ -712,18 +804,28 @@ async def _step(ctx, args: dict) -> dict:
 
 
 async def _close(ctx, _args: dict) -> dict:
-    """US-07：收口报告说事实——走了几步、几步断言失败、失败在哪步，以及它覆盖的是第几个会话。"""
+    """US-07：收口报告说事实——走了几步（含点不动的步）、几步断言失败、失败在哪步，覆盖第几个会话。"""
     sid = str(ctx.run_state.get("browser_session") or "")
     steps = list(ctx.run_state.get("browser_log") or [])
     if sid:
         await _sidecar_delete(sid)
         ctx.run_state["browser_session"] = None
+    # `steps_failed` 只数「断言未通过」（`passed is False`），一条 `ok:false` 都不算进来：
+    # 那是「点不动」，与「点了但结果不对」是两本账（发现项 I-1 的前置约束）。
     failed = [s for s in steps if s.get("passed") is False]
     report = []
     for s in steps:
         item = {"seq": s.get("seq"), "action": s.get("action"),
                 "target": _redact(s.get("target"), TARGET_MAX_CHARS)[0],
+                # 报告项恒带 `ok`（Task 7 的渲染契约：按它分色，`passed` 按它标断言结论）。
+                # 缺 ok 键的旧条目（open 那一条）按「推进了」读。
+                "ok": bool(s.get("ok", True)),
                 "passed": s.get("passed")}
+        # 点不动那一步的原因也要进报告：只给一个 ok:false，读报告的人仍然不知道卡在哪儿。
+        # error 在写 log 时已经过 `_sidecar_text`（先 host 清洗、再遮断、再裁剪），这里再过一遍
+        # `_redact` 是纵深防御——报告是会被原样贴进消息历史的那一份。
+        if s.get("error"):
+            item["error"] = _redact(s["error"], ERROR_MAX_CHARS)[0]
         # 被替换的会话数写在 open 那一条上（裁定 R-25）：前端步骤卡渲染的是 report，
         # 只有返回值带着这个事实的话，看报告的人仍旧会把它当成整个 run 的全貌。
         if s.get("replaced_sessions"):

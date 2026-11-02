@@ -820,6 +820,41 @@ def test_step_unclickable_element_charges_and_rescans(client):
     assert sessions.SESSIONS[sid].steps == 1
 
 
+def test_action_failure_reports_the_new_items_of_the_broken_step(client):
+    """裁定 R-29：`_action_failure` 复用 `_step_state`，「点不动」那一步也带本步增量信号。
+
+    真机里最常见的一格是「点下去把页面点崩了、动作本身却报失败」：点击触发的脚本抛未捕获异常，
+    Playwright 因此等不到稳定态。原来这条响应只有 `error` + 清单，模型拿到一张崩页图却读不到
+    一句文字证据，只能靠图猜——而那件证据下一步才浮出，且因为这一步没记账，下一步会把这次的
+    崩溃当成「本步新增」，归因错一位。
+    """
+    sid = _opened(client, lambda: FakePage(url=OPEN_URL, nodes=NODES))
+    s = sessions.SESSIONS[sid]
+    s.page.click_error = TimeoutError("element is not visible")
+    # 崩溃发生在这一「步」里：首屏那批已由 open 记过账，这三条是动作之后才出现的
+    s.collectors.page_errors.append("Uncaught TypeError: 被点崩了 at app.js:1:9")
+    s.collectors.console.append({"level": "error", "text": "点完就报的错"})
+    s.collectors.failed.append({"method": "GET", "url": "http://127.0.0.1:8210/api/orders",
+                                "status": 500, "type": "fetch", "blocked": False})
+    body = _step(client, sid, action="click", ref="e1").json()
+    assert body["ok"] is False and "元素不可点击或动作失败" in body["error"]
+    # 形状仍是「点不动」：`passed` 这个键一个字都不许出现在这条响应里（与断言失败分家）
+    assert "passed" not in body and "note" not in body
+    assert body["page_errors_new"] == ["Uncaught TypeError: 被点崩了 at app.js:1:9"]
+    assert [i["text"] for i in body["console_new"]] == ["点完就报的错"]
+    assert [i["url"] for i in body["failed_requests_new"]] == ["http://127.0.0.1:8210/api/orders"]
+    assert body["steps_charged"] is True and s.steps == 1
+    # 增量键成族，全量那份不与自己并存（裁定 R-27 的口径）
+    assert "page_errors" not in body and "console" not in body and "failed_requests" not in body
+
+    # 记账就在失败这一步做完：下一步不许把这批旧账当「本步新增」重播一遍
+    s.page.click_error = None
+    second = _step(client, sid, action="click", ref="e1").json()
+    assert second["ok"] is True
+    assert second["page_errors_new"] == [] and second["console_new"] == []
+    assert second["failed_requests_new"] == []
+
+
 def test_dead_page_is_reported_as_gone_and_dropped(client):
     """「这一步做砸了」和「这个会话物理上没了」必须分开：后者要让后端释放额度并重建会话。"""
     sid = _opened(client, lambda: FakePage(url=OPEN_URL, nodes=NODES))
@@ -828,6 +863,9 @@ def test_dead_page_is_reported_as_gone_and_dropped(client):
     body = _step(client, sid, action="click", ref="e1").json()
     assert body["ok"] is False and body["session_gone"] is True
     assert body["steps_charged"] is False
+    # 裁定 R-29 之后失败响应带采集状态，但「会话没了」那条分诊仍在采集之前：页面物理上不存在，
+    # 就没有「本步新增」可报，报一个空列表会被读成「这一步没崩」。
+    assert "page_errors_new" not in body and "console_new" not in body
     assert sessions.SESSIONS == {}
 
 
