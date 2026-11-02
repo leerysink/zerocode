@@ -1063,7 +1063,7 @@ def test_repo_browser_dockerfile_is_non_root_with_local_context():
     """
     dk = (bo.REPO_ROOT / "browser" / "Dockerfile").read_text(encoding="utf-8")
     assert "USER 10001" in dk
-    assert "COPY app.py inspect_core.py __init__.py /service/browser/" in dk
+    assert "COPY app.py inspect_core.py session_core.py __init__.py /service/browser/" in dk
     assert "COPY browser/" not in dk
     local = (bo.REPO_ROOT / "browser" / "docker-compose.yml").read_text(encoding="utf-8")
     assert "context: ." in local

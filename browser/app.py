@@ -17,6 +17,7 @@ from playwright.async_api import async_playwright
 from .inspect_core import (allow_request, host_of, is_ip_literal, origin_of,
                            parse_allowed_hosts, pick_connect_ip, rewrite_url_host,
                            shape_result, validate_target)
+from .session_core import INTERACTIVE_JS, INTERACTIVE_MAX_DEFAULT, shape_interactive
 
 MAX_CONCURRENCY = 2
 DEFAULT_WAIT_MS = 1200
@@ -130,11 +131,33 @@ async def _inspect(url: str, wait_ms: int, timeout_ms: int) -> dict:
         await context.close()
 
 
-async def _inspect_in_context(context, connect_url: str, wait_ms: int, timeout_ms: int,
-                              started: float) -> dict:
-    page = await context.new_page()
-    console, page_errors, failed = [], [], []
-    blocked_urls = set()
+class Collectors:
+    """一次页面访问期间的 console / pageerror / 失败请求收集。
+
+    增量账（`new_only` 用的 seen 集合）由 session 自己持有：同一个监听器被多个动作复用，
+    账要跟着会话走，不能跟着一次采集走。`/inspect` 一次性检查不读它，全量即增量。
+    """
+
+    def __init__(self):
+        self.console: list[dict] = []
+        self.page_errors: list[str] = []
+        self.failed: list[dict] = []
+        self.blocked_urls: set[str] = set()
+
+    def snapshot(self) -> dict:
+        """session 路径每步取一次的全量视图；`/inspect` 一次性检查直接读字段，不走这里。"""
+        return {"console": list(self.console), "page_errors": list(self.page_errors),
+                "failed": list(self.failed)}
+
+
+async def attach_listeners(page, connect_url: str) -> Collectors:
+    """挂上放行与收集监听。
+
+    console 条目刻意只有 `level` / `text`（不带 `url`）：`session_core.new_only` 用
+    「有没有 url」区分 console 条目与失败请求条目，补一个 url 字段会让 console 静默按
+    请求指纹记账，会话路径每步都回同一批旧错误。
+    """
+    c = Collectors()
 
     async def on_route(route):
         request = route.request
@@ -145,37 +168,73 @@ async def _inspect_in_context(context, connect_url: str, wait_ms: int, timeout_m
         if allow_request(connect_url, request.url, is_main_navigation=is_main):
             await route.continue_()
             return
-        blocked_urls.add(request.url)
-        failed.append({"method": request.method, "url": request.url, "status": 0,
-                       "type": request.resource_type, "blocked": True})
+        c.blocked_urls.add(request.url)
+        c.failed.append({"method": request.method, "url": request.url, "status": 0,
+                         "type": request.resource_type, "blocked": True})
         await route.abort()
 
     def on_console(msg):
         if msg.type in ("error", "warning"):
-            console.append({"level": msg.type, "text": msg.text})
+            c.console.append({"level": msg.type, "text": msg.text})
 
     def on_page_error(err):
-        page_errors.append(str(err))
+        c.page_errors.append(str(err))
 
     def on_response(resp):
         if not resp.url.startswith(("http://", "https://")):
             return
         if resp.status >= 400:
-            failed.append({"method": resp.request.method, "url": resp.url,
-                           "status": resp.status, "type": resp.request.resource_type})
+            c.failed.append({"method": resp.request.method, "url": resp.url,
+                             "status": resp.status, "type": resp.request.resource_type})
 
     def on_request_failed(request):
-        if request.url in blocked_urls or request.url.startswith(("data:", "blob:", "about:")):
+        if request.url in c.blocked_urls or request.url.startswith(("data:", "blob:", "about:")):
             return
-        failed.append({"method": request.method, "url": request.url, "status": 0,
-                       "type": request.resource_type})
+        c.failed.append({"method": request.method, "url": request.url, "status": 0,
+                         "type": request.resource_type})
 
     await page.route("**/*", on_route)
     page.on("console", on_console)
     page.on("pageerror", on_page_error)
     page.on("response", on_response)
     page.on("requestfailed", on_request_failed)
+    return c
 
+
+async def collect_page_state(page, collectors: Collectors, *, started: float,
+                             timed_out: bool, interactive_limit: int = INTERACTIVE_MAX_DEFAULT,
+                             include_screenshot: bool = False) -> dict:
+    """采集一次页面状态：标题、可见文本、交互元素（顺带打标）、console、失败请求。
+
+    快检与 session 走查共用这一个采集器：各写一遍「title + innerText + INTERACTIVE_JS +
+    shape_interactive」的组合，同一页的同一眼状态就会在两条路径里给出两种裁剪口径。
+    截图策略的分歧（`/inspect` 必给、step 默认不给）用参数表达，不靠复制函数。
+    """
+    title = await page.title()
+    text = await page.evaluate("document.body ? document.body.innerText : ''")
+    nodes = await page.evaluate(INTERACTIVE_JS)
+    interactive, inter_truncated = shape_interactive(nodes, interactive_limit)
+    # 截图取在裁剪之前：elapsed_ms 原本就含截图耗时，挪到之后会让这个数凭空变小。
+    shot = await page.screenshot(type="png", full_page=False) if include_screenshot else None
+    result = shape_result(title=title, text=text, console=collectors.console,
+                          page_errors=collectors.page_errors, failed_requests=collectors.failed,
+                          elapsed_ms=_ms(started), timed_out=timed_out)
+    result["interactive"] = interactive
+    # 交互清单的截断另开一个字段：`truncated` 是 preview_page 的既有语义（文本/控制台/请求
+    # 触顶），把元素触顶并进去会让快检在元素多、其余没超限时凭空报「结果已按预算截断」。
+    result["interactive_truncated"] = inter_truncated
+    result["url"] = page.url
+    if shot is not None:
+        result["screenshot_b64"] = base64.b64encode(shot).decode("ascii")
+        result["screenshot_width"] = 1280
+        result["screenshot_height"] = 800
+    return result
+
+
+async def _inspect_in_context(context, connect_url: str, wait_ms: int, timeout_ms: int,
+                              started: float) -> dict:
+    page = await context.new_page()
+    collectors = await attach_listeners(page, connect_url)
     timed_out = False
     try:
         await page.goto(connect_url, wait_until="domcontentloaded", timeout=timeout_ms)
@@ -191,20 +250,12 @@ async def _inspect_in_context(context, connect_url: str, wait_ms: int, timeout_m
                 await page.wait_for_load_state("networkidle", timeout=min(3000, timeout_ms))
             except Exception:  # noqa: BLE001 - networkidle 只是尽力而为
                 pass
-        title = await page.title()
-        text = await page.evaluate("document.body ? document.body.innerText : ''")
-        shot = await page.screenshot(type="png", full_page=False)
+        # 截图失败要落进同一个「页面读取失败」分支——重构前的语义是读不出页面就整体失败。
+        return await collect_page_state(page, collectors, started=started, timed_out=timed_out,
+                                        include_screenshot=True)
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "error": f"页面读取失败: {e}", "timed_out": timed_out,
                 "elapsed_ms": _ms(started)}
-
-    result = shape_result(title=title, text=text, console=console, page_errors=page_errors,
-                          failed_requests=failed, elapsed_ms=_ms(started),
-                          timed_out=timed_out)
-    result["screenshot_b64"] = base64.b64encode(shot).decode("ascii")
-    result["screenshot_width"] = 1280
-    result["screenshot_height"] = 800
-    return result
 
 
 def _ms(started: float) -> int:

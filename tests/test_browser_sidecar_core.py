@@ -130,3 +130,16 @@ def test_allow_request_uses_the_rewritten_origin():
                          is_main_navigation=False) is True
     assert allow_request(target, "http://host.docker.internal:8213/src/main.js",
                          is_main_navigation=True) is False
+
+
+def test_shape_result_keeps_preview_page_contract():
+    """Task 2 抽共享采集函数时的回归锚：preview_page 依赖这些字段名与上限语义。"""
+    out = shape_result(title="订单", text="x" * 9000,
+                       console=[{"level": "log", "text": "噪声"}, {"level": "error", "text": "e"}],
+                       page_errors=["boom"], failed_requests=[], elapsed_ms=10)
+    assert out["ok"] is True
+    assert out["text"].endswith("…（已截断）")
+    assert out["text_truncated"] is True
+    assert out["console"] == [{"level": "error", "text": "e", "truncated": False}]   # log 不收
+    assert out["page_errors"] == ["boom"]
+    assert out["truncated"] is True
