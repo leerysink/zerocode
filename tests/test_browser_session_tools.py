@@ -283,6 +283,107 @@ async def test_open_does_not_bind_state_when_sidecar_failed(monkeypatch):
     assert "browser_checks" not in ctx.run_state
 
 
+# ------------------------------------------------------------------ 重复 open / 步数账（I-1、I-2）
+
+async def test_reopen_auto_closes_the_previous_session(monkeypatch):
+    """规格 §7「一个 run 一个」：重复 open 必须先 DELETE 前一个会话。
+
+    直接覆写绑定的话，前一个 context 永远不会被关——sidecar 的
+    `ZEROCODE_BROWSER_MAX_SESSIONS` 默认 2，同一 run 内第三次 open 就撞 409，还得等 120s TTL
+    才恢复（ADR-0037 后果第 2 条的僵尸 context，正是本功能要防的症状）。
+    """
+    ctx = Ctx()
+    deleted = []
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    monkeypatch.setattr(bst, "_sidecar_delete", lambda sid: _aget(deleted.append(sid) or True))
+    monkeypatch.setattr(bst, "_sidecar_open", lambda url, **kw: _aget((_session_ok(), "")))
+    first = await bst.run_browser_session_tool(ctx, "browser_open", {})
+    assert first["ok"] is True and deleted == []          # 首次 open 不该有多余的 DELETE
+
+    async def second(url, **_kw):
+        return _session_ok(session_id="sid-456"), ""
+
+    monkeypatch.setattr(bst, "_sidecar_open", second)
+    out = await bst.run_browser_session_tool(ctx, "browser_open", {})
+    assert deleted == ["sid-123"]                         # 前一个真的被 DELETE 了
+    assert ctx.run_state["browser_session"] == "sid-456"  # 一个 run 只留一个活会话
+    assert out["ok"] is True and out["auto_closed_previous"] is True
+    assert "自动关闭" in out["hint"]                      # 不许静默换掉（步数账与 log 都是那个 run 的）
+    blob = json.dumps(out, ensure_ascii=False)
+    assert "sid-123" not in blob and "sid-456" not in blob
+    assert "session_id" not in blob
+
+
+async def test_reopen_auto_closes_before_the_quota_check(monkeypatch):
+    """额度判定之前先关旧的：旧会话已经没了，报错文案就不该再让模型「先用 browser_close 收口」。"""
+    ctx = Ctx()
+    ctx.run_state["browser_checks"] = 6
+    ctx.run_state["browser_session"] = "sid-old"
+    calls = []
+
+    async def boom(*_a, **_k):
+        raise AssertionError("额度用尽不该打到 sidecar")
+
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    monkeypatch.setattr(bst, "_sidecar_delete", lambda sid: _aget(calls.append(sid) or True))
+    monkeypatch.setattr(bst, "_sidecar_open", boom)
+    out = await bst.run_browser_session_tool(ctx, "browser_open", {})
+    assert calls == ["sid-old"]
+    assert out["ok"] is False and out["auto_closed_previous"] is True
+    assert "上限" in out["error"] and "browser_close" not in out["error"]
+    assert "sid-old" not in json.dumps(out, ensure_ascii=False)
+
+
+async def test_steps_left_is_per_run_not_per_session(monkeypatch):
+    """步数账 per-run（规格 §10「单 run 步数上限」、US-13 的「本 run 步数已用完」）。
+
+    open 里的归零会把它变成 per-session：Task 5 照这份口径 charge，于是
+    「open→12 步→close→open→12 步」在一个 run 里合法，模型上下文的成本上限被悄悄翻倍。
+    """
+    ctx = Ctx()
+    deleted = []
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    monkeypatch.setattr(bst, "_sidecar_delete", lambda sid: _aget(deleted.append(sid) or True))
+    monkeypatch.setattr(bst, "_sidecar_open", lambda url, **kw: _aget((_session_ok(), "")))
+    first = await bst.run_browser_session_tool(ctx, "browser_open", {})
+    assert first["steps_left"] == 12                      # 缺省仍要初始化成 0 已用
+    ctx.run_state["browser_steps_used"] = 12              # 模拟 Task 5 在本 run 里记满 12 步
+    await bst.run_browser_session_tool(ctx, "browser_close", {})
+    out = await bst.run_browser_session_tool(ctx, "browser_open", {})
+    assert out["ok"] is True
+    assert ctx.run_state["browser_steps_used"] == 12      # 再 open 不许回满
+    assert out["steps_left"] == 0
+
+
+# ------------------------------------------------------------------ interactive_max 接线（R-23）
+
+async def test_interactive_max_config_reaches_the_sidecar(monkeypatch):
+    """规格 §10 的 `agent.browser_interactive_max`（默认 40）不是装饰：改了要传到 sidecar。"""
+    seen = {}
+
+    async def fake_open(url, **kw):
+        seen["interactive_max"] = kw.get("interactive_max")
+        return _session_ok(), ""
+
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    monkeypatch.setattr(bst, "_sidecar_open", fake_open)
+    await bst.run_browser_session_tool(Ctx(cfg={"agent.browser_interactive_max": 12}),
+                                       "browser_open", {})
+    assert seen["interactive_max"] == 12
+
+    seen.clear()
+    await bst.run_browser_session_tool(Ctx(), "browser_open", {})      # 缺省回落到规格默认
+    assert seen["interactive_max"] == bst.DEFAULT_INTERACTIVE_MAX == 40
+
+
+async def test_sidecar_open_payload_carries_interactive_max(monkeypatch):
+    """钉在真正的线协议上：载荷里少了这个字段，配置就成了无人读的死键（OpenRequest 支持它）。"""
+    client, holder = _fake_httpx(resp=_Resp(200, _session_ok()))
+    monkeypatch.setattr(bst, "httpx", holder)
+    await bst._sidecar_open("http://h:1/", timeout_s=45, expect=None, interactive_max=12)
+    assert client.calls[0][2]["interactive_max"] == 12
+
+
 # --------------------------------------------------------------------------- 双形状契约
 
 @pytest.mark.parametrize("status,expected", [
@@ -380,6 +481,87 @@ async def test_dialog_message_is_redacted(monkeypatch):
     assert "hunter2x" not in json.dumps(out["dialog"], ensure_ascii=False)
 
 
+# ---------------------------------------------------------------- 内部 host 清洗（R-22 / I-3）
+
+def test_scrub_known_host_only_rewrites_the_matching_port():
+    out = bst.scrub_known_host(
+        "a http://192.168.65.254:8241/orders 与 http://192.168.65.254:9999/x，"
+        "还有 http://host.docker.internal:8241/y",
+        target_netloc="host.docker.internal:8241", display_netloc="localhost:8241")
+    assert "localhost:8241/orders" in out and "localhost:8241/y" in out
+    assert "192.168.65.254:8241" not in out
+    assert "192.168.65.254:9999" in out          # 别的端口不是本应用的 dev 端口，不动它
+    assert bst.scrub_known_host(None, target_netloc="h:1", display_netloc="d:1") == ""
+
+
+async def test_business_error_does_not_leak_the_container_ip(monkeypatch):
+    """sidecar 的 error 原话内嵌 `_connect_url` 重写后的地址（`browser/app.py` 里那句
+    `f"页面打开失败: {_short(e)}"`：Playwright 的导航异常自带被重写后的 URL）。
+    `redact_sensitive` 只认凭据形态、没有 host/IP 规则——这是 R-16 之外的第二个拓扑出口，
+    而导航失败恰是走查里最常见的失败。
+    """
+    async def fake_open(url, **_kw):
+        return {"ok": False, "session_gone": True,
+                "error": ("Page.goto: net::ERR_CONNECTION_REFUSED at "
+                          "http://192.168.65.254:8241/orders")}, ""
+
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    monkeypatch.setattr(bst, "browser_target_host", lambda: "host.docker.internal")
+    monkeypatch.setattr(bst, "_sidecar_open", fake_open)
+    out = await bst.run_browser_session_tool(Ctx(), "browser_open", {"path": "/orders"})
+    blob = json.dumps(out, ensure_ascii=False)
+    assert "192.168.65.254" not in blob
+    assert "localhost:8241" in out["error"]            # 换回用户看得见的那个地址
+    assert "ERR_CONNECTION_REFUSED" in out["error"]    # 清洗只动地址，原因本身不能被洗掉
+
+
+async def test_rejection_reason_swaps_the_sidecar_host_back(monkeypatch):
+    """传输/拒绝分支同样是 sidecar 自由文本：`validate_target` 的 detail 会回显我们发出去的 host。"""
+    async def fake_open(url, **_kw):
+        return None, "host 不在允许清单: host.docker.internal:8241"
+
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    monkeypatch.setattr(bst, "browser_target_host", lambda: "host.docker.internal")
+    monkeypatch.setattr(bst, "_sidecar_open", fake_open)
+    out = await bst.run_browser_session_tool(Ctx(), "browser_open", {"path": "/orders"})
+    assert out["ok"] is False
+    assert "host.docker.internal" not in json.dumps(out, ensure_ascii=False)
+    assert "localhost:8241" in out["error"]
+
+
+async def test_assertion_note_is_scrubbed_like_the_error(monkeypatch):
+    """note 与 error 同源（都是 sidecar 写的自由文本），走同一把闸，不然只堵了一半。"""
+    async def fake_open(url, **_kw):
+        return _session_ok(passed=False,
+                           note="URL 不匹配：实际停在 http://192.168.65.254:8241/orders"), ""
+
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    monkeypatch.setattr(bst, "browser_target_host", lambda: "host.docker.internal")
+    monkeypatch.setattr(bst, "_sidecar_open", fake_open)
+    out = await bst.run_browser_session_tool(Ctx(), "browser_open", {"path": "/orders"})
+    assert out["passed"] is False
+    assert "192.168.65.254" not in json.dumps(out, ensure_ascii=False)
+    assert "localhost:8241/orders" in out["note"]
+
+
+async def test_scrub_runs_before_the_clip_so_a_long_error_cannot_leak_half_a_host(monkeypatch):
+    """裁剪会把端口号从中间切断（留下 `...65.254:8`），清洗若排在 `_redact` 之后就换不掉这半截。
+    把内部地址正好摆在 300 字裁剪边界上，才能钉住「先换 host、再裁剪」这个顺序。
+    """
+    # 24 == len("http://192.168.65.254:")：边界因此落在完整 IP 之后、端口号中间。
+    long_error = "x" * (bst.ERROR_MAX_CHARS - 24) + "http://192.168.65.254:8241/orders"
+
+    async def fake_open(url, **_kw):
+        return {"ok": False, "error": long_error}, ""
+
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    monkeypatch.setattr(bst, "browser_target_host", lambda: "host.docker.internal")
+    monkeypatch.setattr(bst, "_sidecar_open", fake_open)
+    out = await bst.run_browser_session_tool(Ctx(), "browser_open", {})
+    assert "192.168.65.254" not in out["error"]
+    assert "localhost:8241" in out["error"]
+
+
 async def test_interactive_list_capped_at_40(monkeypatch):
     async def fake_open(url, **_kw):
         return _session_ok(interactive=_interactive(60), interactive_truncated=True), ""
@@ -454,6 +636,8 @@ def test_limits_are_the_ones_the_spec_pinned():
     assert bst.DEFAULT_INTERACTIVE_MAX == 40
     assert bst.DEFAULT_STEP_TIMEOUT_MS == 3000
     assert bst.TEXT_MAX_CHARS == 8000
+    assert bst.INTERACTIVE_CFG_KEY == "agent.browser_interactive_max"     # 规格 §10 的键名逐字
+    assert (bst.INTERACTIVE_MAX_MIN, bst.INTERACTIVE_MAX_MAX) == (1, 200)
 
 
 # --------------------------------------------------------------------------- browser_close

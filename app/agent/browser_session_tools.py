@@ -9,6 +9,8 @@
 反向依赖会成环。handler 只读 ctx 的字段。
 """
 import logging
+import re
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -28,6 +30,9 @@ STEP_TIMEOUT_MS_MAX = 8000
 DEFAULT_OPEN_TIMEOUT_SECONDS = 45   # agent.browser_timeout_seconds，沿用 preview_page 那个键
 OPEN_TIMEOUT_MIN = 10
 OPEN_TIMEOUT_MAX = 120
+INTERACTIVE_MAX_MIN = 1             # agent.browser_interactive_max 的可调区间（规格 §10）
+INTERACTIVE_MAX_MAX = 200
+INTERACTIVE_CFG_KEY = "agent.browser_interactive_max"
 HTTP_TIMEOUT_MARGIN = 15            # 客户端超时 = 导航超时 + 余量：让 sidecar 先给出原因
 TEXT_MAX_CHARS = 8000
 TITLE_MAX_CHARS = 300
@@ -39,9 +44,62 @@ LIST_ITEM_MAX = 40
 LIST_ITEM_CHARS = 1000
 DELETE_TIMEOUT_SECONDS = 10         # 收口 DELETE 的硬上限：对话结束不该等 sidecar
 
+# 「IP:端口」形态：sidecar 把 host 别名换成容器可达 IP 后，自由文本里就是这一串（R-22）。
+_IP_PORT_RE = re.compile(r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}:(\d{1,5})")
+
+
+def _netloc(url: str) -> str:
+    try:
+        return urlsplit(url).netloc
+    except ValueError:
+        return ""
+
+
+def _port_of(netloc: str) -> str:
+    return netloc.rsplit(":", 1)[1] if ":" in netloc else ""
+
+
+def scrub_known_host(text, *, target_netloc: str, display_netloc: str) -> str:
+    """把 sidecar 自由文本里的内部 `host:port` 换成展示用的那一个（裁定 R-22）。
+
+    为什么需要它：`browser/app.py::_connect_url` 会把 host 别名换成容器可达 IP，Playwright 的
+    导航异常因此内嵌 `http://192.168.65.254:8241/orders` 一类的地址，而 `redact_sensitive` 的规则
+    表只认凭据形态、没有 host/IP 规则——这句原话进模型上下文就是内部拓扑泄漏，且触发条件（导航
+    失败）是走查里最常见的失败，它是 R-16 那条闸口之外的第二个出口。
+
+    写成「参数化 target/display」的纯函数是为了让 `preview_page` 那侧也能复用同一口径；本轮不动
+    它的调用点（既有行为，另有测试面，已登记给 Task 8）。
+    """
+    if not isinstance(text, str) or not text or not display_netloc:
+        return text if isinstance(text, str) else ""
+    out = text
+    if target_netloc and target_netloc != display_netloc:
+        out = out.replace(target_netloc, display_netloc)
+    # 端口相同才换：dev 端口是本应用唯一确定的标识，重写掉的只有 host 那一段。
+    port = _port_of(target_netloc) or _port_of(display_netloc)
+    if port:
+        out = _IP_PORT_RE.sub(lambda m: display_netloc if m.group(1) == port else m.group(0), out)
+    return out
+
+
+def _sidecar_text(raw, limit: int, *, target_netloc: str, display_netloc: str) -> tuple[str, int]:
+    """sidecar 自由文本进模型上下文的两道闸：先换内部 host，再过凭据遮断与裁剪。
+
+    顺序是刻意的：`_redact` 末尾会按 limit 裁断，裁在 URL 中间会留下 `192.168.65.254:82` 这种
+    端口不完整的片段，换不掉又泄了半截——所以清洗必须在裁剪之前。
+    """
+    scrubbed = scrub_known_host(raw, target_netloc=target_netloc, display_netloc=display_netloc)
+    text, hits, _cut = _redact(scrubbed, limit)
+    return text, hits
+
 
 def _steps_left(ctx) -> int:
-    """本 run 还剩几步；`agent.browser_max_steps_per_run <= 0` 不限时返回 -1（与 `_checks_left` 同口径）。"""
+    """本 run 还剩几步；`agent.browser_max_steps_per_run <= 0` 不限时返回 -1（与 `_checks_left` 同口径）。
+
+    计数是 **per-run** 的（规格 §7「steps_used 同处计数」、§10「单 run 步数上限」、US-13 的
+    「本 run 步数已用完」）：重复 open 不能把它清零，否则一个 run 里 open→12 步→close→open→12 步
+    会把模型上下文的成本上限悄悄翻倍。
+    """
     limit = _int_cfg(getattr(ctx, "cfg", None), "agent.browser_max_steps_per_run",
                      DEFAULT_MAX_STEPS, 0, 200)
     if limit <= 0:
@@ -77,9 +135,13 @@ def _reject_reason(resp) -> str:
     return f"浏览器服务拒绝请求（HTTP {status}）"
 
 
-async def _sidecar_open(target_url: str, *, timeout_s: int, expect: dict | None) -> tuple[dict | None, str]:
+async def _sidecar_open(target_url: str, *, timeout_s: int, expect: dict | None,
+                        interactive_max: int = DEFAULT_INTERACTIVE_MAX) -> tuple[dict | None, str]:
     """`POST /sessions`。返回 `(状态体, 错误原因)`，两者恰好一个非空——调用方不必再判 status_code。"""
-    payload = {"url": target_url, "timeout_ms": timeout_s * 1000, "expect": expect}
+    # interactive_max 必须透传：sidecar 的 OpenRequest/StepRequest 认这个字段，规格 §10 也承诺了它，
+    # 载荷里少了它就是一个无人读的死配置（清单条数直接决定进模型上下文的 token 量）。
+    payload = {"url": target_url, "timeout_ms": timeout_s * 1000, "expect": expect,
+               "interactive_max": interactive_max}
     try:
         async with httpx.AsyncClient(timeout=timeout_s + HTTP_TIMEOUT_MARGIN) as c:
             resp = await c.post(f"{browser_service_url()}/sessions", json=payload)
@@ -134,7 +196,8 @@ def _redact_list(items, key: str = "text") -> tuple[list[dict], int]:
     return out, hits_total
 
 
-def _shape_state(ctx, data: dict, *, opened: bool, url: str, status: str) -> dict:
+def _shape_state(ctx, data: dict, *, opened: bool, url: str, status: str,
+                 target_netloc: str, display_netloc: str) -> dict:
     """把 sidecar 原始状态裁成给模型的结果。所有自由文本在这里过遮断——
     这是页面内容进模型上下文前的唯一闸口，漏一项等于开了第二条路。
 
@@ -142,6 +205,10 @@ def _shape_state(ctx, data: dict, *, opened: bool, url: str, status: str) -> dic
     `_connect_url` 重写后的容器可达地址（`host.docker.internal` 已被换成 `192.168.65.254`
     一类的 IP），回给模型就是泄漏内部拓扑。**别「顺手统一」成 `data.get("url")`**——
     那正是这条闸口要挡住的东西（Task 5 沿用本函数的口径）。
+
+    `target_netloc` / `display_netloc` 刻意做成必填关键字参数：note 这类由 sidecar 叙述本次
+    操作的自由文本也可能内嵌重写后的地址（裁定 R-22，R-16 的第二出口），少了这两个参数等于
+    开一条不需要清洗的旁路。Task 5 的 `_step` 同样必须传。
     """
     text, hits_text, text_cut = _redact(data.get("text"), TEXT_MAX_CHARS)
     title, hits_title, _ = _redact(data.get("title"), TITLE_MAX_CHARS)
@@ -190,7 +257,11 @@ def _shape_state(ctx, data: dict, *, opened: bool, url: str, status: str) -> dic
         # note 只在断言未通过时给：`session_core.judge_expect` 通过时也返回一句失败措辞
         # （它的既有行为，Task 1 记为携带项）。漏掉这个三元判断，模型会收到
         # 「passed:true + 一句不匹配说明」的自相矛盾文本。
-        out["note"] = "" if passed else _redact(data.get("note"), NOTE_MAX_CHARS)[0]
+        # note 与 error 同源（sidecar 叙述本次操作的自由文本），所以走同一把 host 清洗闸（R-22）。
+        out["note"] = ("" if passed else
+                       _sidecar_text(data.get("note"), NOTE_MAX_CHARS,
+                                     target_netloc=target_netloc,
+                                     display_netloc=display_netloc)[0])
     return out
 
 
@@ -208,8 +279,26 @@ async def _open(ctx, args: dict) -> dict:
         hint = ("预览正在启动，稍后再试" if status in ("starting", "stopping")
                 else "预览未运行：先用 preview_restart 启动")
         return _error("预览未运行", status=status, url=display_base, hint=hint)
+
+    # 一个 run 只保留一个会话（规格 §7）：重复 open 先 DELETE 前一个，否则那个 context 永远没人关，
+    # 而 sidecar 的 `ZEROCODE_BROWSER_MAX_SESSIONS` 默认只有 2——第三次 open 直接撞 409，还要等
+    # 120s TTL 才恢复（ADR-0037 后果第 2 条的僵尸 context）。选「自动关旧的」而不是报错让模型
+    # 自己先 close：模型多一次往返才能自愈，而关会话没有副作用、不丢用户数据。
+    # 放在额度判定之前：即便这一次开不成（额度用尽），也不把旧会话留在 sidecar 里等 TTL；
+    # 下面那条拒绝文案会照实说明它已被关闭，不让模型去 close 一个已经不存在的会话。
+    old_sid = str(ctx.run_state.get("browser_session") or "")
+    closed_previous = False
+    if old_sid:
+        await _sidecar_delete(old_sid)
+        ctx.run_state["browser_session"] = None
+        closed_previous = True
+
     left = _checks_left(ctx)              # 沿用 preview_page 的 open 额度（规格 §10 第一行）
     if left == 0:
+        if closed_previous:
+            # 旧会话已经在这里被关掉了，再让模型「先用 browser_close 收口」是指向一个不存在的会话。
+            return _error("本次任务已打开浏览器会话达到上限，上一个会话已自动关闭，本 run 不能再开新会话",
+                          checks_left=0, auto_closed_previous=True)
         return _error("本次任务已打开浏览器会话达到上限，请先用 browser_close 收口",
                       checks_left=0)
     path, err = normalize_path(args.get("path"))
@@ -218,28 +307,51 @@ async def _open(ctx, args: dict) -> dict:
 
     display_url = display_base.rstrip("/") + path
     target_url = f"http://{browser_target_host()}:{int(dev_port)}{path}"
+    # 两份 netloc：sidecar 自由文本里出现的内部 host:port 一律换回展示地址（裁定 R-22）。
+    display_netloc = _netloc(display_base)
+    target_netloc = _netloc(target_url)
     timeout_s = _int_cfg(ctx.cfg, "agent.browser_timeout_seconds",
                          DEFAULT_OPEN_TIMEOUT_SECONDS, OPEN_TIMEOUT_MIN, OPEN_TIMEOUT_MAX)
-    data, sidecar_err = await _sidecar_open(target_url, timeout_s=timeout_s, expect=None)
+    interactive_max = _int_cfg(ctx.cfg, INTERACTIVE_CFG_KEY, DEFAULT_INTERACTIVE_MAX,
+                               INTERACTIVE_MAX_MIN, INTERACTIVE_MAX_MAX)
+    data, sidecar_err = await _sidecar_open(target_url, timeout_s=timeout_s, expect=None,
+                                            interactive_max=interactive_max)
     if data is None:
-        return _error(sidecar_err, status=status, url=display_url,
+        return _error(scrub_known_host(sidecar_err, target_netloc=target_netloc,
+                                       display_netloc=display_netloc),
+                      status=status, url=display_url,
                       hint="确认 browser sidecar 已启动（本地开发运行 browser/dev-up.bat）")
     if data.get("ok") is not True:
-        return {"ok": False, "error": _redact(data.get("error"), ERROR_MAX_CHARS)[0],
+        # error 里内嵌的是 Playwright 的原话（导航异常自带被 `_connect_url` 重写后的 URL），
+        # redact_sensitive 只认凭据形态、管不到 host——这里是拓扑泄漏的第二出口（R-22）。
+        error_text, _hits = _sidecar_text(data.get("error"), ERROR_MAX_CHARS,
+                                          target_netloc=target_netloc,
+                                          display_netloc=display_netloc)
+        return {"ok": False, "error": error_text,
                 "status": status, "url": display_url,
                 "session_gone": bool(data.get("session_gone")),
                 "hint": "可先用 preview_status / preview_logs 确认预览确实可用"}
 
     ctx.run_state["browser_checks"] = int(ctx.run_state.get("browser_checks", 0) or 0) + 1
     ctx.run_state["browser_session"] = str(data.get("session_id") or "")
-    ctx.run_state["browser_steps_used"] = 0
+    # 缺省才初始化：步数账是 per-run 的（规格 §7「steps_used 同处计数」、§10「单 run 步数上限」、
+    # US-13「本 run 步数已用完」）。写成赋值就把口径改成了 per-session，
+    # 「open→12 步→close→open→12 步」会在一个 run 里合法，模型上下文的成本上限悄悄翻倍。
+    ctx.run_state.setdefault("browser_steps_used", 0)
     # refs 存 sidecar 的原始清单（不是给模型看的裁剪版）：Task 5 的 sensitive `fill` 遮断
     # 要按 ref 查 sensitive，裁剪版少了判定所需的字段。
     ctx.run_state["browser_refs"] = list(data.get("interactive") or [])
     # 收口报告的 url 同样用 display_url（裁定 R-16）：这份日志会进 browser_close 的返回值。
     ctx.run_state["browser_log"] = [{"seq": 0, "action": "open", "target": path,
                                      "passed": None, "url": display_url}]
-    return _shape_state(ctx, data, opened=True, url=display_url, status=status)
+    out = _shape_state(ctx, data, opened=True, url=display_url, status=status,
+                       target_netloc=target_netloc, display_netloc=display_netloc)
+    if closed_previous:
+        # 不能静默换掉：模型会以为自己还在同一个会话上，而步数账与 browser_log 都是那个 run 的。
+        # 只报事实，不带旧 session_id（ADR-0037：session_id 不进任何模型可见出口）。
+        out["auto_closed_previous"] = True
+        out["hint"] = "上一个浏览器会话已在本次 open 前自动关闭（一个 run 只保留一个会话），旧 ref 全部作废"
+    return out
 
 
 async def _step(_ctx, _args: dict) -> dict:
