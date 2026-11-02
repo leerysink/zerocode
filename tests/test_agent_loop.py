@@ -543,10 +543,12 @@ async def test_preview_tools_mounted_only_for_app_workspace(test_engine, tmp_pat
     sid, aid, sf = await mk_app_session(test_engine, tmp_path)
     llm = ScriptedLLM([[delta("好"), *done("好了")]])
     await mk_runner(sf, llm, Recorder()).run(sid, "起个预览", asyncio.Event())
-    assert tool_names(llm)[-6:] == ["preview_status", "preview_logs", "preview_restart",
-                                    "db_query", "db_write", "preview_page"]
+    assert tool_names(llm)[-9:] == ["preview_status", "preview_logs", "preview_restart",
+                                    "db_query", "db_write", "preview_page",
+                                    "browser_open", "browser_step", "browser_close"]
     assert "<preview>" in llm.received[0][0]["content"]
     assert "<browser>" in llm.received[0][0]["content"]
+    assert "<browser_session>" in llm.received[0][0]["content"]
     assert "vue3-fastapi" in llm.received[0][0]["content"]
 
 
@@ -560,8 +562,11 @@ async def test_no_preview_tools_without_app_row(test_engine, tmp_path):
     names = tool_names(llm)
     assert not any(n.startswith("preview_") for n in names)
     assert not any(n.startswith("db_") for n in names)
+    assert not any(n.startswith("browser_") for n in names)   # 交互工具同闸（规格 §5.1）
     assert "<preview>" not in llm.received[0][0]["content"]
     assert "<database>" not in llm.received[0][0]["content"]
+    assert "<browser>" not in llm.received[0][0]["content"]
+    assert "<browser_session>" not in llm.received[0][0]["content"]
 
 
 @pytest.mark.asyncio
@@ -579,8 +584,10 @@ async def test_duplicate_workspace_binding_fails_closed_with_note(test_engine, t
     await mk_runner(sf, llm, Recorder()).run(sid, "起个预览", asyncio.Event())
     assert not any(n.startswith("preview_") for n in tool_names(llm))
     assert not any(n.startswith("db_") for n in tool_names(llm))   # 数据库工具同闸 fail closed
+    assert not any(n.startswith("browser_") for n in tool_names(llm))
     assert "<database>" not in llm.received[0][0]["content"]
     assert "<browser>" not in llm.received[0][0]["content"]
+    assert "<browser_session>" not in llm.received[0][0]["content"]
     assert "绑定了多个应用" in llm.received[0][0]["content"]
 
 
@@ -592,8 +599,72 @@ async def test_preview_prompt_follows_the_stack(test_engine, tmp_path):
     await mk_runner(sf, llm, Recorder()).run(sid, "改个后端", asyncio.Event())
     c = llm.received[0][0]["content"]
     assert "必须 preview_restart" in c and "uvicorn" not in c     # 按栈差异化，不串味
-    assert c.rstrip().endswith("</browser>")                      # 块在 system 尾部（契约/技能之后）
+    assert c.rstrip().endswith("</browser_session>")              # 块在 system 尾部（契约/技能之后）
     assert "</preview>" in c and "<browser>" in c                 # 浏览器指引跟在预览块之后
+    assert "</browser>" in c and "<browser_session>" in c         # 交互指引跟在快检指引之后
+
+
+@pytest.mark.asyncio
+async def test_run_close_sweeps_the_browser_session(test_engine, tmp_path, monkeypatch):
+    """US-21：模型忘了 browser_close，run 收口也要 best-effort 发 DELETE。
+
+    sidecar 在 `mem_limit: 1g` 的容器里攒僵尸 context 是唯一运维义务；绑定与收口都只在服务端，
+    模型拿到的结果里既没有 session_id，也没有被重写过的容器地址（裁定 R-16）。
+    """
+    from app.agent import browser_session_tools as bst
+
+    sid, aid, sf = await mk_app_session(test_engine, tmp_path, status="running", slug="pvsess",
+                                        dev_port=8287, prod_port=8286)
+
+    async def fake_open(url, **kw):
+        return {"ok": True, "session_id": "secret-sid", "title": "订单", "text": "共 3 条",
+                "url": "http://192.168.65.254:8287/orders", "interactive": [],
+                "console": [], "failed_requests": [], "elapsed_ms": 10}, ""
+
+    deleted = []
+
+    async def fake_delete(sid_):
+        deleted.append(sid_)
+        return True
+
+    monkeypatch.setattr(bst, "_sidecar_open", fake_open)
+    monkeypatch.setattr(bst, "_sidecar_delete", fake_delete)
+    rec = Recorder()
+    turns = [done(None, [tool_call("c1", "browser_open", path="/orders")]), done("看完了")]
+    await mk_runner(sf, ScriptedLLM(turns), rec, tasks={}).run(sid, "走一遍", asyncio.Event())
+    tr = next(e for e in rec.events if e["type"] == "tool_result" and e["name"] == "browser_open")
+    assert tr["result"]["ok"] is True
+    blob = json.dumps(tr["result"], ensure_ascii=False)
+    assert "secret-sid" not in blob and "192.168.65.254" not in blob
+    assert deleted == ["secret-sid"]
+
+
+@pytest.mark.asyncio
+async def test_error_path_still_closes_the_browser_session(test_engine, tmp_path, monkeypatch):
+    """收口覆盖每一条出口：run 打成 error 终态也不能把会话留在 sidecar 里（只有 TTL 兜底就行）。"""
+    from app.agent import browser_session_tools as bst
+
+    sid, aid, sf = await mk_app_session(test_engine, tmp_path, status="running", slug="pvsess2",
+                                        dev_port=8289, prod_port=8288)
+
+    async def fake_open(url, **kw):
+        return {"ok": True, "session_id": "sid-err", "title": "t", "text": "", "url": "http://h/",
+                "interactive": [], "console": [], "failed_requests": [], "elapsed_ms": 1}, ""
+
+    deleted = []
+
+    async def fake_delete(sid_):
+        deleted.append(sid_)
+        return True
+
+    monkeypatch.setattr(bst, "_sidecar_open", fake_open)
+    monkeypatch.setattr(bst, "_sidecar_delete", fake_delete)
+    # 只给一轮：派发完 browser_open 后 ScriptedLLM 会在第二轮炸掉，run 落 error 终态
+    turns = [done(None, [tool_call("c1", "browser_open", path="/")])]
+    rec = Recorder()
+    status = await mk_runner(sf, ScriptedLLM(turns), rec, tasks={}).run(sid, "走一遍", asyncio.Event())
+    assert status == "error"
+    assert deleted == ["sid-err"]
 
 
 @pytest.fixture

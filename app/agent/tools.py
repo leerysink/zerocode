@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 from sqlalchemy import text
 
-from app.agent.llm import PREVIEW_TOOL_NAMES, DB_TOOL_NAMES, BROWSER_TOOL_NAMES
+from app.agent.llm import PREVIEW_TOOL_NAMES, DB_TOOL_NAMES, BROWSER_TOOL_NAMES, BROWSER_SESSION_TOOL_NAMES
 
 MAX_READ_BYTES = 200 * 1024
 BINARY_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".pdf", ".zip", ".gz", ".exe", ".dll", ".so", ".bin", ".db", ".sqlite", ".mp3", ".mp4"}
@@ -140,6 +140,12 @@ async def execute_tool(ctx: ToolContext, name: str, args: dict, *, confirmed: bo
         # 只读，无确认、无命令面；失败同样是带原因的正常结果。
         from app.agent.browser_tools import run_browser_tool
         return await run_browser_tool(ctx, name, args)
+    if name in BROWSER_SESSION_TOOL_NAMES:
+        # 预览页交互验证（规格 docs/specs/2026-11-02-agent-browser-interaction.md §5）：
+        # 与 preview_page 同款约定——失败一律是带原因的正常结果，不抛 ToolError。
+        # 会话 id 只存在 ctx.run_state，模型手上没有指到别人会话的参数面（ADR-0037）。
+        from app.agent.browser_session_tools import run_browser_session_tool
+        return await run_browser_session_tool(ctx, name, args)
     if name == "list_dir":
         d = resolve_in_workspace(ctx.root, args.get("path"))
         if not d.is_dir():

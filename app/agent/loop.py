@@ -14,6 +14,7 @@ from pathlib import Path
 from app.agent.preview_tools import (build_preview_prompt, confirm_summary, fetch_app,
                                      need_confirm, resolve_session_app)
 from app.agent.browser_tools import build_browser_prompt
+from app.agent.browser_session_tools import build_browser_session_prompt, close_browser_session
 from app.agent.db_tools import build_db_prompt, db_confirm_summary
 from app.agent.prompts import build_clarify_prompt, build_system_prompt
 from app.agent import clarify as _cl
@@ -108,6 +109,10 @@ class AgentRunner:
         # 本轮历史已内联的图片原始字节合计（_history 构建时写入）：插话带图与历史共用
         # 同一份 MAX_INLINE_BYTES 预算，否则一次运行的内联总量可以越过上限
         self._inline_used = 0
+        # 本 run 的工具上下文（_inner 建好 ctx 时写入）：run 收口时要用它把浏览器会话关掉
+        # （US-21）。放在实例上而不是把 `_inner` 的循环整体缩进 try/finally：一个 runner 只服务
+        # 一次 run（app/api/ws.py 每个 run 新建一个），而收口必须覆盖正常结束/取消/报错三条出口。
+        self._tool_ctx = None
 
     async def _root_of(self, session_id: int):
         async with self.sf() as s:
@@ -171,6 +176,7 @@ class AgentRunner:
     async def run(self, session_id: int, user_text: str, cancel: asyncio.Event,
                   attachment_ids: list[int] | None = None) -> str:
         status = "idle"
+        self._tool_ctx = None      # 每个 run 重新绑定：收口只认本次 run 的会话
         try:
             await self._inner(session_id, user_text, cancel, attachment_ids)
         except _Cancelled:
@@ -182,6 +188,10 @@ class AgentRunner:
         finally:
             await self._set_status(session_id, status)
             await self.send({"type": "status", "status": status})
+            # 浏览器会话收口（规格 2026-11-02 US-21）：模型没调 browser_close 也要发 DELETE，
+            # 否则 sidecar 会在 mem_limit 1g 里攒僵尸 context。放在状态帧之后、且内部全吞：
+            # 一次没收口的清理不该把对话结束的读数拖住最多 10 秒。
+            await close_browser_session(self._tool_ctx)
         return status
 
     async def _set_status(self, session_id, status):
@@ -427,12 +437,15 @@ class AgentRunner:
         app, preview_note = await self._resolve_app(session_id)
         preview_prompt = preview_note or (build_preview_prompt(app["stack"]) if app else None)
         if app:
-            # 数据库指引与工具同生同灭：多应用 fail closed（preview_note）时两者都不注入。
-            # <database> 放在 <preview> 之前；<browser> 跟在 <preview> 之后（system 尾部锚定
-            # </browser>，见 test_agent_loop 的提示词顺序断言）。
+            # 数据库指引与工具同生同灭（多应用 fail closed 时两者都不注入）。块顺序固定：
+            # <database> → <preview> → <browser> → <browser_session>；system 尾部锚定
+            # </browser_session>（见 test_agent_loop 的提示词顺序断言）。
             preview_prompt = (build_db_prompt() + (preview_prompt or "")
-                              + build_browser_prompt())
-        tools = _TOOLS + PREVIEW_TOOLS + DB_TOOLS + BROWSER_TOOLS if app else _TOOLS
+                              + build_browser_prompt() + build_browser_session_prompt())
+        # 交互工具的挂载条件与 preview_page 完全一致（规格 §5.1）：只在解析出唯一应用时挂载，
+        # 非应用工作区连「调了才发现不能用」的假工具都不给。
+        tools = (_TOOLS + PREVIEW_TOOLS + DB_TOOLS + BROWSER_TOOLS + BROWSER_SESSION_TOOLS
+                 if app else _TOOLS)
         # 澄清工具与门禁同生同灭（规格 §4 故事 20）：关掉开关的账户既不该看见 clarify_done，
         # 更不该被一道模型看不见的闸拦下写入——那只会让写文件变成莫名失败。
         clarify_on = _cl.enabled(cfg)
@@ -463,6 +476,7 @@ class AgentRunner:
                           app=app, cfg=cfg, cancel=cancel, deploy_hub=self.deploy_hub,
                           deploy_tasks=self.dev_tasks, run_state=run_state,
                           model_cfg=self.model_cfg, llm=await self._llm_for(cfg))
+        self._tool_ctx = ctx      # run 收口要用它发浏览器会话的 DELETE（见 run 的 finally）
         max_rounds = int(cfg.get("agent.max_tool_rounds", 30))
         # <=0 = 不限工具轮数（与超时参数 <=0 不限制的约定一致），不再 range(0) 零轮即错
         rounds = itertools.count() if max_rounds <= 0 else range(max_rounds)
@@ -681,4 +695,5 @@ class AgentRunner:
 class _Cancelled(Exception):
     pass
 
-from app.agent.llm import PREVIEW_TOOLS, DB_TOOLS, BROWSER_TOOLS, CLARIFY_TOOLS, TOOLS as _TOOLS
+from app.agent.llm import (PREVIEW_TOOLS, DB_TOOLS, BROWSER_TOOLS, BROWSER_SESSION_TOOLS,
+                           CLARIFY_TOOLS, TOOLS as _TOOLS)

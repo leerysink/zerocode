@@ -163,6 +163,42 @@ BROWSER_TOOLS = [
 
 BROWSER_TOOL_NAMES = ("preview_page",)
 
+# 预览页交互验证（规格 docs/specs/2026-11-02-agent-browser-interaction.md）：与应用工作区同生同灭，
+# 挂载条件与 preview_page 完全一致。参数面里没有 app/url/session_id——目标由后端按 dev 端口构造，
+# 会话绑定只存在 ctx.run_state（ADR-0037：模型能指到别人的 session 就全完了）。
+# 描述保持一句话：这三条随每次请求发送，教程在 system prompt 的 <browser_session> 块里。
+BROWSER_SESSION_TOOLS = [
+    {"type": "function", "function": {
+        "name": "browser_open",
+        "description": ("在当前应用 dev 预览开一个可交互浏览器会话，返回标题、可见文本与"
+                        "可交互元素清单（ref 只在最近一次返回内有效）"),
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "同源相对路径，默认 /"}},
+            "required": []}}},
+    {"type": "function", "function": {
+        "name": "browser_step",
+        "description": ("对当前浏览器会话执行一个动作并返回新状态；expect 给了就由工具判定"),
+        "parameters": {"type": "object", "properties": {
+            "action": {"type": "string", "enum": ["click", "fill", "press", "select",
+                                                  "scroll_into_view", "navigate"]},
+            "target": {"type": "string",
+                       "description": "上一次清单里的 ref；navigate 时填同源相对路径"},
+            "value": {"type": "string",
+                      "description": "fill 的文本 / press 的键名 / select 的选项值"},
+            "expect": {"type": "object", "properties": {
+                "type": {"type": "string", "enum": ["text_contains", "element_visible",
+                                                    "url_matches", "no_new_console_error"]},
+                "value": {"type": "string"}}, "required": ["type"]},
+            "screenshot": {"type": "boolean", "description": "是否附截图，默认 false"}},
+            "required": ["action", "target"]}}},
+    {"type": "function", "function": {
+        "name": "browser_close",
+        "description": "关闭当前浏览器会话，返回本次路径走查的收口报告",
+        "parameters": {"type": "object", "properties": {}, "required": []}}},
+]
+
+BROWSER_SESSION_TOOL_NAMES = ("browser_open", "browser_step", "browser_close")
+
 
 def _reasoning_of(delta):
     """兼容取 reasoning_content：SDK 具名属性优先，其次 model_extra（未知字段兜底）。"""
