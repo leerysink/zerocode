@@ -442,9 +442,42 @@ Agent 通过 `ask_user` 向用户提问、通过 `confirm_request` 请求放行�
   诊断文本回给主模型；当前会话模型不支持视觉时降级为纯文本并明确告知。
 - **触发**：由模型按需调用，`preview_restart` 不自动触发；预览未运行时只返回状态与
   「先 preview_restart」的提示，不隐式起栈。
+- **两条路径、一个采集器**：只读快检（`preview_page` → sidecar `POST /inspect`）与交互走查
+  （`browser_open` / `browser_step` / `browser_close` → `POST /sessions*`）共享同一个采集与裁剪
+  函数 `collect_page_state`，截图策略只用 `include_screenshot` 参数分岔（快检必给图、走查默认
+  不给）。两份并排必然漂移，所以不写第二套采集。
+- **一处有意的字段名不对称**，别「统一」掉它：快检是一次性全量检查，回 `page_errors`（全量）；
+  走查每步只报新增，回 `page_errors_new`，与同一条响应里的 `console_new`、`failed_requests_new`
+  成族。把走查那侧改回 `page_errors`，等于让每一步都重播首屏那次崩溃。
+
+## 浏览器会话（browser session）
+
+Agent 交互走查在 sidecar 里持有的**一个活页面及其 BrowserContext**。`browser_open` 建它，
+`browser_close` 或 run 收口时关它，生命周期口径是「一个 run，空闲 120s 由 sidecar 自行回收」；
+同时能活的会话数有上限（默认 2），**超限是拒绝而不是排队**。
+
+- 它与「预览栈（dev 预览）」是两件事，别混着说：**预览栈是被访问的那个应用本身在跑**，
+  浏览器会话是**访问它的那个浏览器**。预览未运行时 `browser_open` 只回提示，绝不自己起栈。
+- 它是 sidecar 新建的干净 context，**不读取、不复用用户宿主浏览器的 cookie 与登录态**；
+  应用里的登录态（token 落 localStorage）只活在这份 context 里，随它一起生灭。
+- **一个 run 只保留一个会话**：重复 `browser_open` 先关掉前一个再开新的，旧 ref 全部作废。
+  措辞上说「重新打开」，不说「切换会话」——模型手上从来没有 `session_id`，无从切换。
+- 显式 close、空闲 TTL、并发上限**三者必须同时存在**：只有 TTL 会在 `mem_limit: 1g` 的容器里
+  攒出僵尸 context（ADR-0037）。
+
+## 交互元素句柄（ref）
+
+sidecar 给可交互元素打的一次性编号（DOM 属性 `data-zc-ref`，形状 `e1`、`e7`），
+随交互元素清单一起返回；模型下一步用 ref 指元素。
+
+- 术语上**不叫「元素 ID」**——它没有跨调用的身份。规范限定语恒为「只在最近一次返回的清单内有效」。
+- 作废是**物理事实而不是约定**：每次采集先清掉旧属性、按当次遍历顺序重打，而 Vue 重建 DOM 节点会
+  连 `data-zc-ref` 一起丢掉，旧句柄连选择器都找不到元素。所以同一个 `e7` 在两份清单里大概率是
+  两个元素；失效时结果当场带回新清单，而不是让模型再花一次往返去要。
+- 唯一的例外是 `navigate`：它的 `target` 填同源相对 path，不是 ref。
 
 ## 浏览器 sidecar（browser sidecar）
 
-承载 `preview_page` 的独立容器：headless Chromium + Playwright，无 docker.sock、无平台库凭据、
-非 root、限资源；后端只经内部 HTTP 调用它，它只经 host-gateway 访回应用 dev 端口。
-它不是应用运行时的一部分，也不走网关；后端容器内不运行浏览器（ADR-0031）。
+承载 `preview_page` 与三个交互工具的独立容器：headless Chromium + Playwright，无 docker.sock、
+无平台库凭据、非 root、限资源；后端只经内部 HTTP 调用它，它只经 host-gateway 访回应用 dev 端口。
+它不是应用运行时的一部分，也不走网关；后端容器内不运行浏览器（ADR-0031，会话化由 ADR-0037 修订）。

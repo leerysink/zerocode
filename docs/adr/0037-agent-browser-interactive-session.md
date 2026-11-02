@@ -1,5 +1,7 @@
 # Agent 浏览器验证从一次性只读检查改为可交互会话
 
+**状态**：已实施（走查记录见 docs/specs/2026-11-02-agent-browser-interaction.md §15）
+
 ADR-0031 把浏览器验证定成「每次请求新建 BrowserContext、只读、不点击」。上线后暴露两类它回答不了的问题。一是等待策略只有固定 sleep：应用带 2 秒级开场动画时，截图必然落在动画中段，Agent 连续 6 次都读到「正在配置组件」，把它误判成渲染故障——而这不是运气差，`domcontentloaded` 后等 1200ms 写死在 `agent.browser_settle_ms`，与任何应用自己的启动时序无关。二是只读检查看不到业务闭环：表单能不能提交、点删除有没有真的少一行、按钮点了有没有反应，只有操作过才知道。两类问题都要求活页面跨调用存在，而「无状态、一次一 context」正是 0031 的安全支点，所以这不是加参数能解决的，需要单开一条修订。
 
 决策：sidecar 增加进程内 session 注册表（`POST /sessions` 开、`POST /sessions/{id}/step` 走一步、`DELETE` 关），活页面留在 sidecar 内存，后端只持 `session_id ↔ chat_session` 绑定与额度。隔离前提中不变的部分照旧：同一个无 docker.sock、无平台库凭据、非 root、只读根文件系统的容器；仍不接收任意 URL，目标 origin 由后端构造并校验；仍不复用用户浏览器的 cookie 与登录态——session 是 sidecar 新建的干净 context，不是宿主上那个 Chrome。变的部分只有一条：context 的生命周期从「一次请求」拉长到「一个 run（空闲 120s 回收）」，页面 JS 因此可以在一次验证内累积状态并执行 Agent 的动作。
