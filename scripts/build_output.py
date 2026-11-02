@@ -1375,6 +1375,22 @@ sidecar 未启动或崩溃时，`preview_page` 会返回「浏览器检查服务
 预览的启动/日志/重启不受影响。截图落在 `<部署根>/data/browser_shots/`（运行期数据，
 不在包里，也不要被同步命令的 `--delete` 扫掉）。
 
+可交互会话（Agent 的 `browser_open` / `browser_step` / `browser_close`）是**有状态**的：活页面
+（Playwright context）留在 sidecar 进程内存里，后端只持绑定与收口责任。两个键管着它的上限，
+`.env.example` 与 compose 里都显式写着默认值——靠代码默认值的话，默认值漂了运维这边看不见：
+
+- `ZEROCODE_BROWSER_MAX_SESSIONS`（默认 2）：同时能留几个活页面。**超限是拒绝而不是排队**——
+  新的 `browser_open` 当场拿回一句「浏览器服务已满」，Agent 会先 `browser_close` 收口或稍后重试，
+  不会把用户晾在一个卡住的请求上。同一个 run 只保留一个会话（重复 open 会先关旧的），
+  所以正常情况下这个数用不尽；撞限通常是上一条 run 被杀、会话还没被关掉。
+- `ZEROCODE_BROWSER_SESSION_TTL_SECONDS`（默认 120）：一个会话**空闲**多久后被回收（巡检每 10s 一跳）。
+  打开中的等待与每一步动作都会把空闲时钟拨回现在，所以刚开好的会话不会下一步就撞上 TTL。
+  正常路径由后端在 run 收口时发 `DELETE` 关掉，TTL 兜的是容器重启、后端被杀那类没人关的 context。
+
+调大这两个数要连着看 `browser` 服务的 `mem_limit: 1g`：一个活会话就是一个 Chromium context，
+两个数一起放大等于在 1g 里攒 OOM。调小 TTL 是另一头的代价——聊到一半会话先没了，Agent 拿到的
+那句是「浏览器会话已结束，请重新 browser_open」，步骤卡会把那一步画成失败。
+
 ### 网关（通配域名 HTTPS）
 
 包的 `gateway/` 下是一个**独立的 OpenResty compose 项目**：终止 TLS，并按
@@ -1554,6 +1570,7 @@ bash deploy.sh          # 第 1 问选 upgrade
 | 域名打不开（未备案 / 443 被拦），想先走 IP | 把部署根 `.env` 的 `ZEROCODE_SSL_ENABLE` 设成 `false` 并 `docker compose up -d`：控制台、发布记录、应用 README 的应用地址一起改成 `http://<ZEROCODE_PREVIEW_HOST>:<prod 端口>`，网关不用停；宿主防火墙要放行应用端口段（默认 8210-8399）。备案或证书就绪后改回 `true` |
 | Agent 报「浏览器检查服务不可用」 | 九成是 sidecar 根本没部署：宿主的 `docker-compose.yml` 比包旧（只重传 `backend/` 时的常态），整块没有 `browser` 服务，后端于是回落连容器自己的 `127.0.0.1:8101`。先 `grep -c browser docker-compose.yml`——为 0 就是这一种。已在跑的用 `docker compose ps browser` 看是否反复重启、`docker compose logs browser` 看 Chromium 启动错误。sidecar 不发布宿主端口，别从宿主访问 8101；若改过 `ZEROCODE_BROWSER_TARGET_HOST`，确认同一 host 已加进 `.env` 的 `BROWSER_ALLOWED_HOSTS`（默认只放行 `host.docker.internal,127.0.0.1,localhost`）。`bash deploy.sh` 现在两道都拦：预检要求 compose 声明 `browser` 服务，自检要求后端容器里探得通 `/healthz` |
 | `preview_page` 能开页面但截图为空 / 视觉诊断为「未启用」 | 图像缺失是截图落盘失败（看后端日志与 `<部署根>/data/browser_shots/` 权限）；「未启用」表示当前会话模型没有声明视觉能力，属正常降级 |
+| Agent 反复说「浏览器服务已满」/「浏览器会话已结束」 | 前者是活会话上限 `ZEROCODE_BROWSER_MAX_SESSIONS`（默认 2）用尽：超限的新会话被直接拒绝而不是排队，先 `docker compose logs browser` 看还留着几个没关的 context，别一上来调大——容器只有 `mem_limit: 1g`。后者多半是 `ZEROCODE_BROWSER_SESSION_TTL_SECONDS`（默认 120）到点回收，或 sidecar 中途重启过（内存里的会话全丢，重启容器不会「接回」它们）；两种都是正常降级出口，Agent 会重新 `browser_open`，用户数据不受影响 |
 | 应用域名 502 Bad Gateway | 先看 `docker compose -f gateway/docker-compose.yml logs gateway`：出现 `host.docker.internal could not be resolved` 就是上游地址在 Linux 上解析不了（nginx 不读 `/etc/hosts`），把 `gateway/.env` 的 `ZEROCODE_GATEWAY_UPSTREAM` 设成宿主 docker0 网关（默认 `172.17.0.1`）后重建网关；若日志是 `connection refused`，核对应用 prod 栈与 `routes.json` 的端口是否一致 |
 | 网关容器起不来 / 反复重启 | `docker compose -f gateway/docker-compose.yml logs gateway`：多为 `gateway/certs/gateway.crt|key` 缺失，或 80/443 被占用 |
 | 发布成功但域名仍是 404 | 检查 `<部署根>/gateway/routes/routes.json` 里有没有该 slug；没有就看 backend 日志里 `gateway routes.json 刷新失败` 一行（该失败只告警、不阻断发布） |

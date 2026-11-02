@@ -16,7 +16,7 @@
 
 ## 2. 方案概述
 
-- **三个交互工具**：`browser_open(path)` / `browser_step(action, target, value?, expect?)` / `browser_close()`。与 `preview_page` 并存，后者继续作为「改完看一眼」的便宜选项。
+- **三个交互工具**：`browser_open(path?, expect?)` / `browser_step(action, target, value?, expect?)` / `browser_close()`。与 `preview_page` 并存，后者继续作为「改完看一眼」的便宜选项。
 - **sidecar 变成有状态服务**：新增进程内 session 注册表。活页面（Playwright context + page）留在 sidecar 内存，后端只持 `session_id ↔ chat_session` 绑定、步数额度与收口责任。**`session_id` 不进模型参数面**——沿用既有铁律「应用身份由服务端解析，schema 里没有 app_id」。
 - **等待改为按条件等**：给了 `expect` 就轮询等到满足或超时（默认 3s、上限 8s）；没给只等一个短 networkidle 窗口。固定 sleep 不再是唯一的等待手段。
 - **元素句柄用 ref，不用 CSS selector**：每次返回一份精简的**交互元素清单**（role + accessible name + ref + sensitive 标记），上限 40 条。模型下一步用 ref 指元素。理由是应用是 Vue SPA，scoped 样式类的哈希值不可预测，让模型写选择器等于让它瞎猜。
@@ -33,7 +33,7 @@
 - **US-03** 作为 Agent，我在 step 里带 `expect: {"type": "text_contains", "value": "订单已创建"}`，工具在超时窗口内轮询判定，返回 `passed: true/false`；不带 expect 时不判定，我自己读。
 - **US-04** 作为 Agent，每步返回的 `console` 与 `failed_requests` 只含**上一步以来新增**的条目，所以我能判断「这个错是不是我这一步搞出来的」，也不必重读同一批旧错误。（字段名是 `console_new` / `failed_requests_new`；裁定 R-27 之后未捕获异常也记同一本增量账，叫 `page_errors_new`。）
 - **US-05** 作为 Agent，断言失败时结果自动附带一张截图；断言通过时没有截图，省 token。（裁定 R-26 把口径放宽成「这一步没能往前推进」：**动作层面的失败**——ref 失效、点不动——同样自动附图。）
-- **US-06** 作为 Agent，目标应用有 2.1 秒开场动画时，我带 `expect` 打开首页，工具等到动画结束、目标文案出现后才返回——我不再需要让用户关掉动画才能看到真实首屏。（追认：`browser_open` 的参数面里没有 `expect`，这条在实现里的走法是「open 之后**第一步**带 expect」，等价达成同一结果；见 §6.3 与 §14。）
+- **US-06** 作为 Agent，目标应用有 2.1 秒开场动画时，我带 `expect` 打开首页，工具等到动画结束、目标文案出现后才返回——我不再需要让用户关掉动画才能看到真实首屏。（裁定 R-41 已接线：`browser_open` 的参数面里有 `expect`，后端 `_open` 把它透传给 `POST /sessions`，`_open_step` 的 `await_expect` 轮询与结论 `passed`/`note` 都回到模型手上；见 §6.3。）
 - **US-07** 作为 Agent，我调 `browser_close()` 得到一份收口报告：走了几步、几步断言失败、失败在哪步。（裁定 R-31 之后报告分开两本账：`steps_failed` 只数断言未过、`steps_action_failed` 只数「点不动」，另报 `steps_used` / `sessions_opened` / `sessions_replaced`；一个 expect 都没声明时 `hint` 不说「所有已声明的断言均通过」，改说「本次走查未声明任何断言」。）
 - **US-08** 作为 Agent，验证带登录的大型应用时，我从清单里找到账号与密码输入框，`fill` 两次再 `click` 登录，后续步骤里 session 保留着登录态（token 存在这个干净 context 的 localStorage 里）。
 
@@ -88,9 +88,13 @@
 
 ```json
 {"name": "browser_open",
- "description": "在当前应用 dev 预览开一个可交互的浏览器会话，返回标题、可见文本与可交互元素清单",
+ "description": "在当前应用 dev 预览开一个可交互的浏览器会话，返回标题、可见文本与可交互元素清单；expect 给了就等首屏满足再返回",
  "parameters": {"type": "object", "properties": {
-   "path": {"type": "string", "description": "同源相对路径，默认 /"}}}}
+   "path": {"type": "string", "description": "同源相对路径，默认 /"},
+   "expect": {"type": "object", "properties": {
+     "type":  {"type": "string", "enum": ["text_contains","element_visible","url_matches","no_new_console_error"]},
+     "value": {"type": "string", "description": "断言参数；no_new_console_error 不需要"}},
+     "required": ["type"]}}}}
 
 {"name": "browser_step",
  "description": "对当前浏览器会话执行一个动作并返回新状态；ref 只在上一次返回的清单内有效",
@@ -112,7 +116,7 @@
 
 挂载条件与 `preview_page` 完全一致：仅当 `resolve_session_app` 解析出唯一应用时挂载。
 
-参数面（properties 与 `required`）与 `app/agent/llm.py::BROWSER_SESSION_TOOLS` 一致——实现里 `browser_open` / `browser_close` 还显式写了空数组 `"required": []`，与本文省略该键同义；`browser_step` 的五个属性名由 `tests/test_browser_session_tools.py` 逐字钉住。`description` 是实现文本的**摘要**不是发送原文——实现里三条描述刻意保持一句话，教程住在 `<browser_session>` 提示词块（`browser_session_tools.py::build_browser_session_prompt`），随每次请求发送的是短句。`browser_open` 的属性面只有 `path`：`expect` 不在模型可给的参数里（§6.3 追认）。
+参数面（properties 与 `required`）与 `app/agent/llm.py::BROWSER_SESSION_TOOLS` 一致——实现里 `browser_open` / `browser_close` 还显式写了空数组 `"required": []`，与本文省略该键同义；`browser_step` 的五个属性名由 `tests/test_browser_session_tools.py` 逐字钉住。`description` 是实现文本的**摘要**不是发送原文——实现里三条描述刻意保持一句话，教程住在 `<browser_session>` 提示词块（`browser_session_tools.py::build_browser_session_prompt`），随每次请求发送的是短句。`browser_open` 的属性面是 `{path, expect}`（裁定 R-41 接线，见 §6.3）：那份 `expect` 与 `browser_step` 的是**同一个对象**（`llm.py::BROWSER_EXPECT_SCHEMA`），不是抄出来的第二份形状，四选一枚举因此不可能一侧加档、另一侧掉队。
 
 ### 5.2 step 成功结果
 
@@ -144,6 +148,9 @@
   元素，拿它标「这一步动的谁」会画出假目标。查得到才写这个键，查不到就不写（卡片自行回落「句柄 e7」）。
 - `passed` 只在给了 `expect` 时出现；不给则 `passed` / `note` 两个字段一起缺席，模型自判。
   给了 `expect` 时 `note` 键**恒在**：`judge_expect` 通过时也返回一句失败措辞，所以通过那一步是空串。
+  open 那一面是同一对字段、同一道闸（`_shape_state`，裁定 R-41）：`browser_open` 带 `expect` 时返回值里
+  就有 `passed` / `note`，不带时一并缺席；但 open 的返回值**没有** `action` / `target` / `steps_charged`
+  那三个回显键——它不是一步，§6.3 的四条口径（不扣步数、不自动附图）就是从这条形状差异上立住的。
 - `page_errors_new` 是第三本增量账（裁定 R-27）。字段名与 `/inspect` 的全量 `page_errors` **有意
   不对称**，别「统一」掉它：快检是一次性全量检查，走查每步只报新增，改回全量等于每一步都重播
   首屏那次崩溃。
@@ -223,7 +230,7 @@ ref 实现：采集时给每个交互元素写 `data-zc-ref="eN"`，step 时按�
 - 没给 `expect` → 只尝试短 `networkidle`（沿用现有 3s 上界），拿到当下状态。
 - 固定 `settle_ms` 降级为 step 的**可选参数，默认 0**，只用于「动画结束后还想再看一眼」的场景，不再是默认路径。它**不复用** `agent.browser_settle_ms`（那个键属于 `preview_page` 的一次性检查，默认 1200 保持不变）——两条路径的等待语义从此分家，别再拿一个键去管两件事。
 - **`no_new_console_error` 只看 `console`，不看 `page_errors`**（`session_core.judge_expect` 的入参只有 `console_new`）。这是 R-27 之前的既有判定面，**未随增量账扩展**：一个只抛未捕获异常（`pageerror`）、不打 `console.error` 的崩页——Vue 运行时的多数异常正是这个形状——照样能穿过这条断言拿到 `passed:true`。要看崩没崩得去读 `page_errors_new`，别把这条断言当「页面没炸」的证明。
-- **`browser_open` 的 `expect` 在当前实现里走不通**（追认，不是待办）：sidecar 的 `OpenRequest` 支持 `expect`，`_open_step` 也实现了轮询，但后端 `_open` 恒传 `expect=None`、`browser_open` 的 schema 里没有这个参数（§5.1 的 `{path}` 是准的）。于是 US-06「带 expect 打开首页、等真实首屏」的等价走法是 **open 之后第一步带 `expect`**：那一步的 `await_expect` 会替模型等到动画结束。但要说清这一走法有两个前提——**那一步得真有一个可点的元素**（动画中段清单里可能一个带名字的条目都没有），而 `navigate` 到同一个 path 虽然能「重载 + 轮询」，它同时把动画从头再放一遍。没有 `wait` 这种「不动作、只等」的动作可用。轮询预算也不同：open 那一档即便接上线也是写死的 3000ms 常量，不读 `agent.browser_expect_timeout_ms`。
+- **`browser_open` 的 `expect` 已接线**（裁定 R-41，US-06 的落点）：`browser_open` 参数面里那份 `expect` 与 `browser_step` 的是**同一个对象**（`llm.py::BROWSER_EXPECT_SCHEMA`，§5.1），后端 `_open` 原样透传给 `POST /sessions`，由 sidecar 的 `_open_step` 走同一份 `await_expect` 轮询——首屏等到目标文案才返回，动画中段的中间态不再进模型上下文。四条口径要记住：① 它是 open 的一部分、**不是 step**，因此不占步数额度（`browser_steps_used` 不动，而 open 自己照旧花 `agent.browser_max_per_run` 那一本账）；额度判定 → path 校验 → 自动关旧三者的既有顺序一字未动（裁定 R-24）。② 结论只经 `_shape_state` 那一道唯一闸口回 `passed` / `note`（`passed` 只在给了 expect 时出现、`note` 只在 `passed` 为假时给，与 step 同形），不新开出口、不绕过 `scrub_known_host`。③ open 的 expect 失败**不自动附现场图**：R-26 那条「失败自动附图」的口径只覆盖 step——open 的失败形状里没有 `steps_charged`，步骤卡也不按 open 的返回值找图。④ 轮询预算与 step 那一档仍不同：`_open_step` 用写死的 `STEP_TIMEOUT_MS_DEFAULT`（3000ms），**不读** `agent.browser_expect_timeout_ms`（§10 同一行记着，接线没有改变它）。
 
 ### 6.4 运行约束
 
@@ -336,7 +343,7 @@ ref 实现：采集时给每个交互元素写 `data-zc-ref="eN"`，step 时按�
 
 **sidecar 纯函数单测（无浏览器依赖，沿用 `inspect_core` 的做法）**：ref 打标与找回、失效判定、sensitive 标记（password / 名称命中 / 不命中）、增量裁剪（去重集合与上限）、4 种 expect 的判定矩阵、TTL 与上限的边界（恰好满、恰好过期、并发下不淘汰在用）。
 
-**后端单测**：三工具挂载条件；`session_id` 不出现在模型可见 schema；未 open 就 step；session 失效不扣步数；步数额度用尽；run 收口发 DELETE（含失败只记日志）；sensitive `fill` value 落库前被遮断；结果各字段过 `redact_sensitive`；sidecar 未知 id 降级；预览未运行不调 sidecar；expect 不过回 `ok:true, passed:false` 而非失败。
+**后端单测**：三工具挂载条件；`session_id` 不出现在模型可见 schema；未 open 就 step；session 失效不扣步数；步数额度用尽；run 收口发 DELETE（含失败只记日志）；sensitive `fill` value 落库前被遮断；结果各字段过 `redact_sensitive`；sidecar 未知 id 降级；预览未运行不调 sidecar；expect 不过回 `ok:true, passed:false` 而非失败。open 的 `expect` 通道另四条（裁定 R-41）：载荷里真带着它（钉到发给 sidecar 的请求体，不替身 `_sidecar_open`）、不给时载荷里是 `null` 且返回值没有 `passed` 键、`passed:false` 时 `note` 已过遮断与 host 清洗而 `passed:true` 时是空串、带 expect 的 open 不扣步数额度且失败不自动附图；另有 `llm.py` 那份共享形状断 `is`（两侧不是抄出来的两份）。
 
 **sidecar 集成（真 Playwright，标记为需要容器的慢测）**：open→click→expect 通过；重渲染后旧 ref 失效且返回新清单；被遮挡元素超时并附截图；原生 confirm 被 dismiss 且 `dialog` 字段有值；navigate 跳出 origin 被阻断；TTL 到点回收。
 **实际交付形态与本计划不同（追认）**：这一组**没有**独立成真慢测套件。注册表与端点段用桩浏览器跑（`tests/test_browser_sessions.py`，没装 playwright 的机器临时补模块桩，裁定 R-18），上面六条里能被语义层覆盖的都在单测里，**真 Chromium 的「点得到点不到、框弹没弹、TTL 真回收」全部移交 §15 手工矩阵**（按 R-8 由控制器/主会话在真容器上跑）。所以 §15 那张表不是走流程，它替这一段测试兜底——空着就是这一段没有测试。
@@ -345,7 +352,7 @@ ref 实现：采集时给每个交互元素写 `data-zc-ref="eN"`，step 时按�
 
 **打包测试**：compose 含 session 上限与 TTL 两项 env；容器约束不漂移（`read_only`、`cap_drop`、`pids_limit`、无 `ports`）。
 
-**手工矩阵**：正常路径跑通 / 2 秒级开场动画应用（正是 US-06 的回归目标，拿 chudadi 验证不再需要手动关动画）/ 大型栈登录（admin123 走 fill，检查历史记录里是否被遮断）/ 带原生 confirm 的删除 / 断言故意写错看失败卡 / 步数耗尽 / sidecar 中途重启 / 拖拽类应用（预期得到诚实的「点不到」）/ 刷新后步骤卡仍在 / 删除会话后截图清理。**逐行的走法与判定条件以 §15 那张表为准**：它把上面这些项铺开成可勾的行走法，在此之上另加「重复 open」「拓扑不泄漏（Task 4 登记）」「动作失败也带文字信号」「同一条消息里两个 step」「navigate path 非法」五条，并把开场动画那条改写成当前实现真能走的走法。
+**手工矩阵**：正常路径跑通 / 2 秒级开场动画应用（正是 US-06 的回归目标，拿 chudadi 验证不再需要手动关动画）/ 大型栈登录（admin123 走 fill，检查历史记录里是否被遮断）/ 带原生 confirm 的删除 / 断言故意写错看失败卡 / 步数耗尽 / sidecar 中途重启 / 拖拽类应用（预期得到诚实的「点不到」）/ 刷新后步骤卡仍在 / 删除会话后截图清理。**逐行的走法与判定条件以 §15 那张表为准**：它把上面这些项铺开成可勾的行走法，在此之上另加「重复 open」「拓扑不泄漏（Task 4 登记）」「动作失败也带文字信号」「同一条消息里两个 step」「navigate path 非法」五条，并把开场动画那条按接线后的走法写回「`browser_open` 带 expect」（裁定 R-41）。
 
 ## 13. 任务拆分（垂直切片）
 
@@ -363,9 +370,8 @@ ref 实现：采集时给每个交互元素写 `data-zc-ref="eN"`，step 时按�
 七轮修复里点过但**没有**在本分支收口的口子，集中登记在这里，免得下一个人以为它们是疏漏。
 
 - **R-37 / R-39**：见 §8 那三条的全文。两条都需要新裁定（R-37 要定「什么动作作废轮初清单」，R-39 要定「不可解析的 args 是否整串换成占位符」），且 R-39 的影响面是全工具共用路径，**须另立规格**。
-- **`browser_open` 的 `expect` 没接线**：sidecar 的 `OpenRequest.expect` 与 `_open_step` 的轮询都在，后端 `_open` 恒传 `expect=None`、schema 里也没有这个参数（§6.3）。US-06 现在靠「open 后第一步带 expect」等价达成。要么补一行接线（含 open 那一档轮询预算改读配置），要么改写 US-06，**需要一条裁定，不是顺手改**。
+- **open 的 `expect` 接线剩下的两条尾巴**（裁定 R-41 已把主口收掉：schema、透传、`passed`/`note` 结论与测试面见 §5.1 与 §6.3）：① open 那一档的轮询预算仍是 sidecar 里写死的 `STEP_TIMEOUT_MS_DEFAULT`（3000ms），不读 `agent.browser_expect_timeout_ms`（§10）——要改得动 `browser/`，另立裁定。② open 上声明的断言**不进收口报告的两本账**：`browser_log` 的 open 那条恒 `passed:null`，所以 `steps_failed` 与 `declared` 只数 step，「只有 open 带了一条 expect、各步都不写」的 run，`hint` 仍会说「本次走查未声明任何断言」。这条是刻意保留的——改 open 那条的 `passed` 会同时改 `browser_close` 的报告形状与 Task 7 步骤卡的既有渲染契约（§5.2 写明「open 那条与没给 expect 的步都是 None」），属另一个决定。
 - **`preview_page` 那侧的 host 清洗未收口**：`browser_tools.py::_inspect` 的 `url` / `error` / `console` / `failed_requests` 仍可能带 `_connect_url` 重写后的容器内地址。裁定 R-22 / R-28 明确「同病但属既有行为、有自己的测试面，本轮不动」并登记给 Task 8；本轮是文档收口，**代码未动**，这条继续挂着。
-- **交付包 `README-deploy.md` 未提「活会话上限 / TTL」**（Task 6 → T8 登记）：`browser/README.md` 本轮已补，交付包那份由 `scripts/build_output.py` 的模板字符串生成，属代码改动，本轮未动。
 - **工具名单还剩第三处字面量**：`run_browser_session_tool` 里的 `if name == "browser_open" / "browser_step" / "browser_close"`（Task 7 → T8 登记）。分派闸与位次口径已收成同一个 tuple 对象，这一处漏改的方向是**安全向**（名单有、handler 不认 → 回「未知工具」→ 不执行、不写清单 → 只是多遮），但别把它读成「三份名单已统一」。
 - **两条 sidecar 形状的已知不一致**（Task 5 minor deferred）：① `_do_navigate` 的 path 非法出口不接 `_step_state`，那一步会落 log 但三段增量字段缺席；② 成功支的 `_append_log` 不受 `steps_charged` 门控（当前无害——sidecar 的成功响应把 `steps_charged` 写死 `true`）。镜像重建后在 §15 里 live 复核 ①。
 - **一条测试缺口**（Task 6 minor deferred）：没有断言直接钉 `bo.BROWSER_MAX_SESSIONS_ENV == "ZEROCODE_BROWSER_MAX_SESSIONS"`，即「键名漂了但默认值没漂」这条第二漂移路径未封。
@@ -377,7 +383,7 @@ ref 实现：采集时给每个交互元素写 `data-zc-ref="eN"`，step 时按�
 
 | 项 | 走法 | 必须看到 | 实测 |
 |---|---|---|---|
-| 开场动画应用 | 对 chudadi 打开首页，**open 之后的第一步**就带 `expect:{type:"text_contains",value:"牌桌"}`（`browser_open` 当前不接 `expect`，见 §6.3） | 轮询等到动画结束、真实首屏出现后才返回 `passed:true`，**不需要用户关动画**（本功能的回归目标） | 待主会话走查回填 |
+| 开场动画应用 | 对 chudadi 打开首页，`browser_open` 直接带 `expect:{type:"text_contains",value:"牌桌"}`（裁定 R-41 已接线，§6.3） | open 等到动画结束、真实首屏出现后才返回，返回值里 `passed:true` 且没有 `note`，**不需要用户关动画**（本功能的立项理由）；这一步**不扣步数额度**、不自动附截图 | 待主会话走查回填 |
 | 大型栈登录 | `fill` 账号 + `fill` 密码（`admin123`）+ `click` 登录 | 后续步骤保持登录态；聊天历史里 `admin123` 已被遮断（`message.tool_args` 与 WS `tool_call` 里是 `<redacted:sensitive_input>`），而登录**真的成功**（原值送达了 sidecar） | 待主会话走查回填 |
 | 带原生 confirm 的删除 | 点一个带确认框的删除 | `dialog.handled:"dismissed"`，卡片提示「页面弹出了确认框，已按取消处理」，且**数据没被删**（别把取消读成成功） | 待主会话走查回填 |
 | 断言故意写错 | `expect` 一个不存在的文案 | `ok:true, passed:false` + 自动附一张截图 + `note` 说清为什么没过 | 待主会话走查回填 |

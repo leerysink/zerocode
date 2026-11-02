@@ -119,10 +119,27 @@ async def test_session_schema_exposes_no_session_id():
     from app.agent.llm import BROWSER_SESSION_TOOLS
     props = {t["function"]["name"]: set(t["function"]["parameters"]["properties"])
              for t in BROWSER_SESSION_TOOLS}
-    assert props["browser_open"] == {"path"}
+    assert props["browser_open"] == {"path", "expect"}
     assert props["browser_close"] == set()
     assert "session_id" not in props["browser_step"]
     assert props["browser_step"] == {"action", "target", "value", "expect", "screenshot"}
+
+
+async def test_open_and_step_share_one_expect_shape():
+    """两份 expect 必须是同一个对象（裁定 R-41），不是「今天抄得一样」的两份。
+
+    新造第二种形状不会红任何测试：一侧将来加一档（例如 title_contains）时另一侧照旧，模型看到
+    两个同名参数两种枚举，就会在 open 上写出一个 sidecar 认不出的 type，换回一句 422。
+    枚举值本身也钉一遍——断 `is` 挡住「换了定义处」，这份挡住「两边一起漂」。
+    """
+    from app.agent.llm import BROWSER_EXPECT_SCHEMA, BROWSER_SESSION_TOOLS
+    props = {t["function"]["name"]: t["function"]["parameters"]["properties"]
+             for t in BROWSER_SESSION_TOOLS}
+    assert props["browser_open"]["expect"] is BROWSER_EXPECT_SCHEMA
+    assert props["browser_step"]["expect"] is BROWSER_EXPECT_SCHEMA
+    assert props["browser_open"]["expect"]["properties"]["type"]["enum"] == [
+        "text_contains", "element_visible", "url_matches", "no_new_console_error"]
+    assert props["browser_open"]["expect"]["required"] == ["type"]
 
 
 async def test_session_tool_names_match_the_schema():
@@ -510,6 +527,113 @@ async def test_sidecar_open_payload_carries_interactive_max(monkeypatch):
     monkeypatch.setattr(bst, "httpx", holder)
     await bst._sidecar_open("http://h:1/", timeout_s=45, expect=None, interactive_max=12)
     assert client.calls[0][2]["interactive_max"] == 12
+
+
+# --------------------------------------------------- open 的 expect 通道（规格 US-06、裁定 R-41）
+
+_EXPECT = {"type": "text_contains", "value": "订单列表"}
+
+
+async def test_open_expect_reaches_the_sidecar_request_body(monkeypatch):
+    """US-06 的落点：`await_expect` 的轮询能力一直躺在 sidecar 里，模型够不着是因为后端恒传 None。
+
+    这里不替身 `_sidecar_open`——它正是被改的那一层。替了就只能证明「后端函数把参数接住了」，
+    证不了线上那份 JSON 真带着这个字段：`_open` 传错关键字、`_sidecar_open` 的 payload 漏键，
+    两种写法都能骗过函数级断言，而症状（截图停在开场动画中段）照旧。
+    """
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    client, holder = _fake_httpx(resp=_Resp(
+        200, _session_ok(passed=True, note="页面文本未包含「订单列表」")))
+    monkeypatch.setattr(bst, "httpx", holder)
+    out = await bst.run_browser_session_tool(Ctx(), "browser_open",
+                                             {"path": "/orders", "expect": _EXPECT})
+    method, url, payload = client.calls[0]
+    assert method == "POST" and url.endswith("/sessions")
+    assert payload["expect"] == _EXPECT
+    # 判定结论要出现在返回值里（同样只经 `_shape_state` 那一道闸），否则模型等完了也读不到结果。
+    assert out["ok"] is True and out["passed"] is True and out["note"] == ""
+    assert "session_id" not in json.dumps(out, ensure_ascii=False)
+
+
+async def test_open_without_expect_sends_null_and_returns_no_passed(monkeypatch):
+    """既有路径一字不变：不给 expect 时载荷里仍是 null（sidecar 走那条 networkidle 短等待），
+    返回值里 `passed`/`note` 两个键都缺席——凭空多出一个恒真的 passed，会被读成「验证过且通过」。
+    """
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    client, holder = _fake_httpx(resp=_Resp(200, _session_ok()))
+    monkeypatch.setattr(bst, "httpx", holder)
+    out = await bst.run_browser_session_tool(Ctx(), "browser_open", {"path": "/orders"})
+    payload = client.calls[0][2]
+    assert "expect" in payload and payload["expect"] is None
+    assert "passed" not in out and "note" not in out
+
+
+async def test_open_expect_verdict_passes_and_fails_with_the_right_note(monkeypatch):
+    """open 的 `passed`/`note` 沿用 `_shape_state` 那套：note 只在 passed 为假时给，
+    且与 step 那一条走同一把闸（先换内部 host、再过凭据遮断）。
+
+    `judge_expect` 在通过时也返回一句失败措辞（Task 1 记为携带项），所以通过那一支必须显式钉住
+    「note 是空串」——漏了三元判断，模型收到的就是 `passed:true` 配一句「页面文本未包含…」的矛盾文本。
+    """
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    monkeypatch.setattr(bst, "browser_target_host", lambda: "host.docker.internal")
+    note = "页面文本未包含「订单列表」；当前停在 http://192.168.65.254:8241/orders password=hunter2"
+
+    client, holder = _fake_httpx(resp=_Resp(200, _session_ok(passed=False, note=note)))
+    monkeypatch.setattr(bst, "httpx", holder)
+    out = await bst.run_browser_session_tool(Ctx(), "browser_open",
+                                             {"path": "/orders", "expect": _EXPECT})
+    assert out["passed"] is False
+    assert "localhost:8241/orders" in out["note"]          # 内部地址换回用户看得见的那个
+    assert "192.168.65.254" not in json.dumps(out, ensure_ascii=False)
+    assert "hunter2" not in json.dumps(out, ensure_ascii=False)   # 遮断闸没被绕开
+
+    client2, holder2 = _fake_httpx(resp=_Resp(200, _session_ok(passed=True, note=note)))
+    monkeypatch.setattr(bst, "httpx", holder2)
+    out = await bst.run_browser_session_tool(Ctx(), "browser_open",
+                                             {"path": "/orders", "expect": _EXPECT})
+    assert out["passed"] is True and out["note"] == ""
+
+
+async def test_open_expect_does_not_charge_the_step_budget(monkeypatch):
+    """expect 是 open 的一部分，不是 step：步数账只在 `_charge_step` 那两支涨（规格 §10）。
+
+    带断言的 open 也扣一步的话，模型学到一个坏经验——「等首屏比直接点更贵」，正好绕开本功能
+    要它用的那条路径；而 open 的额度本来就走 `agent.browser_max_per_run` 那一本账。
+    """
+    ctx = Ctx()
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    monkeypatch.setattr(bst, "_sidecar_open",
+                        lambda url, **kw: _aget((_session_ok(passed=True, note=""), "")))
+    out = await bst.run_browser_session_tool(ctx, "browser_open", {"expect": _EXPECT})
+    assert out["ok"] is True and out["passed"] is True
+    assert ctx.run_state["browser_steps_used"] == 0
+    assert out["steps_left"] == bst.DEFAULT_MAX_STEPS
+    # open 的返回值不报「这一步扣没扣」：那是 step 才有的字段，出现了就是把它当一步读的漂移点。
+    assert "steps_charged" not in out
+    # open 没动过这本账，所以紧随其后的第一步之后剩的正好是「上限 - 1」；open 也扣的话这里是 -2。
+    monkeypatch.setattr(bst, "_sidecar_step", lambda sid, payload: _aget(
+        (_step_data(passed=True, note=""), "")))
+    stepped = await bst.run_browser_session_tool(
+        ctx, "browser_step", {"action": "click", "target": "e1", "expect": _EXPECT})
+    assert stepped["steps_left"] == bst.DEFAULT_MAX_STEPS - 1
+
+
+async def test_failed_open_expect_attaches_no_scene_shot(monkeypatch):
+    """R-26 的「失败自动附图」只覆盖 step：open 不是「一步」，它的形状里没有 `steps_charged`，
+    前端步骤卡也不按 open 的返回值找图。
+
+    首屏没等到文案时页面通常已经渲染完（动画还在动），一张图说明不了「等到什么时候算完」，
+    而断言结论 `passed:false` + note 才是那条信号。真要现场，模型可以 close 后重开或下一步显式要。
+    """
+    seen = _no_shot(monkeypatch)
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    monkeypatch.setattr(bst, "_sidecar_open", lambda url, **kw: _aget(
+        (_session_ok(passed=False, note="页面文本未包含「订单列表」"), "")))
+    out = await bst.run_browser_session_tool(Ctx(), "browser_open", {"expect": _EXPECT})
+    assert out["ok"] is True and out["passed"] is False
+    assert "screenshot" not in out and "screenshot_note" not in out
+    assert seen == []
 
 
 # --------------------------------------------------------------------------- 双形状契约

@@ -505,7 +505,13 @@ async def _open(ctx, args: dict) -> dict:
     timeout_s = _int_cfg(ctx.cfg, "agent.browser_timeout_seconds",
                          DEFAULT_OPEN_TIMEOUT_SECONDS, OPEN_TIMEOUT_MIN, OPEN_TIMEOUT_MAX)
     interactive_max = _interactive_max(ctx)
-    data, sidecar_err = await _sidecar_open(target_url, timeout_s=timeout_s, expect=None,
+    # expect 原样透传（裁定 R-41）：sidecar 的 `_open_step` 早就有 `await_expect` 轮询，
+    # 后端此前恒传 None，等于把「等开场动画结束」的能力关在模型够不着的地方（规格 US-06）。
+    # 不给时载荷与旧行为逐字相同（`expect` 仍是 null），走的还是 sidecar 那条 networkidle 短等待。
+    # 后端不校验形状，与 `_step` 同口径：不合法的 expect 由 sidecar 的 422 出口给出人话原因。
+    # 结论一侧不需要新闸口——`_shape_state` 已经按 `data["passed"]` 决定给不给 `passed`/`note`。
+    data, sidecar_err = await _sidecar_open(target_url, timeout_s=timeout_s,
+                                            expect=args.get("expect"),
                                             interactive_max=interactive_max)
     if data is None:
         return _error(scrub_known_host(sidecar_err, target_netloc=target_netloc,
@@ -1117,6 +1123,8 @@ def build_browser_session_prompt() -> str:
         "- ref 是一次性的：每次 step 后旧 ref 全部作废，只能用最近一次返回的 interactive 清单里的 ref。",
         "- expect 可选但强烈建议给：给了工具会轮询等到满足或超时，这能避开开场动画、异步加载这类时序坑；"
         "不给则只等一个短窗口，你可能读到中间态。",
+        "- 目标应用有开场动画或首屏异步渲染时，browser_open 也带 expect：等那句文案出现再返回，"
+        "别读动画中段的中间态，也别让用户为了看清首屏去关动画。",
         "- 断言不过返回 ok:true + passed:false，点不动返回 ok:false——两种形状，下一步该换 ref"
         "还是该改断言由它决定。两者都自动附一张现场图，不必再要 screenshot。",
         "- 每步的 console_new / page_errors_new 只含新增：前者判「这个错是不是我这一步搞出来的」，"

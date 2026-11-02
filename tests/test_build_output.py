@@ -1102,6 +1102,22 @@ def test_compose_bakes_browser_session_limits(fake_repo):
     assert "ports" not in side, "给 sidecar 开宿主端口 = 把能交互的浏览器暴露出去"
 
 
+def test_readme_documents_browser_session_limits(fake_repo):
+    """交付包那份 README 要自己说清「活会话上限 / TTL」（Task 6 → T8 的登记项，本轮收口）。
+
+    compose 与 `.env.example` 里早就有这两个键，运维手上读的却是 README：上一轮只把说明写进
+    仓库内的 `browser/README.md`，交付包里没有那一份，出包后读 README 的人仍然不知道超限是
+    拒绝而不是排队、也不知道 TTL 兜的是没人关的 context。「把上限调大」于是成了一件看不见后果
+    的操作，而容器只有 `mem_limit: 1g`。
+    """
+    readme = (_build(fake_repo)["out"] / "README-deploy.md").read_text(encoding="utf-8")
+    assert bo.BROWSER_MAX_SESSIONS_ENV in readme
+    assert bo.BROWSER_SESSION_TTL_ENV in readme
+    assert "拒绝而不是排队" in readme            # 超限的行为口径
+    assert "mem_limit: 1g" in readme             # 调大的代价写在同一句里，不是另一个文档里
+    assert "浏览器会话已结束" in readme           # TTL 到点时 Agent 实际拿到的那一句
+
+
 def test_local_dev_compose_matches_baked_session_limits():
     """事实核对（读仓库真文件）：本地 dev 的 sidecar compose 与交付包烘的是同一组资源闸数字。
 

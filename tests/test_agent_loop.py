@@ -676,6 +676,63 @@ async def test_error_path_still_closes_the_browser_session(test_engine, tmp_path
     assert deleted == ["sid-err"]
 
 
+@pytest.mark.asyncio
+async def test_open_expect_survives_the_loop_into_the_sidecar_payload(test_engine, tmp_path,
+                                                                     monkeypatch):
+    """US-06 走真 loop：模型在 `browser_open` 上写出的 expect 必须原样送达 sidecar。
+
+    单元级那条（`test_open_expect_reaches_the_sidecar_request_body`）钉的是 `_open` 到线协议这一程，
+    这里钉的是模型到 `_open` 这一程：loop 会解析 args、把它交给通用凭据遮断与位次计数那两道闸
+    （裁定 R-33/R-35/R-38），expect 是嵌套对象、顶层没有 `value` 键，因此既不该被改写、也不该被
+    遮成占位符——一旦哪道闸把它当填表值处理，模型收到的就是「等了一句占位符」。
+    返回值一侧照旧：判定结论进得来，session_id 与被重写过的容器地址进不来（R-16/ADR-0037）。
+    """
+    from app.agent import browser_session_tools as bst
+
+    sid, aid, sf = await mk_app_session(test_engine, tmp_path, status="running", slug="psexp",
+                                        dev_port=8311, prod_port=8310)
+    seen = []
+
+    async def fake_open(url, **kw):
+        seen.append(kw.get("expect"))
+        return {"ok": True, "session_id": "sid-secret", "title": "看板", "text": "订单列表",
+                "url": "http://192.168.65.254:8311/", "interactive": [], "console": [],
+                "failed_requests": [], "page_errors": [], "passed": True,
+                "note": "页面文本未包含「订单列表」", "elapsed_ms": 10}, ""
+
+    deleted = []
+
+    async def fake_delete(sid_):
+        deleted.append(sid_)
+        return True
+
+    monkeypatch.setattr(bst, "_sidecar_open", fake_open)
+    monkeypatch.setattr(bst, "_sidecar_delete", fake_delete)
+    rec = Recorder()
+    turns = [done(None, [tool_call("c1", "browser_open", path="/",
+                                   expect={"type": "text_contains", "value": "订单列表"})]),
+             done("首屏等到了")]
+    await mk_runner(sf, ScriptedLLM(turns), rec, tasks={}).run(sid, "走一遍", asyncio.Event())
+
+    expect = {"type": "text_contains", "value": "订单列表"}
+    assert seen == [expect]                                   # 一字未改地送达 sidecar
+    tr = next(e for e in rec.events if e["type"] == "tool_result" and e["name"] == "browser_open")
+    assert tr["result"]["passed"] is True and tr["result"]["note"] == ""   # 通过时不带失败措辞
+    blob = json.dumps(rec.events, ensure_ascii=False)
+    assert "sid-secret" not in blob and "192.168.65.254" not in blob
+    # 落库与推送那两份 args：expect 是嵌套对象、顶层没有 `value` 键，遮断闸对它应当完全不动。
+    # 结构一旦被动过（被当填表值遮成占位符、或被裁掉一层），模型下一轮重建历史时就读不回它声明过什么。
+    async with sf() as s:
+        rows = (await s.execute(sql(
+            "SELECT tool_args FROM message WHERE session_id=:i AND role='assistant'"
+            " AND tool_args IS NOT NULL ORDER BY seq"), {"i": sid})).scalars().all()
+    opened = next(r["tool_calls"][0] for r in rows if isinstance(r, dict)
+                  and (r["tool_calls"][0]["function"]["name"] == "browser_open"))
+    assert json.loads(opened["function"]["arguments"]) == {"path": "/", "expect": expect}
+    ev = next(e for e in rec.events if e["type"] == "tool_call" and e["name"] == "browser_open")
+    assert ev["args"]["expect"] == expect
+
+
 async def _fill_env(test_engine, tmp_path, monkeypatch, bst, *, slug, dev_port, prod_port):
     """跑起来的预览应用 + sidecar 替身：open 回一份含 sensitive 元素的清单，step 记下发的载荷。
 
