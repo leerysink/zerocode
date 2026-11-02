@@ -386,6 +386,11 @@ def _ms(started: float) -> int:
 # ---------------------------------------------------------------------------
 
 
+# 三种响应形状，Task 4 的后端要按 status_code 分支读（读串了会拿到空错误串）：
+#   400 / 409 / 503 → {"detail": str}     —— 拒绝，走 HTTPException 的固定外壳，没有 ok/error
+#   422             → {"detail": [dict]}  —— 请求体形状不合法（pydantic 校验失败），
+#                                          detail 是**列表**不是字符串，和上面两种别当同一种解析
+#   200             → {"ok": bool, ...}   —— 常态结果：失败也留在 200 里带 ok:false 和原因
 @app.post("/sessions")
 async def open_session(req: OpenRequest):
     """开一个有状态会话：干净 context → 打开目标页 → 回首轮完整状态。
@@ -416,6 +421,9 @@ async def open_session(req: OpenRequest):
         await _abandon(context)
         raise HTTPException(409, SESSION_FULL_MESSAGE)
     SESSIONS[s.session_id] = s
+    # 打开中不算空闲（见 `Session.opening` 的字段注释）。只在各 await 边界后 touch 是不够的：
+    # 最长的 await 就是 goto 本身（timeout_ms 上限 120000），边界补不到中间那一百多秒。
+    s.opening = True
     try:
         return await asyncio.wait_for(_open_step(s, connect_url, req, timeout_ms),
                                       timeout=timeout_ms / 1000 + 5)
@@ -425,6 +433,13 @@ async def open_session(req: OpenRequest):
     except Exception as e:  # noqa: BLE001 - 打不开必须是可读结果，不是给后端的 500
         await drop(s.session_id)
         return {"ok": False, "error": f"页面打开失败: {_short(e)}", "session_gone": True}
+    finally:
+        # 清标记要走 finally 覆盖每一条出口（正常返回 / 超时 / 异常 / 被 wait_for cancel）：
+        # 漏一次这个会话就永远不进巡检，注册表里的 context 能一直占到进程退出——比「早杀一步」糟。
+        s.opening = False
+        # 打开本身就能耗掉一整个 TTL，所以收尾时把空闲时钟拨回现在：刚打开完的会话不该在
+        # 下一步动作时就撞上「空闲 120s」，那才是这条不变式要保护的场景。
+        touch(s)
 
 
 async def _abandon(context) -> None:
@@ -578,6 +593,7 @@ async def step(sid: str, req: StepRequest):
     limit = _interactive_limit(req.interactive_max)
     timeout_ms = _clamp(req.timeout_ms, STEP_TIMEOUT_MS_DEFAULT, 500, STEP_TIMEOUT_MS_MAX)
     started = time.monotonic()
+    steps_before = s.steps
     try:
         if req.action == "navigate":
             return await _do_navigate(s, req, limit, timeout_ms, started)
@@ -598,7 +614,25 @@ async def step(sid: str, req: StepRequest):
             await drop(sid)
             return {"ok": False, "error": "浏览器会话异常终止，请重新 browser_open",
                     "session_gone": True, "steps_charged": False}
-        raise
+        # 「动作成了、随后读不回」是常态而不是意外：点一下触发 SPA 重新渲染/主文档导航时，
+        # evaluate 抛的是「Execution context was destroyed」——既不是 gone 也不是 timeout。
+        # 这里裸 raise 的后果是 FastAPI 回一个空壳 500，而 `charge` 已经落过账：sidecar 记了
+        # 一步、后端只拿到一个没有原因的错误，重试还是不重试全凭猜（全局约束「工具失败一律是
+        # 带原因的正常结果」）。
+        # 也可能是还没记账的那条出口（`_action_failure` 里重采就炸了），这里补上，让
+        # 「回 steps_charged:true」与注册表里多出的那一步始终一一对应。
+        if s.steps == steps_before:
+            charge(s)
+        result = {"ok": False, "error": f"步骤执行后页面读取失败: {_short(e)}",
+                  "steps_charged": True}
+        try:
+            # 尽力再采一次：这类页面多半只是正在导航，这一帧过去清单就又读得出来了（US-09）。
+            fresh = await _rescan(s, limit, started)
+        except Exception:  # noqa: BLE001 - 重采再败就只回原因，别再把它变成 500
+            return result
+        result["interactive"] = fresh["interactive"]
+        result["interactive_truncated"] = fresh["interactive_truncated"]
+        return result
 
 
 @app.post("/sessions/{sid}/screenshot")

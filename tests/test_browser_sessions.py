@@ -782,6 +782,61 @@ def test_dead_page_is_reported_as_gone_and_dropped(client):
     assert sessions.SESSIONS == {}
 
 
+def test_step_after_action_read_failure_is_readable_not_a_500(client):
+    """「动作执行成功、随后读不回页面」是常态失败，必须是 200 + ok:false + 原因。
+
+    真机场景就是本功能要治的那类 SPA：点一下触发重新渲染/主文档导航，`page.evaluate` 抛
+    「Execution context was destroyed」——既不是 gone 也不是 timeout，落不进前面任何一条分诊，
+    而外层若把它继续往上抛，FastAPI 就回一个没有原因的空壳 500。更糟的是 `charge` 已经在
+    采集之前跑过了：sidecar 记了这一步，后端却什么也读不出来，重试语义两难。
+    """
+    class ReRenderingPage(FakePage):
+        """点击之后紧跟的那一次采集抛错，再采一帧就恢复正常（页面导航已经过去）。"""
+
+        def __init__(self):
+            super().__init__(url=OPEN_URL, nodes=NODES)
+            self.broken_reads_left = 0
+
+        async def click(self, sel, timeout=None):
+            await super().click(sel, timeout=timeout)
+            self.broken_reads_left = 1
+
+        async def evaluate(self, script, *a):
+            if self.broken_reads_left:
+                self.broken_reads_left -= 1
+                raise RuntimeError("Execution context was destroyed, most likely because of "
+                                   "a navigation.")
+            return await super().evaluate(script, *a)
+
+    sid = _opened(client, ReRenderingPage)
+    r = _step(client, sid, action="click", ref="e1")
+    assert r.status_code == 200, r.text      # 不是 500：工具失败一律是带原因的正常结果
+    body = r.json()
+    assert body["ok"] is False
+    assert "步骤执行后页面读取失败" in body["error"]
+    assert "Execution context was destroyed" in body["error"]    # 原因原文要在，不许糊掉
+    assert body["steps_charged"] is True     # 动作确实执行过，账也已经落下
+    assert sessions.SESSIONS[sid].steps == 1
+    # 尽力重采拿到了清单（US-09 省一次往返）；会话没有被摘掉——读不回一帧不等于会话没了
+    assert [i["ref"] for i in body["interactive"]] == ["e1", "e2", "e3"]
+    assert "session_gone" not in body
+    assert sid in sessions.SESSIONS
+
+
+def test_step_omits_the_ref_list_when_the_retry_also_fails(client):
+    """重采也读不回来时只回原因：`interactive` 宁缺毋滥，更不能把它变成 500。"""
+    sid = _opened(client, lambda: FakePage(url=OPEN_URL, nodes=NODES))
+    sessions.SESSIONS[sid].page.evaluate_error = RuntimeError(
+        "Execution context was destroyed, most likely because of a navigation.")
+    r = _step(client, sid, action="click", ref="e1")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"] is False and "步骤执行后页面读取失败" in body["error"]
+    assert body["steps_charged"] is True
+    assert "interactive" not in body          # 没有可信清单就别摆一个空的出来
+    assert sid in sessions.SESSIONS
+
+
 def test_step_dialog_is_reported_once_and_only_for_that_step(client):
     """US-11：原生弹窗按取消处理并显式回报；而且「本步弹过一次」不能变成「每步都弹过」。"""
     def factory():
@@ -949,3 +1004,43 @@ async def test_idle_session_is_swept_and_the_next_step_reports_gone(client):
     assert context.closed is True                 # 回收是真的把 context 关了，不是只删表
     body = _step(client, sid, action="click", ref="e1").json()
     assert body["session_gone"] is True and body["steps_charged"] is False
+
+
+async def test_open_is_not_swept_away_while_the_page_is_still_loading(client):
+    """巡检不许在 open 进行中把会话关掉——一次打开的预算比 TTL 还长。
+
+    导航超时上限 120000ms 再套上 `wait_for` 的 5s 宽限 = 125s > TTL 120s，而 `last_used` 停在
+    登记那一刻，巡检每 10s 一跳必然落在中间。命中的症状是回一句「页面打开失败」：方向没错，
+    文案失真——真相是 goto 还没结束 context 就被自家巡检关了，排查的人会去查为什么打不开，
+    而那个页面根本打得开。
+    """
+    class LoadingPage(FakePage):
+        def __init__(self):
+            super().__init__(url=OPEN_URL, nodes=NODES)
+            self.swept_during_open: list = []
+
+        async def goto(self, url, **kw):
+            # 在打开中间真跑一拍巡检，并把时钟拨过 TTL：等价于真机上 _sweeper 那一跳落在 goto 期间
+            self.swept_during_open.append(await sessions.sweep_expired(
+                now=time.monotonic() + sessions.session_ttl() + 1))
+            await super().goto(url, **kw)
+
+    made: list = []
+
+    def factory():
+        page = LoadingPage()
+        made.append(page)
+        return page
+
+    client.fake_browser.page_factory = factory
+    body = client.post("/sessions",
+                       json={"url": OPEN_URL, "timeout_ms": _sidecar.TIMEOUT_MS_MAX}).json()
+    assert body["ok"] is True, body
+    assert made[0].swept_during_open == [[]]      # 巡检跳了一拍，而且没动正在打开的会话
+    sid = body["session_id"]
+    assert sessions.SESSIONS[sid].context.closed is False
+    # 标记必须在 open 结束后清掉，否则这个会话永远不进巡检：
+    # 占到进程退出比「早杀一步」糟得多，所以两个方向都要钉住。
+    assert sessions.SESSIONS[sid].opening is False
+    assert await sessions.sweep_expired(
+        now=time.monotonic() + sessions.session_ttl() + 1) == [sid]

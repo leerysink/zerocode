@@ -43,6 +43,11 @@ class Session:
     last_used: float = field(default_factory=time.monotonic)
     steps: int = 0
     dialog: dict | None = None
+    # 「正在打开」标记：打开期间 `last_used` 停在登记那一刻，而一次 open 的预算比 TTL 还长
+    # （timeout_ms 上限 120000，外面还套了 wait_for 的 +5s 宽限 = 125s > TTL 120s，巡检每 10s
+    # 一跳必然落在中间）。让它算「空闲」的后果是在 goto 还没返回时把 context 关掉，最终报出去
+    # 的「页面打开失败」就成了失真文案——真相是被自家巡检杀的。
+    opening: bool = False
 
 
 SESSIONS: dict[str, Session] = {}
@@ -85,10 +90,15 @@ async def drop(session_id: str) -> bool:
 
 
 async def sweep_expired(now: float | None = None, ttl_seconds: int | None = None) -> list[str]:
-    """回收空闲超阈值的 session，返回被回收的 id。由 app 的后台巡检每 10s 调一次。"""
+    """回收空闲超阈值的 session，返回被回收的 id。由 app 的后台巡检每 10s 调一次。
+
+    `opening` 的会话不算空闲，也不参与回收：它的 `last_used` 本来就不反映活跃度（见字段注释），
+    而打开路径自己带超时与 `drop`，不会靠巡检兜底。
+    """
     moment = time.monotonic() if now is None else now
     ttl = session_ttl() if ttl_seconds is None else ttl_seconds
-    gone = [sid for sid, s in SESSIONS.items() if expired(s.last_used, moment, ttl)]
+    gone = [sid for sid, s in SESSIONS.items()
+            if not s.opening and expired(s.last_used, moment, ttl)]
     for sid in gone:
         await drop(sid)
     return gone
