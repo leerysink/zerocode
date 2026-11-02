@@ -1,12 +1,14 @@
 // @vitest-environment happy-dom
-// SideBar 行为契约（两块独立需求，共用一套挂载桩）：
+// SideBar 行为契约（三块独立需求，共用一套挂载桩）：
 //   ① 会话组折叠回归：展开其余 N 个后必须能收起（原缺陷：expand 单向置位，只能刷新页面）。
 //   ② 侧栏分组 = 应用：分组行由 GET /apps 驱动（不再显示手动建的旧工作区），行最右侧有
 //      「+」（在该应用下直接建会话并打开）与「⋯」（重命名 / 删除应用）；删除属危险操作，
 //      必须输入 slug 才放行（规格 08 FR8-08）。
+//   ③ 文件夹折叠与拖动排序的接线：箭头示状态、点组头折叠并跨挂载记忆、按存好的顺序渲染、
+//      按住组头拖动能换位并落盘（顺序/折叠的算法本身见 useSidebarFolders.test.js）。
 // mock 掉 api 层与 antd message，专注组件自身的渲染与交互契约。
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { h } from 'vue'
+import { h, nextTick } from 'vue'
 import { mount, flushPromises } from '@vue/test-utils'
 import { createPinia, setActivePinia } from 'pinia'
 
@@ -24,6 +26,7 @@ vi.mock('ant-design-vue', () => ({ message: { success: vi.fn(), error: vi.fn(), 
 import { listApps, listSessions, listWorkspaces, createSession, renameApp, deleteApp } from '../api'
 import { message } from 'ant-design-vue'
 import SideBar from './SideBar.vue'
+import { FOLDERS_STORAGE_KEY } from '../composables/useSidebarFolders'
 import { useChatStore } from '../stores/chat'
 
 // 只渲染默认插槽的桩：折叠断言依赖 .zc-session / .zc-more 等组件自有元素
@@ -134,6 +137,7 @@ async function mountSideBar({ appRows = [APP], wsRows = [LEGACY_WS], sessionRows
 
 beforeEach(() => {
   vi.clearAllMocks()
+  localStorage.clear() // 折叠/顺序现在会落本机记忆，不清会串到下一条用例
 })
 
 describe('SideBar 会话折叠', () => {
@@ -296,6 +300,89 @@ describe('SideBar 删除应用', () => {
     await flushPromises()
     expect(store.currentSessionId).toBeNull()
     expect(store.currentWorkspaceId).toBeNull()
+  })
+})
+
+describe('SideBar 文件夹折叠与拖动排序', () => {
+  const TWO = [APP, { ...APP, id: 8, workspace_id: 2, name: '进销存', slug: 'jxc' }]
+
+  const headEls = (wrapper) => wrapper.findAll('.zc-group-head')
+  const bodyEls = (wrapper) => wrapper.findAll('.zc-group-body')
+  const arrowEls = (wrapper) => wrapper.findAll('.zc-fold-arrow')
+  const names = (wrapper) => wrapper.findAll('.zc-ws-name').map((n) => n.text())
+  const hidden = (body) => (body.attributes('style') || '').includes('display: none')
+  const savedFolders = () => JSON.parse(localStorage.getItem(FOLDERS_STORAGE_KEY) || '{}')
+
+  // 真实指针事件：VTU 的 trigger('pointerdown') 造出来的事件没有 button，会被 startDrag 挡掉
+  const press = (el, clientY) => el.dispatchEvent(
+    new MouseEvent('pointerdown', { clientY, button: 0, bubbles: true }))
+  const dragTo = (clientY) => window.dispatchEvent(new MouseEvent('pointermove', { clientY }))
+  const drop = () => window.dispatchEvent(new MouseEvent('pointerup'))
+
+  it('默认全部展开：箭头带 is-open（朝下），成员看得见', async () => {
+    const { wrapper } = await mountSideBar({ appRows: TWO })
+    expect(arrowEls(wrapper).every((a) => a.classes('is-open'))).toBe(true)
+    expect(bodyEls(wrapper).every((b) => !hidden(b))).toBe(true)
+  })
+
+  it('点组头折叠该组：成员隐藏、箭头转回朝右', async () => {
+    const { wrapper } = await mountSideBar({ appRows: TWO })
+    await headEls(wrapper)[0].trigger('click')
+    expect(hidden(bodyEls(wrapper)[0])).toBe(true)
+    expect(hidden(bodyEls(wrapper)[1])).toBe(false)
+    expect(arrowEls(wrapper)[0].classes('is-open')).toBe(false)
+    expect(savedFolders().folded).toEqual([7])
+  })
+
+  it('折叠状态跨挂载保留——刷新、切页回来都还在', async () => {
+    const first = await mountSideBar({ appRows: TWO })
+    await first.wrapper.find('.zc-group-head').trigger('click')
+    first.wrapper.unmount()
+
+    const { wrapper } = await mountSideBar({ appRows: TWO })
+    expect(hidden(bodyEls(wrapper)[0])).toBe(true)
+  })
+
+  it('按存好的顺序渲染分组，新出现的应用顶到最前', async () => {
+    localStorage.setItem(FOLDERS_STORAGE_KEY, JSON.stringify({ order: [8, 7], folded: [] }))
+    const { wrapper } = await mountSideBar({ appRows: TWO })
+    expect(names(wrapper)).toEqual(['进销存', '来料登记'])
+
+    const { wrapper: withNew } = await mountSideBar({
+      appRows: [{ ...APP, id: 9, workspace_id: 3, name: '新开的', slug: 'new' }, ...TWO],
+    })
+    expect(names(withNew)[0]).toBe('新开的')
+  })
+
+  it('按住组头上下拖动能换序并落盘', async () => {
+    const { wrapper } = await mountSideBar({ appRows: TWO })
+    expect(names(wrapper)).toEqual(['来料登记', '进销存'])
+    press(headEls(wrapper)[0].element, 60)
+    dragTo(600) // happy-dom 里所有行高都是 0，越过所有中线即落到最后一格
+    drop()
+    await nextTick()
+    expect(names(wrapper)).toEqual(['进销存', '来料登记'])
+    expect(savedFolders().order).toEqual([8, 7])
+  })
+
+  it('拖完浏览器补发的那次 click 不会顺手把该组折起来', async () => {
+    const { wrapper } = await mountSideBar({ appRows: TWO })
+    const head = headEls(wrapper)[0]
+    press(head.element, 60)
+    dragTo(600)
+    drop()
+    await head.trigger('click')
+    expect(hidden(bodyEls(wrapper)[0])).toBe(false)
+    expect(savedFolders().folded).toEqual([])
+  })
+
+  it('行尾的 + 不翻折叠：新建会话只把该组确保展开', async () => {
+    const { wrapper } = await mountSideBar({ appRows: TWO })
+    createSession.mockResolvedValue({ data: { id: 555, workspace_id: 1, title: '新会话' } })
+    await wrapper.find('.zc-add').trigger('click')
+    await flushPromises()
+    expect(hidden(bodyEls(wrapper)[0])).toBe(false)
+    expect(savedFolders().folded).toEqual([])
   })
 })
 

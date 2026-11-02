@@ -3,15 +3,18 @@
 // （一行 = 一个应用），手动挂目录的旧工作区不再作为入口出现（记录仍在 workspace 表里，只是不展示）。
 // 分组行最右侧两个入口：`+` = 在该应用下直接建会话并打开（无弹窗）；`⋯` = 重命名 / 删除应用。
 // 删除按规格 08 FR8-08 走「输入 slug 才能确认」；M1 只删平台记录，工程目录与数据库保留并在文案里说明。
-// 组头点击折叠/展开成员（默认展开）；成员默认显 5 条，「展开其余 N 个会话」放开全部；hover 出删除。
+// 组头左侧箭头示折叠态，点击折叠/展开成员（默认展开）；按住组头上下拖可改文件夹顺序——
+// 折叠态与顺序都只记在本机 localStorage（见 useSidebarFolders），换浏览器回到服务端默认序。
+// 成员默认显 5 条，「展开其余 N 个会话」放开全部；hover 出删除。
 import { computed, onMounted, reactive, ref } from 'vue'
 import { message } from 'ant-design-vue'
 import {
   AppstoreOutlined, DeleteOutlined, EllipsisOutlined, FolderOutlined, PlusOutlined,
-  SettingOutlined, ShopOutlined,
+  RightOutlined, SettingOutlined, ShopOutlined,
 } from '@ant-design/icons-vue'
 import { createSession, deleteApp, deleteSession, listApps, listSessions, renameApp } from '../api'
 import { useChatStore } from '../stores/chat'
+import { useSidebarFolders } from '../composables/useSidebarFolders'
 import { relativeTime } from '../utils/time'
 import NewSessionModal from './NewSessionModal.vue'
 
@@ -26,11 +29,26 @@ const showNew = ref(false)
 const loading = ref(true)
 const apps = ref([])
 const expand = reactive({}) // wsId -> 已展开全部（默认 false = 每组显 5 条）
-const folded = reactive({}) // wsId -> 组已折叠（默认展开）
 const rename = reactive({ open: false, app: null, name: '' })
 const del = reactive({ open: false, app: null, typed: '' })
 
 const VISIBLE = 5 // brief：默认每组显 5 个
+
+// 拖拽落点按组行的实际几何算；读不到 DOM 时给空数组，让 startDrag 直接放弃而不是猜位置
+const groupsEl = ref(null)
+function getGroupRects() {
+  const root = groupsEl.value
+  if (!root) return []
+  return [...root.children]
+    .filter((el) => el.classList.contains('zc-group'))
+    .map((el) => {
+      const box = el.getBoundingClientRect()
+      return { top: box.top, height: box.height }
+    })
+}
+const { applyOrder, syncOrder, setFolded, isFolded, startDrag, onHeadClick, draggingId } =
+  useSidebarFolders({ getGroupRects })
+const groups = computed(() => applyOrder(apps.value))
 
 const sessionsOf = (wsId) => store.sessionsByWs[wsId] || []
 function visibleSessions(wsId) {
@@ -42,13 +60,6 @@ function hasMore(wsId) {
 function moreCount(wsId) {
   return sessionsOf(wsId).length - VISIBLE
 }
-function isOpen(wsId) {
-  return folded[wsId] !== true
-}
-// 组头点击：折叠/展开组成员（行尾的 + 与 ⋯ 各自 stop，不会连带触发折叠）
-function toggle(wsId) {
-  folded[wsId] = !isOpen(wsId)
-}
 
 // 拉应用 + 逐应用拉会话填 sessionsByWs。loadWorkspaces 仍要跑：文件面板面包屑与输入区
 // 的工作区名回显读的是 store.workspaces（按 id 查，含旧工作区），改名后也要靠它刷新。
@@ -57,6 +68,7 @@ async function loadAll() {
   try {
     const [res] = await Promise.all([listApps(), store.loadWorkspaces()])
     apps.value = res.data
+    syncOrder(res.data) // 补进新建的应用、剔掉已删的，存的顺序才跟真实行对得上
     await Promise.all(
       apps.value.map(async (a) => {
         store.sessionsByWs[a.workspace_id] = (await listSessions(a.workspace_id)).data
@@ -86,7 +98,7 @@ async function addSession(app) {
   try {
     const { data: s } = await createSession({ workspace_id: app.workspace_id })
     store.sessionsByWs[app.workspace_id] = [s, ...sessionsOf(app.workspace_id)]
-    folded[app.workspace_id] = false // 新会话必须看得见：顺手展开被折叠的组
+    setFolded(app.id, false) // 新会话必须看得见：顺手展开被折叠的组
     await store.openSession(s.id, app.workspace_id)
   } catch (e) {
     message.error(e?.response?.data?.detail || '新建会话失败')
@@ -142,19 +154,26 @@ async function doDelete() {
   <aside class="zc-sidebar" :class="{ 'is-collapsed': collapsed }" :style="panelStyle">
     <div class="zc-logo">zerocode</div>
     <a-button type="primary" block @click="showNew = true">＋ 新会话</a-button>
-    <div class="zc-groups">
+    <div ref="groupsEl" class="zc-groups">
       <a-spin v-if="loading" class="zc-loading" />
       <a-empty v-else-if="!apps.length" description="还没有应用">
         <router-link class="zc-empty-link" to="/apps">去「应用」页新建应用</router-link>
       </a-empty>
-      <div v-for="app in apps" :key="app.id" class="zc-group">
-        <div class="zc-group-head" @click="toggle(app.workspace_id)">
+      <div v-for="app in groups" :key="app.id" class="zc-group" :class="{ 'is-dragging': draggingId === app.id }">
+        <div
+          class="zc-group-head"
+          title="点击折叠/展开；按住上下拖动可调整顺序"
+          @pointerdown="startDrag($event, app.id)"
+          @click="onHeadClick(app.id)"
+        >
+          <right-outlined class="zc-fold-arrow" :class="{ 'is-open': !isFolded(app.id) }" />
           <folder-outlined />
           <span class="zc-ws-name">{{ app.name }}</span>
           <span class="zc-count">{{ sessionsOf(app.workspace_id).length }}</span>
-          <plus-outlined class="zc-add" title="在该应用下新建会话" @click.stop="addSession(app)" />
+          <plus-outlined class="zc-add" title="在该应用下新建会话"
+                         @pointerdown.stop @click.stop="addSession(app)" />
           <a-dropdown :trigger="['click']" placement="bottomRight">
-            <ellipsis-outlined class="zc-menu-btn" @click.stop />
+            <ellipsis-outlined class="zc-menu-btn" @pointerdown.stop @click.stop />
             <template #overlay>
               <div class="zc-app-menu">
                 <div class="zc-app-menu-item zc-menu-rename" @click.stop="openRename(app)">重命名</div>
@@ -165,7 +184,7 @@ async function doDelete() {
             </template>
           </a-dropdown>
         </div>
-        <div v-show="isOpen(app.workspace_id)">
+        <div v-show="!isFolded(app.id)" class="zc-group-body">
           <div v-if="!sessionsOf(app.workspace_id).length" class="zc-none">暂无会话</div>
           <template v-for="s in visibleSessions(app.workspace_id)" :key="s.id">
             <div
@@ -262,6 +281,11 @@ async function doDelete() {
 .zc-group {
   margin-bottom: 10px;
 }
+/* 拖动中的那一组：抬起来一点，跟其它行拉开层次（换位是实时提交的，不补位移动画） */
+.zc-group.is-dragging .zc-group-head {
+  background: var(--zc-sidebar-bg);
+  box-shadow: 0 2px 10px rgba(47, 58, 71, 0.16);
+}
 .zc-group-head {
   display: flex;
   align-items: center;
@@ -271,9 +295,22 @@ async function doDelete() {
   cursor: pointer;
   font-weight: 500;
   color: var(--zc-text);
+  user-select: none;
+  /* 触屏下按住组头是拖拽排序，不能让浏览器顺手把这段当成滚动/文字选择 */
+  touch-action: none;
 }
 .zc-group-head:hover {
   background: var(--zc-bg);
+}
+/* 折叠指示箭头：默认朝右=已折叠，转 90° 朝下=已展开 */
+.zc-fold-arrow {
+  flex-shrink: 0;
+  font-size: 10px;
+  color: var(--zc-text-sub);
+  transition: transform 0.15s ease;
+}
+.zc-fold-arrow.is-open {
+  transform: rotate(90deg);
 }
 .zc-ws-name {
   flex: 1;

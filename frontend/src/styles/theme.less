@@ -19,3 +19,10 @@ body.zc-panel-resizing .zc-fp,
 body.zc-panel-resizing .zc-edge {
   transition: none !important;
 }
+
+/* 侧栏文件夹拖动排序期间：整页保持 grabbing、不选中文字（拖出组头也不脱手） */
+body.zc-folder-dragging,
+body.zc-folder-dragging * {
+  cursor: grabbing !important;
+  user-select: none !important;
+}
