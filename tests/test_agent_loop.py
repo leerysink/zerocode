@@ -1311,3 +1311,34 @@ async def test_ask_user_options_survive_double_encoding(test_engine, tmp_path):
     assert status == "idle"
     q = captured["questions"][0]
     assert [o["label"] for o in q["options"]] == ["甲", "乙"]   # 裸字符串选项也包成 {label}
+
+
+@pytest.mark.asyncio
+async def test_ask_user_questions_array_survive_double_encoding(test_engine, tmp_path):
+    """模型把整个 questions 数组塞成 JSON 字符串时也认（实跑形状），否则它会白烧一轮才重发。"""
+    captured = {}
+
+    async def spy_ask(session_id, questions, timeout):
+        captured["questions"] = questions
+        return {"answers": [{"answer": "甲"}]}
+
+    payload = json.dumps([{"question": "选哪个", "options": [{"label": "甲"}]}], ensure_ascii=False)
+    turns = [done(None, [tool_call("c1", "ask_user", questions=payload)]), done("好了")]
+    sid, status, evs, sf = await run_once(test_engine, tmp_path, turns, ask=spy_ask)
+    assert status == "idle"
+    assert captured["questions"] == [{"question": "选哪个", "options": [{"label": "甲"}]}]
+
+
+@pytest.mark.asyncio
+async def test_ask_user_garbage_options_falls_back_to_free_answer(test_engine, tmp_path):
+    """反向断言：解不出合法 JSON 的 options 就回落自由回答，不画假选项也不炸整轮。"""
+    captured = {}
+
+    async def spy_ask(session_id, questions, timeout):
+        captured["questions"] = questions
+        return {"answers": [{"answer": "随便"}]}
+
+    turns = [done(None, [tool_call("c1", "ask_user", question="叫什么", options="不是 JSON")]), done("好了")]
+    sid, status, evs, sf = await run_once(test_engine, tmp_path, turns, ask=spy_ask)
+    assert status == "idle"
+    assert captured["questions"][0]["options"] == []

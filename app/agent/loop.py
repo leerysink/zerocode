@@ -62,6 +62,13 @@ def _normalize_questions(args: dict) -> list[dict]:
     返回长度恒为 1 的列表，hub/事件/answers 的既有形状不变。
     """
     qs = args.get("questions")
+    if isinstance(qs, str):
+        # 与 options 同一类畸形：模型把整个数组塞成 JSON 字符串（2026-11-01 实跑撞到）。
+        # 不接的话它会走到「缺少 question」分支，白烧一轮才重发。
+        try:
+            qs = json.loads(qs)
+        except json.JSONDecodeError:
+            qs = None
     if isinstance(qs, list):
         if len(qs) != 1 or not isinstance(qs[0], dict):
             raise ToolError("一次只能问一个问题，请先只问最关键的一个")
