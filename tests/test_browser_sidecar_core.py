@@ -5,6 +5,7 @@
 （见文件末尾的 `_load_sidecar_app`，它只补一个 playwright 模块桩，不引入依赖）。
 """
 import base64
+import importlib.util
 import socket
 import sys
 import time
@@ -177,25 +178,40 @@ SCREENSHOT_KEYS = {"screenshot_b64", "screenshot_width", "screenshot_height"}
 
 
 def _load_sidecar_app():
-    """取到 browser.app 模块；主树 venv 没装 playwright，这里补一个最小模块桩。
+    """取到 browser.app 模块；主树 venv 没装 playwright，这里临时补一个最小模块桩。
 
     playwright 按全局约束只属于 browser/requirements.txt（镜像里装），不该为了跑单测
     进共享 venv。app.py 只在 startup 事件里用 async_playwright，被搬动的两个函数一行
-    都不碰它，所以空壳足够；装了真 playwright 的机器走 try 分支，不覆盖真模块。
+    都不碰它，所以空壳足够；装了真 playwright 的机器走另一分支，不覆盖真模块。
+    桩只活在导入那一瞬，导入完立刻还原 sys.modules（审查携带项）：它若常驻，就成了
+    跨测试文件的隐式全局状态——同一个 pytest session 里后来真用 playwright 的代码会
+    拿到这个假模块。判定用 find_spec 而不是 `import playwright`，是为了只把「没装」当
+    补桩的理由；装了但坏掉必须响亮报错，不能被桩悄悄替掉。
     """
-    try:
-        import playwright.async_api  # noqa: F401
-    except ImportError:
+    if "playwright" not in sys.modules and importlib.util.find_spec("playwright") is None:
         pkg = types.ModuleType("playwright")
         api = types.ModuleType("playwright.async_api")
         api.async_playwright = lambda: None
         pkg.async_api = api
-        sys.modules["playwright"] = pkg
-        sys.modules["playwright.async_api"] = api
+        stubs = {"playwright": pkg, "playwright.async_api": api}
+        sys.modules.update(stubs)
+        try:
+            return _import_sidecar_app()
+        finally:
+            for key in stubs:
+                sys.modules.pop(key, None)
+    return _import_sidecar_app()
+
+
+def _import_sidecar_app():
     with warnings.catch_warnings():
         # app.py 用 FastAPI 已弃用的 on_event 装饰器（既有选择，本轮不动实现），
         # 不吞掉的话 import 期会冒出一条 DeprecationWarning，读起来像本次改动引入的。
-        warnings.simplefilter("ignore", DeprecationWarning)
+        # 只按消息吞 on_event 那一条（审查携带项）：消息宽的 ignore DeprecationWarning
+        # 会连 pydantic 的 PydanticDeprecatedSince* 一起吞掉，那些是真信号。
+        # `(?s)` 必需——FastAPI 的文案以换行开头，过滤器用 re.match 锚起点。
+        warnings.filterwarnings("ignore", message=r"(?s).*on_event is deprecated",
+                                category=DeprecationWarning)
         import browser.app as sidecar_app
     return sidecar_app
 
@@ -247,6 +263,22 @@ class _Msg:
     def __init__(self, level, text):
         self.type = level
         self.text = text
+
+
+class _Dialog:
+    """假原生弹窗：playwright 给的是 type / message + accept() / dismiss()。"""
+
+    def __init__(self, type_="confirm", message="确认删除？"):
+        self.type = type_
+        self.message = message
+        self.dismissed = False
+        self.accepted = False
+
+    async def dismiss(self):
+        self.dismissed = True
+
+    async def accept(self):
+        self.accepted = True
 
 
 INTERACTIVE_NODES = [
@@ -331,8 +363,11 @@ async def test_attach_listeners_registers_route_and_honours_allowlist():
     collectors = await attach_listeners(page, CONNECT_URL)
 
     assert page.route_patterns == ["**/*"]
-    assert set(page.handlers) == {"route", "console", "pageerror", "response", "requestfailed"}
-    assert collectors.snapshot() == {"console": [], "page_errors": [], "failed": []}
+    # dialog 也在册：原生弹窗必须有人接，否则 confirm 会把整次 goto 卡到超时
+    assert set(page.handlers) == {"route", "console", "pageerror", "response", "requestfailed",
+                                  "dialog"}
+    assert collectors.snapshot() == {"console": [], "page_errors": [], "failed": [],
+                                     "dialog": None}
     on_route = page.handlers["route"]
 
     main_doc = _Route(_Req(CONNECT_URL, navigation=True, frame=page.main_frame))
@@ -393,6 +428,32 @@ async def test_attach_listeners_ignores_non_http_responses():
                                     resource_type="fetch"))
     assert collectors.failed == [{"method": "GET", "url": "http://192.168.65.254:8210/api/orders",
                                   "status": 500, "type": "fetch"}]
+
+
+async def test_attach_listeners_dismisses_dialogs_and_reports_them():
+    """原生弹窗一律 dismiss 且把现场记进 `collectors.dialog`（规格 US-11）。
+
+    两头都少不得：不 dismiss 的话 confirm 会把页面挂在那里直到动作超时；dismiss 了不回报
+    的话，Agent 点了「删除」、弹窗被取消、它以为删除成功了。这里也钉住 `/inspect` 同样受益
+    ——共用一个 attach_listeners 就是这条覆盖能落在两个调用面上的原因。
+    """
+    page = _Page()
+    collectors = await attach_listeners(page, CONNECT_URL)
+    dialog = _Dialog("confirm", "确认删除全部订单？")
+    await page.handlers["dialog"](dialog)
+
+    assert dialog.dismissed is True
+    assert dialog.accepted is False          # accept 等于替 Agent 按下不可撤销的确认
+    assert collectors.dialog == {"type": "confirm", "message": "确认删除全部订单？",
+                                 "handled": "dismissed"}
+
+    long = _Dialog("alert", "x" * 400)
+    await page.handlers["dialog"](long)
+    assert len(collectors.dialog["message"]) == 200   # 弹窗文案是页面给的，不能整段进上下文
+
+    state = await collect_page_state(page, collectors, started=time.monotonic(),
+                                     timed_out=False)
+    assert "dialog" not in state             # 弹窗由 step 端点单独回报，采集器不替它做归属
 
 
 async def test_collect_page_state_keeps_the_key_contract():
