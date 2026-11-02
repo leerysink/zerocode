@@ -26,8 +26,8 @@ async def test_engine():
     async with engine.begin() as conn:
         await conn.execute(text(
             "TRUNCATE message_attachment, message, file_change, compaction, chat_session, workspace, "
-            "app_project, model_config, deploy_record, app_instance_link, release_application, app_release, actor "
-            "RESTART IDENTITY CASCADE"))
+            "app_project, model_config, deploy_record, app_instance_link, release_application, app_release, "
+            "actor_session, actor RESTART IDENTITY CASCADE"))
         await conn.execute(text(
             "INSERT INTO app_config (key, value) VALUES "
             "('llm.base_url', '\"https://api.deepseek.com/v1\"'), "

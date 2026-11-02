@@ -145,8 +145,7 @@ async def test_memory_embeddingMigrationPerKindDefaultsCoexist(test_engine):
     from sqlalchemy.exc import IntegrityError
     async with test_engine.begin() as conn:
         uid = (await conn.execute(text(
-            "INSERT INTO actor (nickname, token) VALUES ('kind-owner', 'tok-kind') "
-            "RETURNING id"))).scalar()
+            "INSERT INTO actor (nickname) VALUES ('kind-owner') RETURNING id"))).scalar()
         for name, k in (("c", "chat"), ("e", "embedding")):
             await conn.execute(text(
                 "INSERT INTO model_config (name, base_url, api_key, model, is_default, owner_user_id, kind) "
@@ -232,3 +231,42 @@ async def test_chat_image_migration_reappliesThroughRunMigrations(test_engine):
         await conn.execute(text("DELETE FROM schema_migration WHERE filename=:f"), {"f": target})
     applied = await run_migrations(test_engine)
     assert applied == [target]
+
+
+# ---------- V20261030_01：多设备并发会话（actor_session） ----------
+
+async def test_actor_session_migration_schema(test_engine):
+    """会话表就位 + 每账号上限默认 10 + 旧凭据列退役（可空、不再唯一）。"""
+    async with test_engine.connect() as conn:
+        t = (await conn.execute(text("SELECT to_regclass('actor_session')"))).scalar()
+        s_cols = (await conn.execute(text(
+            "SELECT column_name FROM information_schema.columns WHERE table_name='actor_session'"))).scalars().all()
+        idx = (await conn.execute(text(
+            "SELECT indexname FROM pg_indexes WHERE tablename='actor_session'"))).scalars().all()
+        a_cols = (await conn.execute(text(
+            "SELECT column_name, is_nullable, column_default FROM information_schema.columns "
+            "WHERE table_name='actor'"))).all()
+        uniq_token = (await conn.execute(text(
+            "SELECT count(*) FROM pg_indexes WHERE tablename='actor' AND indexdef ILIKE '%unique%' "
+            "AND indexdef ILIKE '%token%'"))).scalar()
+    assert t is not None
+    assert {"id", "actor_id", "token", "created_at", "last_seen_at"} <= set(s_cols)
+    assert "idx_actor_session_actor_last_seen" in idx
+    by_name = {c[0]: c for c in a_cols}
+    assert by_name["max_sessions"][1] == "NO" and by_name["max_sessions"][2] == "10"
+    assert by_name["token"][1] == "YES", "退役列放开 NOT NULL，注册不再写它"
+    assert uniq_token == 0, "旧列的唯一约束必须解除，否则同名会话凭据无处可发"
+
+
+async def test_actor_session_migration_replayable(test_engine):
+    """全量重放轨守卫：存量库升级后重跑本文件不报错（新注册行 token 为 NULL，靠 WHERE 跳过）。"""
+    from app.db import split_statements
+    from pathlib import Path
+    stmts = split_statements(
+        Path("changelog/V20261030_01_actor_session.sql").read_text(encoding="utf-8"))
+    assert len(stmts) == 6  # 建表 + 建索引 + 加列 + 搬存量凭据 + 放开两约束
+    async with test_engine.begin() as conn:
+        await conn.execute(text(
+            "INSERT INTO actor (nickname) VALUES ('replay-no-token')"))
+        for st in stmts:
+            await conn.execute(text(st))

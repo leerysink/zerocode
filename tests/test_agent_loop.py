@@ -398,13 +398,12 @@ async def test_no_current_todos_block_when_empty(test_engine, tmp_path):
 
 # ---- Ticket 004：prompt 注入 <available_skills>（session → workspace.owner_user_id → 已启用技能）----
 
-async def _mk_owned_session(test_engine, tmp_path, token="tok-loop") -> tuple[int, int]:
+async def _mk_owned_session(test_engine, tmp_path) -> tuple[int, int]:
     """建 actor + 带 owner_user_id 的 workspace + chat_session，返回 (sid, uid)。"""
     sf = make_session_factory(test_engine)
     async with sf() as s:
         uid = (await s.execute(sql(
-            "INSERT INTO actor (nickname, token) VALUES ('loop-owner', :t) RETURNING id"),
-            {"t": token})).scalar()
+            "INSERT INTO actor (nickname) VALUES ('loop-owner') RETURNING id"))).scalar()
         ws = (await s.execute(sql(
             "INSERT INTO workspace (name, root_path, owner_user_id) VALUES ('t', :p, :u) RETURNING id"),
             {"p": str(tmp_path), "u": uid})).scalar()
@@ -447,7 +446,7 @@ async def test_enabled_skill_injected(test_engine, tmp_path):
 @pytest.mark.asyncio
 async def test_disabled_skill_not_injected(test_engine, tmp_path):
     # 故事10：停用技能不出现在块中（enabled 布尔驱动）
-    sid, uid = await _mk_owned_session(test_engine, tmp_path, token="tok-2")
+    sid, uid = await _mk_owned_session(test_engine, tmp_path)
     sf = make_session_factory(test_engine)
     await _add_skill(test_engine, uid, "on", "启用技能", "在用", str(tmp_path / "a"), enabled=True)
     await _add_skill(test_engine, uid, "off", "停用技能", "停用", str(tmp_path / "b"), enabled=False)
@@ -459,7 +458,7 @@ async def test_disabled_skill_not_injected(test_engine, tmp_path):
 @pytest.mark.asyncio
 async def test_no_available_skills_block_without_enabled(test_engine, tmp_path):
     # 无启用技能（全部停用）不注入空块，与 current_todos 空守卫同口径
-    sid, uid = await _mk_owned_session(test_engine, tmp_path, token="tok-3")
+    sid, uid = await _mk_owned_session(test_engine, tmp_path)
     sf = make_session_factory(test_engine)
     await _add_skill(test_engine, uid, "off", "停用技能", "停用", str(tmp_path / "b"), enabled=False)
     c = await _system_content(test_engine, sf, sid)
@@ -469,11 +468,11 @@ async def test_no_available_skills_block_without_enabled(test_engine, tmp_path):
 @pytest.mark.asyncio
 async def test_skill_injection_is_user_scoped(test_engine, tmp_path):
     # 隔离：会话归属 alice，只注入 alice 的技能；bob 的同 owner 表技能不得泄露
-    sid, alice = await _mk_owned_session(test_engine, tmp_path, token="tok-alice")
+    sid, alice = await _mk_owned_session(test_engine, tmp_path)
     sf = make_session_factory(test_engine)
     async with sf() as s:
         bob = (await s.execute(sql(
-            "INSERT INTO actor (nickname, token) VALUES ('bob', 'tok-bob') RETURNING id"))).scalar()
+            "INSERT INTO actor (nickname) VALUES ('bob') RETURNING id"))).scalar()
         await s.commit()
     await _add_skill(test_engine, alice, "a", "Alice技能", "属于A", str(tmp_path / "a"))
     await _add_skill(test_engine, bob, "b", "Bob技能", "属于B", str(tmp_path / "b"))

@@ -21,8 +21,8 @@ async def test_app_project_has_origin_column(test_engine):
 async def test_release_version_unique_per_slug(test_engine):
     """同一 slug 的同一版本只能有一条——包不可等的落库兜底。"""
     async with test_engine.begin() as c:
-        await c.execute(text("INSERT INTO actor (nickname, token) VALUES ('t', 'tk-mig-1')"))
-        aid = (await c.execute(text("SELECT id FROM actor WHERE token='tk-mig-1'"))).scalar()
+        aid = (await c.execute(text(
+            "INSERT INTO actor (nickname) VALUES ('t') RETURNING id"))).scalar()
         await c.execute(text(
             "INSERT INTO app_release (app_id, slug, version, title, anchor, fingerprint, created_by) "
             "VALUES (0, 'demo', 'b1', 'Demo', '[]'::jsonb, 'fp1', :a)"), {"a": aid})

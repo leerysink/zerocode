@@ -68,3 +68,52 @@ async def test_登出后旧cookie对业务接口失效(client):
     assert (await client.get("/api/workspaces")).status_code == 200
     await client.post("/api/auth/logout")
     assert (await client.get("/api/workspaces")).status_code == 401
+
+
+# ---------- 多设备并发会话（V20261030_01，推翻 spec §7「不做多设备并发会话」）----------
+
+def _device(app):
+    """一台独立设备：不共享 cookie jar 的裸 client。"""
+    from httpx import AsyncClient, ASGITransport
+    return AsyncClient(transport=ASGITransport(app=app), base_url="http://t")
+
+
+async def test_同账号两处登录都在线(client):
+    """登录不再换发全局唯一凭据：B 上线不影响 A 继续用。"""
+    token_a = client.cookies.get("zc_actor")
+    async with _device(client.app) as dev_b:
+        r = await dev_b.post("/api/auth/login", json={"nickname": "owner", "password": "owner-pw"})
+        assert r.status_code == 200
+        assert dev_b.cookies.get("zc_actor") != token_a
+        assert (await dev_b.get("/api/auth/me")).json()["nickname"] == "owner"
+    assert (await client.get("/api/auth/me")).status_code == 200, "B 登录不得踢掉 A"
+
+
+async def test_登出只作废自己的会话(client):
+    async with _device(client.app) as dev_b:
+        await dev_b.post("/api/auth/login", json={"nickname": "owner", "password": "owner-pw"})
+        assert (await client.post("/api/auth/logout")).status_code == 200
+        assert (await client.get("/api/auth/me")).status_code == 401
+        assert (await dev_b.get("/api/auth/me")).status_code == 200, "A 登出只该带走 A"
+
+
+async def test_坐满上限时挤掉最久未活动的(client):
+    """上限取自 actor.max_sessions（列默认 10，用例改成 2 好验证）：登录永不失败，代价由最久没动的人承担。"""
+    from sqlalchemy import text
+    from app.store.identity import sleep_a_bit
+    async with client.app.state.session_factory() as s:
+        await s.execute(text("UPDATE actor SET max_sessions = 2 WHERE nickname = 'owner'"))
+        await s.commit()
+    token_old = client.cookies.get("zc_actor")
+    async with _device(client.app) as dev:
+        await dev.post("/api/auth/login", json={"nickname": "owner", "password": "owner-pw"})
+        token_mid = dev.cookies.get("zc_actor")
+        await sleep_a_bit()  # LRU 靠 last_seen_at 排序，时间戳必须有先后
+        await dev.post("/api/auth/login", json={"nickname": "owner", "password": "owner-pw"})
+        token_new = dev.cookies.get("zc_actor")
+    async with _device(client.app) as probe:
+        probe.cookies.set("zc_actor", token_old)
+        assert (await probe.get("/api/auth/me")).status_code == 401, "第 3 人上线该挤掉最久未活动的"
+        for t in (token_mid, token_new):
+            probe.cookies.set("zc_actor", t)
+            assert (await probe.get("/api/auth/me")).status_code == 200

@@ -31,8 +31,8 @@ async def _mk_actor(sf, nickname):
     """model_config.owner_user_id 有 FK 到 actor，隔使用例必须先有真账号。"""
     async with sf() as s:
         uid = (await s.execute(sql(
-            "INSERT INTO actor (nickname, token) VALUES (:n, :t) RETURNING id"),
-            {"n": nickname, "t": "tok-" + nickname})).scalar()
+            "INSERT INTO actor (nickname) VALUES (:n) RETURNING id"),
+            {"n": nickname})).scalar()
         await s.commit()
     return uid
 
