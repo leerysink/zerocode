@@ -144,6 +144,16 @@ describe('askQuestionsOf 提问载荷整形', () => {
     expect(askQuestionsOf({ question: '选哪个', options: ['A'] }))
       .toEqual([{ question: '选哪个', options: [{ label: 'A' }] }])
   })
+  it('options 被模型双重编码成 JSON 字符串时解回来', () => {
+    // 调用行里存的是模型原始参数；实时流的 options 由后端规整过，两边都解一次才不破「实时 ≡ 历史」
+    const raw = JSON.stringify([{ label: '甲' }, '乙'])
+    expect(askQuestionsOf({ question: '选哪个', options: raw }))
+      .toEqual([{ question: '选哪个', options: [{ label: '甲' }, { label: '乙' }] }])
+  })
+  it('解不出合法 JSON 的 options 按无选项处理（落回自由回答，不画假选项）', () => {
+    expect(askQuestionsOf({ question: '选哪个', options: '不是 JSON' }))
+      .toEqual([{ question: '选哪个' }])
+  })
   it('没有题目就返回空列表（卡片不渲染，落回折叠块）', () => {
     expect(askQuestionsOf({})).toEqual([])
     expect(askQuestionsOf(null)).toEqual([])

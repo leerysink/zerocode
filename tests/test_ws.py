@@ -336,6 +336,23 @@ async def test_watchdog_skips_pending_ask(test_engine):
         if not fut.done():
             fut.cancel()
 
+async def test_watchdog_skips_locally_running_session(test_engine):
+    """长工具轮不 touch updated_at：本进程仍在跑的会话不是孤儿，不得标 error。
+
+    需求澄清模式会把单轮拉得更长（先解读、再逐题拷问、收口后才动文件），这条误判的命中
+    率随之上升——2026-11-01 实跑就撞上了一次（会话被标 error 而 runner 还在写文件）。
+    崩溃恢复的本职不受影响：重启后 hub.running 为空，见上一条 marks_stale_running。
+    """
+    hub = ChatHub()
+    sid = await _stale_running_session(test_engine, tempfile.mkdtemp())
+    hub.running.add(sid)
+    try:
+        marked = await main_module._watchdog_tick(test_engine, hub)
+        assert sid not in marked
+        assert await _session_status(test_engine, sid) == "running"
+    finally:
+        hub.running.discard(sid)
+
 # ---------- 死循环修复：执行中拒绝必须是非终态 busy，不得回 error ----------
 
 def _busy_hanging_llm():

@@ -28,14 +28,28 @@ from sqlalchemy import text
 
 logger = logging.getLogger(__name__)
 
+def _options_of(raw) -> list:
+    """把 options 规整成列表，容忍模型把它**双重编码成 JSON 字符串**。
+
+    实测有模型写成 `"options": "[{\\"label\\":...}]"`（字符串里装 JSON）。直接按「非 list 就丢」
+    处理的话，提问卡会静默退化成纯输入框——选项凭空消失比报错难查得多，用户看不出是模型
+    的锅还是平台的锅。解不出来才回落空列表（= 自由回答）。
+    """
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+    if isinstance(raw, list):
+        return [{"label": o} if isinstance(o, str) else o for o in raw]
+    return []
+
+
 def _normalize_question(q: dict) -> dict:
     text = str(q.get("question") or "").strip()
     if not text:
         raise ToolError("缺少 question")
-    raw_opts = q.get("options")
-    opts = [{"label": o} if isinstance(o, str) else o
-            for o in raw_opts] if isinstance(raw_opts, list) else []
-    out = {"question": text, "options": opts}
+    out = {"question": text, "options": _options_of(q.get("options"))}
     if "multi_select" in q:
         out["multi_select"] = bool(q["multi_select"])
     return out

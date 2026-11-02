@@ -107,12 +107,23 @@ export function askQuestionsOf(args) {
     .filter((q) => q && typeof q.question === 'string' && q.question.trim())
     .map((q) => {
       const out = { question: q.question.trim() }
-      if (Array.isArray(q.options)) {
-        out.options = q.options.map((o) => (typeof o === 'string' ? { label: o } : o))
-      }
+      const opts = optionsOf(q.options)
+      if (opts.length) out.options = opts
       if (q.multi_select !== undefined) out.multi_select = !!q.multi_select
       return out
     })
+}
+
+// options 的双重编码容错：模型有时把选项数组当字符串发（"options": "[{...}]"），
+// 后端已按同一口径解一次，但调用行里存的仍是原始 args——已答态从消息行重建时得再解一次，
+// 否则实时流有选项、刷新后只剩输入框，破掉 ADR-0029 的「实时 ≡ 历史」。
+function optionsOf(raw) {
+  let v = raw
+  if (typeof v === 'string') {
+    try { v = JSON.parse(v) } catch { return [] }
+  }
+  if (!Array.isArray(v)) return []
+  return v.map((o) => (typeof o === 'string' ? { label: o } : o))
 }
 
 // 「不再提问，自行决定」的固定答复**即协议**：模型在工具结果里读到它就停止追问、按默认继续。

@@ -1290,3 +1290,24 @@ async def test_app_decisions_injected_and_skipped_when_empty(test_engine, tmp_pa
     system = llm2.received[0][0]["content"]
     assert "<app_decisions>" in system and "docs/adr/0001-gate.md" in system
     assert "首轮澄清门禁" in system
+
+
+@pytest.mark.asyncio
+async def test_ask_user_options_survive_double_encoding(test_engine, tmp_path):
+    """模型把 options 当 JSON 字符串发时（实跑撞上过的形状），必须解回来再交给提问卡。
+
+    静默按「非 list 就丢」处理的话，卡片会退化成只剩输入框：用户看不出是模型的锅还是平台的锅，
+    而拷问流程依赖的就是那几项可点的口径。
+    """
+    captured = {}
+
+    async def spy_ask(session_id, questions, timeout):
+        captured["questions"] = questions
+        return {"answers": [{"answer": "甲"}]}
+
+    opts = json.dumps([{"label": "甲", "description": "A"}, "乙"], ensure_ascii=False)
+    turns = [done(None, [tool_call("c1", "ask_user", question="选哪个", options=opts)]), done("好了")]
+    sid, status, evs, sf = await run_once(test_engine, tmp_path, turns, ask=spy_ask)
+    assert status == "idle"
+    q = captured["questions"][0]
+    assert [o["label"] for o in q["options"]] == ["甲", "乙"]   # 裸字符串选项也包成 {label}

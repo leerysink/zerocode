@@ -33,13 +33,20 @@ async def _watchdog_tick(engine, hub) -> list[int]:
 
     ask/confirm future 仍挂起的会话属用户作答期间（G2 裁定 timeout=0 不限时，
     updated_at 停更是正常等待而非崩溃），跳过不标并记录日志。返回本次标记的会话 id。
+
+    另一条同等重要的判据是 `sid not in hub.running`：**本进程还在跑的会话一律不是孤儿**。
+    `updated_at` 只在 run 起止时落库，中间的工具轮不 touch 它，于是一轮超过 10 分钟的长作业
+    （读几十个文件、连续写文件）会被误标成 error，而 runner 仍在跑——前端拿 error 复位执行态，
+    用户看到「像挂了其实还在跑」。需求澄清模式把单轮拉得更长，这条撞上的概率显著上升（ADR-0032）。
+    进程重启/崩溃后 hub.running 是空的，所以加了这条判据仍保留崩溃恢复的本职。
     """
     async with engine.begin() as conn:
         stale = (await conn.execute(_sql(
             "SELECT id FROM chat_session "
             "WHERE status='running' AND updated_at < now() - interval '10 minutes'"))).scalars().all()
         to_mark = [sid for sid in stale
-                   if sid not in hub.ask_futures and sid not in hub.confirm_futures]
+                   if sid not in hub.ask_futures and sid not in hub.confirm_futures
+                   and sid not in hub.running]
         skipped = [sid for sid in stale if sid not in to_mark]
         if to_mark:
             await conn.execute(_sql(
