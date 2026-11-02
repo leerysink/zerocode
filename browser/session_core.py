@@ -82,14 +82,50 @@ def new_only(seen: set[tuple], current: list[dict]):
     return fresh, seen
 
 
+# 三种形态的匹配对象见 `_url_forms`；下面三处 note 反复引用这句话，因为它是给模型的改写指引：
+# 断言恒假不报错（规格 §6.3 轮询到超时），模型只看得到「不匹配」三个字，就会原样重试同一个模式。
+_URL_MATCH_SYNTAX = ("url_matches 只支持结尾单个 `*` 通配，"
+                     "模式可比的是完整 URL、`path?query` 或 `path`")
+
+
+def _url_forms(url: str):
+    """一条 URL 参与匹配的三种形态：完整 URL、`path?query`、`path`。
+
+    只比 path 会丢掉 scheme/host 和 query，于是 `http://localhost:8210/orders` 与
+    `/orders?id=4` 这两种模型最自然写出的模式恒假。这是本功能要修掉的那类静默失败，
+    不能在新断言里复活，所以宁可多比两种形态。
+    """
+    raw = (url or "").strip()
+    parts = urlsplit(raw)
+    return (raw, parts.path + (f"?{parts.query}" if parts.query else ""), parts.path)
+
+
+def _url_pattern_supported(pat: str) -> bool:
+    """通配只支持结尾单个 `*`。中段通配（`/orders/*/edit`）不做实现是有意的取舍，
+    但这个限制必须由 note 说出口——悄悄返回 False 跟只比 path 的恒假是同一个病。"""
+    return "*" not in pat or (pat.count("*") == 1 and pat.endswith("*"))
+
+
 def _url_matches(pattern: str, url: str) -> bool:
-    path = urlsplit(url or "").path
     pat = (pattern or "").strip()
-    if not pat:
+    if not pat or not _url_pattern_supported(pat):
         return False
     if pat.endswith("*"):
-        return path.startswith(pat[:-1])
-    return path == pat or path == pat.rstrip("/") + "/"
+        prefix = pat[:-1]
+        return any(form.startswith(prefix) for form in _url_forms(url))
+    return any(form in (pat, pat.rstrip("/") + "/") for form in _url_forms(url))
+
+
+def _url_expect_note(pattern: str, url: str) -> str:
+    """失败说明要能指导改写：模式写法本身不被支持时，光陈述「不匹配」等于让模型重试同一个模式。"""
+    pat = (pattern or "").strip()
+    cur = (url or "").strip()[:80]
+    if not pat:
+        return f"url_matches 需要 value（{_URL_MATCH_SYNTAX}）；当前 URL：{cur}"
+    if not _url_pattern_supported(pat):
+        return (f"模式「{pat[:40]}」写法不被支持：{_URL_MATCH_SYNTAX}。"
+                f"请去掉中段的 * 或把它移到结尾，例：/orders*；当前 URL：{cur}")
+    return f"当前 URL「{cur}」不匹配模式「{pat[:40]}」（{_URL_MATCH_SYNTAX}）"
 
 
 def judge_expect(expect: dict, snapshot: dict, console_new: list[dict]):
@@ -110,7 +146,8 @@ def judge_expect(expect: dict, snapshot: dict, console_new: list[dict]):
                   for i in snapshot.get("interactive") or [])
         return hit, f"交互清单里没有「{value[:40]}」"
     if kind == "url_matches":
-        return _url_matches(value, snapshot.get("url") or ""), f"当前 URL 不匹配 {value}"
+        url = str(snapshot.get("url") or "")
+        return _url_matches(value, url), _url_expect_note(value, url)
     if kind == "no_new_console_error":
         return not console_new, f"本步新增 {len(console_new)} 条控制台错误"
     return False, f"未知断言类型: {kind or '（空）'}"
