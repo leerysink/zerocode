@@ -158,7 +158,11 @@ const issues = computed(() => consoleItems.value.length + pageErrors.value.lengt
   + failedRequests.value.length)
 
 const closeFailed = computed(() => Number(result.value?.steps_failed || 0))
-const closeActionFailed = computed(() => Number(result.value?.steps_action_failed || 0))
+// M-3：缺字段与 0 是两件事。`steps_action_failed` 是裁定 R-31 之后才有的，Task 5/6 期间产生的
+// 历史行没有它——那种行照 `|| 0` 读会写成「点不动 0」，而同一张卡的 report 里就摆着红色的
+// `ok:false` 行，两张嘴说反话。照本组件对 `steps_used` 的 `!== undefined` 守卫写：缺字段就不画。
+const closeActionFailed = computed(() => (result.value?.steps_action_failed === undefined
+  ? null : Number(result.value.steps_action_failed || 0)))
 const report = computed(() => (name.value === 'browser_close' ? result.value?.report || [] : []))
 const hint = computed(() => result.value?.hint || '')
 const quotaLine = computed(() => {
@@ -207,8 +211,13 @@ function rowTone(item) {
 function rowLabel(item) {
   const a = ACTION_TEXT[item.action] || item.action || '步骤'
   const t = typeof item.target === 'string' && item.target ? item.target : ''
-  const who = t ? (/^e\d+$/.test(t) ? `句柄 ${t}` : t) : ''
-  return who ? `${a} ${who}` : a
+  // M-6：报告的行也不能只留一个作废句柄。按规格 §6.2，那些 ref 早就作废，读报告的人手上没有
+  // 任何一份清单能对回 `e7` 是谁。名字取 report 项的 `target_name`（后端 _step 算好的那一份，
+  // 来自动作之前的清单），查不到——包括 Task 5/6 期间没有这个字段的历史行——照旧回落句柄 / path。
+  const n = typeof item.target_name === 'string' ? item.target_name.trim() : ''
+  if (!t) return a
+  const who = n ? `${n}（句柄 ${t}）` : (/^e\d+$/.test(t) ? `句柄 ${t}` : t)
+  return `${a} ${who}`
 }
 function rowVerdict(item) {
   if (item.ok === false) return item.error || '动作未成功'
@@ -321,7 +330,9 @@ function rowVerdict(item) {
         <div class="zc-page-counts">
           <span>共 {{ result.steps_total ?? 0 }} 步</span>
           <span :class="{ 'is-bad': closeFailed }">断言未过 {{ closeFailed }}</span>
-          <span :class="{ 'is-bad': closeActionFailed }">点不动 {{ closeActionFailed }}</span>
+          <span v-if="closeActionFailed !== null" :class="{ 'is-bad': closeActionFailed }">
+            点不动 {{ closeActionFailed }}
+          </span>
           <span v-if="result.steps_used !== undefined">已用 {{ result.steps_used }} 步</span>
         </div>
         <ul v-if="report.length" class="zc-page-report" data-test="report">
@@ -401,6 +412,13 @@ function rowVerdict(item) {
 .zc-page-badge.is-action {
   color: #a05a5a;
   background: rgba(196, 99, 106, 0.14);
+}
+/* 琥珀这一档必须自己写死，不能只靠 `.zc-page-badge` 的基础色继承：基础色哪天被改成红，
+   「两种失败糊成一个红」就会静默通过全部测试（测试比的是 class 名与文案，比不出继承链）。
+   色值与基础色同源，取自 PageInspectCard 既有的琥珀，不引入新色相。 */
+.zc-page-badge.is-expect {
+  color: #a17c5b;
+  background: rgba(161, 124, 91, 0.12);
 }
 .zc-page-badge.is-pass {
   color: #52a06b;

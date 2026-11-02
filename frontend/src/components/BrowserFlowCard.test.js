@@ -4,6 +4,8 @@
 // 「点不动」（ok:false）与「点了但结果不对」（ok:true + passed:false）必须分色分文案、
 // 两种形状都可能带图、弹窗必须说出口、口令不许上卡。
 import { h, nextTick } from 'vue'
+import { readFileSync } from 'node:fs'
+import { URL as NodeURL, fileURLToPath } from 'node:url'
 import { mount } from '@vue/test-utils'
 import { describe, expect, it } from 'vitest'
 
@@ -223,6 +225,75 @@ describe('BrowserFlowCard', () => {
     expect(rows[0].text()).toContain('替换过 1 个会话')
     expect(w.text()).toContain('断言未过 1')
     expect(w.text()).toContain('点不动 2')
+  })
+
+  it('旧历史行缺 steps_action_failed 时不说「点不动 0」（M-3）', () => {
+    // `steps_action_failed` 是裁定 R-31 之后才加的字段，Task 5/6 期间产生的 close 行没有它。
+    // 照 `|| 0` 读会画一句「点不动 0」，而同一张卡的 report 里就摆着红色的 `ok:false` 行——
+    // 两张嘴说反话。守卫照本组件对 `steps_used` 的 `!== undefined` 写法：缺字段就不画这个数。
+    const legacy = mountCard({
+      name: 'browser_close',
+      result: {
+        ok: true, steps_total: 2, steps_failed: 0,
+        hint: '本次走查未声明任何断言（各步只做了动作，结论要自己读页面文本判断）',
+        report: [
+          { seq: 0, action: 'open', target: '/orders', ok: true, passed: null },
+          { seq: 1, action: 'click', target: 'e1', ok: false, passed: null, error: '元素不可点击' },
+        ],
+      },
+    })
+    const legacyRows = legacy.findAll('[data-test="report-row"]')
+    expect(legacyRows[1].classes()).toContain('is-action')   // 红行还在
+    expect(legacy.find('[data-test="close"]').text()).not.toContain('点不动')
+    // 守卫不是把这一档整个删掉：字段在的时候照旧报数
+    const fresh = mountCard({
+      name: 'browser_close',
+      result: { ok: true, steps_total: 2, steps_failed: 0, steps_action_failed: 1, report: [] },
+    })
+    expect(fresh.text()).toContain('点不动 1')
+    // 真的是 0 也照实说 0（缺字段与 0 是两件事）
+    const zero = mountCard({
+      name: 'browser_close',
+      result: { ok: true, steps_total: 2, steps_failed: 0, steps_action_failed: 0, report: [] },
+    })
+    expect(zero.text()).toContain('点不动 0')
+  })
+
+  it('close 的 report 行也带元素名，查不到才回落句柄（M-6）', () => {
+    // 按规格 §6.2 那些 ref 早就作废，读报告的人手上没有任何一份清单能对回 `e7` 是谁，
+    // 只印一个句柄就是噪声。名字取 report 项的 `target_name`（后端 `_step` 按动作前清单算好的）。
+    const w = mountCard({
+      name: 'browser_close',
+      result: {
+        ok: true, steps_total: 3, steps_failed: 0, steps_action_failed: 0,
+        report: [
+          { seq: 0, action: 'open', target: '/orders', ok: true, passed: null },
+          { seq: 1, action: 'click', target: 'e7', target_name: '结算', ok: true, passed: null },
+          { seq: 2, action: 'click', target: 'e9', ok: false, passed: null, error: '元素不可点击' },
+        ],
+      },
+    })
+    const rows = w.findAll('[data-test="report-row"]')
+    expect(rows[1].text()).toContain('点击 结算（句柄 e7）')
+    expect(rows[2].text()).toContain('点击 句柄 e9')     // 缺字段（含旧历史行）照旧回落句柄
+    expect(rows[0].text()).toContain('打开会话 /orders')   // path 形态不查名字
+  })
+
+  it('「断言没过」的徽标色是自己写死的琥珀，不靠基础色继承（两种失败不许糊成一个红）', () => {
+    // scoped CSS 不进 happy-dom，DOM 上比不出色值，所以断的是源码里那条规则本身：
+    // 删掉 `.zc-page-badge.is-expect { … }` 这条测试就该红。只靠继承的话，基础色哪天被改成红，
+    // 「点不动」与「断言没过」会在用户眼里糊成同一种失败，而全部只比 class 名与文案的测试照绿。
+    const src = readFileSync(
+      fileURLToPath(new NodeURL('./BrowserFlowCard.vue', import.meta.url)), 'utf8')
+    expect(src.length).toBeGreaterThan(0)          // 读空了就当失败，免得断言静默空跑
+    const block = (re) => (src.match(re) || [])[1] || ''
+    const base = block(/\.zc-page-badge\s*\{([^}]*)\}/)
+    const expectBadge = block(/\.zc-page-badge\.is-expect\s*\{([^}]*)\}/)
+    const actionBadge = block(/\.zc-page-badge\.is-action\s*\{([^}]*)\}/)
+    const colorOf = (b) => (b.match(/color:\s*([^;]+);/) || [])[1]?.trim()
+    expect(expectBadge).not.toBe('')               // 显式规则必须存在
+    expect(colorOf(expectBadge)).toBe(colorOf(base))   // 且与当前继承到的那一份同值（不改视觉）
+    expect(colorOf(actionBadge)).not.toBe(colorOf(expectBadge))  // 两本账两种色
   })
 
   it('目标元素名读后端 echo 的 target_name，不拿动作后的新快照反查（裁定 R-32）', () => {
