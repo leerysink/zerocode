@@ -10,6 +10,11 @@ REF_ATTR = "data-zc-ref"
 REF_RE = re.compile(r"^e[1-9]\d{0,5}$")
 SENSITIVE_NAME_RE = re.compile(r"(token|secret|password|passwd|api[_-]?key|code)", re.IGNORECASE)
 INTERACTIVE_MAX_DEFAULT = 40
+# 浏览器侧一次遍历的节点上限（Task 1 携带项）：Python 侧的 40 条只裁「给模型看几条」，
+# 打标与回传的代价从来不受它约束——大 SPA 会给上千个匹配元素写属性并整份序列化回来，
+# 在 read_only + mem_limit 1g 的容器里这就是一次自伤。上限取 40 的 5 倍：留足「无名条目
+# 被 Python 丢掉后仍能凑满 40 条」的余量，又不必在每次采集里为整页 DOM 买单。
+INTERACTIVE_JS_SCAN_MAX = 200
 
 
 def selector_for(ref) -> str | None:
@@ -40,8 +45,9 @@ def shape_interactive(nodes: list[dict], limit: int = INTERACTIVE_MAX_DEFAULT):
     """
     budget = max(int(limit), 1)
     items = []
+    raw_nodes = list(nodes or [])
     named = 0  # 满了之后仍要数完：截断与否看的是原始清单里有多少条可辨识条目
-    for raw in nodes or []:
+    for raw in raw_nodes:
         name = str(raw.get("name") or "").strip()[:60]
         if not name:
             continue
@@ -56,7 +62,9 @@ def shape_interactive(nodes: list[dict], limit: int = INTERACTIVE_MAX_DEFAULT):
             "sensitive": is_sensitive(input_type=str(raw.get("type") or ""),
                                       name=name, label=str(raw.get("label") or "")),
         })
-    return items, named > budget
+    # 浏览器侧遍历封顶也算截断，而且要单独算：采到 SCAN_MAX 说明后面还有没看过的元素，
+    # 哪怕这一屏里只有 3 个带名字（named > budget 为假）也不能对模型说「清单是完整的」。
+    return items, (named > budget or len(raw_nodes) >= INTERACTIVE_JS_SCAN_MAX)
 
 
 def new_only(seen: set[tuple], current: list[dict]):
@@ -116,10 +124,22 @@ def _url_matches(pattern: str, url: str) -> bool:
     return any(form in (pat, pat.rstrip("/") + "/") for form in _url_forms(url))
 
 
+def _url_echo_shape(url: str) -> str:
+    """给模型看的 URL 回显只取 `path?query`（裁定 R-17）。
+
+    两件事一起决定不能整条回显：snapshot 里的 `url` 是 `_connect_url` 重写后的**内部容器
+    IP**，进 note 就是进模型上下文与 run log（拓扑泄漏）；而模型下一轮本来就该写
+    `path?query` 这个形状的模式，回显成对的形状比回显一条它复制过去也匹配不上的地址更有指导性。
+    匹配仍然用完整 url（`_url_matches` 收的是 snapshot 原值），只是不外发。
+    """
+    forms = _url_forms(url)
+    return (forms[1] or forms[2] or forms[0])[:80]
+
+
 def _url_expect_note(pattern: str, url: str) -> str:
     """失败说明要能指导改写：模式写法本身不被支持时，光陈述「不匹配」等于让模型重试同一个模式。"""
     pat = (pattern or "").strip()
-    cur = (url or "").strip()[:80]
+    cur = _url_echo_shape(url)
     if not pat:
         return f"url_matches 需要 value（{_URL_MATCH_SYNTAX}）；当前 URL：{cur}"
     if not _url_pattern_supported(pat):
@@ -167,16 +187,20 @@ def expired(last_used: float, now: float, ttl_seconds: int) -> bool:
 # （Vue 的异步渲染就发生在那两次往返之间）。旧属性先清掉——上一轮的 ref 必须作废。
 # 脚本里的 attr 字面量必须与 REF_ATTR 同值：改了 REF_ATTR 忘了这里，每个点击都会被
 # selector_for 判非法，症状出现在另一个文件里，很难定位。
-INTERACTIVE_JS = """
+# 遍历上限用占位符从 Python 常量注入，不在 JS 里再写一遍字面量：两处数字漂开的话，
+# `shape_interactive` 的「采到封顶」判据会静默失效，模型看到的清单少了条目却写着 truncated:false。
+_INTERACTIVE_JS_TEMPLATE = """
 () => {
   const SEL = ['a[href]', 'button', 'input', 'select', 'textarea',
                '[role=button]', '[role=link]', '[role=menuitem]', '[role=tab]',
                '[role=checkbox]', '[role=radio]', '[role=combobox]', '[role=switch]',
                '[onclick]', '[tabindex]:not([tabindex="-1"])'].join(',');
   const attr = 'data-zc-ref';
+  const SCAN_MAX = __ZC_SCAN_MAX__;
   for (const el of document.querySelectorAll('[' + attr + ']')) el.removeAttribute(attr);
   const out = [];
   for (const el of document.querySelectorAll(SEL)) {
+    if (out.length >= SCAN_MAX) break;
     const r = el.getBoundingClientRect();
     if (r.width === 0 && r.height === 0) continue;
     const label = el.getAttribute('aria-label')
@@ -198,3 +222,5 @@ INTERACTIVE_JS = """
   return out;
 }
 """
+
+INTERACTIVE_JS = _INTERACTIVE_JS_TEMPLATE.replace("__ZC_SCAN_MAX__", str(INTERACTIVE_JS_SCAN_MAX))
