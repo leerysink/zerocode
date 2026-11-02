@@ -283,7 +283,7 @@ async def test_open_does_not_bind_state_when_sidecar_failed(monkeypatch):
     assert "browser_checks" not in ctx.run_state
 
 
-# ------------------------------------------------------------------ 重复 open / 步数账（I-1、I-2）
+# ------------------------------------------- 重复 open / 步数账 / 收口口径（I-1、I-2、R-24、R-25）
 
 async def test_reopen_auto_closes_the_previous_session(monkeypatch):
     """规格 §7「一个 run 一个」：重复 open 必须先 DELETE 前一个会话。
@@ -314,11 +314,17 @@ async def test_reopen_auto_closes_the_previous_session(monkeypatch):
     assert "session_id" not in blob
 
 
-async def test_reopen_auto_closes_before_the_quota_check(monkeypatch):
-    """额度判定之前先关旧的：旧会话已经没了，报错文案就不该再让模型「先用 browser_close 收口」。"""
+async def test_quota_exhausted_keeps_the_old_session_alive(monkeypatch):
+    """裁定 R-24：额度判定排在自动关旧**之前**——一次被拒绝的调用不许留下副作用。
+
+    同 `app/deploy/engine.py::start_dev` 的「预检失败 = 状态零变更」。反过来（先关再拒）模型看到的是
+    「我没做成任何事，但我手上的会话没了」：下一步只能重开，而重开又要再花一次额度，形成它自己
+    解释不了的死循环。旧会话因此必须仍然活着、仍绑在 run 上，可继续 step 也可 browser_close。
+    """
     ctx = Ctx()
     ctx.run_state["browser_checks"] = 6
     ctx.run_state["browser_session"] = "sid-old"
+    ctx.run_state["browser_log"] = [{"seq": 0, "action": "open", "target": "/", "passed": None}]
     calls = []
 
     async def boom(*_a, **_k):
@@ -328,10 +334,28 @@ async def test_reopen_auto_closes_before_the_quota_check(monkeypatch):
     monkeypatch.setattr(bst, "_sidecar_delete", lambda sid: _aget(calls.append(sid) or True))
     monkeypatch.setattr(bst, "_sidecar_open", boom)
     out = await bst.run_browser_session_tool(ctx, "browser_open", {})
-    assert calls == ["sid-old"]
-    assert out["ok"] is False and out["auto_closed_previous"] is True
-    assert "上限" in out["error"] and "browser_close" not in out["error"]
+    assert calls == []                                    # 被拒绝的 open 一个 DELETE 都不发
+    assert ctx.run_state["browser_session"] == "sid-old"  # 旧会话原样留着
+    assert ctx.run_state["browser_log"] == [{"seq": 0, "action": "open", "target": "/",
+                                             "passed": None}]
+    assert ctx.run_state.get("browser_sessions_replaced") in (None, 0)
+    assert out["ok"] is False and "上限" in out["error"]
+    assert out.get("auto_closed_previous") is not True    # 这句话在该分支下不成立
+    assert "browser_close" in out["error"]                # 文案指向一个确实还在的会话
     assert "sid-old" not in json.dumps(out, ensure_ascii=False)
+
+
+async def test_rejected_open_never_closes_the_old_session(monkeypatch):
+    """同一条不变式的第二个拒绝出口：path 不合法也一样不能先把旧会话关掉再报错。"""
+    ctx = Ctx()
+    ctx.run_state["browser_session"] = "sid-old"
+    calls = []
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    monkeypatch.setattr(bst, "_sidecar_delete", lambda sid: _aget(calls.append(sid) or True))
+    out = await bst.run_browser_session_tool(ctx, "browser_open", {"path": "orders"})
+    assert out["ok"] is False and "同源" in out["error"]
+    assert calls == []
+    assert ctx.run_state["browser_session"] == "sid-old"
 
 
 async def test_steps_left_is_per_run_not_per_session(monkeypatch):
@@ -353,6 +377,37 @@ async def test_steps_left_is_per_run_not_per_session(monkeypatch):
     assert out["ok"] is True
     assert ctx.run_state["browser_steps_used"] == 12      # 再 open 不许回满
     assert out["steps_left"] == 0
+
+
+async def test_close_report_says_how_many_sessions_it_covers(monkeypatch):
+    """裁定 R-25：重复 open 依旧重置 `browser_log`（一个 run 一个会话，跨会话合并会让
+    `steps_total` 与 per-run 步数账对不上），但收口报告必须**承认**自己只覆盖最后一个会话。
+    """
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    monkeypatch.setattr(bst, "_sidecar_open", lambda url, **kw: _aget((_session_ok(), "")))
+    deleted: list[str] = []
+    monkeypatch.setattr(bst, "_sidecar_delete", lambda sid: _aget(deleted.append(sid) or True))
+
+    clean = Ctx()                                        # 单会话的 run：计数为 0，hint 不多话
+    await bst.run_browser_session_tool(clean, "browser_open", {})
+    out = await bst.run_browser_session_tool(clean, "browser_close", {})
+    assert out["sessions_replaced"] == 0
+    assert "共开过" not in out["hint"]
+
+    ctx = Ctx()                                          # 同一 run 里连开三个会话
+    for _ in range(3):
+        got = await bst.run_browser_session_tool(ctx, "browser_open", {})
+        assert got["ok"] is True
+    assert ctx.run_state["browser_sessions_replaced"] == 2
+
+    out = await bst.run_browser_session_tool(ctx, "browser_close", {})
+    assert out["sessions_replaced"] == 2
+    assert out["steps_total"] == 1                        # report 仍只是最后一个会话，不合并历史
+    assert "本 run 共开过 3 个浏览器会话" in out["hint"]
+    assert "只覆盖最后一个" in out["hint"]
+    assert any(s.get("replaced_sessions") == 2 for s in out["report"])   # 事实也写进 report 本身
+    blob = json.dumps(out, ensure_ascii=False)
+    assert "sid-" not in blob and "session_id" not in blob               # 计数不带 session_id
 
 
 # ------------------------------------------------------------------ interactive_max 接线（R-23）

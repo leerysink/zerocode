@@ -69,6 +69,10 @@ def scrub_known_host(text, *, target_netloc: str, display_netloc: str) -> str:
 
     写成「参数化 target/display」的纯函数是为了让 `preview_page` 那侧也能复用同一口径；本轮不动
     它的调用点（既有行为，另有测试面，已登记给 Task 8）。
+
+    清洗范围只限**错误/提示类自由文本**（`error`、`note`、传输与拒绝原因）：页面正文
+    `title`/`text`/`console`/`failed_requests` 一律不清洗——那是被检查的数据本身，洗它等于篡改
+    走查对象（修复轮 1 顾虑 3 的裁定）。
     """
     if not isinstance(text, str) or not text or not display_netloc:
         return text if isinstance(text, str) else ""
@@ -280,30 +284,38 @@ async def _open(ctx, args: dict) -> dict:
                 else "预览未运行：先用 preview_restart 启动")
         return _error("预览未运行", status=status, url=display_base, hint=hint)
 
-    # 一个 run 只保留一个会话（规格 §7）：重复 open 先 DELETE 前一个，否则那个 context 永远没人关，
-    # 而 sidecar 的 `ZEROCODE_BROWSER_MAX_SESSIONS` 默认只有 2——第三次 open 直接撞 409，还要等
-    # 120s TTL 才恢复（ADR-0037 后果第 2 条的僵尸 context）。选「自动关旧的」而不是报错让模型
-    # 自己先 close：模型多一次往返才能自愈，而关会话没有副作用、不丢用户数据。
-    # 放在额度判定之前：即便这一次开不成（额度用尽），也不把旧会话留在 sidecar 里等 TTL；
-    # 下面那条拒绝文案会照实说明它已被关闭，不让模型去 close 一个已经不存在的会话。
-    old_sid = str(ctx.run_state.get("browser_session") or "")
-    closed_previous = False
-    if old_sid:
-        await _sidecar_delete(old_sid)
-        ctx.run_state["browser_session"] = None
-        closed_previous = True
-
+    # 额度判定在自动关旧**之前**（裁定 R-24）：一次被拒绝的调用不许留下副作用，这是仓库自己的
+    # 既有不变式——`app/deploy/engine.py::start_dev` 把 `preflight_docker()` 排在任何状态变更之前，
+    # `app/agent/preview_tools.py::_restart` 也照这个顺序。先关再拒的话，模型看到的是「我没做成
+    # 任何事，但我手上的会话没了」，下一步只能重开，而重开又要再花一次额度，形成它解释不了的死循环。
     left = _checks_left(ctx)              # 沿用 preview_page 的 open 额度（规格 §10 第一行）
+    old_sid = str(ctx.run_state.get("browser_session") or "")
     if left == 0:
-        if closed_previous:
-            # 旧会话已经在这里被关掉了，再让模型「先用 browser_close 收口」是指向一个不存在的会话。
-            return _error("本次任务已打开浏览器会话达到上限，上一个会话已自动关闭，本 run 不能再开新会话",
-                          checks_left=0, auto_closed_previous=True)
+        # 旧会话在这个分支里仍然活着，所以文案指向它：可以继续 step，也可以 close 收口。
+        if old_sid:
+            return _error("本次任务已打开浏览器会话达到上限；当前会话还在，可继续 browser_step，"
+                          "或先用 browser_close 收口（额度不退还）", checks_left=0)
         return _error("本次任务已打开浏览器会话达到上限，请先用 browser_close 收口",
                       checks_left=0)
     path, err = normalize_path(args.get("path"))
     if err:
         return _error(err, status=status, url=display_base)
+
+    # 一个 run 只保留一个会话（规格 §7）：重复 open 先 DELETE 前一个，否则那个 context 永远没人关，
+    # 而 sidecar 的 `ZEROCODE_BROWSER_MAX_SESSIONS` 默认只有 2——第三次 open 直接撞 409，还要等
+    # 120s TTL 才恢复（ADR-0037 后果第 2 条的僵尸 context）。选「自动关旧的」而不是报错让模型
+    # 自己先 close：模型多一次往返才能自愈，而关会话没有副作用、不丢用户数据。
+    # 位置在所有拒绝出口之后、真正的 open 之前：这里关掉旧的、紧接着开新的，中间不再有「拒绝了但
+    # 已经动手」的分支；而 open 本身失败（sidecar 满 / 导航失败）时旧会话确实已腾出位置，属既成事实。
+    closed_previous = False
+    if old_sid:
+        await _sidecar_delete(old_sid)
+        ctx.run_state["browser_session"] = None
+        # 被替换的会话数累计在 run 上（裁定 R-25）：browser_log 随 open 重置，收口报告因此只覆盖
+        # 最后一个会话，这个缺口必须说得出数字，不能只留一句「自动关闭」的即时提示。
+        ctx.run_state["browser_sessions_replaced"] = (
+            int(ctx.run_state.get("browser_sessions_replaced") or 0) + 1)
+        closed_previous = True
 
     display_url = display_base.rstrip("/") + path
     target_url = f"http://{browser_target_host()}:{int(dev_port)}{path}"
@@ -342,8 +354,12 @@ async def _open(ctx, args: dict) -> dict:
     # 要按 ref 查 sensitive，裁剪版少了判定所需的字段。
     ctx.run_state["browser_refs"] = list(data.get("interactive") or [])
     # 收口报告的 url 同样用 display_url（裁定 R-16）：这份日志会进 browser_close 的返回值。
+    # replaced_sessions 顺手写进 open 那一条（裁定 R-25）：browser_log 恰好在这一次 open 被重置，
+    # 所以活下来的这条自然带上整个 run 的替换数——收口报告因此能自己说清它覆盖的是哪个会话。
     ctx.run_state["browser_log"] = [{"seq": 0, "action": "open", "target": path,
-                                     "passed": None, "url": display_url}]
+                                     "passed": None, "url": display_url,
+                                     "replaced_sessions":
+                                         int(ctx.run_state.get("browser_sessions_replaced") or 0)}]
     out = _shape_state(ctx, data, opened=True, url=display_url, status=status,
                        target_netloc=target_netloc, display_netloc=display_netloc)
     if closed_previous:
@@ -364,21 +380,34 @@ async def _step(_ctx, _args: dict) -> dict:
 
 
 async def _close(ctx, _args: dict) -> dict:
-    """US-07：收口报告说事实——走了几步、几步断言失败、失败在哪步。"""
+    """US-07：收口报告说事实——走了几步、几步断言失败、失败在哪步，以及它覆盖的是第几个会话。"""
     sid = str(ctx.run_state.get("browser_session") or "")
     steps = list(ctx.run_state.get("browser_log") or [])
     if sid:
         await _sidecar_delete(sid)
         ctx.run_state["browser_session"] = None
     failed = [s for s in steps if s.get("passed") is False]
+    report = []
+    for s in steps:
+        item = {"seq": s.get("seq"), "action": s.get("action"),
+                "target": _redact(s.get("target"), TARGET_MAX_CHARS)[0],
+                "passed": s.get("passed")}
+        # 被替换的会话数写在 open 那一条上（裁定 R-25）：前端步骤卡渲染的是 report，
+        # 只有返回值带着这个事实的话，看报告的人仍旧会把它当成整个 run 的全貌。
+        if s.get("replaced_sessions"):
+            item["replaced_sessions"] = int(s["replaced_sessions"])
+        report.append(item)
+    replaced = int(ctx.run_state.get("browser_sessions_replaced") or 0)
+    hint = ("以下断言未通过：" + ", ".join(str(f.get("seq")) for f in failed)
+            if failed else "所有已声明的断言均通过")
+    if replaced:
+        # 不合并历史是刻意的（一个 run 一个会话）：合并会让 steps_total 与 per-run 步数账对不上。
+        # 但既然只覆盖最后一个会话就必须说出来——否则这份报告会被读成整个 run 的全貌。
+        hint += (f"；本 run 共开过 {replaced + 1} 个浏览器会话（前 {replaced} 个在重复 open 时"
+                 "被自动关闭），report 只覆盖最后一个会话的步骤")
     return {"ok": True, "closed": bool(sid), "steps_total": len(steps),
-            "steps_failed": len(failed),
-            "report": [{"seq": s.get("seq"), "action": s.get("action"),
-                        "target": _redact(s.get("target"), TARGET_MAX_CHARS)[0],
-                        "passed": s.get("passed")}
-                       for s in steps],
-            "hint": ("以下断言未通过：" + ", ".join(str(f.get("seq")) for f in failed)
-                     if failed else "所有已声明的断言均通过")}
+            "steps_failed": len(failed), "sessions_replaced": replaced,
+            "report": report, "hint": hint}
 
 
 async def close_browser_session(ctx) -> None:
