@@ -3,7 +3,9 @@
 
 sidecar 一律替身：这里验绑定、额度、遮断、收口，真浏览器由 Task 3 的走查与手工矩阵负责。
 """
+import base64
 import json
+import struct
 import types
 
 import httpx
@@ -410,6 +412,60 @@ async def test_close_report_says_how_many_sessions_it_covers(monkeypatch):
     assert "sid-" not in blob and "session_id" not in blob               # 计数不带 session_id
 
 
+async def test_failed_reopen_says_the_old_session_is_already_gone(monkeypatch):
+    """遗留 #3：额度尚在、但新 open 打到 sidecar 失败时，旧会话已经被 DELETE 了。
+
+    这条出口不回报「旧的已关」，模型会以为手上那个会话还活着，下一步白跑一次 step；
+    而替换计数记在一笔没建成的替换上，收口报告的数字就虚高。
+    """
+    ctx = Ctx()
+    ctx.run_state["browser_session"] = "sid-old"
+    deleted = []
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    monkeypatch.setattr(bst, "_sidecar_delete", lambda sid: _aget(deleted.append(sid) or True))
+    monkeypatch.setattr(bst, "_sidecar_open", lambda url, **kw: _aget((None, "浏览器服务已满")))
+    out = await bst.run_browser_session_tool(ctx, "browser_open", {})
+    assert out["ok"] is False and deleted == ["sid-old"]
+    assert ctx.run_state["browser_session"] is None            # 绑定确实跟着 DELETE 解掉了
+    assert "browser_close" not in out["hint"]
+    assert "上一个浏览器会话已关闭" in out["hint"]               # 旧会话不再可用，要说出口
+    assert "现在没有可用会话" in out["hint"]
+    assert ctx.run_state.get("browser_sessions_replaced") in (None, 0)   # 计数不虚高
+    assert ctx.run_state.get("browser_opens") in (None, 0)
+
+    # 业务失败（导航失败）那条出口同样要交代，否则症状一模一样。
+    ctx2 = Ctx()
+    ctx2.run_state["browser_session"] = "sid-old"
+    monkeypatch.setattr(bst, "_sidecar_open", lambda url, **kw: _aget(
+        ({"ok": False, "error": "页面打开失败: net::ERR_CONNECTION_REFUSED",
+          "session_gone": True}, "")))
+    got = await bst.run_browser_session_tool(ctx2, "browser_open", {"path": "/orders"})
+    assert got["ok"] is False and got["session_gone"] is True
+    assert "上一个浏览器会话已关闭" in got["hint"]
+    assert ctx2.run_state.get("browser_sessions_replaced") in (None, 0)
+
+
+async def test_close_counts_every_session_this_run_actually_opened(monkeypatch):
+    """遗留 #1：`replaced + 1` 数的是「没被 close 打断的替换链」，不是本 run 开过的会话数。
+
+    open→close→open→open→close 这条合法路径上，`replaced` 只有 1，写「共开过 2 个」是给模型
+    的一句假话——收口报告是模型唯一一次向用户交代全过程的地方，它必须数得准。
+    """
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    monkeypatch.setattr(bst, "_sidecar_open", lambda url, **kw: _aget((_session_ok(), "")))
+    monkeypatch.setattr(bst, "_sidecar_delete", lambda sid: _aget(True))
+    ctx = Ctx()
+    await bst.run_browser_session_tool(ctx, "browser_open", {})        # 第 1 个
+    await bst.run_browser_session_tool(ctx, "browser_close", {})        # 正常收口，不算替换
+    await bst.run_browser_session_tool(ctx, "browser_open", {})         # 第 2 个
+    await bst.run_browser_session_tool(ctx, "browser_open", {})         # 第 3 个（替换掉第 2 个）
+    assert ctx.run_state["browser_sessions_replaced"] == 1
+    out = await bst.run_browser_session_tool(ctx, "browser_close", {})
+    assert out["sessions_replaced"] == 1
+    assert "本 run 共开过 3 个浏览器会话" in out["hint"]
+    assert ctx.run_state["browser_opens"] == 3
+
+
 # ------------------------------------------------------------------ interactive_max 接线（R-23）
 
 async def test_interactive_max_config_reaches_the_sidecar(monkeypatch):
@@ -695,6 +751,615 @@ def test_limits_are_the_ones_the_spec_pinned():
     assert (bst.INTERACTIVE_MAX_MIN, bst.INTERACTIVE_MAX_MAX) == (1, 200)
 
 
+# --------------------------------------------------------------------------- browser_step
+
+def _step_data(**extra):
+    """Task 3 的 `POST /sessions/{sid}/step` 200 体形状（`_step_state` 的产物）。
+
+    console / failed_requests 在 step 响应里是**全量**且已被 sidecar 换成 `*_new` 两键，
+    这份替身保留那个差异：把两边写成同形会放过「重播旧错误」这个 bug（US-04）。
+    """
+    data = {"ok": True, "title": "订单管理", "text": "订单列表\n共 3 条",
+            "text_truncated": False, "url": "http://192.168.65.254:8241/orders",
+            "interactive": _interactive(), "interactive_truncated": False,
+            "console_new": [], "failed_requests_new": [], "page_errors": [],
+            "truncated": False, "timed_out": False, "dialog": None,
+            "steps_charged": True, "elapsed_ms": 900}
+    data.update(extra)
+    return data
+
+
+def _step_env(monkeypatch, replies):
+    """装好 `fetch_app` + `_sidecar_step` 替身；`replies` 是被调用时返回的 200 体。"""
+    seen = []
+
+    async def fake_step(sid, payload):
+        seen.append((sid, payload))
+        return replies, ""
+
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    monkeypatch.setattr(bst, "_sidecar_step", fake_step)
+    return seen
+
+
+async def test_fill_on_sensitive_ref_redacts_value_before_storing(monkeypatch):
+    """模型填的口令会进聊天历史。指向 sensitive 元素的 value 必须在落库前遮掉。"""
+    ctx = Ctx()
+    ctx.run_state["browser_session"] = "abc"
+    ctx.run_state["browser_refs"] = [{"ref": "e2", "role": "textbox", "name": "密码",
+                                      "sensitive": True}]
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    monkeypatch.setattr(bst, "_sidecar_step",
+                        lambda sid, payload: _aget((_step_data(passed=True, interactive=[]), "")))
+    out = await bst.run_browser_session_tool(
+        ctx, "browser_step", {"action": "fill", "target": "e2", "value": "hunter2"})
+    assert out["ok"] is True
+    stored = ctx.run_state["browser_log"][-1]
+    assert "hunter2" not in str(stored)
+    assert stored["value_redacted"] is True
+
+
+async def test_fill_on_normal_ref_keeps_value_visible_in_log(monkeypatch):
+    ctx = Ctx()
+    ctx.run_state["browser_session"] = "abc"
+    ctx.run_state["browser_refs"] = [{"ref": "e3", "role": "textbox", "name": "备注",
+                                     "sensitive": False}]
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    monkeypatch.setattr(bst, "_sidecar_step",
+                        lambda sid, payload: _aget((_step_data(interactive=[]), "")))
+    await bst.run_browser_session_tool(
+        ctx, "browser_step", {"action": "fill", "target": "e3", "value": "第一单"})
+    assert ctx.run_state["browser_log"][-1]["value"] == "第一单"
+
+
+async def test_sensitive_value_still_reaches_the_sidecar_verbatim(monkeypatch):
+    """遮断只针对落库那份：sidecar 拿到的必须是原值，否则 US-08 的登录根本填不进去。"""
+    ctx = Ctx()
+    ctx.run_state["browser_session"] = "abc"
+    ctx.run_state["browser_refs"] = [{"ref": "e2", "role": "textbox", "name": "密码",
+                                      "sensitive": True}]
+    seen = _step_env(monkeypatch, _step_data())
+    await bst.run_browser_session_tool(
+        ctx, "browser_step", {"action": "fill", "target": "e2", "value": "hunter2"})
+    assert seen[0][1]["value"] == "hunter2"
+    assert seen[0][0] == "abc"                       # 会话由后端绑定，模型参数面里没有它
+
+
+async def test_action_failure_is_ok_false_and_expect_failure_is_passed_false(monkeypatch):
+    ctx = Ctx()
+    ctx.run_state["browser_session"] = "abc"
+    ctx.run_state["browser_refs"] = [{"ref": "e1", "role": "button", "name": "出牌"}]
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+
+    async def blocked(sid, payload):
+        return {"ok": False, "error": "元素不可点击或动作失败: timeout",
+                "interactive": [{"ref": "e1", "role": "button", "name": "出牌"}],
+                "steps_charged": True}, ""
+
+    monkeypatch.setattr(bst, "_sidecar_step", blocked)
+    out = await bst.run_browser_session_tool(
+        ctx, "browser_step", {"action": "click", "target": "e1"})
+    assert out["ok"] is False
+    assert out["interactive"]                        # 失败当场带回新清单，省一次往返
+
+    # 两种形状不许混：断言不过仍是 ok:true，模型对它们的下一步动作完全不同。
+    ctx2 = Ctx()
+    ctx2.run_state["browser_session"] = "abc"
+    _step_env(monkeypatch, _step_data(passed=False, note="页面文本未包含「订单已创建」"))
+    got = await bst.run_browser_session_tool(
+        ctx2, "browser_step", {"action": "click", "target": "e1",
+                               "expect": {"type": "text_contains", "value": "订单已创建"}})
+    assert got["ok"] is True and got["passed"] is False
+    assert got["note"] == "页面文本未包含「订单已创建」"
+
+
+async def test_step_without_session_does_not_call_sidecar(monkeypatch):
+    async def boom(*_a, **_k):
+        raise AssertionError("没开会话不该打 sidecar")
+    monkeypatch.setattr(bst, "_sidecar_step", boom)
+    out = await bst.run_browser_session_tool(
+        Ctx(), "browser_step", {"action": "click", "target": "e1"})
+    assert out["ok"] is False and "browser_open" in out["error"]
+
+
+async def test_steps_exhausted_rejects_before_the_sidecar(monkeypatch):
+    """US-13：额度用尽要说清楚「先收口」，而且不发起一次不执行的调用、不动任何账。"""
+    ctx = Ctx(cfg={"agent.browser_max_steps_per_run": 2})
+    ctx.run_state["browser_session"] = "abc"
+    ctx.run_state["browser_steps_used"] = 2
+    ctx.run_state["browser_refs"] = [{"ref": "e1", "role": "button", "name": "出牌"}]
+
+    async def boom(*_a, **_k):
+        raise AssertionError("步数用尽不该打到 sidecar")
+
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    monkeypatch.setattr(bst, "_sidecar_step", boom)
+    out = await bst.run_browser_session_tool(ctx, "browser_step",
+                                             {"action": "click", "target": "e1"})
+    assert out["ok"] is False and out["steps_left"] == 0
+    assert "browser_close" in out["error"]
+    assert ctx.run_state["browser_session"] == "abc"      # 会话还在，只是不能再走
+    assert ctx.run_state["browser_steps_used"] == 2
+
+
+async def test_bad_navigate_path_and_missing_target_reject_without_sidecar(monkeypatch):
+    """US-17：navigate 只接受同源相对 path；其余动作少了 target 就是没意图，别替它猜。"""
+    async def boom(*_a, **_k):
+        raise AssertionError("参数不合法不该打到 sidecar")
+
+    ctx = Ctx()
+    ctx.run_state["browser_session"] = "abc"
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    monkeypatch.setattr(bst, "_sidecar_step", boom)
+
+    out = await bst.run_browser_session_tool(
+        ctx, "browser_step", {"action": "navigate", "target": "https://evil.example/x"})
+    assert out["ok"] is False and "同源" in out["error"]
+    assert out["steps_charged"] is False
+    out = await bst.run_browser_session_tool(ctx, "browser_step", {"action": "click", "target": ""})
+    assert out["ok"] is False and "target" in out["error"]
+    assert ctx.run_state.get("browser_steps_used") in (None, 0)
+
+
+async def test_session_gone_charges_nothing_and_unbinds(monkeypatch):
+    """US-12 / US-14：会话没了不扣步数，且要解绑——留着绑定会让每一步都重打那个死 id。"""
+    ctx = Ctx()
+    ctx.run_state["browser_session"] = "abc"
+    ctx.run_state["browser_refs"] = [{"ref": "e1", "role": "button", "name": "出牌"}]
+    _step_env(monkeypatch, {"ok": False, "error": "浏览器会话已结束，请重新 browser_open",
+                            "session_gone": True, "steps_charged": False})
+    out = await bst.run_browser_session_tool(ctx, "browser_step",
+                                             {"action": "click", "target": "e1"})
+    assert out["ok"] is False and out["session_gone"] is True
+    assert out["steps_charged"] is False
+    assert "browser_open" in out["error"]
+    assert ctx.run_state["browser_session"] is None
+    assert ctx.run_state.get("browser_steps_used") in (None, 0)
+
+
+async def test_step_charges_exactly_what_the_sidecar_charged(monkeypatch):
+    """步数账与 `steps_charged` 必须一起涨或一起不涨（规格 §5.2）。
+
+    只信 sidecar 的读数、自己不加，`steps_left` 会长期虚高，US-13 的上限形同不存在；
+    反过来自加而 sidecar 没扣，会话没了的那一步会被白记一笔。
+    """
+    ctx = Ctx()
+    ctx.run_state["browser_session"] = "abc"
+    ctx.run_state["browser_refs"] = [{"ref": "e1", "role": "button", "name": "出牌"}]
+
+    async def reply(sid, payload):
+        return _step_data(steps_charged=payload["action"] != "click"), ""
+
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    monkeypatch.setattr(bst, "_sidecar_step", reply)
+    out = await bst.run_browser_session_tool(ctx, "browser_step",
+                                             {"action": "click", "target": "e1"})
+    assert out["steps_charged"] is False
+    assert ctx.run_state.get("browser_steps_used") in (None, 0)
+    out = await bst.run_browser_session_tool(ctx, "browser_step",
+                                             {"action": "fill", "target": "e1", "value": "x"})
+    assert out["steps_charged"] is True
+    assert ctx.run_state["browser_steps_used"] == 1
+    assert out["steps_left"] == bst.DEFAULT_MAX_STEPS - 1
+
+
+async def test_action_failure_charges_and_refreshes_the_ref_list(monkeypatch):
+    """US-09：ref 失效当场附新清单，且清单要成为下一步的判定源（旧 ref 物理上已作废）。"""
+    ctx = Ctx()
+    ctx.run_state["browser_session"] = "abc"
+    ctx.run_state["browser_refs"] = [{"ref": "e9", "role": "button", "name": "旧按钮",
+                                      "sensitive": False}]
+    fresh = [{"ref": "e1", "role": "textbox", "name": "密码 token=abc123def456ghi",
+              "sensitive": True}]
+
+    async def gone(sid, payload):
+        return {"ok": False, "error": "页面已变化，请用最新清单里的 ref",
+                "interactive": fresh, "interactive_truncated": False,
+                "steps_charged": True}, ""
+
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    monkeypatch.setattr(bst, "_sidecar_step", gone)
+    out = await bst.run_browser_session_tool(ctx, "browser_step",
+                                             {"action": "click", "target": "e9"})
+    assert out["ok"] is False
+    assert [i["ref"] for i in out["interactive"]] == ["e1"]
+    assert out["steps_charged"] is True
+    assert ctx.run_state["browser_steps_used"] == 1
+    assert ctx.run_state["browser_refs"] == fresh       # 存原始清单（sensitive 判定源）
+    # 失败分支带回的清单也是页面派生文本，同 `_shape_state` 一个口径过遮断，不许开第二条路。
+    assert "abc123def456ghi" not in json.dumps(out, ensure_ascii=False)
+    assert out["redacted"] >= 1
+
+
+async def test_action_failure_error_is_scrubbed_and_reports_the_dialog(monkeypatch):
+    """R-22 与 US-11：动作失败的原因文本是 sidecar 原话（内嵌容器 IP），弹窗也来自页面。
+
+    失败分支若不走 `_sidecar_text` 这把闸，拓扑泄漏就只在「点不动」这条最常见的路径上复活；
+    丢掉 dialog 的后果是模型以为删除生效了。
+    """
+    ctx = Ctx()
+    ctx.run_state["browser_session"] = "abc"
+    ctx.run_state["browser_refs"] = [{"ref": "e1", "role": "button", "name": "删除"}]
+    monkeypatch.setattr(bst, "browser_target_host", lambda: "host.docker.internal")
+
+    async def failed(sid, payload):
+        return {"ok": False,
+                "error": "导航失败: net::ERR_BLOCKED at http://192.168.65.254:8241/x",
+                "dialog": {"type": "confirm", "message": "确定删除 password=hunter2 吗",
+                           "handled": "dismissed"},
+                "steps_charged": True}, ""
+
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    monkeypatch.setattr(bst, "_sidecar_step", failed)
+    out = await bst.run_browser_session_tool(
+        ctx, "browser_step", {"action": "navigate", "target": "/x"})
+    blob = json.dumps(out, ensure_ascii=False)
+    assert "192.168.65.254" not in blob
+    assert "hunter2" not in blob
+    assert "localhost:8241" in out["error"]
+    assert "ERR_BLOCKED" in out["error"]
+    assert out["dialog"]["handled"] == "dismissed"
+
+
+async def test_step_never_leaks_the_bound_session_or_the_internal_url(monkeypatch):
+    """ADR-0037 + R-16 的合并锚：返回值与 browser_log 里既没有 session_id 也没有容器 IP。
+
+    run_state 里的绑定本身不算泄漏面（它不进消息历史），所以只断言模型看得见的那两份。
+    """
+    ctx = Ctx()
+    ctx.run_state["browser_session"] = "sid-123"
+    ctx.run_state["browser_refs"] = [{"ref": "e1", "role": "button", "name": "出牌"}]
+    internal = "http://192.168.65.254:8241/orders?page=2"
+    _step_env(monkeypatch, _step_data(url=internal))
+    out = await bst.run_browser_session_tool(ctx, "browser_step",
+                                             {"action": "click", "target": "e1"})
+    assert out["url"] == "http://localhost:8241/orders?page=2"
+    assert ctx.run_state["browser_log"][-1]["url"] == "http://localhost:8241/orders?page=2"
+    for blob in (json.dumps(out, ensure_ascii=False),
+                 json.dumps(ctx.run_state["browser_log"], ensure_ascii=False)):
+        assert "sid-123" not in blob
+        assert internal not in blob
+        assert "session_id" not in blob
+
+
+async def test_step_transport_rejection_scrubs_the_internal_host(monkeypatch):
+    """拒绝文案也是 sidecar 自由文本（`validate_target` 会回显我们发出去的 host）：
+    step 这一面同样要过 `_sidecar_text`，否则拓扑泄漏只在「服务不可用」这条路径上复活。
+    """
+    ctx = Ctx()
+    ctx.run_state["browser_session"] = "abc"
+    ctx.run_state["browser_refs"] = [{"ref": "e1", "role": "button", "name": "出牌"}]
+    monkeypatch.setattr(bst, "browser_target_host", lambda: "host.docker.internal")
+
+    async def refused(sid, payload):
+        return None, "目标地址不在允许清单内: 192.168.65.254:8241"
+
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    monkeypatch.setattr(bst, "_sidecar_step", refused)
+    out = await bst.run_browser_session_tool(ctx, "browser_step",
+                                             {"action": "click", "target": "e1"})
+    assert out["ok"] is False
+    assert "192.168.65.254" not in json.dumps(out, ensure_ascii=False)
+    assert "localhost:8241" in out["error"]
+
+
+async def test_step_transport_rejection_reads_both_detail_shapes(monkeypatch):
+    """双形状契约在 step 这一面同样成立：409 的 detail 是 str、422 的是 list。"""
+    ctx = Ctx()
+    ctx.run_state["browser_session"] = "abc"
+    ctx.run_state["browser_refs"] = [{"ref": "e1", "role": "button", "name": "出牌"}]
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+
+    client, holder = _fake_httpx(resp=_Resp(409, {"detail": "浏览器服务已满"}))
+    monkeypatch.setattr(bst, "httpx", holder)
+    out = await bst.run_browser_session_tool(ctx, "browser_step",
+                                             {"action": "click", "target": "e1"})
+    assert out["ok"] is False and out["error"] == "浏览器服务已满"
+    assert out["steps_charged"] is False
+    assert client.calls[0][1].endswith("/sessions/abc/step")
+
+    client, holder = _fake_httpx(resp=_Resp(422, {"detail": [
+        {"loc": ["body", "expect"], "msg": "Input should be a valid dictionary",
+         "type": "dict_type"}]}))
+    monkeypatch.setattr(bst, "httpx", holder)
+    out = await bst.run_browser_session_tool(ctx, "browser_step",
+                                             {"action": "click", "target": "e1"})
+    assert "expect" in out["error"] and "dict_type" not in out["error"]
+    assert ctx.run_state.get("browser_steps_used") in (None, 0)
+
+
+def test_step_payload_pins_the_expect_timeout_bounds():
+    """上限值不许漂：夹在 500..8000 是规格 §10 钉的，超界配置要落到边界而不是原样发出。"""
+    assert (bst.STEP_TIMEOUT_MS_MIN, bst.STEP_TIMEOUT_MS_MAX) == (500, 8000)
+    assert bst.DEFAULT_STEP_TIMEOUT_MS == 3000
+    assert bst.EXPECT_TIMEOUT_CFG_KEY == "agent.browser_expect_timeout_ms"
+
+
+async def test_step_payload_carries_the_configured_budgets(monkeypatch):
+    ctx = Ctx(cfg={"agent.browser_expect_timeout_ms": 99999,
+                   "agent.browser_interactive_max": 12})
+    ctx.run_state["browser_session"] = "abc"
+    ctx.run_state["browser_refs"] = [{"ref": "e1", "role": "button", "name": "出牌"}]
+    seen = _step_env(monkeypatch, _step_data())
+    await bst.run_browser_session_tool(ctx, "browser_step",
+                                       {"action": "click", "target": "e1",
+                                        "expect": {"type": "url_matches", "value": "/orders*"}})
+    assert seen[0][1]["timeout_ms"] == bst.STEP_TIMEOUT_MS_MAX          # 夹在上限，不漂
+    assert seen[0][1]["interactive_max"] == 12
+    assert seen[0][1]["expect"] == {"type": "url_matches", "value": "/orders*"}
+
+    plain = Ctx(cfg={"agent.browser_expect_timeout_ms": 1})
+    plain.run_state["browser_session"] = "abc"
+    seen2 = _step_env(monkeypatch, _step_data())
+    await bst.run_browser_session_tool(plain, "browser_step",
+                                       {"action": "click", "target": "e1"})
+    assert seen2[0][1]["timeout_ms"] == bst.STEP_TIMEOUT_MS_MIN          # 也夹在下限
+    assert seen2[0][1]["expect"] is None                                 # 没给就不判定
+    assert seen2[0][1]["ref"] == "e1" and seen2[0][1]["path"] == ""
+
+
+async def test_navigate_step_sends_path_and_keeps_origin_local(monkeypatch):
+    """US-17：navigate 走 `path` 字段（sidecar 拼回会话 origin），`ref` 留空免得被当元素动作。"""
+    ctx = Ctx()
+    ctx.run_state["browser_session"] = "abc"
+    seen = _step_env(monkeypatch, _step_data(url="http://192.168.65.254:8241/orders/7"))
+    await bst.run_browser_session_tool(ctx, "browser_step",
+                                       {"action": "navigate", "target": "/orders/7"})
+    assert seen[0][1]["path"] == "/orders/7"
+    assert seen[0][1]["ref"] == ""
+    assert ctx.run_state["browser_log"][-1]["target"] == "/orders/7"
+
+
+def _png(width: int = 1280, height: int = 800) -> bytes:
+    """够骗过 `png_size` 的最小 PNG 头（与 tests/test_browser_shots.py 同形）。
+
+    宽高默认取 1280×800，也就是 sidecar 的视口（`browser/app.py::VIEWPORT_WIDTH`）：
+    落盘服务报出的宽高读的是 IHDR 而不是 sidecar 自报的字段，两者对不上就是前端坐标换算的坑。
+    """
+    return (b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + b"IHDR"
+            + struct.pack(">II", width, height) + b"\x00" * 14)
+
+
+def _shot_b64() -> str:
+    return base64.b64encode(_png()).decode("ascii")
+
+
+def _shot_env(monkeypatch, *, replies=None, shot=None):
+    """`_sidecar_step` + `_sidecar_screenshot` 两个替身；截图面被叫了几次要数得出来。"""
+    shots_seen = []
+
+    async def fake_shot(sid):
+        shots_seen.append(sid)
+        return shot if shot is not None else ({"ok": True, "screenshot_b64": _shot_b64(),
+                                               "screenshot_width": 1280,
+                                               "screenshot_height": 800}, "")
+
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    monkeypatch.setattr(bst, "_sidecar_step",
+                        lambda sid, payload: _aget((replies if replies is not None
+                                                    else _step_data(), "")))
+    monkeypatch.setattr(bst, "_sidecar_screenshot", fake_shot)
+    return shots_seen
+
+
+async def test_failed_assertion_attaches_a_scene_shot(monkeypatch, tmp_path):
+    """US-05：断言不过的那一刻是唯一值得看现场的时刻，落盘沿用 preview_page 那套服务（US-23）。"""
+    monkeypatch.setenv("ZEROCODE_DATA_DIR", str(tmp_path))
+    ctx = Ctx()
+    ctx.run_state["browser_session"] = "abc"
+    ctx.run_state["browser_refs"] = [{"ref": "e1", "role": "button", "name": "出牌"}]
+    seen = _shot_env(monkeypatch, replies=_step_data(passed=False, note="页面文本未包含「已创建」"))
+    out = await bst.run_browser_session_tool(
+        ctx, "browser_step", {"action": "click", "target": "e1",
+                              "expect": {"type": "text_contains", "value": "已创建"}})
+    assert out["ok"] is True and out["passed"] is False
+    assert out["screenshot"]["url"].startswith("/api/browser/shots/7/")
+    assert out["screenshot"]["width"] == 1280 and out["screenshot"]["bytes"] == len(_png())
+    assert (tmp_path / "browser_shots" / "7" / out["screenshot"]["url"].rsplit("/", 1)[1]).is_file()
+    assert seen == ["abc"]
+
+
+async def test_passing_assertion_attaches_no_shot(monkeypatch):
+    """一张 1280×800 的图不便宜：通过时不附图是规格 §4 的决策，不是遗漏。"""
+    ctx = Ctx()
+    ctx.run_state["browser_session"] = "abc"
+    ctx.run_state["browser_refs"] = [{"ref": "e1", "role": "button", "name": "出牌"}]
+    seen = _shot_env(monkeypatch, replies=_step_data(passed=True, note="页面文本未包含「已创建」"))
+    out = await bst.run_browser_session_tool(
+        ctx, "browser_step", {"action": "click", "target": "e1",
+                              "expect": {"type": "text_contains", "value": "已创建"}})
+    assert out["passed"] is True and "screenshot" not in out
+    assert seen == []
+
+
+async def test_explicit_screenshot_attaches_even_without_an_assertion(monkeypatch, tmp_path):
+    """`screenshot: true` 是模型的显式请求：没给 expect、动作也成功也要给图。"""
+    monkeypatch.setenv("ZEROCODE_DATA_DIR", str(tmp_path))
+    ctx = Ctx()
+    ctx.run_state["browser_session"] = "abc"
+    ctx.run_state["browser_refs"] = [{"ref": "e1", "role": "button", "name": "出牌"}]
+    seen = _shot_env(monkeypatch, replies=_step_data())
+    out = await bst.run_browser_session_tool(
+        ctx, "browser_step", {"action": "click", "target": "e1", "screenshot": True})
+    assert "passed" not in out and out["screenshot"]["height"] == 800
+    assert seen == ["abc"]
+
+
+async def test_screenshot_on_action_failure_only_when_asked(monkeypatch, tmp_path):
+    """其余情况不附图（token 成本）：点不动自带新清单，图只是可选补充。"""
+    monkeypatch.setenv("ZEROCODE_DATA_DIR", str(tmp_path))
+    ctx = Ctx()
+    ctx.run_state["browser_session"] = "abc"
+    ctx.run_state["browser_refs"] = [{"ref": "e1", "role": "button", "name": "出牌"}]
+    seen = _shot_env(monkeypatch, replies={"ok": False, "error": "元素不可点击，可能被遮挡",
+                                           "steps_charged": True})
+    out = await bst.run_browser_session_tool(
+        ctx, "browser_step", {"action": "click", "target": "e1"})
+    assert out["ok"] is False and "screenshot" not in out
+    assert seen == []
+
+    ctx2 = Ctx()
+    ctx2.run_state["browser_session"] = "abc"
+    ctx2.run_state["browser_refs"] = [{"ref": "e1", "role": "button", "name": "出牌"}]
+    seen2 = _shot_env(monkeypatch, replies={"ok": False, "error": "元素不可点击，可能被遮挡",
+                                            "steps_charged": True})
+    got = await bst.run_browser_session_tool(
+        ctx2, "browser_step", {"action": "click", "target": "e1", "screenshot": True})
+    assert got["ok"] is False and got["screenshot"]["bytes"] == len(_png())
+    assert seen2 == ["abc"]
+
+
+async def test_capturing_the_shot_costs_no_step(monkeypatch, tmp_path):
+    """补图走 screenshot 端点：它既不 touch 也不计步，两步账（1 次动作 + 1 次补图）必须是 1。"""
+    monkeypatch.setenv("ZEROCODE_DATA_DIR", str(tmp_path))
+    ctx = Ctx()
+    ctx.run_state["browser_session"] = "abc"
+    ctx.run_state["browser_refs"] = [{"ref": "e1", "role": "button", "name": "出牌"}]
+    ctx.run_state["browser_steps_used"] = 4
+    _shot_env(monkeypatch, replies=_step_data(passed=False, note="不匹配"))
+    out = await bst.run_browser_session_tool(
+        ctx, "browser_step", {"action": "click", "target": "e1",
+                              "expect": {"type": "text_contains", "value": "已创建"}})
+    assert out["screenshot"] and out["steps_charged"] is True
+    assert ctx.run_state["browser_steps_used"] == 5
+    assert out["steps_left"] == bst.DEFAULT_MAX_STEPS - 5
+
+
+async def test_missing_shot_says_so_instead_of_failing_the_step(monkeypatch):
+    """补图失败不该把已经拿到手的断言结论一起带走（模型要的是 passed 与现场说明）。"""
+    ctx = Ctx()
+    ctx.run_state["browser_session"] = "abc"
+    ctx.run_state["browser_refs"] = [{"ref": "e1", "role": "button", "name": "出牌"}]
+    _shot_env(monkeypatch, replies=_step_data(passed=False, note="不匹配"),
+              shot=(None, "浏览器服务不可用"))
+    out = await bst.run_browser_session_tool(
+        ctx, "browser_step", {"action": "click", "target": "e1",
+                              "expect": {"type": "text_contains", "value": "已创建"}})
+    assert out["ok"] is True and out["passed"] is False
+    assert out["screenshot"] is None
+    assert "截图" in out["screenshot_note"]
+
+
+async def test_a_broken_image_does_not_become_a_step_failure(monkeypatch, tmp_path):
+    """落盘炸了（不是 PNG / 超预算）只说「这张没图」，不把断言结论降级成工具失败。"""
+    monkeypatch.setenv("ZEROCODE_DATA_DIR", str(tmp_path))
+    ctx = Ctx()
+    ctx.run_state["browser_session"] = "abc"
+    ctx.run_state["browser_refs"] = [{"ref": "e1", "role": "button", "name": "出牌"}]
+    _shot_env(monkeypatch, replies=_step_data(passed=False, note="不匹配"),
+              shot=({"ok": True, "screenshot_b64": "###not base64###"}, ""))
+    out = await bst.run_browser_session_tool(
+        ctx, "browser_step", {"action": "click", "target": "e1",
+                              "expect": {"type": "text_contains", "value": "已创建"}})
+    assert out["ok"] is True and out["passed"] is False and out["screenshot"] is None
+
+
+async def test_interactive_max_shrinks_the_list_for_both_tools(monkeypatch):
+    """遗留 #2：配置只发给 sidecar、后端仍按常量 40 切片的话，调小不省 token、调大被静默挡回。
+
+    清单条数是直接决定进模型上下文 token 量的那把尺，配置必须真的生效在这一刀上。
+    """
+    ctx = Ctx(cfg={"agent.browser_interactive_max": 12})
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    monkeypatch.setattr(bst, "_sidecar_open",
+                        lambda url, **kw: _aget((_session_ok(interactive=_interactive(60)), "")))
+    out = await bst.run_browser_session_tool(ctx, "browser_open", {})
+    assert len(out["interactive"]) == 12
+
+    ctx2 = Ctx(cfg={"agent.browser_interactive_max": 12})
+    ctx2.run_state["browser_session"] = "abc"
+    _step_env(monkeypatch, _step_data(interactive=_interactive(60), interactive_truncated=True))
+    got = await bst.run_browser_session_tool(ctx2, "browser_step",
+                                             {"action": "click", "target": "e1"})
+    assert len(got["interactive"]) == 12
+    assert got["interactive_truncated"] is True
+
+
+async def test_empty_console_new_does_not_replay_the_opening_errors(monkeypatch):
+    """遗留 #4：`data.get("console_new") or data.get("console")` 把「本步新增为空」与
+    「字段不存在」混为一谈。实现 `_step` 后两份都可能带 `console`，届时每步都会重播首屏的
+    旧错误，US-04 那个「这个错是不是我这一步搞出来的」的核心信号就没了。
+    """
+    ctx = Ctx()
+    ctx.run_state["browser_session"] = "abc"
+    ctx.run_state["browser_refs"] = [{"ref": "e1", "role": "button", "name": "出牌"}]
+    _step_env(monkeypatch, _step_data(console_new=[],
+                                      console=[{"level": "error", "text": "首屏就有的旧错误"}]))
+    out = await bst.run_browser_session_tool(ctx, "browser_step",
+                                             {"action": "click", "target": "e1"})
+    assert out["console_new"] == []
+    assert "首屏就有的旧错误" not in json.dumps(out, ensure_ascii=False)
+
+
+async def test_open_without_console_new_reports_its_full_console(monkeypatch):
+    """存在性判定的另一头：`POST /sessions` 只回全量 `console`，那一面仍要当基线报出去。"""
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    monkeypatch.setattr(bst, "_sidecar_open", lambda url, **kw: _aget(
+        (_session_ok(console=[{"level": "error", "text": "首屏报错"}]), "")))
+    out = await bst.run_browser_session_tool(Ctx(), "browser_open", {})
+    assert [i["text"] for i in out["console_new"]] == ["首屏报错"]
+
+
+async def test_step_result_describes_the_step_it_just_ran(monkeypatch):
+    """规格 §5.2：step 的返回值自带 `action` / `target`（/ 给了就带 `expect`）。
+
+    步骤卡（Task 7）与收口报告都要按步读，只给一份页面状态的话「这一步是对哪个 ref 做的」
+    就得回头翻上一条消息记录——那是可以省掉的一次歧义。
+    """
+    ctx = Ctx()
+    ctx.run_state["browser_session"] = "abc"
+    ctx.run_state["browser_refs"] = [{"ref": "e7", "role": "button", "name": "提交订单"}]
+    _step_env(monkeypatch, _step_data(passed=False, note="不匹配"))
+    out = await bst.run_browser_session_tool(
+        ctx, "browser_step", {"action": "click", "target": "e7",
+                              "expect": {"type": "text_contains", "value": "订单已创建"}})
+    assert out["action"] == "click" and out["target"] == "e7"
+    assert out["expect"] == {"type": "text_contains", "value": "订单已创建"}
+
+    plain = Ctx()
+    plain.run_state["browser_session"] = "abc"
+    plain.run_state["browser_refs"] = [{"ref": "e7", "role": "button", "name": "提交订单"}]
+    _step_env(monkeypatch, _step_data())
+    got = await bst.run_browser_session_tool(plain, "browser_step",
+                                             {"action": "click", "target": "e7"})
+    assert got["action"] == "click" and got["target"] == "e7"
+    assert "expect" not in got                        # 没给断言就不假装判过
+
+    # 失败的那一步也要自述：步骤卡对成功与失败用同一份字段渲染，否则失败卡只能显示一句原因。
+    failed = Ctx()
+    failed.run_state["browser_session"] = "abc"
+    failed.run_state["browser_refs"] = [{"ref": "e7", "role": "button", "name": "提交订单"}]
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    monkeypatch.setattr(bst, "_sidecar_step", lambda sid, payload: _aget(
+        ({"ok": False, "error": "元素不可点击或动作失败: timeout", "steps_charged": True}, "")))
+    bad = await bst.run_browser_session_tool(failed, "browser_step",
+                                             {"action": "click", "target": "e7"})
+    assert bad["ok"] is False and bad["action"] == "click" and bad["target"] == "e7"
+
+
+async def test_open_then_steps_report_continuous_seq_in_the_close_report(monkeypatch):
+    """open→step→step→close 的账要连得上：`seq` 连续、`steps_used` 与扣费一致、报告说得出步数。"""
+    deleted = []
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    monkeypatch.setattr(bst, "_sidecar_open", lambda url, **kw: _aget((_session_ok(), "")))
+    monkeypatch.setattr(bst, "_sidecar_delete", lambda sid: _aget(deleted.append(sid) or True))
+    ctx = Ctx()
+    await bst.run_browser_session_tool(ctx, "browser_open", {"path": "/orders"})
+    _step_env(monkeypatch, _step_data())
+    await bst.run_browser_session_tool(ctx, "browser_step", {"action": "click", "target": "e1"})
+    _step_env(monkeypatch, _step_data(passed=False, note="页面文本未包含「已创建」"))
+    monkeypatch.setattr(bst, "_sidecar_screenshot", lambda sid: _aget((None, "服务不可用")))
+    await bst.run_browser_session_tool(
+        ctx, "browser_step", {"action": "click", "target": "e2",
+                              "expect": {"type": "text_contains", "value": "已创建"}})
+    out = await bst.run_browser_session_tool(ctx, "browser_close", {})
+    assert [s["seq"] for s in out["report"]] == [0, 1, 2]
+    assert out["steps_used"] == 2 == ctx.run_state["browser_steps_used"]
+    assert out["steps_failed"] == 1
+    assert "2" in out["hint"]                          # 说得出失败在第几步
+    assert deleted == ["sid-123"]
+
+
 # --------------------------------------------------------------------------- browser_close
 
 async def test_close_reports_failed_steps(monkeypatch):
@@ -780,13 +1445,25 @@ async def test_sidecar_delete_is_idempotent_on_unknown_session(monkeypatch):
 
 # --------------------------------------------------------------------------- 分派
 
-async def test_step_is_recognised_but_not_wired_yet():
-    """Task 5 落地 browser_step；本任务先保证它不被当成「未知工具」静默失败。"""
-    out = await bst.run_browser_session_tool(Ctx(), "browser_step",
-                                             {"action": "click", "target": "e1"})
+async def test_step_is_wired_to_the_handler_not_a_placeholder(monkeypatch):
+    """分派表上的 browser_step 落到真实现：畸形参数也只会拿到「没有会话」，不是「没这个工具」。"""
+    out = await bst.run_browser_session_tool(Ctx(), "browser_step", "不是字典")
     assert out["ok"] is False
-    assert "browser_step" in out["error"]
     assert "未知" not in out["error"]
+    assert "browser_open" in out["error"]
+
+
+async def test_step_handler_runs_after_the_dispatch(monkeypatch):
+    ctx = Ctx()
+    ctx.run_state["browser_session"] = "abc"
+    _step_env(monkeypatch, _step_data())
+    out = await bst.run_browser_session_tool(
+        ctx, "browser_step", {"action": "click", "target": "e1"})
+    assert out["ok"] is True and out["session"] == "active"
+    assert out["steps_left"] == bst.DEFAULT_MAX_STEPS - 1
+    assert ctx.run_state["browser_steps_used"] == 1
+    # 收口报告的 seq 连续：open 那条是 0，第一步是 1（US-07 的「失败在哪步」靠它定位）。
+    assert [s["seq"] for s in ctx.run_state["browser_log"]] == [1]
 
 
 async def test_unknown_tool_is_a_normal_result():
