@@ -225,6 +225,44 @@ describe('BrowserFlowCard', () => {
     expect(w.text()).toContain('点不动 2')
   })
 
+  it('目标元素名读后端 echo 的 target_name，不拿动作后的新快照反查（裁定 R-32）', () => {
+    const w = mountCard({
+      name: 'browser_step',
+      result: {
+        ok: true, action: 'click', target: 'e7', target_name: '结算', passed: null,
+        // 动作之后的新快照里 e7 已经是另一个元素：拿它反查「这一步点的是谁」会画出假目标
+        // （ref 每次重渲染全部作废，规格 §6.2）。target_name 取的是动作之前那份清单。
+        interactive: [{ ref: 'e7', role: 'button', name: '退出登录', sensitive: false }],
+      },
+    })
+    const step = w.find('.zc-page-step')
+    expect(step.text()).toContain('点击 结算')
+    expect(step.text()).toContain('e7')                 // 名字之外仍留句柄，好对着清单读
+    expect(step.text()).not.toContain('退出登录')        // 新快照绝不参与标目标
+    expect(w.find('[data-test="interactive"]').text()).toContain('退出登录')   // 清单照旧要画
+  })
+
+  it('target_name 缺席时回落显示句柄 / path，不编一个名字', () => {
+    const noName = mountCard({
+      name: 'browser_step',
+      result: { ok: true, action: 'click', target: 'e7', passed: null },
+    })
+    expect(noName.find('.zc-page-step').text()).toContain('点击 句柄 e7')
+    const nav = mountCard({
+      name: 'browser_step',
+      result: { ok: true, action: 'navigate', target: '/orders', passed: null },
+    })
+    expect(nav.find('.zc-page-step').text()).toContain('跳转 /orders')
+    // 名字缺席、而新快照里恰好有同一个 ref：仍旧只画句柄，绝不拿新快照凑一个名
+    const stale = mountCard({
+      name: 'browser_step',
+      result: { ok: false, error: '点不动', action: 'click', target: 'e7',
+                interactive: [{ ref: 'e7', role: 'button', name: '退出登录' }] },
+    })
+    expect(stale.find('.zc-page-step').text()).toContain('句柄 e7')
+    expect(stale.find('.zc-page-step').text()).not.toContain('退出登录')
+  })
+
   it('不渲染 args 里的 fill 值（口令只该以遮断后的形态出现）', () => {
     const w = mountCard({
       name: 'browser_step',

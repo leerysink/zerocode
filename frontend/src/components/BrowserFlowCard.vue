@@ -13,8 +13,9 @@
 // 两种失败形状都可能带 `screenshot`（裁定 R-26），存在就有 url / width / height / bytes。
 // `session_id` 不出现在任何返回值里（ADR-0037），这里也就无从显示它。
 //
-// 刻意不读 `msg.args`：fill 的 value 是明文口令，后端只在落库那份遮断（US-19），
-// 卡片再照抄一遍就白遮了；ref 也在结果里带着，不需要回退到参数。
+// 刻意不读 `msg.args`：fill 的 value 只有指向 sensitive 元素的那一份才被遮断（裁定 R-33），
+// 非敏感目标的 value 按设计仍是明文（备注、地址这类要能被回看）；卡片再照 args 抄一遍
+// 就把这条边界抹平了，而 ref 与元素名都在结果里带着，不需要回退到参数。
 import { computed, ref } from 'vue'
 
 const props = defineProps({
@@ -99,17 +100,24 @@ const action = computed(() => {
   return typeof a === 'string' ? a : ''
 })
 // target 只有 ref 或 path 两种形态（spec §5.1：navigate 时 target 改填 path）。
-// 刻意不拿本步的 interactive 去反查元素名：ref 是按采集顺序现编的句柄，每次重渲染全部作废
-// （规格 §6.2），动作之后那份清单里的同名 ref 是「另一个元素」，拿它标这一步会画出假目标。
+// 元素名读后端 echo 的 `target_name`（裁定 R-32，US-22）——它取的是**动作之前**那份清单。
+// 刻意不拿本步结果里的 interactive 反查：那是**动作之后**的新快照，而 ref 是按采集顺序现编的、
+// 每次重渲染全部作废（规格 §6.2），用它标「这一步动的谁」会把目标画成另一个元素。
 const target = computed(() => {
   const t = result.value?.target
   return typeof t === 'string' ? t : ''
+})
+const targetName = computed(() => {
+  const n = result.value?.target_name
+  return typeof n === 'string' ? n.trim() : ''
 })
 const stepLabel = computed(() => {
   if (!result.value || (!action.value && !target.value)) return ''
   const text = ACTION_TEXT[action.value] || action.value
   if (!target.value) return text || '执行动作'
-  const who = /^e\d+$/.test(target.value) ? `句柄 ${target.value}` : target.value
+  // 名字查不到就回落句柄：编一个不存在的名比只显示 e7 更糟
+  const who = targetName.value ? `${targetName.value}（句柄 ${target.value}）`
+    : (/^e\d+$/.test(target.value) ? `句柄 ${target.value}` : target.value)
   return text ? `${text} ${who}` : who
 })
 const expectLabel = computed(() => {
