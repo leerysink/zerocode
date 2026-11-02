@@ -972,11 +972,54 @@ async def test_every_step_after_the_first_is_masked_even_on_a_listed_plain_ref()
          _tool_call("browser_step", action="navigate", target="/login", value="hunter2")], refs)
     assert tail_hits == 1
     assert json.loads(tail[1]["function"]["arguments"])["value"] == "<redacted:sensitive_input>"
+    # 遮的只有 value：navigate 的 target 是 path 不是句柄，读历史的人仍要能看出这一步去了哪
+    # （防止后来人「顺手」把 target 一起遮掉）
+    assert json.loads(tail[1]["function"]["arguments"])["target"] == "/login"
     # 位次是按**传进来的那份列表**数的（loop 传的是整条 assistant 消息的全部调用）：
     # 同一条 fill 单独喂进来就是位次 1、照旧放行——这条规则整个挂在「同一份列表里有前序调用」上
     alone, alone_hits = bst.redact_sensitive_step_args(calls[2:3], refs)
     assert alone_hits == 0
     assert json.loads(alone[0]["function"]["arguments"])["value"] == "第一单"
+
+
+async def test_open_and_close_hold_an_ordinal_but_other_tools_do_not():
+    """位次口径（裁定 R-36）数的是「本条消息在这一步之前有没有别的**浏览器调用**改写过清单」。
+
+    R-35 的计数器只数 `browser_step`，可改写/作废清单的调用不止它：
+    - `_open` 同样往 `run_state["browser_refs"]` 写新页清单（`browser_session_tools.py` 的
+      `ctx.run_state["browser_refs"] = list(data.get("interactive"))`），而轮初那份在派发前就一次读死。
+      于是 `[browser_open "/login", browser_step fill e2]` 里落库看到旧页（`e2=搜索框`，放行）、
+      执行读到新页（`e2=口令`，遮断）——形状 ④。
+    - `_close` 之后的 step 必然被拒，值进不了表单也进不了 `browser_log`，但落库那行写在派发之前，
+      原值照样明文进 `message.tool_args`。同族，一并计入。
+
+    非浏览器调用不占位次：`fs_write` 之类改不动页面清单，把它算进去会把「一条写文件 + 一条正常
+    step」这种普通消息一起遮成占位符，那是 R-34/R-35 都明确拒绝的一刀切。
+    open/close 自身不带 `value`，进计数器只占位次、条目原样返回（`hits == 0` 保原对象那条身份契约）。
+    """
+    refs = [{"ref": "e2", "role": "textbox", "name": "搜索框", "sensitive": False},
+            {"ref": "e3", "role": "textbox", "name": "备注", "sensitive": False}]
+    fill = _tool_call("browser_step", action="fill", target="e2", value="hunter2")
+    open_call = _tool_call("browser_open", path="/login")
+    close_call = _tool_call("browser_close")
+    write_call = _tool_call("fs_write", path="a.txt", content="notes")
+
+    # open 占位次：紧随其后的 fill 不看清单
+    out, hits = bst.redact_sensitive_step_args([open_call, fill], refs)
+    assert hits == 1
+    assert json.loads(out[1]["function"]["arguments"])["value"] == "<redacted:sensitive_input>"
+    assert out[0] is open_call                     # open 的 args 一字未改，连条目对象都是原引用
+    # close 占位次
+    out2, hits2 = bst.redact_sensitive_step_args([close_call, fill], refs)
+    assert hits2 == 1
+    assert json.loads(out2[1]["function"]["arguments"])["value"] == "<redacted:sensitive_input>"
+    assert out2[0] is close_call
+    # 别的浏览器调用也占位次：open 之后已经两步，第三条 fill 更该从严
+    out3, hits3 = bst.redact_sensitive_step_args([close_call, open_call, fill], refs)
+    assert hits3 == 1 and out3[0] is close_call and out3[1] is open_call
+    # 非浏览器调用不占位次：单条 step 仍是位次 1、轮初清单照旧权威（反向钉）
+    kept, kept_hits = bst.redact_sensitive_step_args([write_call, fill], refs)
+    assert kept_hits == 0 and kept[0] is write_call and kept[1] is fill
 
 
 async def test_a_numeric_pin_is_masked_on_both_sides(monkeypatch):

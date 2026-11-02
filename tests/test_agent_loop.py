@@ -956,6 +956,214 @@ async def test_two_steps_in_one_round_mask_a_ref_that_was_plain_at_round_start(t
     assert json.loads(back[-1]["tool_calls"][1]["function"]["arguments"])["value"] == "hunter2"
 
 
+@pytest.mark.asyncio
+async def test_an_open_before_a_step_in_one_round_holds_the_ordinal(test_engine, tmp_path,
+                                                                    monkeypatch):
+    """形状 ④（裁定 R-36）：改写页面清单的不止 `browser_step`——`_open` 也写 `browser_refs`。
+
+    位次规则管的是「本条消息在这一步之前，有没有别的**浏览器调用**改写过清单」，而 R-35 的计数器
+    只数 step（白名单 `("browser_step",)`）。于是一条消息里
+    `[browser_open "/login", browser_step fill e2 value=hunter2]` 这一路：
+    落库那行看到的是**旧页**的轮初清单（`e2=搜索框`，非 sensitive），fill 又被数成位次 1，
+    于是判「已知非 sensitive」→ 原值进 `message.tool_args` 与 WS `tool_call`；
+    而派发是顺序的：`_open` 先把 `browser_refs` 换成 /login 那份（`e2=口令`，sensitive），
+    `_step` 读到新清单 → 结果侧遮断。两侧又分家——与前三轮收掉的是同一个根因（清单时点不同），
+    而现有测试没有任何一条把 open 与 step 放进同一条消息。
+
+    这里走的仍是真 loop、钉的仍是那五件事。`browser_open` 的 args 里没有 `value` 键，
+    所以它进计数器只是占掉一个位次、自身原样返回（`redact.py` 的「处数 0 保原条目对象」那条
+    身份契约不许动），落库与推送那份都读得出 `path == "/login"`。
+    """
+    from app.agent import browser_session_tools as bst
+
+    sid, aid, sf, seen = await _fill_env(test_engine, tmp_path, monkeypatch, bst, slug="pvsens5",
+                                         dev_port=8309, prod_port=8308)
+    stale = [{"ref": "e1", "role": "button", "name": "搜索", "sensitive": False},
+             {"ref": "e2", "role": "textbox", "name": "搜索框", "sensitive": False},
+             {"ref": "e3", "role": "textbox", "name": "备注", "sensitive": False}]
+    login = [{"ref": "e1", "role": "textbox", "name": "用户名", "sensitive": False},
+             {"ref": "e2", "role": "textbox", "name": "口令", "sensitive": True},
+             {"ref": "e3", "role": "textbox", "name": "备注", "sensitive": False}]
+    opened = []
+
+    async def fake_open(url, **kw):
+        # 首屏与 /login 是两份清单，同一个 `e2` 是两个不同的元素（规格 §6.2：每次重渲染从头重编）
+        opened.append(url)
+        interactive = login if url.rstrip("/").endswith("/login") else stale
+        return {"ok": True, "session_id": f"sid-{len(opened)}", "title": "页面", "text": "",
+                "url": "http://192.168.65.254:8309/", "interactive": interactive,
+                "console": [], "failed_requests": [], "page_errors": [], "elapsed_ms": 1}, ""
+
+    async def fake_step(session_id, payload):
+        seen.append((session_id, payload))
+        return {"ok": True, "title": "登录", "text": "",
+                "url": "http://192.168.65.254:8309/login", "interactive": login,
+                "interactive_truncated": False, "dialog": None, "console_new": [],
+                "failed_requests_new": [], "page_errors_new": [], "truncated": False,
+                "timed_out": False, "steps_charged": True, "elapsed_ms": 1}, ""
+
+    deleted = []
+
+    async def fake_delete(sid_):
+        deleted.append(sid_)
+        return True
+
+    monkeypatch.setattr(bst, "_sidecar_open", fake_open)
+    monkeypatch.setattr(bst, "_sidecar_step", fake_step)
+    monkeypatch.setattr(bst, "_sidecar_delete", fake_delete)
+    captured = {}
+    real_run = bst.run_browser_session_tool
+
+    async def spy_run(ctx, name, args):
+        captured["ctx"] = ctx
+        return await real_run(ctx, name, args)
+
+    monkeypatch.setattr(bst, "run_browser_session_tool", spy_run)
+
+    turns = [done(None, [tool_call("c1", "browser_open", path="/")]),
+             done(None, [tool_call("c2", "browser_open", path="/login"),
+                         tool_call("c3", "browser_step", action="fill", target="e2",
+                                   value="hunter2")]),
+             done("填好了")]
+    rec = Recorder()
+    llm = ScriptedLLM(turns)
+    await mk_runner(sf, llm, rec, tasks={}).run(sid, "登录一遍", asyncio.Event())
+
+    # ① 消息表全表（tool_args + tool_result 一起 dump）不含明文
+    async with sf() as s:
+        rows = (await s.execute(sql(
+            "SELECT role, tool_args, tool_result FROM message WHERE session_id=:i ORDER BY seq"),
+            {"i": sid})).all()
+    blob = json.dumps([list(r) for r in rows], ensure_ascii=False)
+    assert "hunter2" not in blob, "口令明文进了消息表：open 改写过清单，轮初那份对它不再权威"
+    pair_row = next(list(r)[1] for r in rows
+                    if isinstance(list(r)[1], dict)
+                    and len(list(r)[1].get("tool_calls") or []) == 2)
+    calls = pair_row["tool_calls"]
+    assert [c["function"]["name"] for c in calls] == ["browser_open", "browser_step"]
+    open_tc, fill_tc = calls
+    assert open_tc["id"] == "c2"
+    # open 只是占位次：它自己的 args 一个字不改（没有 value 键，走的是那条早退分支）
+    assert json.loads(open_tc["function"]["arguments"]) == {"path": "/login"}
+    assert fill_tc["id"] == "c3"
+    masked = json.loads(fill_tc["function"]["arguments"])
+    assert masked["value"] == "<redacted:sensitive_input>"
+    assert masked["action"] == "fill" and masked["target"] == "e2"   # 结构照旧读得出做了什么
+
+    # ② WS 推送那一份：三条事件、顺序与派发一致，open 的 path 仍读得出
+    evs = [e for e in rec.events if e["type"] == "tool_call"]
+    assert [e["name"] for e in evs] == ["browser_open", "browser_open", "browser_step"]
+    assert evs[1]["args"] == {"path": "/login"}
+    assert evs[2]["args"]["value"] == "<redacted:sensitive_input>"
+    assert "hunter2" not in json.dumps(evs, ensure_ascii=False)
+
+    # ③ 结果侧同一份账：`_step` 读到的是 open 换上的新清单，所以它遮
+    logged = [s_ for s_ in captured["ctx"].run_state["browser_log"] if s_.get("action") == "fill"]
+    assert len(logged) == 1
+    assert logged[0]["value_redacted"] is True and "hunter2" not in str(logged[0])
+    # 这一步的证据链闭合：元素名取自动作前的清单，而它已经是新页的「口令」——
+    # 也就是「参数侧那份轮初清单（搜索框）确实被同一条消息里的 open 换掉了」
+    assert logged[0]["target_name"] == "口令"
+
+    # ④ 原值照样送达 sidecar（US-08 的登录填得进去）
+    assert [p["value"] for _sid, p in seen if p["action"] == "fill"] == ["hunter2"]
+    # 中间那次 open 确实自动关掉了旧会话：派发顺序就是这条形状成立的原因；
+    # 第二条是新会话在 run 收口时被 best-effort 清掉的（US-21），不是模型发的 close
+    assert deleted == ["sid-1", "sid-2"]
+
+    # ⑤ 当轮回注模型仍是原值（跨轮从净化库重建才是遮断版）
+    back = [m for m in llm.received[2] if m["role"] == "assistant" and m.get("tool_calls")]
+    assert json.loads(back[-1]["tool_calls"][1]["function"]["arguments"])["value"] == "hunter2"
+
+
+@pytest.mark.asyncio
+async def test_a_close_before_a_step_in_one_round_holds_the_ordinal(test_engine, tmp_path,
+                                                                     monkeypatch):
+    """形状 ④ 的同族（裁定 R-36）：`[browser_close, browser_step fill]`——值进不了表单，但仍会明文落库。
+
+    `close` 之后的 step 必然被拒（`_step` 第一条拒绝出口：「还没有浏览器会话」），所以那个 value
+    根本不会进表单，也**不会**进 `browser_log`（拒绝出口一律不写 run_state）。但落库那行写在派发
+    **之前**，旧口径下 fill 是位次 1、target 在轮初清单里且非 sensitive → 原值照样进
+    `message.tool_args` 与 WS `tool_call`。同一个计数器一并把 close 计入位次即可。
+
+    这一支「两侧同结论」的形状与 open 那条不同，结果侧没有 log 条目可对，所以钉的是：
+    参数侧遮断 + 那个值既没进 sidecar 也没进 browser_log（这一步确实什么都没做成）。
+    """
+    from app.agent import browser_session_tools as bst
+
+    sid, aid, sf, seen = await _fill_env(test_engine, tmp_path, monkeypatch, bst, slug="pvsens6",
+                                         dev_port=8311, prod_port=8310)
+    stale = [{"ref": "e1", "role": "button", "name": "搜索", "sensitive": False},
+             {"ref": "e2", "role": "textbox", "name": "搜索框", "sensitive": False},
+             {"ref": "e3", "role": "textbox", "name": "备注", "sensitive": False}]
+
+    async def fake_open(url, **kw):
+        return {"ok": True, "session_id": "sid-1", "title": "首页", "text": "",
+                "url": "http://192.168.65.254:8311/", "interactive": stale,
+                "console": [], "failed_requests": [], "page_errors": [], "elapsed_ms": 1}, ""
+
+    deleted = []
+
+    async def fake_delete(sid_):
+        deleted.append(sid_)
+        return True
+
+    monkeypatch.setattr(bst, "_sidecar_open", fake_open)
+    monkeypatch.setattr(bst, "_sidecar_delete", fake_delete)
+    captured = {}
+    real_run = bst.run_browser_session_tool
+
+    async def spy_run(ctx, name, args):
+        captured["ctx"] = ctx
+        return await real_run(ctx, name, args)
+
+    monkeypatch.setattr(bst, "run_browser_session_tool", spy_run)
+
+    turns = [done(None, [tool_call("c1", "browser_open", path="/")]),
+             done(None, [tool_call("c2", "browser_close"),
+                         tool_call("c3", "browser_step", action="fill", target="e2",
+                                   value="hunter2")]),
+             done("收工")]
+    rec = Recorder()
+    llm = ScriptedLLM(turns)
+    await mk_runner(sf, llm, rec, tasks={}).run(sid, "填完就收口", asyncio.Event())
+
+    # ① 消息表全表不含明文
+    async with sf() as s:
+        rows = (await s.execute(sql(
+            "SELECT role, tool_args, tool_result FROM message WHERE session_id=:i ORDER BY seq"),
+            {"i": sid})).all()
+    blob = json.dumps([list(r) for r in rows], ensure_ascii=False)
+    assert "hunter2" not in blob, "口令明文进了消息表：close 之后的 step 填不进去，但值照样落库"
+    pair_row = next(list(r)[1] for r in rows
+                    if isinstance(list(r)[1], dict)
+                    and len(list(r)[1].get("tool_calls") or []) == 2)
+    calls = pair_row["tool_calls"]
+    assert [c["function"]["name"] for c in calls] == ["browser_close", "browser_step"]
+    # close 自己不带 value：原样落库，结构不动
+    assert calls[0]["id"] == "c2" and json.loads(calls[0]["function"]["arguments"]) == {}
+    assert calls[1]["id"] == "c3"
+    masked = json.loads(calls[1]["function"]["arguments"])
+    assert masked["value"] == "<redacted:sensitive_input>"
+    assert masked["action"] == "fill" and masked["target"] == "e2"
+
+    # ② WS 推送那一份
+    evs = [e for e in rec.events if e["type"] == "tool_call"]
+    assert [e["name"] for e in evs] == ["browser_open", "browser_close", "browser_step"]
+    assert evs[2]["args"]["value"] == "<redacted:sensitive_input>"
+    assert "hunter2" not in json.dumps(evs, ensure_ascii=False)
+
+    # ③ 这一步真的什么都没做成：会话被同一条消息里的 close 关掉、sidecar 没收到载荷、
+    #    结果侧的 browser_log 里也没有 fill 这一条（拒绝出口不写 run_state）
+    assert deleted == ["sid-1"]
+    assert seen == []
+    assert [s_.get("action") for s_ in captured["ctx"].run_state["browser_log"]] == ["open"]
+
+    # ④ 当轮回注模型仍是原值（这一支没执行成功，模型要靠它重开会话再填一遍）
+    back = [m for m in llm.received[2] if m["role"] == "assistant" and m.get("tool_calls")]
+    assert json.loads(back[-1]["tool_calls"][1]["function"]["arguments"])["value"] == "hunter2"
+
+
 @pytest.fixture
 def pv_seams(monkeypatch):
     """预览重启链路的 Docker 侧替身：预检放行、探针 200、起栈像真引擎那样把终态写进库。"""

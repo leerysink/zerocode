@@ -666,10 +666,11 @@ def _step_failure(ctx, data: dict, *, target_netloc: str, display_netloc: str,
 # 不拿动作之后的新快照做后两件：ref 是按采集顺序现编的、每次重渲染全部作废（规格 §6.2），
 # 用新快照反查 `e7` 会标到另一个元素上——名字画错比不画更糟，遮断遮错对象就是明文泄漏。
 # 参数侧还多两条「清单说了也不算」的从严（`is_sensitive_ref_or_unknown` 与位次规则，Critical C-1
-# 的裁定 R-34 / R-35）：它在派发之前跑，天生只能拿到本轮开始时那份清单，而一条消息里发两个 step 时
+# 的裁定 R-34 / R-35 / R-36）：它在派发之前跑，天生只能拿到本轮开始时那份清单，而一条消息里发两个 step 时
 # 第二步面对的是「已经被第一步改写过、但这一行写不出来」的页面——第二步的 ref 既可能全新（旧清单
 # 查无此号），也可能复用旧索引（每次重渲染从头重编，规格 §6.2：旧清单里的 `e2` 是搜索框，
-# 展开表单后的 `e2` 是口令框）。两条合起来的效果是：只有**第一条** step 按轮初清单判。
+# 展开表单后的 `e2` 是口令框）。两条合起来的效果是：只有**本条消息在这一步之前没有别的浏览器调用
+# 改写过页面**的那条 step，才按轮初清单判（改写者含 `_open`，裁定 R-36）。
 def is_sensitive_ref(refs, ref: str) -> bool:
     """sensitive 判定的**唯一口径**：两处 value 遮断（结果侧与参数侧）共用它，不许各写一遍。"""
     if not ref:
@@ -768,14 +769,15 @@ def redact_sensitive_step_args(tool_calls, refs) -> tuple[list[dict], int]:
     判定与 `browser_log` 那一处**同源同口径**：同一个 `is_sensitive_ref`、同一份「动作之前」
     的清单（`refs` 由调用方从 `ctx.run_state["browser_refs"]` 取，一轮内不变）。一处遮一处不遮
     就是漏，所以两处共用一个判定，不在这里重写规则。参数侧额外多两条从严（Critical C-1）：
-    「未知句柄也遮」（`is_sensitive_ref_or_unknown`），以及**位次从严**（裁定 R-35，见下）。
+    「未知句柄也遮」（`is_sensitive_ref_or_unknown`），以及**位次从严**（裁定 R-35 / R-36，见下）。
 
-    位次从严（R-35，收 C-1 残留）：`refs` 是**本轮开始时**那份清单，它只对**第一条**
-    `browser_step` 权威——那之前本 run 没有别的步改写过页面。第 2 条及以后面对的是「已经被
-    前几条 step 换过一遍、但落库这行写在派发之前、写不出来它长什么样」的清单，而两种失效形状
-    都在这份旧清单上判不出来：新出现的 ref（旧清单查无此号，由「未知即遮」兜），以及
-    **复用旧索引**的 ref（旧 `e2=搜索框`、`click` 展开后 `e2=口令框`，未知即遮兜不到，
-    因为它在清单里）。与其猜那份清单长什么样，不如一律按 sensitive 处理。
+    位次从严（R-35，收 C-1 残留）：`refs` 是**本轮开始时**那份清单（`loop.py` 在派发前一次读死，
+    整轮不变），它只对**本条消息在这一步之前没有别的浏览器调用改写过页面**的那条 `browser_step`
+    权威。之后的每一条面对的是「已经被前几条调用换过一遍、但落库这行写在派发之前、写不出来它长
+    什么样」的清单，而三种失效形状都在这份旧清单上判不出来：新出现的 ref（旧清单查无此号，由
+    「未知即遮」兜）、**复用旧索引**的 ref（旧 `e2=搜索框`、`click` 展开后 `e2=口令框`，未知即遮
+    兜不到，因为它在清单里），以及**同一条消息里换页**（`browser_open` 之后 `e2` 是新页的元素，
+    裁定 R-36）。与其猜那份清单长什么样，不如一律按 sensitive 处理。
     代价是同轮多调用时非口令的 fill 也显示成占位符（每次走查 0–2 条的量级），
     而 sidecar 拿的仍是原值，功能不断。结果侧不需要同这条：它逐步读各自动作前的清单，恒是新的。
 
@@ -787,10 +789,16 @@ def redact_sensitive_step_args(tool_calls, refs) -> tuple[list[dict], int]:
     原值照样送达（US-08 的登录要真填进去），当轮回注模型的 assistant tool_calls 也保留原值，
     否则模型下一步重试时会把占位符当口令填进表单。
     """
-    # `rewrite_tool_calls_args` 只把带**可解析 arguments 的 browser_step**交给 `rewrite`，
-    # 且按列表原顺序逐条调用——正好是 loop 的派发顺序，所以这个计数器读得出的就是
-    # 「这是本轮第几条真会被派发的 step」。带不了 value 的畸形条目也占一个位次：
-    # 它排在前面时后面的 fill 更该从严，不是更该被信任。
+    # `rewrite_tool_calls_args` 只把带**可解析 arguments 的浏览器调用**交给 `rewrite`，且按列表
+    # 原顺序逐条调用——正好是 loop 的派发顺序，所以这个计数器读得出的就是「派发到这里之前，
+    # 本条消息里已经有几条浏览器调用可能改写过页面清单」。名单取 `SESSION_TOOL_NAMES`
+    # （open / step / close 三个，裁定 R-36）：改写 `browser_refs` 的不止 `_step`，`_open` 也写它，
+    # 而 `_close` 之后的 step 必然被拒、值进不了表单却照样明文落库——同一条消息里排在前面的
+    # 任何一个都让轮初那份清单不再是当步的事实。非浏览器调用（fs_write 之类）改不动清单，
+    # 不进口径：把它们算进去就是把「一条写文件 + 一条正常 step」也遮掉，那是明确拒绝的一刀切。
+    # 不带 value 的调用同样占一个位次：它排在前面时后面的 fill 更该从严，不是更该被信任。
+    # open / close 自己不带 `value` 键，走下面那条早退分支——身份与结构都不受影响
+    # （`redact.py` 的「处数 0 保留原条目对象」这条契约就是靠它成立的）。
     ordinal = 0
 
     def rewrite(args):
@@ -802,14 +810,14 @@ def redact_sensitive_step_args(tool_calls, refs) -> tuple[list[dict], int]:
         if not value:
             return args, 0
         if ordinal == 1 and not is_sensitive_ref_or_unknown(refs, str(args.get("target") or "")):
-            # 只有位次 1 才按轮初清单放行；位次 2 起清单不作权威（R-35）
+            # 只有位次 1 才按轮初清单放行；位次 2 起清单不作权威（R-35 + R-36）
             return args, 0
         if contains_redaction_marker(value):
             # 已被通用规则表遮过一轮：幂等，不重复计数也不套娃（检查排在转换之后）
             return args, 0
         return {**args, "value": SENSITIVE_VALUE_PLACEHOLDER}, 1
 
-    return rewrite_tool_calls_args(tool_calls, rewrite, ("browser_step",))
+    return rewrite_tool_calls_args(tool_calls, rewrite, SESSION_TOOL_NAMES)
 
 
 def _append_log(ctx, entry: dict) -> None:
