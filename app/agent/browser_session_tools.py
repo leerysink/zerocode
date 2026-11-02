@@ -795,16 +795,24 @@ async def _step(ctx, args: dict) -> dict:
         # 而 browser_log 会经 `browser_close` 与步骤卡进消息历史（US-19）。
         entry.update({"value": "" if sensitive else _redact(value, VALUE_MAX_CHARS)[0],
                       "value_redacted": sensitive})
-    _append_log(ctx, entry)
 
     result = _shape_state(ctx, data, opened=False, url=display_url, status=info["status"],
                           target_netloc=target_netloc, display_netloc=display_netloc)
     result["steps_charged"] = steps_charged
+    # 断言未通过的那一步，`note` 也要进账（裁定 R-31 第 2 条）：改前只有「点不动」带 `error`，
+    # 「点了但结果不对」在收口报告的 report 项里一片空白，步骤卡因此一半有红字原因、一半什么也没说。
+    # 写日志的顺序因此排在 `_shape_state` 之后——复用模型这一步看到的那一份已清洗文本，
+    # 而不是另调一次 `_sidecar_text`（两处各写一遍迟早分家）。
+    # 通过的那一步不写：`_shape_state` 对 passed:true 给的是空串（sidecar 的既有行为，见那里）。
+    if data.get("passed") is False:
+        entry["note"] = result.get("note") or ""
+    _append_log(ctx, entry)
     return await _attach_shot(ctx, sid, args, data, {**result, **echo})
 
 
 async def _close(ctx, _args: dict) -> dict:
-    """US-07：收口报告说事实——走了几步（含点不动的步）、几步断言失败、失败在哪步，覆盖第几个会话。"""
+    """US-07：收口报告说事实——走了几步（含点不动的步）、几步断言失败、几步点不动、失败在哪步、
+    覆盖第几个会话。断言账（`steps_failed`）与动作账（`steps_action_failed`）各报各的数。"""
     sid = str(ctx.run_state.get("browser_session") or "")
     steps = list(ctx.run_state.get("browser_log") or [])
     if sid:
@@ -813,6 +821,13 @@ async def _close(ctx, _args: dict) -> dict:
     # `steps_failed` 只数「断言未通过」（`passed is False`），一条 `ok:false` 都不算进来：
     # 那是「点不动」，与「点了但结果不对」是两本账（发现项 I-1 的前置约束）。
     failed = [s for s in steps if s.get("passed") is False]
+    # 两本账的另一本也要单独报数（裁定 R-31 第 1 条）：`ok is False` 的步即「点不动」。
+    # 只靠 `steps_total - steps_failed` 反推的话，「12 次点不动 + 一次 open」会被读成
+    # 「12 步都推进了」，而它们连一次都没走到位。
+    action_failed = [s for s in steps if s.get("ok") is False]
+    # 真跑过判定的步：`passed` 非 None 才说明那一步带 expect。open 那条与没给 expect 的步
+    # 都是 None，所以这个数就是「本 run 声明过几条断言」。
+    declared = [s for s in steps if s.get("passed") is not None]
     report = []
     for s in steps:
         item = {"seq": s.get("seq"), "action": s.get("action"),
@@ -826,6 +841,11 @@ async def _close(ctx, _args: dict) -> dict:
         # `_redact` 是纵深防御——报告是会被原样贴进消息历史的那一份。
         if s.get("error"):
             item["error"] = _redact(s["error"], ERROR_MAX_CHARS)[0]
+        # 断言没过那一步的原因同理（裁定 R-31 第 2 条）：改前只有 `error` 进报告，
+        # 于是步骤卡「点不动那步有红字原因、断言没过那步什么也没说」。
+        # note 同样在写 log 前过了 `_sidecar_text`，这里只是补上报告这一头的对称性。
+        if s.get("note"):
+            item["note"] = _redact(s["note"], NOTE_MAX_CHARS)[0]
         # 被替换的会话数写在 open 那一条上（裁定 R-25）：前端步骤卡渲染的是 report，
         # 只有返回值带着这个事实的话，看报告的人仍旧会把它当成整个 run 的全貌。
         if s.get("replaced_sessions"):
@@ -833,8 +853,19 @@ async def _close(ctx, _args: dict) -> dict:
         report.append(item)
     replaced = int(ctx.run_state.get("browser_sessions_replaced") or 0)
     opens = int(ctx.run_state.get("browser_opens") or 0)
-    hint = ("以下断言未通过：" + ", ".join(str(f.get("seq")) for f in failed)
-            if failed else "所有已声明的断言均通过")
+    # 汇总行的三档措辞（裁定 R-31 第 1 条）：「断言没过」/「声明过的都过了」/「压根没声明断言」。
+    # 中间那档只在 `declared` 非空时才成立：一个 expect 都没写过的 run 讲「所有已声明的断言均通过」
+    # 字面为真，但模型对 browser_close 的默认读法就是看这一行、不逐条翻 report，
+    # 于是「从未验证」会被讲成「验证过且全绿」。
+    if failed:
+        hint = "以下断言未通过：" + ", ".join(str(f.get("seq")) for f in failed)
+    elif declared:
+        hint = "所有已声明的断言均通过"
+    else:
+        hint = "本次走查未声明任何断言（各步只做了动作，结论要自己读页面文本判断）"
+    if action_failed:
+        # 追加而不是并入 `steps_failed`：两本账合一个数就分不出「12 次点不动」与「12 次断言不过」。
+        hint += f"；另有 {len(action_failed)} 步动作未成功（见 report 的 ok:false 项）"
     if opens > 1 or replaced:
         # 不合并历史是刻意的（一个 run 一个会话）：合并会让 steps_total 与 per-run 步数账对不上。
         # 但既然只覆盖最后一个会话就必须说出来——否则这份报告会被读成整个 run 的全貌。
@@ -844,7 +875,8 @@ async def _close(ctx, _args: dict) -> dict:
                  "被自动关闭），report 只覆盖最后一个会话的步骤")
     return {"ok": True, "closed": bool(sid), "steps_total": len(steps),
             "steps_used": int(ctx.run_state.get("browser_steps_used") or 0),
-            "steps_failed": len(failed), "sessions_replaced": replaced,
+            "steps_failed": len(failed), "steps_action_failed": len(action_failed),
+            "sessions_replaced": replaced,
             "sessions_opened": opens,
             "report": report, "hint": hint}
 

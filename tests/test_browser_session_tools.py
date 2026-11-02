@@ -1720,7 +1720,47 @@ async def test_close_report_counts_failed_actions_without_calling_them_assertion
     assert "ref" in out["report"][2]["error"]
     assert "error" not in out["report"][0] and "error" not in out["report"][3]
     assert "均通过" not in out["hint"] and "3" in out["hint"]
+    assert "另有 2 步动作未成功" in out["hint"]          # 两本账在汇总行里都露头
     assert "192.168.65.254" not in json.dumps(out, ensure_ascii=False)
+
+
+async def test_close_report_carries_the_assertion_note(monkeypatch):
+    """裁定 R-31 第 2 条：断言未通过那一步的 `note` 也要进 log 与 report。
+
+    改前只有动作失败带 `error`，断言失败在 report 里什么也没说——步骤卡因此「点不动那步有红字
+    原因、断言没过那步一片空白」。note 与 error 同源（sidecar 自由文本），写日志前已过同一把
+    清洗闸，报告里再过一遍 `_redact` 是纵深防御。
+    """
+    replies = [_step_data(passed=True, note="页面文本未包含「已创建」"),
+               _step_data(passed=False,
+                          note="URL 不匹配：实际停在 http://192.168.65.254:8241/orders")]
+
+    async def fake_step(sid, payload):
+        return replies.pop(0), ""
+
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    monkeypatch.setattr(bst, "browser_target_host", lambda: "host.docker.internal")
+    monkeypatch.setattr(bst, "_sidecar_open", lambda url, **kw: _aget((_session_ok(), "")))
+    monkeypatch.setattr(bst, "_sidecar_delete", lambda sid: _aget(True))
+    monkeypatch.setattr(bst, "_sidecar_step", fake_step)
+    monkeypatch.setattr(bst, "_sidecar_screenshot", lambda sid: _aget((None, "本测试不验截图")))
+    ctx = Ctx()
+    await bst.run_browser_session_tool(ctx, "browser_open", {"path": "/orders"})
+    expect = {"type": "text_contains", "value": "已创建"}
+    logged = []
+    for _ in range(2):
+        out = await bst.run_browser_session_tool(
+            ctx, "browser_step", {"action": "click", "target": "e1", "expect": expect})
+        # 写进账的那一句，就是模型这一步看到的那一句（两处各写一遍迟早分家）
+        logged.append(ctx.run_state["browser_log"][-1].get("note"))
+    assert logged[0] is None and logged[1] == out["note"]
+    close = await bst.run_browser_session_tool(ctx, "browser_close", {})
+    report = close["report"]
+    assert "note" not in report[1]                        # 断言通过的那步不假装有失败说明
+    assert report[2]["passed"] is False
+    assert "URL 不匹配" in report[2]["note"]
+    assert "localhost:8241/orders" in report[2]["note"]    # 换回用户看得见的那个地址
+    assert "192.168.65.254" not in json.dumps(close, ensure_ascii=False)
 
 
 # --------------------------------------------------------------------------- browser_close
@@ -1744,11 +1784,61 @@ async def test_close_reports_failed_steps(monkeypatch):
 async def test_close_reports_all_assertions_passed(monkeypatch):
     ctx = Ctx()
     ctx.run_state["browser_session"] = "abc"
-    ctx.run_state["browser_log"] = [{"seq": 0, "action": "open", "target": "/", "passed": None}]
+    ctx.run_state["browser_log"] = [
+        {"seq": 0, "action": "open", "target": "/", "passed": None},
+        {"seq": 1, "action": "click", "target": "e1", "ok": True, "passed": True}]
     monkeypatch.setattr(bst, "_sidecar_delete", lambda sid: _aget(True))
     out = await bst.run_browser_session_tool(ctx, "browser_close", {})
     assert out["ok"] is True and out["closed"] is True and out["steps_failed"] == 0
     assert "均通过" in out["hint"]
+
+
+async def test_close_hint_does_not_call_an_unasserted_run_clean(monkeypatch):
+    """裁定 R-31 第 1 条（空真那一半）：从未声明 expect 的 run 不能说「所有已声明的断言均通过」。
+
+    「未声明任何断言」与「声明的断言均通过」是两件事：前者是本步没做判定（模型自判），
+    后者是走了查且全绿。字面上都为真，但模型对 `browser_close` 的默认读法只看汇总行、
+    不逐条翻 report，把前者讲成后者就是凭空造出一条「已验证通过」的假结论。
+    """
+    ctx = Ctx()
+    ctx.run_state["browser_session"] = "abc"
+    ctx.run_state["browser_log"] = [
+        {"seq": 0, "action": "open", "target": "/", "passed": None},
+        {"seq": 1, "action": "click", "target": "e1", "ok": True, "passed": None}]
+    monkeypatch.setattr(bst, "_sidecar_delete", lambda sid: _aget(True))
+    out = await bst.run_browser_session_tool(ctx, "browser_close", {})
+    assert out["steps_failed"] == 0 and out["steps_action_failed"] == 0
+    assert "均通过" not in out["hint"]
+    assert "未声明任何断言" in out["hint"]
+
+
+async def test_close_hint_counts_action_failures_even_without_any_expect(monkeypatch):
+    """裁定 R-31 第 1 条（该组合此前无测试）：动作失败拉满、一条 expect 都没声明。
+
+    这是最贵的一种失真——`steps_failed` 恒 0、断言层确实「全绿」，而 12 次点不动只在 report 的
+    `ok:false` 项里逐条躺着。hint 必须另报 `steps_action_failed`，否则汇总行讲成一路干净。
+    """
+    async def fake_step(sid, payload):
+        return ({"ok": False, "error": "元素不可点击或动作失败: timeout",
+                 "url": "http://192.168.65.254:8241/orders", "interactive": _interactive(),
+                 "steps_charged": True}), ""
+
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    monkeypatch.setattr(bst, "_sidecar_open", lambda url, **kw: _aget((_session_ok(), "")))
+    monkeypatch.setattr(bst, "_sidecar_delete", lambda sid: _aget(True))
+    monkeypatch.setattr(bst, "_sidecar_step", fake_step)
+    _no_shot(monkeypatch)
+    ctx = Ctx()
+    await bst.run_browser_session_tool(ctx, "browser_open", {"path": "/orders"})
+    for _ in range(bst.DEFAULT_MAX_STEPS):     # 一直点到步数额度用尽
+        await bst.run_browser_session_tool(ctx, "browser_step", {"action": "click", "target": "e1"})
+    out = await bst.run_browser_session_tool(ctx, "browser_close", {})
+    assert out["steps_action_failed"] == bst.DEFAULT_MAX_STEPS
+    assert out["steps_failed"] == 0                       # 两本账不串（发现项 I-1 的口径）
+    assert out["steps_total"] == bst.DEFAULT_MAX_STEPS + 1
+    assert "均通过" not in out["hint"]
+    assert f"另有 {bst.DEFAULT_MAX_STEPS} 步动作未成功" in out["hint"]
+    assert "未声明任何断言" in out["hint"]                 # 两个缺口都要说出口
 
 
 async def test_close_redacts_report_targets(monkeypatch):
