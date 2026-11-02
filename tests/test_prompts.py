@@ -156,3 +156,15 @@ def test_no_preview_block_by_default():
     assert "<preview>" not in build_system_prompt("/ws", "2026-10-29")
     assert "<preview>" not in build_system_prompt("/ws", "2026-10-29", app_contract="【应用契约】")
 
+
+
+def test_clarify_prompt_orders_plan_before_implementation():
+    """文档时机（ADR-0033 复盘补的裁定）：计划先行、ADR 可后补，且只征询一次。
+
+    只钉三处短语与它们的先后，不比对整段文案——否则改一个字就得回来修测试。
+    """
+    from app.agent.prompts import build_clarify_prompt
+    p = build_clarify_prompt()
+    assert "<clarify_mode>" in p
+    assert p.index("先落计划再动代码") < p.index("允许在实现之后补")  # 先后本身要成立
+    assert "共用第 8 步那一次征询" in p                              # 不为 ADR 再打断一轮
