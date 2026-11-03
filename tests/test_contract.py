@@ -111,3 +111,43 @@ def test_contract_small_stack_text_byte_identical(tmp_path):
     assert c.rstrip().endswith("正式使用请点「发布」。")     # 1)–7) 尾行未变
     assert "已由平台注入，代码不得自行拼接或硬编码" not in c   # 负向 pin 用真实子串（springboot 专属那句不得漏进小栈）
     assert "退出重登" not in c                                  # 10) 补的 LoginUser 缓存句只跟大型栈走
+
+
+META_MOBILE = {**META_SB, "stack": "vue3-springboot-mobile"}
+
+
+def test_mobile_contract_is_the_large_contract_plus_the_mobile_slice(tmp_path):
+    """移动栈 = 大栈文案逐字节 + 尾部追加的移动端段（规格 §5：大栈文案不变）。
+
+    除栈标签这一处替换外，两段文本必须完全相等：往共用段或大栈段里顺手塞一句，
+    会同时改变所有已生成应用的提示词，而症状只会以「Agent 行为变了」的形式出现。
+    """
+    from app.deploy import contract
+    large = _contract(tmp_path, META_SB)
+    mob = _contract(tmp_path, META_MOBILE)
+    extra = contract.STACK_EXTRA[contract.MOBILE_STACK]
+    base = contract.STACK_EXTRA["vue3-springboot"]
+    assert extra.startswith(base)                                       # 基座 8)–11) 一条不少
+    mobile_only = extra[len(base):]
+    assert mob.endswith(mobile_only)                                     # 移动端段只在尾部追加
+    assert mob[:-len(mobile_only)] == large.replace(
+        "Vue3 + Spring Boot 3，", "Vue3 + Spring Boot 3 + uni-app 移动端，")
+
+
+def test_contract_mobile_stack_states_the_uni_app_conventions(tmp_path):
+    """US-04 的判据：Agent 读到的契约里必须写清 uni-app 的四个约定与账号口径。"""
+    c = _contract(tmp_path, META_MOBILE)
+    for anchor in ("frontend/mobile/", "`uni.*` API", "条件编译", "rpx", "相对 `/api`",
+                   "/h5/", "h5.router.base", "pages.json", "不要为移动端新增发布端口",
+                   "移动端用户", "role_key 为 `mobile`", "POST /auth/register",
+                   "后台用户列表默认就按这个角色过滤"):
+        assert anchor in c, anchor
+    assert "\n12)" in c and "\n13)" in c and "\n14)" in c
+    assert c.count("Vue3 + Spring Boot 3 + uni-app 移动端") == 1
+
+
+def test_mobile_stack_key_agrees_with_the_registry():
+    """契约里的栈 key 是字面量：与 compose 登记、栈注册表必须是同一个字符串。"""
+    from app.deploy import compose, contract
+    from app.services import app_service
+    assert contract.MOBILE_STACK == compose.MOBILE_STACK == app_service.MOBILE_STACK

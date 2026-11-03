@@ -104,6 +104,14 @@ export const prodStatus = (id) => http.get(`/apps/${id}/prod/status`)
 export const appRecords = (id, limit = 50) => http.get(`/apps/${id}/records`, { params: { limit } })
 export const deleteRecord = (id, rid) => http.delete(`/apps/${id}/records/${rid}`)
 export const appUrls = (id) => http.get(`/apps/${id}/urls`)
+// 移动端分发（规格 2026-11-03 US-15~US-19）：H5 地址只读投影 + APK 写进 prod 的 uploads 卷。
+// APK 体积上限在服务端（200MB）；前端传 onUploadProgress 只为进度条，不做第二条体积闸门。
+export const appMobile = (id) => http.get(`/apps/${id}/mobile`)
+export const uploadMobileApk = (id, file, onUploadProgress) => {
+  const fd = new FormData()
+  fd.append('file', file)
+  return http.post(`/apps/${id}/mobile/apk`, fd, { onUploadProgress })
+}
 // 应用资源监控（Ticket 001）：当前实时值（本期 workspace_size + prod_status）。
 export const appMetricsCurrent = (id) => http.get(`/apps/${id}/metrics/current`)
 // 历史曲线（Ticket 002）：window 取 1h/24h/7d/30d，返回各 kind 时序。

@@ -16,8 +16,10 @@ SCHEMA = "zc-release/1"
 # （需求决策与计划），与同样被排除的 README.md/deploy/sqlchange 一类——不是应用运行内容，
 # 且 ADR 里可能含内部讨论，不能让装机者拿到。新增顶层目录时记得回来交代它算哪一类。
 EXCLUDE_TOP = {"deploy", "sqlchange", "app.json", "README.md", "docs"}
+# unpackage/ 是 HBuilderX 在移动栈 frontend/mobile/ 下生成的打包产物（本地/云打包都会写），
+# 可随时重新生成、体积又不小；与 node_modules/dist 同类，既不进包也不算源码分叉。
 EXCLUDE_DIRS = {"node_modules", ".venv", "dist", "__pycache__", ".pytest_cache", ".vite",
-                "venv", "build"}
+                "venv", "build", "unpackage"}
 # 大型栈 dev 预览就地跑 mvn：backend/target 与 backend/logs 直接落在应用工作区里。不收它们，
 # 每预览一次 source_hash 就变一次（分叉判定会误报），包体还要背上几百 MB 编译产物。
 # 按路径尾屏蔽而非裸名：target / logs 都是业务通用词（目标管理、日志页面），按名屏蔽会把作者的

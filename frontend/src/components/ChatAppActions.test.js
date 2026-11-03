@@ -12,6 +12,8 @@ vi.mock('../api', () => ({
   devStart: vi.fn(), devStop: vi.fn(), devRestart: vi.fn(),
   devReset: vi.fn().mockResolvedValue({ data: { ok: true } }),
   prodStart: vi.fn(), prodStop: vi.fn(),
+  // 移动端弹框的 import 面：本文件把组件整体桩掉，但按命名导出解析时必须存在
+  appMobile: vi.fn(), uploadMobileApk: vi.fn(),
   // chat store 的 import 面，组件不直接调，但不给会解析失败
   getMessages: vi.fn(), getSessionDetail: vi.fn(), listModels: vi.fn(),
   listWorkspaces: vi.fn(), patchSessionModel: vi.fn(), wsUrl: vi.fn(() => 'ws://test'),
@@ -30,6 +32,7 @@ import { useChatStore } from '../stores/chat'
 const APPS = [
   { id: 11, workspace_id: 101, slug: 'win', stack: 'vue3-fastapi', dev_port: 8211, status_dev: 'running', preview_url: 'http://localhost:8211/', prod_port: 8210, status_prod: 'running', prod_url: 'https://win.example.test' },
   { id: 12, workspace_id: 102, slug: 'test1', stack: 'vue3-fastapi', dev_port: 8213, status_dev: 'stopped', preview_url: 'http://localhost:8213/', prod_port: 8212, status_prod: 'stopped', prod_url: 'https://test1.example.test' },
+  { id: 13, workspace_id: 103, slug: 'mob', stack: 'vue3-springboot-mobile', dev_port: 8215, status_dev: 'running', preview_url: 'http://localhost:8215/', prod_port: 8214, status_prod: 'running', prod_url: 'https://mob.example.test' },
 ]
 
 // 下拉：antd 的 overlay 是懒渲染的，桩把触发区与浮层都渲出来，菜单项才可点
@@ -69,6 +72,7 @@ const mountActions = () =>
         'a-drawer': DrawerStub, 'a-modal': ModalStub,
         DeployLogPanel: LogsStub, MetricsModal: MetricsStub,
         PublishModal: PublishStub, PublishHistory: HistoryStub,
+        MobileModal: MobileStub,
       },
     },
   })
@@ -363,6 +367,13 @@ const MetricsStub = {
     return h('div', { class: 'stub-metrics', 'data-slug': this.app?.slug })
   },
 }
+const MobileStub = {
+  name: 'MobileModal',
+  props: ['app', 'open'],
+  render() {
+    return h('div', { class: 'stub-mobile', 'data-slug': this.app?.slug })
+  },
+}
 const DrawerStub = {
   name: 'a-drawer',
   props: ['open'],
@@ -425,6 +436,37 @@ it('四个壳子互斥：开监控会把日志抽屉关掉', async () => {
   expect(w.find('.stub-logs').exists()).toBe(false)
   expect(w.find('.stub-metrics').exists()).toBe(true)
   expect(w.find('.stub-metrics').attributes('data-slug')).toBe('test1')
+})
+
+// ---- 移动端入口（规格 2026-11-03 US-19）：只对移动栈出现，点开与卡面共用同一个弹框 ----
+it('非移动栈会话的「更多」没有移动端入口', async () => {
+  useChatStore().currentWorkspaceId = 102 // vue3-fastapi
+  const w = mountActions()
+  await flushPromises()
+  expect(w.find('.zc-menu-mobile').exists()).toBe(false)
+})
+
+it('移动栈会话的「更多」多出「移动端」，点开挂上共用弹框并传当前应用', async () => {
+  useChatStore().currentWorkspaceId = 103
+  const w = mountActions()
+  await flushPromises()
+  const item = w.find('.zc-menu-mobile')
+  expect(item.exists()).toBe(true)
+  await item.trigger('click')
+  const modal = w.find('.stub-mobile')
+  expect(modal.exists()).toBe(true)
+  expect(modal.attributes('data-slug')).toBe('mob')
+})
+
+it('移动端弹框与日志抽屉互斥', async () => {
+  useChatStore().currentWorkspaceId = 103
+  const w = mountActions()
+  await flushPromises()
+  await w.find('.zc-menu-logs').trigger('click')
+  expect(w.find('.stub-logs').exists()).toBe(true)
+  await w.find('.zc-menu-mobile').trigger('click')
+  expect(w.find('.stub-logs').exists()).toBe(false)
+  expect(w.find('.stub-mobile').exists()).toBe(true)
 })
 
 it('「数据库操作」是新标签整页链接，指向当前应用', async () => {

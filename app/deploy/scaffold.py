@@ -71,3 +71,14 @@ def render(template: Path, dst: Path, mapping: dict) -> None:
         hit = RESIDUE.search(p.read_text(encoding="utf-8", errors="replace"))
         if hit:
             raise DeployError(f"占位符渲染残留: {p.relative_to(dst)} 处有 {hit.group(0)}")
+
+
+def render_layers(templates, dst: Path, mapping: dict) -> None:
+    """按序叠加多层模板（规格 2026-11-03 US-03 / ADR-0039）：后层覆盖同路径，基底独有文件保留。
+
+    正当实现就是「逐层调 render」，不是合并也不是替换：第二层只有它自己那几个文件，
+    抹掉第一层等于把 springboot 后端代码从产物里删了。逐层各跑一次残留自检还有额外好处——
+    基底坏了在覆盖层落地前就报，错误信息指向真正的肇事模板。
+    """
+    for template in templates:
+        render(template, dst, mapping)

@@ -258,11 +258,13 @@ class FakeBrowser:
     def __init__(self, page_factory=None):
         self.page_factory = page_factory or (lambda: FakePage(url=OPEN_URL, nodes=NODES))
         self.contexts: list[FakeContext] = []
+        self.context_kwargs: list[dict] = []
         self.closed = False
 
     async def new_context(self, **kw):
         context = FakeContext(self.page_factory())
         self.contexts.append(context)
+        self.context_kwargs.append(kw)
         return context
 
     async def close(self):
@@ -282,7 +284,12 @@ class FakePlaywright:
 
     打桩点在 `async_playwright` 而不是 `_browser`：startup 会给模块全局 `_browser` 赋值，
     进 TestClient 之前塞进去的假浏览器会被它覆盖掉。
+    `devices` 模拟 Playwright 自带的设备表（`resolve_device_options` 从 _playwright 上读它）。
     """
+
+    devices = {"iPhone 14": {"user_agent": "UA", "viewport": {"width": 390, "height": 664},
+                             "device_scale_factor": 3, "is_mobile": True, "has_touch": True,
+                             "default_browser_type": "webkit"}}
 
     def __init__(self, browser):
         self.chromium = FakeChromium(browser)
@@ -711,6 +718,37 @@ def test_open_registers_a_session_and_returns_the_state_contract(client):
     # 首屏 console 是整份报的（增量账从这里才开始），失败请求同理
     assert body["console"] == [{"level": "error", "text": "首屏就炸了", "truncated": False}]
     assert body["page_errors"] == []
+
+
+def test_open_applies_the_device_viewport(client):
+    """US-20：设备名落到 context 的建立上；采集字段与桌面路径完全同一套（US-21）。"""
+    body = _open(client, device="iPhone 14").json()
+    assert body["ok"] is True
+    kw = client.fake_browser.context_kwargs[-1]
+    assert kw["viewport"] == {"width": 390, "height": 664}
+    assert kw["device_scale_factor"] == 3
+    assert kw["is_mobile"] is True and kw["has_touch"] is True
+    assert kw["locale"] == "zh-CN"
+    assert "default_browser_type" not in kw
+    # 采集契约不变：桌面与移动端都从同一个 collect_page_state 出同样的键
+    assert {"title", "text", "interactive", "console", "failed_requests"} <= set(body)
+
+
+def test_open_rejects_unknown_device_before_creating_a_context(client):
+    r = _open(client, device="iPhone 99")
+    assert r.status_code == 400
+    assert "iPhone 99" in r.json()["detail"]
+    assert client.fake_browser.contexts == []
+
+
+def test_inspect_accepts_device_and_rejects_unknown(client):
+    ok = client.post("/inspect", json={"url": OPEN_URL, "device": "iPhone 14"})
+    assert ok.status_code == 200 and ok.json()["ok"] is True
+    kw = client.fake_browser.context_kwargs[-1]
+    assert kw["viewport"] == {"width": 390, "height": 664}
+
+    bad = client.post("/inspect", json={"url": OPEN_URL, "device": "No Such Phone"})
+    assert bad.status_code == 400 and "No Such Phone" in bad.json()["detail"]
 
 
 def test_open_does_not_take_the_inspect_semaphore(client, monkeypatch):

@@ -277,15 +277,18 @@ async def _ensure_prod_proxy_conf(root: Path, stack: str = "vue3-fastapi") -> bo
     模板源取 `app_service.TEMPLATES`——平台唯一写入方就地补文件，不造 parents 链（控制者裁定）。
     补齐源按栈取（C2）：给大型应用刷 fastapi 那份 = 把 `backend:8000` 的 upstream 塞进它镜像，
     必须跟着 app 自己的 stack 走；`stack` 默认 vue3-fastapi 保旧调用形状不变。
+    叠加栈（移动栈）按层序**倒序**找：覆盖层先于基底，与 scaffold 渲染「后者胜」一致。
     """
-    from app.services.app_service import TEMPLATES
+    from app.services.app_service import TEMPLATES, template_layers_of
     fe = root / "frontend"
     conf = fe / "nginx.conf"
     patched = False
     if fe.is_dir() and not conf.is_file():
-        src = TEMPLATES / stack / "frontend" / "nginx.conf"
-        if not src.is_file():
-            raise DeployError(f"生产反代模板缺失：{src}", status=500)
+        src = next((TEMPLATES / layer / "frontend" / "nginx.conf"
+                    for layer in reversed(template_layers_of(stack))
+                    if (TEMPLATES / layer / "frontend" / "nginx.conf").is_file()), None)
+        if src is None:
+            raise DeployError(f"生产反代模板缺失：{stack}/frontend/nginx.conf", status=500)
         conf.write_text(src.read_text(encoding="utf-8"), encoding="utf-8", newline="")
         patched = True
     if fe.is_dir() and _wire_dockerfile_proxy(fe / "Dockerfile"):

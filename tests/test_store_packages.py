@@ -20,7 +20,9 @@ def app_tree(tmp_path):
                 # 反向地雷：target / logs 都是业务通用词（目标管理、日志页面），不该被一起藏掉
                 "frontend/src/views/target/Index.vue", "frontend/src/views/logs/Index.vue",
                 # 裁定（B1c 后）：上传件算运行时数据，不进包也不进指纹
-                "backend/uploads/2026/09/avatar.png"):
+                "backend/uploads/2026/09/avatar.png",
+                # HBuilderX 的打包产物：可重新生成，不该进包或参与 source_hash
+                "frontend/mobile/unpackage/dist/build/app-plus/app.apk"):
         p = root / rel
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(f"# {rel}\n", encoding="utf-8", newline="")
@@ -52,6 +54,7 @@ def test_write_package_excludes_secrets_and_artifacts(tmp_path, app_tree):
     assert not any(f.startswith("src/backend/target/") for f in files), "包里有 maven 编译产物"
     assert not any(f.startswith("src/backend/logs/") for f in files), "包里有运行时日志"
     assert not any(f.startswith("src/backend/uploads/") for f in files), "上传件是运行时数据，不进包"
+    assert not any("unpackage" in f for f in files), "HBuilderX 打包产物是生成物，不进包"
     assert "src/frontend/src/views/target/Index.vue" in files, "业务目录不该被裸名屏蔽"
     assert "src/frontend/src/views/logs/Index.vue" in files
     assert "sqlchange/V20260920_02_more.sql" not in files, "未应用的迁移不得进包"

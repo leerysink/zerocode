@@ -63,6 +63,31 @@ async def test_export_is_idempotent_no_rewrite(test_engine, tmp_path):
     assert os.stat(out).st_mtime_ns == mtime1, "内容没变却重写了文件"
 
 
+async def test_mobile_stack_app_still_exports_exactly_one_route(test_engine, tmp_path):
+    """移动栈应用在 routes.json 里只有一条 `{slug: prod_port}`（规格 2026-11-03 §5 反向断言）。
+
+    这条防的是「给移动端再加一个发布端口」的将来：H5 与后台管理系统同源同端口是 ADR-0039 的地基，
+    一旦有人给 /h5 单开端口，网关的 router.lua 只取一级子域当 slug，多出来的那条要么覆盖主路由、
+    要么永远命中不了——两种症状都不会在本地预览里出现，只在线上域名上出现。
+    """
+    sf = make_session_factory(test_engine)
+    async with sf() as s:
+        wid = (await s.execute(text(
+            "INSERT INTO workspace (name, root_path) VALUES (:n, :r) RETURNING id"),
+            {"n": "mob", "r": "/tmp/mob"})).scalar()
+        await s.execute(text(
+            "INSERT INTO app_project (workspace_id, name, slug, scale, stack, prod_port, dev_port, status_prod) "
+            "VALUES (:w, '移动应用', 'mobapp', 'large', 'vue3-springboot-mobile', 8330, 8331, 'running')"),
+            {"w": wid})
+        await s.commit()
+    out = tmp_path / "routes.json"
+
+    result = await gateway_routes.export_routes(sf, out)
+
+    assert result == {"mobapp": 8330}
+    assert _read(out) == {"mobapp": 8330}
+
+
 async def test_malformed_slug_skipped(test_engine, tmp_path, caplog):
     """通配证书只匹配一级域名：含点号等的畸形 slug 不进表，且留下告警。"""
     sf = make_session_factory(test_engine)

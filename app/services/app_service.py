@@ -19,10 +19,23 @@ from app.deploy.slugs import validate_slug
 SCALES = ("small", "large")
 SMALL_STACKS = ("vue3-fastapi", "vue3-node", "static")
 LARGE_STACK = "vue3-springboot"
-STACKS = SMALL_STACKS + (LARGE_STACK,)
+MOBILE_STACK = "vue3-springboot-mobile"   # 大型档 + uni-app 移动端（ADR-0039）
+MOBILE_OVERLAY = "uniapp-overlay"         # 移动栈的模板覆盖层目录名，不是独立栈目录
+LARGE_STACKS = (LARGE_STACK, MOBILE_STACK)
+STACKS = SMALL_STACKS + LARGE_STACKS
 TEMPLATES = REPO_ROOT / "app" / "templates"   # 仓库根/app/templates（同 scaffold 测试的 TEMPLATE 常量）
+# 栈 → 模板层序列：基底在前、覆盖层在后，依次渲染后者胜。
+# 移动栈刻意不复制整份 springboot 模板——两份后端代码修一处忘一处（ADR-0039）。
+TEMPLATE_LAYERS = {MOBILE_STACK: (LARGE_STACK, MOBILE_OVERLAY)}
 HEALTH_BY_STACK = {"vue3-fastapi": "/api/health", "vue3-node": "/api/health",
-                   "vue3-springboot": "/api/health", "static": ""}
+                   "vue3-springboot": "/api/health", "vue3-springboot-mobile": "/api/health",
+                   "static": ""}
+
+
+def template_layers_of(stack: str) -> tuple[str, ...]:
+    """该栈要依次渲染的模板目录名（多数栈就是自己那一层）。"""
+    return TEMPLATE_LAYERS.get(stack, (stack,))
+
 NAME_MAX = 100    # workspace.name / app_project.name 同为 VARCHAR(100)
 # 名字会被内插进生成工程的源码与配置（pom.xml 的 <name>、Java 启动横幅的字符串字面量、main.py 的字符串字面量、
 # index.html 的 <title>），单引号安全（SQL 字面量路径由 scaffold 做 '→'' 转义），故只拒写坏产物的那几个。
@@ -60,13 +73,18 @@ def to_dict(row) -> dict:
 def _check_scale_stack(scale: str, stack: str) -> None:
     if scale not in SCALES:
         raise DeployError(f"规模非法: {scale}（small/large）")
-    if scale == "large" and stack != LARGE_STACK:
+    if scale == "large" and stack not in LARGE_STACKS:
         raise DeployError("大型应用锁定 Vue3 + Spring Boot 3")
+    if scale == "small" and stack not in SMALL_STACKS:
+        # 反方向也要守：只挡「large 必须 springboot 系」时，small + 移动栈会渲染出大型栈目录、
+        # 却在 scale 列上写着 small，两边语义从此打架。
+        raise DeployError(f"该技术栈不属于小型档: {stack}")
     if stack not in STACKS:
         raise DeployError(f"技术栈非法: {stack}")
     # 裁定 R-C：模板未交付的栈在此提前 400（不放行则 scaffold.render 会冒「栈模板不存在 500」）。
     # vue3-springboot 已由 base-pro 移植交付（A3）；vue3-node / static 仍未开放。
-    if not (TEMPLATES / stack).is_dir():
+    # 叠加层的存在性一并在这里判——漏判会把「覆盖层没交付」推迟到渲染中途，留下半套目录。
+    if any(not (TEMPLATES / layer).is_dir() for layer in template_layers_of(stack)):
         raise DeployError(f"该技术栈尚未开放: {stack}（即将上线）", status=400)
 
 
@@ -154,7 +172,9 @@ async def create_app_project(session_factory, *, name: str, slug: str, scale: st
     workspace_id = None
     provisioned_ok = False   # 本流是否真的供给过 dev 库：回滚只允许删本流自己建的东西（I-1）
     try:
-        render = materialize or (lambda rp, mp: scaffold.render(TEMPLATES / stack, rp, mp))
+        render = materialize or (
+            lambda rp, mp: scaffold.render_layers(
+                [TEMPLATES / layer for layer in template_layers_of(stack)], rp, mp))
         render(root_path, mapping)   # R-C 已保证模板目录存在
         app = await _insert_rows(session_factory, name=name_stripped, slug=slug, scale=scale,
                                  stack=stack, root=root_path, prod_port=prod_port,

@@ -1,0 +1,10 @@
+node_modules/
+dist/
+**/node_modules
+**/dist
+**/unpackage
+# 陈旧编译产物会遮蔽真配置（Vite 读 vite.config.js 优先于 .ts），别让它们进构建上下文。
+# 注意这是「仅根目录」的精确匹配：mobile/vite.config.js 是 uni-app 工程的真配置，必须进上下文。
+vite.config.js
+vite.config.d.ts
+*.tsbuildinfo

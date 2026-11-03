@@ -126,10 +126,14 @@ def _error(message: str, **extra) -> dict:
 
 
 async def _sidecar_inspect(target_url: str, timeout_s: int, settle_ms: int,
-                           session_token: str = "") -> tuple[dict | None, str]:
+                           session_token: str = "",
+                           device: str = "") -> tuple[dict | None, str]:
     payload = {"url": target_url, "wait_ms": settle_ms, "timeout_ms": timeout_s * 1000}
     if session_token:
         payload["session_token"] = session_token
+    # 只有显式给了才进载荷：不带视口参数时请求体与旧行为逐字节相同
+    if device:
+        payload["device"] = device
     try:
         async with httpx.AsyncClient(timeout=timeout_s + 15) as client:
             resp = await client.post(f"{browser_service_url()}/inspect", json=payload)
@@ -218,7 +222,8 @@ async def _inspect(ctx, args: dict) -> dict:
     timeout_s = _int_cfg(ctx.cfg, "agent.browser_timeout_seconds",
                          DEFAULT_TIMEOUT_SECONDS, TIMEOUT_MIN, TIMEOUT_MAX)
     settle_ms = _int_cfg(ctx.cfg, "agent.browser_settle_ms", DEFAULT_SETTLE_MS, 0, SETTLE_MAX)
-    data, sidecar_err = await _sidecar_inspect(target_url, timeout_s, settle_ms, token)
+    device = args.get("device") if isinstance(args.get("device"), str) else ""
+    data, sidecar_err = await _sidecar_inspect(target_url, timeout_s, settle_ms, token, device)
     if data is None:
         return _error(sidecar_err, status=status, url=display_url, identity=identity,
                       hint="确认 browser sidecar 已启动（本地开发运行 browser/dev-up.bat）")
@@ -328,5 +333,7 @@ def build_browser_prompt() -> str:
         "看到的是管理员视角，比普通用户宽；登录不可用时退回匿名（identity.kind=anonymous），"
         "页面可能停在登录页。admin 视角验证不了「未登录应该被拦住」这类行为，需要时请用户提出。",
         "- 截图来自无头浏览器首屏，与用户浏览器可能略有差异；没有视觉能力时只能拿到文本与日志。",
+        "- 验证移动栈的 /h5/ 页面时带 device（Playwright 设备名，如 \"iPhone 14\"），"
+        "拿到的是窄屏渲染结果；不传就是桌面 1280×800。视口只影响渲染环境，返回字段不变。",
         "- 一次检查开销较大，同一改动不要反复刷；有次数上限。",
     ]) + "\n</browser>"

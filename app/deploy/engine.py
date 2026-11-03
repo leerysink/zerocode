@@ -31,10 +31,21 @@ logger = logging.getLogger(__name__)
 JOINT_HEALTH_STACKS = ("vue3-springboot",)
 
 
-async def docker(*args, cwd=None, on_line=None, timeout=600) -> tuple[int, str]:
-    """执行一条 docker 命令：stdout+stderr 合流逐行收集（并转给 on_line），返回 (退出码, 末尾 300 行)。"""
+_FEED_CHUNK = 1024 * 1024   # stdin 灌流分块：APK 这类大文件不能整包进内存
+
+
+async def docker(*args, cwd=None, on_line=None, timeout=600, feed=None) -> tuple[int, str]:
+    """执行一条 docker 命令：stdout+stderr 合流逐行收集（并转给 on_line），返回 (退出码, 末尾 300 行)。
+
+    `feed`（可选）：有 `await read(n)` 的可读流，逐块灌进子进程 stdin（移动端 APK 上传把
+    `compose exec -T backend sh -c 'cat > …'` 当写管道用，见 app/deploy/mobile.py）。
+    灌流阶段抛错（如体积超限 413）时**必须杀进程再上抛**：只关 stdin 会让容器内的写命令
+    正常读到 EOF 并继续执行自己的后续命令，截断被当成成功。
+    """
     p = await asyncio.create_subprocess_exec(
-        "docker", *args, cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        "docker", *args, cwd=cwd,
+        stdin=asyncio.subprocess.PIPE if feed is not None else None,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
     lines: list[str] = []
 
     async def _pump():
@@ -47,9 +58,50 @@ async def docker(*args, cwd=None, on_line=None, timeout=600) -> tuple[int, str]:
                 if inspect.isawaitable(res):
                     await res
 
+    async def _feed():
+        assert p.stdin
+        try:
+            while chunk := await feed.read(_FEED_CHUNK):
+                p.stdin.write(chunk)
+                await p.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            pass                                        # 子进程先退出：原因在 docker 输出里，交给退出码判定
+        except BaseException:
+            p.kill()                                    # 半个文件不得 mv 转正（见 docstring）
+            raise
+        finally:
+            try:
+                p.stdin.close()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
     pump = asyncio.create_task(_pump())
+    feed_task = asyncio.create_task(_feed()) if feed is not None else None
+
+    async def _settle(task):
+        """回收子任务：先等 EOF 自然收尾（末行输出是断言来源），超时/取消再兜底 cancel。"""
+        try:
+            await asyncio.wait_for(task, 10)
+        except asyncio.TimeoutError:
+            task.cancel()
+        except asyncio.CancelledError:
+            task.cancel()
+            if asyncio.current_task().cancelling():
+                raise                                   # 外层取消必须继续传播，不能吞掉
+
     try:
         code = await asyncio.wait_for(p.wait(), timeout)
+    except asyncio.CancelledError:
+        # 调用方取消（请求断开）：子进程还在跑就必须杀掉，否则 docker compose exec 会挂着继续写卷。
+        p.kill()
+        try:
+            await asyncio.wait_for(p.wait(), 10)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            pass
+        for t in (pump, feed_task):
+            if t is not None and not t.done():
+                t.cancel()
+        raise
     except asyncio.TimeoutError:
         p.kill()
         # 被杀子进程的 transport 必须在本 loop 关闭前收尾：先回收退出码，再让泵任务读到 EOF 关掉管道，
@@ -58,17 +110,16 @@ async def docker(*args, cwd=None, on_line=None, timeout=600) -> tuple[int, str]:
             await asyncio.wait_for(p.wait(), 10)
         except asyncio.TimeoutError:
             pass
-        try:
-            await asyncio.wait_for(pump, 10)
-        except (asyncio.TimeoutError, asyncio.CancelledError):
-            pump.cancel()
+        await _settle(pump)
+        if feed_task is not None:
+            await _settle(feed_task)
         raise DeployError(f"docker {' '.join(args[:3])}… 超时（{timeout}s）", status=504)
     # 进程退出时管道里可能还有未读完的尾部输出（compose 的最后一行 Started/ERROR 正是断言与用户
     # 引导的来源），立即 cancel 会丢末行——先让泵任务读到 EOF 自然收尾，超时兜底再 cancel。
-    try:
-        await asyncio.wait_for(pump, 10)
-    except (asyncio.TimeoutError, asyncio.CancelledError):
-        pump.cancel()
+    await _settle(pump)
+    if feed_task is not None:
+        # 灌流异常（体积上限 413 / 读文件失败）原样上抛；_settle 只吞超时与取消，不吞业务异常。
+        await _settle(feed_task)
     return code, "\n".join(lines[-300:])
 
 

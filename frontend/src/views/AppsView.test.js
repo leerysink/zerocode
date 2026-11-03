@@ -14,7 +14,7 @@ const mocks = vi.hoisted(() => ({
     appUrls: vi.fn(), publishApp: vi.fn(), rollbackApp: vi.fn(),
     appRecords: vi.fn(), deleteRecord: vi.fn(), systemNics: vi.fn(), putConfig: vi.fn(),
     releaseToStore: vi.fn(), renameApp: vi.fn(), deleteApp: vi.fn(), openFolder: vi.fn(),
-    appMetricsCurrent: vi.fn(),
+    appMetricsCurrent: vi.fn(), appMobile: vi.fn(), uploadMobileApk: vi.fn(),
     wsUrl: vi.fn(() => 'ws://test'),
   },
   antd: { message: { success: vi.fn(), error: vi.fn(), info: vi.fn(), warning: vi.fn() },
@@ -80,6 +80,8 @@ const STUBS = {
   PublishHistory: { name: 'PublishHistory', render() { return h('div', { class: 'stub-pub-history' }) } },
   MetricsModal: { name: 'MetricsModal', props: ['app'],
     render() { return h('div', { class: 'stub-metrics-modal' }, String(this.app?.id ?? '')) } },
+  MobileModal: { name: 'MobileModal', props: ['app', 'open'],
+    render() { return h('div', { class: 'stub-mobile-modal' }, String(this.app?.id ?? '')) } },
 }
 
 async function mountView() {
@@ -597,5 +599,41 @@ describe('AppsView 正式地址', () => {
 
     expect(mocks.api.appUrls).toHaveBeenCalledTimes(2)
     expect(writeText).toHaveBeenCalledWith('https://aaa.example.test')
+  })
+})
+
+// ---------- 移动端入口：只对移动栈开 ☰ 项；弹框内容由 MobileModal.test 覆盖 ----------
+const MOBILE_APPS = [
+  { id: 4, name: '丁', slug: 'ddd', stack: 'vue3-springboot-mobile', scale: 'large', dev_port: 8304,
+    prod_port: 8404, status_dev: 'running', status_prod: 'running', current_version: 'b1',
+    preview_url: 'http://10.0.1.25:8304', workspace_id: 14 },
+  { id: 5, name: '戊', slug: 'eee', stack: 'vue3-springboot', scale: 'large', dev_port: 8305,
+    prod_port: 8405, status_dev: 'stopped', status_prod: 'stopped', current_version: null,
+    preview_url: 'http://10.0.1.25:8305', workspace_id: 15 },
+]
+
+async function mountMobileView() {
+  mocks.api.listApps.mockResolvedValue({ data: MOBILE_APPS })
+  const wrapper = mount(AppsView, { global: { stubs: STUBS } })
+  await flushPromises()
+  return wrapper
+}
+
+describe('AppsView 移动端入口', () => {
+  it('移动栈卡片有「移动端」菜单项，普通大型栈没有', async () => {
+    const wrapper = await mountMobileView()
+    const cards = wrapper.findAll('.stub-card')
+    expect(cards[0].find('.zc-menu-mobile').exists()).toBe(true)
+    expect(cards[0].find('.zc-menu-mobile').text()).toContain('移动端')
+    expect(cards[1].find('.zc-menu-mobile').exists()).toBe(false)
+  })
+
+  it('点「移动端」挂上弹框并收到当前应用', async () => {
+    const wrapper = await mountMobileView()
+    expect(wrapper.find('.stub-mobile-modal').exists()).toBe(false)
+    await wrapper.findAll('.zc-menu-mobile')[0].trigger('click')
+    const modal = wrapper.find('.stub-mobile-modal')
+    expect(modal.exists()).toBe(true)
+    expect(modal.text()).toBe('4')
   })
 })

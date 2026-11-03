@@ -8,7 +8,7 @@ import {
   AppstoreOutlined, CloudServerOutlined, CloudUploadOutlined, CopyOutlined, DashboardOutlined,
   DatabaseOutlined, DeleteOutlined, EditOutlined,
   ExperimentOutlined,
-  EyeOutlined, FolderOpenOutlined, HistoryOutlined, MenuOutlined, PlayCircleOutlined,
+  EyeOutlined, FolderOpenOutlined, HistoryOutlined, MenuOutlined, MobileOutlined, PlayCircleOutlined,
   PoweroffOutlined, ProfileOutlined, RedoOutlined, ReloadOutlined, RocketOutlined, ShopOutlined,
 } from '@ant-design/icons-vue'
 import {
@@ -17,13 +17,15 @@ import {
 } from '../api'
 import PublishHistory from '../components/PublishHistory.vue'
 import MetricsModal from '../components/MetricsModal.vue'
+import MobileModal from '../components/MobileModal.vue'
 import PublishModal from '../components/PublishModal.vue'
-import { SMALL_STACKS, slugFromName, validateForm } from '../utils/appForm'
+import { LARGE_STACKS, SMALL_STACKS, slugFromName, validateForm } from '../utils/appForm'
 import { copyText } from '../utils/clipboard'
 import DeployLogPanel from '../components/DeployLogPanel.vue'
 import BackButton from '../components/BackButton.vue'
 import { openWorkspaceFilesPage, resolveOpenFolderMode } from '../utils/openFolder'
 import { canPublish } from '../utils/publishableStacks'
+import { isMobileApp } from '../utils/mobileApp'
 import { useConfigStore } from '../stores/config'
 
 const apps = ref([])
@@ -35,6 +37,7 @@ const logs = reactive({ open: false, app: null })
 const pub = reactive({ open: false, app: null, mode: 'publish', version: null, autoStart: false, seq: 0 })
 const hist = reactive({ open: false, app: null })
 const mon = reactive({ open: false, app: null })
+const mob = reactive({ open: false, app: null })
 const rel = reactive({ open: false, app: null, title: '', summary: '' })
 const urlsCache = reactive({})
 // 复制失败时的就地兜底：{ key, url }，key 是失败发生的那一处（`card:<id>` / 'preview'）
@@ -48,7 +51,7 @@ let timer = null
 
 const scaleCards = [
   { value: 'small', title: '小型', desc: '表单/台账/查询类，选一种轻量后端' },
-  { value: 'large', title: '大型', desc: '多角色/流程类系统，Vue3 + Spring Boot 3（自带登录与权限基座）' },
+  { value: 'large', title: '大型', desc: '多角色/流程类系统，Vue3 + Spring Boot 3（可选 uni-app 移动端）' },
 ]
 
 // silent=true：后台 5s 轮询只悄悄换数据、不翻 loading 态——否则每 5 秒整片卡片被 <a-spin>
@@ -86,7 +89,12 @@ function nextFrom1() {
   current.value = 1
 }
 function nextFrom2() {
-  if (form.scale === 'large') form.stack = 'vue3-springboot'
+  // 换档时把栈拉回本档合法值：large→small 之后还停在 springboot 会被后端 400 拒掉
+  if (form.scale === 'large' && !LARGE_STACKS.some((s) => s.value === form.stack)) {
+    form.stack = 'vue3-springboot'
+  } else if (form.scale === 'small' && !SMALL_STACKS.some((s) => s.value === form.stack)) {
+    form.stack = 'vue3-fastapi'
+  }
   current.value = 2
 }
 async function submit() {
@@ -280,6 +288,11 @@ function openMetrics(a) {
   mon.app = a
   mon.open = true
 }
+// 移动端弹框：卡面 ☰ 与聊天页「更多」共用 MobileModal（自持 a-modal），这里只传 app。
+function openMobile(a) {
+  mob.app = a
+  mob.open = true
+}
 // 历史页确认回滚 → 关掉抽屉、开进度弹层（autoStart 单点触发 rollbackApp）
 function startRollback(version) {
   const app = hist.app
@@ -372,6 +385,7 @@ async function doRelease() {
                 <div class="zc-app-menu-item zc-menu-reset" @click.stop="resetDev(a)"><redo-outlined /> 重建 dev</div>
                 <div class="zc-app-menu-item zc-menu-history" @click.stop="openHistory(a)"><history-outlined /> 发布历史</div>
                 <div class="zc-app-menu-item zc-menu-metrics" @click.stop="openMetrics(a)"><dashboard-outlined /> 资源监控</div>
+                <div v-if="isMobileApp(a)" class="zc-app-menu-item zc-menu-mobile" @click.stop="openMobile(a)"><mobile-outlined /> 移动端</div>
                 <div v-if="canReleaseToStore(a)" class="zc-app-menu-item zc-menu-release" @click.stop="openRelease(a)"><shop-outlined /> 发布到商店</div>
                 <div class="zc-app-menu-item zc-menu-rename" @click.stop="openRename(a)"><edit-outlined /> 重命名</div>
                 <div class="zc-app-menu-item zc-menu-folder" @click.stop="openAppFolder(a)"><folder-open-outlined /> 打开工程目录</div>
@@ -471,7 +485,7 @@ async function doRelease() {
         <a-form layout="horizontal" :label-col="{ style: { width: '120px', textAlign: 'right' } }">
           <a-form-item label="技术栈" required>
             <a-select v-model:value="form.stack" :options="form.scale === 'large'
-              ? [{ value: 'vue3-springboot', label: 'Vue3 + Spring Boot 3（默认）', disabled: false }]
+              ? LARGE_STACKS
               : SMALL_STACKS" />
           </a-form-item>
         </a-form>
@@ -523,6 +537,8 @@ async function doRelease() {
       </template>
       <MetricsModal v-if="mon.open && mon.app" :key="mon.app.id" :app="mon.app" />
     </a-modal>
+
+    <MobileModal v-if="mob.open && mob.app" :key="mob.app.id" v-model:open="mob.open" :app="mob.app" />
 
     <a-modal v-model:open="rel.open" title="发布到商店" ok-text="上架" destroy-on-close @ok="doRelease">
       <a-input v-model:value="rel.title" placeholder="商店展示名称" />

@@ -286,12 +286,16 @@ async def _post_json(url: str, payload: dict, *, timeout_s: int,
 
 
 async def _sidecar_open(target_url: str, *, timeout_s: int, expect: dict | None,
-                        interactive_max: int = DEFAULT_INTERACTIVE_MAX) -> tuple[dict | None, str]:
+                        interactive_max: int = DEFAULT_INTERACTIVE_MAX,
+                        device: str = "") -> tuple[dict | None, str]:
     """`POST /sessions`。返回 `(状态体, 错误原因)`，两者恰好一个非空——调用方不必再判 status_code。"""
     # interactive_max 必须透传：sidecar 的 OpenRequest/StepRequest 认这个字段，规格 §10 也承诺了它，
     # 载荷里少了它就是一个无人读的死配置（清单条数直接决定进模型上下文的 token 量）。
     payload = {"url": target_url, "timeout_ms": timeout_s * 1000, "expect": expect,
                "interactive_max": interactive_max}
+    # 视口只在显式给的时候进载荷；缺省时请求体与旧行为逐字节相同（桌面 1280×800）。
+    if device:
+        payload["device"] = device
     return await _post_json(f"{browser_service_url()}/sessions", payload,
                             timeout_s=timeout_s + HTTP_TIMEOUT_MARGIN,
                             timeout_reason="浏览器会话打开超时")
@@ -582,9 +586,11 @@ async def _open(ctx, args: dict) -> dict:
     # 不给时载荷与旧行为逐字相同（`expect` 仍是 null），走的还是 sidecar 那条 networkidle 短等待。
     # 后端不校验形状，与 `_step` 同口径：不合法的 expect 由 sidecar 的 422 出口给出人话原因。
     # 结论一侧不需要新闸口——`_shape_state` 已经按 `data["passed"]` 决定给不给 `passed`/`note`。
+    device = args.get("device") if isinstance(args.get("device"), str) else ""
     data, sidecar_err = await _sidecar_open(target_url, timeout_s=timeout_s,
                                             expect=args.get("expect"),
-                                            interactive_max=interactive_max)
+                                            interactive_max=interactive_max,
+                                            device=device)
     if data is None:
         # 发现项 F-4：这条出口此前只过裸 `scrub_known_host`，没有凭据遮断也没有裁剪——
         # 「清洗闸有三处旁路」里最直白的一处，因为它就在 `_open` 里、离其它出口一步之遥。
@@ -1307,6 +1313,8 @@ def build_browser_session_prompt() -> str:
         "fill 失败时不自动附图（那些框里的字是明文渲染的，一张图就把口令泄进聊天），"
         "真要现场就显式 screenshot: true。",
         "- browser_open 带 expect 而首屏没等到时也自动附一张首屏图；正常首屏想留档就显式要。",
+        "- 走查移动栈的 /h5/ 页面时 browser_open 带 device（Playwright 设备名，如 \"iPhone 14\"），"
+        "拿到的是窄屏渲染下的元素与截图；不传就是桌面 1280×800，视口只影响渲染环境。",
         "- 每步的 console_new / page_errors_new 只含新增：前者判「这个错是不是我这一步搞出来的」，"
         "后者是未捕获异常，非空就说明这一步把页面点崩了。",
         "- dialog 非空说明页面弹了原生确认框且已按取消处理——你以为的删除可能根本没删。",

@@ -159,7 +159,10 @@ BROWSER_TOOLS = [
                         "结果里的 identity 标注本次身份"),
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string",
-                     "description": "同源相对路径，默认 /；只能以 / 开头，不能是绝对 URL"}},
+                     "description": "同源相对路径，默认 /；只能以 / 开头，不能是绝对 URL"},
+            "device": {"type": "string",
+                       "description": ("视口设备名（Playwright 设备名，如 iPhone 14）：验证 /h5/ "
+                                       "移动端页面时用；不传为桌面 1280×800")}},
             "required": []}}},
 ]
 
@@ -187,6 +190,9 @@ BROWSER_SESSION_TOOLS = [
                         "可交互元素清单（ref 只在最近一次返回内有效）；expect 给了就等首屏满足再返回"),
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string", "description": "同源相对路径，默认 /"},
+            "device": {"type": "string",
+                       "description": ("视口设备名（Playwright 设备名，如 iPhone 14）：走查 /h5/ "
+                                       "移动端页面时用；不传为桌面 1280×800")},
             "expect": BROWSER_EXPECT_SCHEMA,
             "screenshot": {"type": "boolean",
                            "description": "是否附首屏截图，默认 false；expect 未通过时自动附一张"}},

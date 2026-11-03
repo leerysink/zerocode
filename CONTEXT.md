@@ -537,7 +537,8 @@ sidecar 给可交互元素打的**一次性令牌**（DOM 属性 `data-zc-ref`�
 新建应用时可选的一种技术栈形态：**同一个应用内容三件套**——应用后端服务（backend，
 `vue3-springboot` 底座）、后端管理系统（admin web，住根路径 `/`）、uni-app 工程（移动端源码，
 编译出 H5）。它是**一个** compose 项目、**一对**端口（dev 奇 / prod 偶）、**一套**库
-（`{slug}_dev` / `{slug}_prod`）。
+（`{slug}_dev` / `{slug}_prod`）。uni-app 工程的目录是 `frontend/mobile/`——它与管理端共用
+前端镜像的构建上下文，不占顶层 `mobile/` 目录（ADR-0039 落地记录）。
 
 规范约束：对外地址只有 `dev_port` / `prod_port` 各一个，移动端**不得**为此新增第二个
 发布端口——它靠同域的路径分流（H5 走前端 nginx 的一个子路径），不靠新地址。
@@ -550,9 +551,9 @@ springboot 基底、再渲染 mobile 覆盖层，避免两份 springboot 后端�
 
 ## H5 端（uni-app 的网页产物）
 
-uni-app 编译出的手机网页，挂在应用同域的 **`/h5/`** 路径（`publicPath=/h5/` + hash 路由），
-由应用现有的前端容器托管，接口用**同源相对路径** `/api`，因此预览、发布、网关 routes.json、
-资源监控全部复用，无需任何地址层改动。
+uni-app 编译出的手机网页，挂在应用同域的 **`/h5/`** 路径（manifest 的 `h5.router.base=/h5/`
++ `h5.router.mode=hash`，源码住 `frontend/mobile/`），由应用现有的前端容器托管，接口用
+**同源相对路径** `/api`，因此预览、发布、网关 routes.json、资源监控全部复用，无需任何地址层改动。
 
 术语上它是「H5 端」，不叫「移动版」「手机版」——后者会让人以为存在第二个站点。
 它也不是 `/m/`：网关 `router.lua` 把 Host 的**一级子域当 slug**，`{slug}-h5.zerocode.com`

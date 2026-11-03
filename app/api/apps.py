@@ -12,11 +12,11 @@ chat 闸门（FR4-09）的 409 detail 是**字典** `{code, message}`——前�
 import logging
 import re
 
-from fastapi import APIRouter, Request, HTTPException
+from fastapi import APIRouter, Request, HTTPException, File, UploadFile
 from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
-from app.deploy import engine, prod, records, sqlrun
+from app.deploy import engine, mobile, prod, records, sqlrun
 from app.deploy import provision
 from app.deploy import tasks as deploy_tasks
 from app.deploy.errors import DeployError
@@ -223,6 +223,34 @@ async def app_urls(request: Request, app_id: int):
         app = await app_service.get_app(sf, app_id, owner_user_id=request.state.actor["id"])
         from app.deploy import nics
         return await nics.app_urls(sf, app)
+    except DeployError as e:
+        raise _http(e)
+
+
+# ---------- 移动端分发（规格 2026-11-03 US-15…US-19）：H5 地址 + APK 代管 ----------
+
+@router.get("/{app_id}/mobile")
+async def mobile_info(request: Request, app_id: int):
+    """移动端弹框数据源：dev/prod 两条 H5 地址 + APK 下载地址与已上传体积（只读）。"""
+    sf = request.app.state.session_factory
+    try:
+        app = await app_service.get_app(sf, app_id, owner_user_id=request.state.actor["id"])
+        return await mobile.info(sf, app)
+    except DeployError as e:
+        raise _http(e)
+
+
+@router.post("/{app_id}/mobile/apk")
+async def mobile_upload_apk(request: Request, app_id: int, file: UploadFile = File(...)):
+    """上传 APK 到应用 prod 的 uploads 卷（同步串流，最多 APK_MAX_BYTES）。
+
+    同步而非 202：写入耗时与上传带宽同量级，且没有可播报的后台进度；失败要当场告诉用户原因
+    （非 .apk / 未发布 / 超限 / 容器异常），挂成后台任务只会把错误变成静默。
+    """
+    sf = request.app.state.session_factory
+    try:
+        app = await app_service.get_app(sf, app_id, owner_user_id=request.state.actor["id"])
+        return await mobile.upload_apk(sf, app, file)
     except DeployError as e:
         raise _http(e)
 

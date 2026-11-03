@@ -46,16 +46,33 @@ def _pip_volume() -> str:
 
 PIP_VOLUME = _pip_volume()
 
+# 移动栈（vue3-springboot-mobile）dev 期的 uni-app H5 dev server：第二个内部服务。
+# 它**没有 ports:**，一应用一对端口是平台地基（端口池 8210-8399、routes.json 一条、网关取一级子域），
+# 手机访问的仍是 dev_port 上的管理端 vite，由它把 /h5 代理过来（规格 2026-11-03 D-8 / US-05）。
+MOBILE_STACK = "vue3-springboot-mobile"
+MOBILE_VOLUME_NAME = "mobile_node_modules"   # 与 fe_node_modules 同挂载点、不同服务不同卷：共用会把两套依赖树盖在一起
+MOBILE_MOUNT_PATH = "/src/node_modules"
+
+
+def _mobile_volume() -> str:
+    """与 _fe_volume() 同构：挂载条目与顶层声明同源。"""
+    return f"{MOBILE_VOLUME_NAME}:{MOBILE_MOUNT_PATH}"
+
+
+MOBILE_VOLUME = _mobile_volume()
+
 UPLOADS_VOLUME = "uploads"          # 上传件卷：镜像重建不丢历史文件（prod 唯一的文件持久化位）
 REDIS_DATA_VOLUME = "redis-data"    # Redis 命名卷：prod 开 AOF，重启不丢会话/缓存基座
 
 # prod-compose.yml 的落盘与渲染闸门：一个事实源，两处共用（写死单栈会让新栈发布必挂）
-PUBLISHABLE_STACKS = ("vue3-fastapi", "vue3-springboot")
+# 移动栈（vue3-springboot-mobile）与大栈同形：同一种 prod 拓扑，只多一层 H5 静态产物。
+PUBLISHABLE_STACKS = ("vue3-fastapi", "vue3-springboot", MOBILE_STACK)
 
 # 栈私有运行密钥：缺则生成、有则保留。口令不进数据库、不进仓库、AI 禁读（deploy/ 是禁区）。
 # 唯一事实源：.env 的密钥位与生成循环都从 STACK_SECRETS 派生，
 # 不再额外模板化一份占位行（那会让「加一个密钥」变成两处改一处、静默漏位）。
-STACK_SECRETS = {"vue3-springboot": ("JWT_SECRET", "REDIS_PASSWORD")}
+STACK_SECRETS = {"vue3-springboot": ("JWT_SECRET", "REDIS_PASSWORD"),
+                 MOBILE_STACK: ("JWT_SECRET", "REDIS_PASSWORD")}
 
 _MARKER_RE = re.compile(r"__[A-Z][A-Z0-9_]*__")   # 只认渲染器自己的标记形态，不误伤 yaml 合法内容
 
@@ -205,9 +222,25 @@ __MIGRATE_SVC__
       - "__DEV_PORT__:5173"
     depends_on:
       - backend
-volumes:
+__MOBILE_SVC__volumes:
   __FE_VOL_NAME__: {}
   __M2_VOL_NAME__: {}
+__MOBILE_VOL_DECL__"""
+
+# 移动栈 dev 的第二个内部服务：bind 挂 frontend/mobile（uni-app 工程住在管理端工程的子目录里，
+# prod 才能由同一个前端镜像构建上下文把 H5 烘进 html/h5，见 ADR-0039 与 frontend/Dockerfile 覆盖层）。
+# node_modules 走独立具名卷：宿主机那份永远是空的，prod 构建上下文因此不会被整套依赖树拖住。
+# 关键：这一条没有 ports:——对外仍只有 __DEV_PORT__ 一个端口，手机经管理端 vite 的 /h5 代理打进来。
+_MOBILE_SVC = """  mobile:
+    image: node:20-alpine
+    working_dir: /src
+    volumes:
+      - ../frontend/mobile:/src
+      - __MOBILE_VOL__
+    command: sh -c "npm install && npm run dev:h5"__NPM_ENV__
+    networks: [default]
+    depends_on:
+      - backend
 """
 
 _FE_ONLY = """name: zc-__SLUG__-dev
@@ -343,14 +376,22 @@ def render_dev_compose(meta: dict) -> str:
         tpl, fragments = _DEV_COMPOSE, (_MIGRATE_SVC,)
     elif stack == "vue3-springboot":
         tpl, fragments = _DEV_COMPOSE_SB, (_MIGRATE_SVC,)   # 迁移闸门完全复用（同库同轨同镜像）
+    elif stack == MOBILE_STACK:
+        tpl, fragments = _DEV_COMPOSE_SB, (_MIGRATE_SVC, _MOBILE_SVC)   # 只多一个不对外发布的 dev server
     else:
         raise DeployError(f"栈模板未支持: {stack}", status=500)
     sources = tpl + "".join(fragments)          # 本次渲染用到的全部标记面
     y = (tpl
          .replace("__MIGRATE_SVC__", _MIGRATE_SVC)
+         # 注入必须早于 __MOBILE_VOL__：片段自己带着别的标记，顺序反了就留一个未替换的 __MOBILE_VOL__。
+         # 标记与 volumes: 同行（不是独立一行）：非移动栈替换成空串时不留空行，大栈产物字节不变。
+         .replace("__MOBILE_SVC__", _MOBILE_SVC if stack == MOBILE_STACK else "")
+         .replace("__MOBILE_VOL_DECL__",
+                  f"  {MOBILE_VOLUME_NAME}: {{}}\n" if stack == MOBILE_STACK else "")
          .replace("__DEV_PORT__", str(dev_port))
          .replace("__FE_VOL__", _fe_volume())
          .replace("__FE_VOL_NAME__", VOLUME_NAME)
+         .replace("__MOBILE_VOL__", _mobile_volume())
          .replace("__M2_VOL__", _m2_volume())
          .replace("__M2_VOL_NAME__", M2_VOLUME_NAME)
          .replace("__PIP_VOL__", _pip_volume())
@@ -370,7 +411,9 @@ def render_prod_compose(meta: dict) -> str:
     stack = meta.get("stack")
     if stack == "vue3-fastapi":
         tpl, fragments = _PROD_COMPOSE, (_MIGRATE_PROD,)
-    elif stack == "vue3-springboot":
+    elif stack in ("vue3-springboot", MOBILE_STACK):
+        # 移动栈的 prod 与大栈逐字节同形：H5 是前端镜像里的一层静态产物（html/h5），
+        # 不是第三个可发布服务——prod.py 的镜像记账/回滚体检只认 frontend+backend 两个 role。
         tpl, fragments = _PROD_COMPOSE_SB, (_MIGRATE_PROD,)   # migrate 片段逐字复用（同库同轨同镜像）
     else:
         raise DeployError(f"栈发布未支持: {stack}", status=400)

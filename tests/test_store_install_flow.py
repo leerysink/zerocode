@@ -147,6 +147,7 @@ async def test_install_build_timeout_follows_stack(sf, stubs, release_row):
                                         want_name="大型实例")
     try:
         assert app["stack"] == "vue3-springboot"
+        assert app["scale"] == "large"             # 规模必须跟栈走（反向闸门要求）
         build_timeouts = [t for _args, t in stubs["build"] if "build" in _args]
         assert build_timeouts == [1800]
     finally:

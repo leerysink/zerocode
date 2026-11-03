@@ -4,6 +4,7 @@ import re
 from pathlib import Path
 import pytest
 from app.deploy import scaffold
+from app.deploy.errors import DeployError
 
 TEMPLATE = Path(__file__).resolve().parents[1] / "app" / "templates" / "vue3-fastapi"
 
@@ -216,6 +217,78 @@ def test_render_flags_spaced_platform_placeholder_as_residue(tmp_path):
         scaffold.render(tpl, tmp_path / "out", {
             "SLUG": "s", "APP_NAME": "甲", "DEV_PORT": "1", "PROD_PORT": "2",
             "DEV_DB": "s_dev", "PROD_DB": "s_prod", "TODAY": "20260922"})
+
+
+MAP = {"SLUG": "s", "APP_NAME": "甲", "DEV_PORT": "1", "PROD_PORT": "2",
+       "DEV_DB": "s_dev", "PROD_DB": "s_prod", "TODAY": "20260922"}
+
+
+def _two_layers(tmp_path):
+    """基底只有一处同路径冲突（frontend/nginx.conf），其余各自独有——叠加语义的三个面一次钉住。"""
+    base, overlay, out = tmp_path / "base", tmp_path / "overlay", tmp_path / "out"
+    (base / "frontend").mkdir(parents=True)
+    (base / "backend" / "src").mkdir(parents=True)
+    (base / "frontend" / "nginx.conf").write_text("BASE\n", encoding="utf-8")
+    (base / "frontend" / "package.json").write_text('{"name": "{{SLUG}}-fe"}\n', encoding="utf-8")
+    (base / "backend" / "src" / "App.java").write_text("只有一份\n", encoding="utf-8")
+    (overlay / "frontend").mkdir(parents=True)
+    (overlay / "frontend" / "nginx.conf").write_text("OVERLAY\n", encoding="utf-8")
+    (overlay / "frontend" / "mobile-entry.js").write_text("新增文件\n", encoding="utf-8")
+    return base, overlay, out
+
+
+def test_render_layers_overlay_wins_on_conflict_and_keeps_base_only_files(tmp_path):
+    """叠加 = 后层覆盖同路径 + 保留基底独有文件（规格 US-03）。
+
+    覆盖顺序反了会静默产出「没有 /h5/ 的 nginx 配置」，栈照样能起、H5 照样 404，
+    是最难从现象倒查的一类 bug；「保留」那半边则拦住把叠加实现成「以覆盖层为准的合并」。
+    """
+    base, overlay, out = _two_layers(tmp_path)
+    scaffold.render_layers([base, overlay], out, MAP)
+    assert (out / "frontend" / "nginx.conf").read_text(encoding="utf-8") == "OVERLAY\n"
+    assert (out / "backend" / "src" / "App.java").is_file()          # 基底后端一行不少
+    assert (out / "frontend" / "mobile-entry.js").is_file()          # 覆盖层新增文件进得来
+    assert (out / "frontend" / "package.json").read_text(encoding="utf-8") == '{"name": "s-fe"}\n'
+
+
+def test_render_layers_single_layer_is_byte_for_byte_render(tmp_path):
+    """单层路径不得改变存量行为：四个既有栈的渲染结果必须与 render 一致。
+
+    render_layers 的正当实现就是「循环」；一旦它顺手做成「先清目标目录再铺最后一层」这类
+    优化，第二层就会抹掉第一层的文件，US-03 的「backend/src 只有一份来自基底」当场失守，
+    而四个既有栈（单层调用）是唯一能证明「没被改动」的对照组。
+    """
+    base, _overlay, out = _two_layers(tmp_path)
+    scaffold.render_layers([base], out, MAP)
+    assert (out / "frontend" / "nginx.conf").read_text(encoding="utf-8") == "BASE\n"
+    assert not (out / "frontend" / "mobile-entry.js").exists()       # 没有覆盖层就没有它的文件
+
+
+def test_render_layers_does_not_duplicate_data_seed_across_layers(tmp_path):
+    """数据轨种子只看 dst 现状：基底自带 RBAC 种子时，覆盖层那轮不得再追 demo_notes。
+
+    每层都跑一次「shipped 判定」，但判定读的是已落盘的产物，所以第二层看到的是第一层的
+    输出——前提是基底那轮确实先落了 sqlchange。顺序若反（或判定改成读模板目录），
+    demo_notes 会被铺进 springboot 栈，首预览迁移必红（该表只存在于 fastapi 栈）。
+    """
+    base, overlay, out = _two_layers(tmp_path)
+    (base / "sqlchange").mkdir(parents=True)
+    (base / "sqlchange" / "D20260101_01_rbac_seed.sql").write_text("SELECT 1;", encoding="utf-8")
+    scaffold.render_layers([base, overlay], out, MAP)
+    assert [p.name for p in (out / "sqlchange").glob("*.sql")] == ["D20260101_01_rbac_seed.sql"]
+
+
+def test_render_layers_missing_overlay_layer_raises(tmp_path):
+    """缺层是配置错误，不是「少铺一点」（裁定 R-C 的同一条口径在叠加形态下的延伸）。
+
+    创建闸门按 template_layers_of 逐层查目录存在（app_service._check_scale_stack），
+    真渲染时目录却没了 = 竞态或人为删目录；这里必须炸得看得见，而不是静默产出没有移动端的
+    「移动栈」应用——那种应用能创建、能预览，只有 /h5/ 打不开。
+    """
+    base, _overlay, out = _two_layers(tmp_path)
+    with pytest.raises(DeployError) as ei:
+        scaffold.render_layers([base, base.parent / "no_such_layer"], out, MAP)
+    assert ei.value.status == 500
 
 
 SPRINGBOOT_TEMPLATE = TEMPLATE.parent / "vue3-springboot"

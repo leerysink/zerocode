@@ -584,7 +584,7 @@ def audit_idempotence(sql: str, origin: str) -> list[str]:
 
     这是 add_idempotence_guards 的兵对兵校验：正则漏匹配、跨行书写、或将来新增了无法自动
     补齐的语句类型，都在这里 fail-closed，而不是等到服务器上 psql 报错才发现。
-    向量改型已由 guard_vector_alter 换成 DO 块（不再以 ALTER TABLE 开头），故不会被误报。
+    向量定维/varchar 加宽已由 guard_column_type_alter 换成 DO 块（不再以 ALTER TABLE 开头），故不会被误报。
     """
     problems: list[str] = []
     for st in split_statements(sql):
@@ -598,15 +598,15 @@ def audit_idempotence(sql: str, origin: str) -> list[str]:
     return problems
 
 
-# 无守卫的向量列改型：PG 不提供 IF-TYPE 形态，重放它 = 全表重写 + ACCESS EXCLUSIVE 锁，
-# 维度不符时还会直接失败。合成产物里换成 DO 块按实际类型判断（changelog 原文保持不动，
-# 因为 app/db.py 的切分器不认 $$，改原文会拖挂后端启动迁移）。
-_VECTOR_TYPE_RE = re.compile(
+# 无守卫的列改型（向量定维、varchar 加宽）：PG 不提供 IF-TYPE 形态，重放它 = 全表重写 +
+# ACCESS EXCLUSIVE 锁，目标维度/宽度不符时还会直接失败。合成产物里换成 DO 块按实际类型判断
+# （changelog 原文保持不动，因为 app/db.py 的切分器不认 $$，改原文会拖挂后端启动迁移）。
+_ALTER_TYPE_RE = re.compile(
     r"ALTER\s+TABLE\s+(?P<tbl>[A-Za-z_]\w*)\s+ALTER\s+COLUMN\s+(?P<col>[A-Za-z_]\w*)\s+"
-    r"TYPE\s+vector\s*\(\s*(?P<dim>\d+)\s*\)\s*;",
+    r"TYPE\s+(?P<type>vector\s*\(\s*\d+\s*\)|varchar\s*\(\s*\d+\s*\))\s*;",
     re.IGNORECASE)
 
-_VECTOR_GUARD_TMPL = """DO $zcvec$
+_ALTER_TYPE_GUARD_TMPL = """DO $zcalter$
 DECLARE
     tbl regclass;
     cur text;
@@ -621,19 +621,34 @@ BEGIN
     IF cur IS NULL THEN
         RETURN;                                   -- 列不存在：同上，不猜
     END IF;
-    IF cur IS DISTINCT FROM 'vector({dim})' THEN
-        EXECUTE format('ALTER TABLE %s ALTER COLUMN {col} TYPE vector({dim})', tbl);
+    IF cur IS DISTINCT FROM '{expected}' THEN
+        EXECUTE format('ALTER TABLE %s ALTER COLUMN {col} TYPE {type_sql}', tbl);
     END IF;
 END
-$zcvec$;"""
+$zcalter$;"""
 
 
-def guard_vector_alter(sql: str) -> tuple[str, int]:
-    """把无守卫的 `ALTER COLUMN … TYPE vector(N)` 换成类型判断 DO 块，返回 (新文本, 替换数)。"""
+def _expected_type_label(type_sql: str) -> str:
+    """`format_type` 给 varchar(N) 的展示名是 `character varying(N)`，以它为比较基准。"""
+    m = re.fullmatch(r"varchar\s*\(\s*(\d+)\s*\)", type_sql, re.IGNORECASE)
+    if m:
+        return f"character varying({m.group(1)})"
+    return type_sql
+
+
+def guard_column_type_alter(sql: str) -> tuple[str, int]:
+    """把无守卫的 `ALTER COLUMN … TYPE vector(N)/varchar(N)` 换成类型判断 DO 块。
+
+    返回 (新文本, 替换数)。`IS DISTINCT FROM` 用 format_type 的实际类型做比较：已是目标
+    类型时整句空转，重放只剩一次系统目录查询，不再全表重写。
+    """
     def _sub(m: re.Match) -> str:
-        return _VECTOR_GUARD_TMPL.format(tbl=m.group("tbl"), col=m.group("col"), dim=m.group("dim"))
+        type_sql = _WS_RE.sub(" ", m.group("type")).strip()
+        return _ALTER_TYPE_GUARD_TMPL.format(
+            tbl=m.group("tbl"), col=m.group("col"), type_sql=type_sql,
+            expected=_expected_type_label(type_sql))
 
-    return _VECTOR_TYPE_RE.subn(_sub, sql)
+    return _ALTER_TYPE_RE.subn(_sub, sql)
 
 
 # ---------------------------------------------------------------- 裸 UPDATE 的显式处置表
@@ -777,7 +792,7 @@ def synth_init_sql(changelog_dir: Path, presets, deploy_root: str,
 --           服务器既有数据永不被洗）。为达此语义，合成时对 changelog 原文做了四处等价改写：
 --           1) 给 CREATE TABLE/INDEX/SEQUENCE/EXTENSION 与 ADD COLUMN 补 IF NOT EXISTS
 --           2) 剔除 ON CONFLICT 的仲裁目标（后续迁移会重塑唯一约束，带目标重放会报错）
---           3) 无守卫的 ALTER COLUMN TYPE vector(N) 换成按实际类型判断的 DO 块
+--           3) 无守卫的 ALTER COLUMN TYPE vector(N)/varchar(N) 换成按实际类型判断的 DO 块
 --           4) 会覆盖服务器既有值的裸 UPDATE 按处置表改写（仅当仍是旧默认值时才生效）
 --           四处均只存在于本生成物，changelog/ 原文不动（它是增量轨的历史，且
 --           app/db.py 的语句切分器不认 $$）。无法自动幂等化的语句会在打包期直接拒包。
@@ -794,7 +809,7 @@ def synth_init_sql(changelog_dir: Path, presets, deploy_root: str,
     for f in files:
         raw = f.read_text(encoding="utf-8")
         problems.extend(audit_replay_safety(raw, f.name))
-        text, hits = guard_vector_alter(raw)
+        text, hits = guard_column_type_alter(raw)
         guarded += hits
         text, hits = strip_conflict_targets(text)
         stripped += hits
@@ -810,12 +825,12 @@ def synth_init_sql(changelog_dir: Path, presets, deploy_root: str,
                          + "\n  - ".join(problems))
 
     merged = header + "\n" + "\n".join(body)
-    # 兜底：合成后不得残留无守卫的向量改型，也不得残留带仲裁目标的 ON CONFLICT。
+    # 兜底：合成后不得残留无守卫的列改型，也不得残留带仲裁目标的 ON CONFLICT。
     # 查的是剥过注释的文本：注释里合法保留着 `ON CONFLICT (列…)` 这类说明性引用。
     active = _strip_sql_comments(merged)
-    leftover = _VECTOR_TYPE_RE.search(active)
+    leftover = _ALTER_TYPE_RE.search(active)
     if leftover:
-        raise BuildError(f"合成后仍残留无守卫的向量改型语句：{leftover.group(0)[:80]}")
+        raise BuildError(f"合成后仍残留无守卫的列改型语句：{leftover.group(0)[:80]}")
     leftover = _CONFLICT_TARGET_RE.search(active)
     if leftover:
         raise BuildError(

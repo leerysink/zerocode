@@ -92,9 +92,13 @@ async def install_release(sf, *, release_row: dict, applicant_actor_id: int,
     try:
         slug = _instance_slug(release_row["slug"], await _taken_slugs(sf))
         _last_slug = slug
+        stack = manifest.get("stack") or "vue3-fastapi"
         app = await app_service.create_app_project(
-            sf, name=want_name, slug=slug, scale="small",
-            stack=manifest.get("stack") or "vue3-fastapi",
+            sf, name=want_name, slug=slug,
+            # 规模跟着栈走：springboot/移动栈的包必须装成 large，否则会被 _check_scale_stack 的
+            # 反向闸门拒掉（small + springboot 的 scale 列与产物语义从此打架）。
+            scale="large" if stack in app_service.LARGE_STACKS else "small",
+            stack=stack,
             origin=f"store:{release_row['id']}", materialize=_materializer(pkg, release_row),
             owner_user_id=applicant_actor_id)   # 安装者即归属人（Ticket 003 扩展态）
         rid = await records.begin(sf, app["id"], "install", release_row["version"])

@@ -50,13 +50,104 @@ def test_render_dev_compose_static():
     assert list(doc["services"]) == ["frontend"]   # static 栈仅 frontend（规格 03 §4.1）
     assert doc["services"]["frontend"]["ports"] == ["8211:5173"]
 
-def test_only_frontend_publishes_ports():
-    """仅前端端口对外（规格 05 FR5-06 / D5，P0）：backend/migrate 不得出现 ports（审查 I-2 / V9-M1）。"""
-    doc = yaml.safe_load(compose.render_dev_compose(META))
+@pytest.mark.parametrize("stack", ["vue3-fastapi", "vue3-springboot", "vue3-springboot-mobile"])
+def test_only_frontend_publishes_ports(stack):
+    """仅前端端口对外（规格 05 FR5-06 / D5，P0）：backend/migrate 不得出现 ports（审查 I-2 / V9-M1）。
+
+    移动栈纳入同一参数化（规格 2026-11-03 §5）：它多出来的 mobile 服务是唯一的新增面，
+    但凡它长出 ports: 就是「一应用两对端口」，本参数化把这条钉在红线上。
+    """
+    m = copy.deepcopy(META); m["stack"] = stack
+    doc = yaml.safe_load(compose.render_dev_compose(m))
     assert doc["services"]["frontend"]["ports"] == ["8211:5173"]
     assert "ports" not in doc["services"]["backend"]
     assert "ports" not in doc["services"]["migrate"]
+    assert "ports" not in doc["services"].get("mobile", {})
     assert [n for n, s in doc["services"].items() if s.get("ports")] == ["frontend"]
+
+
+def test_mobile_stack_passes_publish_gate_and_carries_stack_secrets():
+    """移动栈与大栈共用同一套发布闸门与密钥面（规格 2026-11-03 D-4/D-5 的登记半边）。
+
+    两处漏一处的症状都不在原地：PUBLISHABLE_STACKS 漏它 → 创建能选、发布被闸门拦下；
+    STACK_SECRETS 漏它 → JWT_SECRET/REDIS_PASSWORD 不生成，compose 里的 `${VAR:?}`
+    等到起栈那一刻才拒收，用户看到的是「预览起不来」而不是「栈没登记」。
+    """
+    assert "vue3-springboot-mobile" in compose.PUBLISHABLE_STACKS
+    assert compose.STACK_SECRETS["vue3-springboot-mobile"] == ("JWT_SECRET", "REDIS_PASSWORD")
+
+
+MOBILE_META = {**META, "stack": "vue3-springboot-mobile"}
+
+
+def test_mobile_dev_adds_an_unpublished_service_and_one_port_still():
+    """移动栈 dev 多一个服务，但**不多一个端口**（规格 US-05 / D-8，P0 拓扑不变式）。
+
+    「多个服务 = 多个地址」是这次要破的迷思：mobile 一旦长出 ports:，端口池腰斩、
+    网关只认一条 routes.json 的契约被推翻，而且用户会拿到两个地址不知道该发哪一个。
+    """
+    doc = yaml.safe_load(compose.render_dev_compose(MOBILE_META))
+    assert set(doc["services"]) == {"migrate", "appredis", "backend", "frontend", "mobile"}
+    assert "ports" not in doc["services"]["mobile"]
+    # 只有 frontend 对外，且仍是一对里的 dev 端奇数口
+    assert [n for n, s in doc["services"].items() if s.get("ports")] == ["frontend"]
+    assert doc["services"]["frontend"]["ports"] == ["8211:5173"]
+    # mobile 挂的是管理端工程子目录（不是顶层 mobile/）：prod 前端镜像的构建上下文只有 ../frontend
+    assert "../frontend/mobile:/src" in str(doc["services"]["mobile"]["volumes"])
+    assert doc["services"]["mobile"]["networks"] == ["default"]   # 只上内部网，与 appredis 同级
+    # 引用↔声明一致：多一条卷就必须多一条声明（compose 的 undefined volume 是 up 期硬失败）
+    assert _named_volume_refs(doc) == set(doc["volumes"])
+    assert doc["volumes"][compose.MOBILE_VOLUME_NAME] == {}
+
+
+def test_mobile_dev_volume_is_mounted_at_the_same_path_but_is_a_different_volume():
+    """两条 node_modules 卷同挂载点、不同卷名：共用会把管理端与移动端两套依赖树盖在一起。
+
+    症状出现在最贵的时候——起栈时报 mount 冲突还算客气，静默共用则是一边 npm install
+    把另一边的 node_modules 换成别的版本，页面白屏且两边 package.json 都没错。
+    """
+    y = compose.render_dev_compose(MOBILE_META)
+    doc = yaml.safe_load(y)
+    fe = doc["services"]["frontend"]["volumes"]
+    mo = doc["services"]["mobile"]["volumes"]
+    assert compose.FE_VOLUME in fe and compose.MOBILE_VOLUME in mo
+    assert compose.MOBILE_VOLUME not in fe and compose.FE_VOLUME not in mo
+    # 同一个挂载点上只有一条卷：谁也不能既挂 fe 又挂 mobile
+    at_src = {v for v in fe + mo if str(v).endswith(":/src/node_modules")}
+    assert at_src == {compose.FE_VOLUME, compose.MOBILE_VOLUME}
+
+
+def test_springboot_dev_compose_is_untouched_by_the_mobile_layer():
+    """对照组（反向断言）：大栈 dev 不得长出 mobile 服务或那条卷声明。
+
+    两个标记的注入值都是「按栈判定」的，写反判定条件（或漏判）时大栈会连带起一个空的
+    uni dev server——`npm run dev:h5` 在大栈应用里根本不存在，表现为预览起不来而端口是通的。
+    """
+    y = compose.render_dev_compose(META)
+    assert "  mobile:" not in y
+    assert compose.MOBILE_VOLUME_NAME not in y
+    doc = yaml.safe_load(y)
+    assert _named_volume_refs(doc) == set(doc["volumes"])
+
+
+def test_mobile_prod_compose_is_the_springboot_one_byte_for_byte():
+    """prod 形态与移动栈无关：H5 住在前端镜像里，不是第三个可发布服务（ADR-0039）。
+
+    这条等价性是给 prod.py 兜底的：它的镜像记账、回滚体检、keep-N 清理都写死
+    `for role in ("frontend", "backend")`（prod.py:594/643/703）。移动栈一旦多一个镜像，
+    回滚只校验两个旧 tag、旧 prod-compose 却引用第三个已被清理的 tag——回滚当场起不来。
+    """
+    big = {**META, "stack": "vue3-springboot"}
+    assert compose.render_prod_compose(MOBILE_META) == compose.render_prod_compose(big)
+    doc = yaml.safe_load(compose.render_prod_compose(MOBILE_META))
+    assert [n for n, s in doc["services"].items() if s.get("ports")] == ["frontend"]
+    assert doc["services"]["frontend"]["ports"] == ["8210:80"]
+
+
+def test_mobile_dev_compose_has_no_marker_residue():
+    """移动栈产物同样吃「无 __ 残留」这条全局约束（审查 I-3）：两个新标记都要有替换方。"""
+    assert "__" not in compose.render_dev_compose(MOBILE_META)
+    assert "__" not in compose.render_prod_compose(MOBILE_META)
 
 def test_volume_name_is_single_source_of_truth(monkeypatch):
     """改卷名只动一处：挂载条目与顶层声明都由 VOLUME_NAME 派生（审查 I-1 / V9-M2）。"""
@@ -260,6 +351,7 @@ META_SB = {**META, "slug": "bigapp", "scale": "large", "stack": "vue3-springboot
            "database": {"dev": {"name": "bigapp_dev", "user": "bigapp_dev"},
                         "prod": {"name": "bigapp_prod", "user": "bigapp_prod"}},
            "health": {"frontend": "/", "backend": "/api/health"}}
+META_SB_MOBILE = {**META_SB, "stack": "vue3-springboot-mobile"}
 
 
 def test_render_dev_compose_springboot_shape():
@@ -463,6 +555,22 @@ def test_ensure_deploy_files_springboot_writes_prod_compose(tmp_path):
     assert "JWT_SECRET=" in env and "REDIS_PASSWORD=" in env
     assert env.count("JWT_SECRET=") == 1                 # 文件只有一行键（prod 与 dev 共用）
     assert "PROD_PASSWORD=\n" in env                     # 未供给时留空语义不变
+
+
+def test_ensure_deploy_files_mobile_writes_the_same_prod_shape_as_springboot(tmp_path):
+    """移动栈创建即落一份能 build 的 prod 件，且与大栈逐字相同——多出来的只有 dev 的 mobile 服务。
+
+    反过来说：prod 侧若给移动栈写了第三个服务，prod.py 的镜像记账（frontend/backend 两个 role）
+    就会缺账，回滚时旧 compose 引用的 mobile 镜像没人校验、也没人保留。
+    """
+    compose.ensure_deploy_files(tmp_path, META_SB_MOBILE, {"dev": CRED["dev"]})
+    prod = (tmp_path / "deploy" / "prod-compose.yml").read_text(encoding="utf-8")
+    assert prod == compose.render_prod_compose(META_SB)
+    assert "mobile" not in prod
+    dev = (tmp_path / "deploy" / "dev-compose.yml").read_text(encoding="utf-8")
+    assert "\n  mobile:" in dev and "../frontend/mobile:/src" in dev
+    env = (tmp_path / "deploy" / ".env").read_text(encoding="utf-8")
+    assert env.count("JWT_SECRET=") == 1 and env.count("REDIS_PASSWORD=") == 1   # 密钥面与大栈同一份
 
 
 def test_render_prod_compose_fastapi_matches_golden():

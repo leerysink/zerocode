@@ -54,11 +54,12 @@ def _patch_anon(monkeypatch, note="该应用没有可用的登录接口"):
     monkeypatch.setattr(bt, "login_app_session", anon)
 
 
-async def test_schema_has_only_path():
+async def test_schema_has_path_and_device_only():
     from app.agent.llm import BROWSER_TOOLS, BROWSER_TOOL_NAMES
     assert [t["function"]["name"] for t in BROWSER_TOOLS] == list(BROWSER_TOOL_NAMES)
     fn = BROWSER_TOOLS[0]["function"]
-    assert set(fn["parameters"]["properties"]) == {"path"}
+    assert set(fn["parameters"]["properties"]) == {"path", "device"}
+    assert "iPhone 14" in fn["parameters"]["properties"]["device"]["description"]
     assert fn["parameters"]["required"] == []
 
 
@@ -100,13 +101,33 @@ async def test_sidecar_unavailable_is_normal_result(monkeypatch):
     assert "browser" in out["hint"].lower()
 
 
+async def test_preview_page_forwards_device_to_the_sidecar(monkeypatch):
+    """US-20：device 是透传参数，工具层不改写也不校验——设备名只认 sidecar 的目录表。"""
+    captured = {}
+
+    async def ok(url, timeout_s, settle_ms, session_token="", device=""):
+        captured["device"] = device
+        return _sidecar_ok(screenshot_b64=None), ""
+
+    _patch_anon(monkeypatch)
+    monkeypatch.setattr(bt, "fetch_app", lambda ctx: _aget(_app(stack="vue3-springboot-mobile")))
+    monkeypatch.setattr(bt, "_sidecar_inspect", ok)
+
+    out = await bt.run_browser_tool(Ctx(), "preview_page",
+                                    {"path": "/h5/", "device": "iPhone 14"})
+    assert out["ok"] is True and captured["device"] == "iPhone 14"
+
+    await bt.run_browser_tool(Ctx(), "preview_page", {"path": "/h5/", "device": 3})
+    assert captured["device"] == ""      # 非字符串当没传，不把脏值塞给 sidecar
+
+
 async def test_success_saves_shot_and_redacts(monkeypatch, tmp_path):
     monkeypatch.setenv("ZEROCODE_DATA_DIR", str(tmp_path))
     captured = {}
 
-    async def ok(url, timeout_s, settle_ms, session_token=""):
+    async def ok(url, timeout_s, settle_ms, session_token="", device=""):
         captured.update(url=url, timeout_s=timeout_s, settle_ms=settle_ms,
-                        session_token=session_token)
+                        session_token=session_token, device=device)
         return _sidecar_ok(
             text='token: abcdefgh12345678 页面',
             console=[{"level": "error", "text": "api_key=sk-abcdefgh12345"}],
@@ -198,8 +219,9 @@ async def test_admin_login_hands_token_to_sidecar(monkeypatch, tmp_path):
         captured["dev_port"] = dev_port
         return "jwt-token-abc", ""
 
-    async def ok(url, timeout_s, settle_ms, session_token=""):
+    async def ok(url, timeout_s, settle_ms, session_token="", device=""):
         captured["session_token"] = session_token
+        captured["device"] = device
         return _sidecar_ok(), ""
 
     monkeypatch.setattr(bt, "fetch_app", lambda ctx: _aget(_app(stack="vue3-springboot")))

@@ -541,11 +541,33 @@ def test_init_sql_guards_unguarded_vector_alter(fake_repo):
     """边界：无守卫的 ALTER COLUMN TYPE vector(N) 必须被换成 DO 块——重放它等于全表重写 + 持锁。"""
     sql = (_build(fake_repo)["out"] / "init.sql").read_text(encoding="utf-8")
     assert "ALTER TABLE workspace_memory ALTER COLUMN embedding TYPE vector(1024);" not in sql
-    assert "$zcvec$" in sql and "to_regclass('workspace_memory')" in sql
+    assert "$zcalter$" in sql and "to_regclass('workspace_memory')" in sql
     assert "IS DISTINCT FROM 'vector(1024)'" in sql
     # changelog 原文不许被改写（后端启动迁移靠它，且 split_statements 不认 $$）
     assert "ALTER TABLE workspace_memory ALTER COLUMN embedding TYPE vector(1024);" in (
         fake_repo / "changelog" / "V20260102_01_vec.sql").read_text(encoding="utf-8")
+
+
+def test_init_sql_guards_unguarded_varchar_widening():
+    """VARCHAR 加宽与向量定维同形：重放同样全表重写 + 持锁，必须走同一个按实际类型判断的 DO 块。
+
+    `format_type` 对 varchar(40) 的展示名是 `character varying(40)`，比较基准写错会让 DO 块
+    每次重放都执行一次 ALTER——恰是这条守卫要消灭的行为。
+    """
+    src = "ALTER TABLE app_project ALTER COLUMN stack TYPE VARCHAR(40);"
+    out, hits = bo.guard_column_type_alter(src)
+    assert hits == 1 and "$zcalter$" in out
+    assert "to_regclass('app_project')" in out
+    assert "IS DISTINCT FROM 'character varying(40)'" in out
+    assert "EXECUTE format('ALTER TABLE %s ALTER COLUMN stack TYPE VARCHAR(40)', tbl)" in out
+    assert not out.lstrip().upper().startswith("ALTER TABLE")
+
+
+def test_real_changelog_widens_stack_without_leaving_bare_alter():
+    """真 changelog 的栈键加宽必须存在于合成物里，且不是裸 ALTER COLUMN TYPE。"""
+    sql = bo.synth_init_sql(bo.REPO_ROOT / "changelog", [], ROOT, generated_at=STAMP)
+    assert "ALTER TABLE app_project ALTER COLUMN stack TYPE VARCHAR(40);" not in sql
+    assert "IS DISTINCT FROM 'character varying(40)'" in sql
 
 
 def test_init_sql_seed_rewrites_root_path_and_leaves_owner_null(fake_repo):

@@ -5,18 +5,20 @@
 import { computed, h, onMounted, reactive, ref, watch } from 'vue'
 import {
   CloudServerOutlined, CloudUploadOutlined, DashboardOutlined, DatabaseOutlined,
-  HistoryOutlined, MenuUnfoldOutlined, PlayCircleOutlined, PoweroffOutlined, ProfileOutlined,
-  RedoOutlined, SelectOutlined, SyncOutlined,
+  HistoryOutlined, MenuUnfoldOutlined, MobileOutlined, PlayCircleOutlined, PoweroffOutlined,
+  ProfileOutlined, RedoOutlined, SelectOutlined, SyncOutlined,
 } from '@ant-design/icons-vue'
 import { message, Modal } from 'ant-design-vue'
 import { devReset, devRestart, devStart, listApps, prodStart, prodStop } from '../api'
 import { useChatStore } from '../stores/chat'
 import { useDevStatus } from '../composables/useDevStatus'
 import { devActionLabel, findAppByWorkspace, isDevBusy } from '../utils/appLookup'
+import { isMobileApp } from '../utils/mobileApp'
 import { canPublish as stackPublishable } from '../utils/publishableStacks'
 // 查看类内容一律复用应用列表那套现成组件，零改造、不抽公共层（ADR-0020）
 import DeployLogPanel from './DeployLogPanel.vue'
 import MetricsModal from './MetricsModal.vue'
+import MobileModal from './MobileModal.vue'
 import PublishHistory from './PublishHistory.vue'
 import PublishModal from './PublishModal.vue'
 
@@ -61,6 +63,7 @@ const logsOpen = shellOf('logs')
 const metricsOpen = shellOf('metrics')
 const historyOpen = shellOf('history')
 const publishOpen = shellOf('publish')
+const mobileOpen = shellOf('mobile')
 // 语义仍是「打开某个壳子」，供菜单项与重建后的自动开日志调用
 function openShell(key) {
   active.value = key
@@ -75,6 +78,8 @@ watch(() => chatStore.currentWorkspaceId, () => {
 
 // 栈闸门与列表页同源（utils/publishableStacks.js），不在聊天页另立一份名单
 const canPublish = computed(() => stackPublishable(app.value))
+// 移动端入口只对移动栈出现：非移动应用多一个点开就报 400 的菜单项等于制造死路
+const isMobile = computed(() => isMobileApp(app.value))
 
 // PublishModal 在 setup 期就读 props.app.id（useDeploy(props.app.id)），所以必须 v-if + :key
 // 才挂、不能靠传 null 隐藏；seq 递增保证换应用或再开一次时拿到全新实例（与 AppsView.vue 的挂载写法同款）。
@@ -251,6 +256,9 @@ watch(prodStatus, (next) => {
           <div class="zc-app-menu-item zc-menu-metrics" @click="openShell('metrics')">
             <dashboard-outlined /> 资源监控
           </div>
+          <div v-if="isMobile" class="zc-app-menu-item zc-menu-mobile" @click="openShell('mobile')">
+            <mobile-outlined /> 移动端
+          </div>
           <div class="zc-app-menu-item zc-menu-logs" @click="openShell('logs')">
             <profile-outlined /> 预览日志
           </div>
@@ -293,6 +301,13 @@ watch(prodStatus, (next) => {
     >
       <PublishHistory v-if="historyOpen" :app="app" @rollback="startRollback" />
     </a-drawer>
+
+    <MobileModal
+      v-if="mobileOpen && app"
+      :key="app.id"
+      v-model:open="mobileOpen"
+      :app="app"
+    />
 
     <PublishModal
       v-if="publishOpen"

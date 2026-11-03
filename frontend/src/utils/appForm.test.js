@@ -19,8 +19,16 @@ describe('validateForm', () => {
   it('slug 非法', () => {
     expect(validateForm({ ...base, slug: '2ab' }).ok).toBe(false)
   })
-  it('large 锁定 springboot', () => {
+  it('large 锁定 springboot 两档（含 uni-app 移动端叠加栈）', () => {
     expect(validateForm({ ...base, scale: 'large', stack: 'vue3-fastapi' }).ok).toBe(false)
     expect(validateForm({ ...base, scale: 'large', stack: 'vue3-springboot' }).ok).toBe(true)
+    expect(validateForm({ ...base, scale: 'large', stack: 'vue3-springboot-mobile' }).ok).toBe(true)
+  })
+  it('反方向：small 不得选大型档栈（移动栈/springboot）', () => {
+    expect(validateForm({ ...base, stack: 'vue3-springboot-mobile' }).ok).toBe(false)
+    expect(validateForm({ ...base, stack: 'vue3-springboot' }).ok).toBe(false)
+  })
+  it('未选栈优先提示选择，而不是档位锁定信息', () => {
+    expect(validateForm({ ...base, scale: 'large', stack: '' }).msg).toBe('请选择技术栈')
   })
 })

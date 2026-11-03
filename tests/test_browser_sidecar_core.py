@@ -27,6 +27,35 @@ def test_parse_allowed_hosts_defaults_and_trim():
     assert parse_allowed_hosts(" Example.COM , 10.0.0.1 ") == ("example.com", "10.0.0.1")
 
 
+# ---------- device 视口参数（US-20/21）：只改 context 的建立，不改采集 ----------
+
+DEVICES = {"iPhone 14": {"user_agent": "UA", "viewport": {"width": 390, "height": 664},
+                         "device_scale_factor": 3, "is_mobile": True, "has_touch": True,
+                         "default_browser_type": "webkit"}}
+
+
+def test_resolve_device_options_defaults_to_desktop():
+    options, err = _sidecar.resolve_device_options("", DEVICES)
+    assert err == ""
+    assert options == {"viewport": {"width": 1280, "height": 800}, "device_scale_factor": 1}
+
+
+def test_resolve_device_options_strips_browser_type_unknown_to_new_context():
+    options, err = _sidecar.resolve_device_options("iPhone 14", DEVICES)
+    assert err == ""
+    assert options["viewport"] == {"width": 390, "height": 664}
+    assert options["device_scale_factor"] == 3
+    assert options["is_mobile"] is True and options["has_touch"] is True
+    assert "default_browser_type" not in options
+
+
+def test_resolve_device_options_is_case_insensitive_and_rejects_unknown():
+    options, err = _sidecar.resolve_device_options(" iphone 14 ", DEVICES)
+    assert err == "" and options["viewport"]["width"] == 390
+    options, err = _sidecar.resolve_device_options("iPhone 99", DEVICES)
+    assert options == {} and "iPhone 99" in err
+
+
 def test_validate_target_accepts_allowlisted_http():
     url, err = validate_target("http://host.docker.internal:8210/orders?x=1")
     assert err == ""
@@ -551,6 +580,29 @@ async def test_collect_page_state_keeps_the_key_contract():
     assert out["truncated"] is False
     # url 是重写后的 connect_url（容器可达 IP），展示给用户前还要转回 display_url
     assert out["url"] == CONNECT_URL
+
+
+def _png_header(width: int, height: int) -> bytes:
+    return (b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR"
+            + width.to_bytes(4, "big") + height.to_bytes(4, "big") + b"\x00" * 8)
+
+
+def test_shot_size_prefers_png_header_and_falls_back_to_viewport():
+    """设备模拟下截图是物理像素：宽高必须报图里的真实数字，而不是桌面常量。"""
+    assert _sidecar._shot_size(_png_header(390, 844), None) == (390, 844)
+
+    class _WithViewport:
+        viewport_size = {"width": 390, "height": 664}
+
+    assert _sidecar._shot_size(b"png-bytes", _WithViewport()) == (390, 664)
+    assert _sidecar._shot_size(b"png-bytes", None) == (1280, 800)
+
+
+async def test_collect_page_state_reports_actual_png_dimensions():
+    out = await collect_page_state(_Page(shot=_png_header(390, 844)),
+                                   _collectors_with_events(), started=time.monotonic(),
+                                   timed_out=False, include_screenshot=True)
+    assert (out["screenshot_width"], out["screenshot_height"]) == (390, 844)
 
 
 async def test_collect_page_state_screenshot_is_opt_in_and_adds_three_keys():

@@ -272,3 +272,46 @@ async def test_create_large_app_end_to_end_lands_the_springboot_stack():
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert f"http://localhost:{app['dev_port']}" in readme
     assert "{{DEV_PORT}}" not in readme
+
+
+# ---------------------------------------------------------------------------
+# 移动栈登记（规格 2026-11-03 §5，决策 D-2/D-4/D-5）
+# ---------------------------------------------------------------------------
+
+async def test_mobile_stack_is_registered_as_large_only():
+    """移动栈是第 5 个 stack key，且只挂在 large 档下。
+
+    它不进 SMALL_STACKS 是 D-4 的地基：小型栈模板后端匿名、无鉴权代码，
+    移动端一登录就要重造整套安全体系。健康路径与大型栈同形（context-path /api）。
+    """
+    assert app_service.MOBILE_STACK == "vue3-springboot-mobile"
+    assert app_service.MOBILE_STACK in app_service.LARGE_STACKS
+    assert app_service.MOBILE_STACK not in app_service.SMALL_STACKS
+    assert app_service.MOBILE_STACK in app_service.STACKS
+    assert app_service.HEALTH_BY_STACK[app_service.MOBILE_STACK] == "/api/health"
+
+
+async def test_mobile_stack_renders_base_then_overlay_not_a_copy():
+    """叠加层而非复制整份模板（ADR-0039）：基底是 springboot，覆盖层只带移动端那一层。
+
+    这条断言存在的意义是拦住「图省事把 vue3-springboot 目录拷一份改名」的实现——
+    那会让仓库里出现两份 springboot 后端代码，修一个 bug 要改两处。
+    """
+    assert app_service.template_layers_of(app_service.MOBILE_STACK) == (
+        app_service.LARGE_STACK, app_service.MOBILE_OVERLAY)
+    # 其余栈仍是「一个栈一个目录」，不得被顺手改成叠加形态
+    assert app_service.template_layers_of(app_service.LARGE_STACK) == (app_service.LARGE_STACK,)
+    assert app_service.template_layers_of("vue3-fastapi") == ("vue3-fastapi",)
+
+
+async def test_create_app_rejects_mobile_stack_with_small_scale():
+    """反向闸门：small + 移动栈必须拒。
+
+    只守「large ⇒ 必须 springboot 系」而不守反方向，用户/前端一填错就会拿到一个
+    scale 与 stack 语义打架的应用行，且它渲染出来的是大型栈目录。
+    """
+    sf = make_session_factory(make_engine())
+    with pytest.raises(DeployError):
+        await app_service.create_app_project(
+            sf, name="x", slug=SLUG, scale="small", stack=app_service.MOBILE_STACK, root=str(ROOT))
+    assert not ROOT.exists()

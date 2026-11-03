@@ -716,6 +716,124 @@ async def test_stop_all_dev_on_exit_skipped_when_disabled(sf, make_app, seams):
     assert await _db_status(sf, a["id"]) == "running"    # 关掉开关 → prod 与 dev 栈都不受影响
 
 
+# ---------- feed 灌流（移动端 APK 上传的写管道） ----------
+
+class _Feed:
+    def __init__(self, chunks, error=None):
+        self.chunks = list(chunks)
+        self.error = error
+        self.reads = 0
+
+    async def read(self, n):
+        self.reads += 1
+        if self.error is not None and not self.chunks:
+            raise self.error
+        return self.chunks.pop(0) if self.chunks else b""
+
+
+class _FakeStdin:
+    def __init__(self):
+        self.data = bytearray()
+        self.closed = False
+
+    def write(self, chunk):
+        self.data += chunk
+
+    async def drain(self):
+        pass
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeProc:
+    """create_subprocess_exec 替身：stdout 吐给定行后 EOF，wait 立即返回退出码。"""
+
+    def __init__(self, out=b"", code=0):
+        self.stdin = _FakeStdin()
+        self.stdout = _FakeStdout(out)
+        self.code = code
+        self.killed = False
+
+    async def wait(self):
+        return self.code
+
+    def kill(self):
+        self.killed = True
+
+
+class _FakeStdout:
+    def __init__(self, data):
+        self._lines = data.splitlines(keepends=True)
+
+    async def readline(self):
+        return self._lines.pop(0) if self._lines else b""
+
+    async def read(self, n):
+        data = b"".join(self._lines)
+        self._lines.clear()
+        return data
+
+
+def _fake_exec(proc):
+    async def _f(*args, **kwargs):
+        proc.args = args
+        proc.kwargs = kwargs
+        return proc
+    return _f
+
+
+async def test_docker_feed_pipes_stdin_and_keeps_stdout_capture(monkeypatch):
+    """feed 是可读流时开 stdin 管道：逐块灌完、关管道，stdout 照旧进返回值与 on_line。"""
+    proc = _FakeProc(out=b"staged\n")
+    monkeypatch.setattr(engine.asyncio, "create_subprocess_exec", _fake_exec(proc))
+    seen = []
+    code, out = await engine.docker("compose", "exec", "-T", "backend", "sh", "-c", "cat > x",
+                                    feed=_Feed([b"abc", b"def"]), on_line=seen.append)
+    assert code == 0 and out == "staged" and seen == ["staged"]
+    assert bytes(proc.stdin.data) == b"abcdef"
+    assert proc.stdin.closed and not proc.killed
+    assert proc.kwargs["stdin"] is not None
+
+
+async def test_docker_feed_error_kills_the_child_and_propagates(monkeypatch):
+    """灌流超限（413）必须杀子进程再上抛：只关 stdin 会让容器内的 cat 读到 EOF 并把半个文件转正。"""
+    proc = _FakeProc()
+    monkeypatch.setattr(engine.asyncio, "create_subprocess_exec", _fake_exec(proc))
+    boom = DeployError("APK 不能超过 200MB", status=413)
+    with pytest.raises(DeployError) as ei:
+        await engine.docker("compose", "exec", "-T", "backend", "cat", feed=_Feed([b"abc"], error=boom))
+    assert ei.value.status == 413
+    assert proc.killed is True
+    assert bytes(proc.stdin.data) == b"abc"      # 已写进去的块不回收（进程直接被 kill）
+
+
+async def test_docker_cancel_kills_the_child_and_reraises(monkeypatch):
+    """请求断开（外层 task 被 cancel）同样要杀子进程：否则 compose exec 会继续写卷，半个 APK 留下。"""
+    class _BlockingProc(_FakeProc):
+        def __init__(self):
+            super().__init__()
+            self.released = asyncio.Event()
+
+        async def wait(self):
+            await self.released.wait()
+            return 0
+
+        def kill(self):
+            self.killed = True
+            self.released.set()
+
+    proc = _BlockingProc()
+    monkeypatch.setattr(engine.asyncio, "create_subprocess_exec", _fake_exec(proc))
+    task = asyncio.create_task(
+        engine.docker("compose", "exec", "-T", "backend", "cat", feed=_Feed([])))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert proc.killed is True
+
+
 # ---------- 真实 docker 封装（仅这两条依赖 Docker Desktop） ----------
 
 @needs_docker

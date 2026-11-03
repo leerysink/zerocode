@@ -806,6 +806,18 @@ async def test_ensure_prod_proxy_conf_picks_template_by_stack(tmp_path):
     assert "backend:8080" in conf and "8000" not in conf
 
 
+async def test_ensure_prod_proxy_conf_mobile_stack_uses_overlay(tmp_path):
+    """叠加栈按层序倒序找模板：移动栈没有独立模板目录，反代必须落在覆盖层那一份上。"""
+    from app.services import app_service
+    fe = tmp_path / "frontend"
+    fe.mkdir()
+    assert await prod._ensure_prod_proxy_conf(fe.parent, app_service.MOBILE_STACK) is True
+    conf = (fe / "nginx.conf").read_text(encoding="utf-8")
+    assert conf == (app_service.TEMPLATES / app_service.MOBILE_OVERLAY / "frontend" / "nginx.conf"
+                    ).read_text(encoding="utf-8")
+    assert "location /h5/" in conf       # 覆盖层特征：H5 入口在反代配置里
+
+
 async def test_ensure_prod_proxy_conf_default_stack_untouched(tmp_path):
     """回归钉：不传栈的旧调用形状（存量 fastapi 路径）行为逐字不变。"""
     from app.services import app_service

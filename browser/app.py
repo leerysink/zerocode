@@ -42,6 +42,9 @@ SIDECAR_WAIT_GRACE_SECONDS = 5
 # 两处各写一遍 1280/800 的话，前端按宽高做坐标换算迟早和图对不上。
 VIEWPORT_WIDTH = 1280
 VIEWPORT_HEIGHT = 800
+# 不传 device 时的桌面视口；设备模拟会整份替换掉 viewport / dsf / UA / touch 这几项。
+DESKTOP_VIEWPORT = {"viewport": {"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
+                    "device_scale_factor": 1}
 # 给模型的错误说明长度：Playwright 的原文带着整段选择器与调用栈提示，全量进上下文只是噪声。
 ERROR_TEXT_MAX = 300
 SESSION_GONE_MESSAGE = "浏览器会话已结束，请重新 browser_open"
@@ -72,6 +75,9 @@ class InspectRequest(BaseModel):
     timeout_ms: int = DEFAULT_TIMEOUT_MS
     # 验证会话的 JWT（ADR-0038）：后端代登后只递 token，不递口令；缺省即匿名检查。
     session_token: str | None = None
+    # Playwright 设备名（如 "iPhone 14"）。空串=桌面视口；只影响 context 的建立，
+    # 采集与裁剪仍是同一个 collect_page_state（US-21）。
+    device: str = ""
 
 
 class OpenRequest(BaseModel):
@@ -82,6 +88,7 @@ class OpenRequest(BaseModel):
     expect: dict | None = None
     settle_ms: int = 0
     interactive_max: int = INTERACTIVE_MAX_DEFAULT
+    device: str = ""
 
 
 class StepRequest(BaseModel):
@@ -116,6 +123,53 @@ def _interactive_limit(raw) -> int:
     旋钮等于让调用方自己决定泄漏多少。
     """
     return _clamp(raw, INTERACTIVE_MAX_DEFAULT, 1, INTERACTIVE_MAX_DEFAULT)
+
+
+def resolve_device_options(device: str, known: dict | None = None) -> tuple[dict, str]:
+    """把 `device` 解析成 `new_context` 参数：`(kwargs, 错误原因)` 恰好一个非空。
+
+    空串保持桌面视口（今天的行为）；设备名来自 Playwright 自带的 devices 表，按名字查，
+    大小写宽松。表由启动后的 Playwright 实例提供，`known` 只给纯函数测试注入。
+    Python 的设备描述里带 `default_browser_type`，它不是 `new_context` 的参数，必须摘掉。
+    """
+    name = str(device or "").strip()
+    if not name:
+        return dict(DESKTOP_VIEWPORT), ""
+    table = known
+    if table is None:
+        table = getattr(_playwright, "devices", None) or {}
+    spec = table.get(name) if isinstance(table, dict) else None
+    if spec is None and isinstance(table, dict):
+        folded = {str(k).casefold(): v for k, v in table.items()}
+        spec = folded.get(name.casefold())
+    if not isinstance(spec, dict):
+        return {}, (f"未知视口设备：{name}。请用 Playwright 设备名（如 iPhone 14、Pixel 7），"
+                    "不传则用桌面 1280×800")
+    options = dict(spec)
+    options.pop("default_browser_type", None)
+    options.pop("defaultBrowserType", None)
+    return options, ""
+
+
+def _png_size(data: bytes) -> tuple[int, int] | None:
+    """从 PNG 头取真实像素宽高：设备模拟下截图是物理像素（viewport × dsf），
+    报 CSS 视口尺寸会让「截图宽高」与实际图片对不上。"""
+    if (len(data) >= 24 and data[:8] == b"\x89PNG\r\n\x1a\n"
+            and data[12:16] == b"IHDR"):
+        return int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+    return None
+
+
+def _shot_size(shot: bytes, page) -> tuple[int, int]:
+    """截图宽高：优先 PNG 头，取不到（测试假数据/异常编码）再退回页面视口，最后桌面常量。"""
+    size = _png_size(shot)
+    if size:
+        return size
+    viewport = getattr(page, "viewport_size", None) or {}
+    try:
+        return int(viewport["width"]), int(viewport["height"])
+    except (KeyError, TypeError, ValueError):
+        return VIEWPORT_WIDTH, VIEWPORT_HEIGHT
 
 
 def _short(err: Exception) -> str:
@@ -194,10 +248,13 @@ async def inspect(req: InspectRequest):
         raise HTTPException(503, "浏览器尚未就绪")
     wait_ms = _clamp(req.wait_ms, DEFAULT_WAIT_MS, 0, WAIT_MS_MAX)
     timeout_ms = _clamp(req.timeout_ms, DEFAULT_TIMEOUT_MS, 10000, TIMEOUT_MS_MAX)
+    context_options, device_err = resolve_device_options(req.device)
+    if device_err:
+        raise HTTPException(400, device_err)
     async with _sem:
         try:
             return await asyncio.wait_for(
-                _inspect(url, wait_ms, timeout_ms, req.session_token),
+                _inspect(url, wait_ms, timeout_ms, req.session_token, context_options),
                 timeout=timeout_ms / 1000 + SIDECAR_WAIT_GRACE_SECONDS)
         except asyncio.TimeoutError:
             return {"ok": False, "timed_out": True, "error": "页面检查超时"}
@@ -228,15 +285,13 @@ async def _connect_url(url: str) -> str:
 
 
 async def _inspect(url: str, wait_ms: int, timeout_ms: int,
-                   session_token: str | None = None) -> dict:
+                   session_token: str | None = None,
+                   context_options: dict | None = None) -> dict:
     connect_url = await _connect_url(url)
     started = time.monotonic()
-    context = await _browser.new_context(
-        viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
-        device_scale_factor=1,
-        locale="zh-CN",
-        ignore_https_errors=False,
-    )
+    options = {"locale": "zh-CN", "ignore_https_errors": False,
+               **dict(context_options or DESKTOP_VIEWPORT)}
+    context = await _browser.new_context(**options)
     try:
         script = build_session_script(session_token, origin_string(connect_url))
         if script:
@@ -366,9 +421,10 @@ async def collect_page_state(page, collectors: Collectors, *, started: float,
     # connect_url（重写后的地址，含容器可达 IP），非 display_url：对外展示前必须再转一次。
     result["url"] = page.url
     if shot is not None:
+        width, height = _shot_size(shot, page)
         result["screenshot_b64"] = base64.b64encode(shot).decode("ascii")
-        result["screenshot_width"] = VIEWPORT_WIDTH
-        result["screenshot_height"] = VIEWPORT_HEIGHT
+        result["screenshot_width"] = width
+        result["screenshot_height"] = height
     return result
 
 
@@ -432,6 +488,9 @@ async def open_session(req: OpenRequest):
         raise HTTPException(400, err)
     if _browser is None:
         raise HTTPException(503, "浏览器尚未就绪")
+    context_options, device_err = resolve_device_options(req.device)
+    if device_err:
+        raise HTTPException(400, device_err)
     if not can_open(len(SESSIONS), max_sessions()):
         raise HTTPException(409, SESSION_FULL_MESSAGE)
     timeout_ms = _clamp(req.timeout_ms, DEFAULT_TIMEOUT_MS, 10000, TIMEOUT_MS_MAX)
@@ -442,11 +501,8 @@ async def open_session(req: OpenRequest):
     # 失败一律回带原因的正常结果，不把它升级成给后端的 500（与下面 open 主体的口径一致）。
     context = None
     try:
-        context = await _browser.new_context(
-            viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
-            device_scale_factor=1,
-            locale="zh-CN",
-        )
+        options = {"locale": "zh-CN", **dict(context_options or DESKTOP_VIEWPORT)}
+        context = await _browser.new_context(**options)
         page = await context.new_page()
         collectors = await attach_listeners(page, connect_url)
     except Exception as e:  # noqa: BLE001
@@ -749,8 +805,9 @@ async def session_screenshot(sid: str):
             return {"ok": False, "error": "浏览器会话异常终止，请重新 browser_open",
                     "session_gone": True}
         return {"ok": False, "error": f"截图失败: {_short(e)}"}
+    width, height = _shot_size(shot, s.page)
     return {"ok": True, "screenshot_b64": base64.b64encode(shot).decode("ascii"),
-            "screenshot_width": VIEWPORT_WIDTH, "screenshot_height": VIEWPORT_HEIGHT}
+            "screenshot_width": width, "screenshot_height": height}
 
 
 @app.delete("/sessions/{sid}")

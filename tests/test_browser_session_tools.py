@@ -119,7 +119,7 @@ async def test_session_schema_exposes_no_session_id():
     from app.agent.llm import BROWSER_SESSION_TOOLS
     props = {t["function"]["name"]: set(t["function"]["parameters"]["properties"])
              for t in BROWSER_SESSION_TOOLS}
-    assert props["browser_open"] == {"path", "expect", "screenshot"}
+    assert props["browser_open"] == {"path", "device", "expect", "screenshot"}
     assert props["browser_close"] == set()
     assert "session_id" not in props["browser_step"]
     assert props["browser_step"] == {"action", "target", "value", "expect", "screenshot"}
@@ -527,6 +527,20 @@ async def test_sidecar_open_payload_carries_interactive_max(monkeypatch):
     monkeypatch.setattr(bst, "httpx", holder)
     await bst._sidecar_open("http://h:1/", timeout_s=45, expect=None, interactive_max=12)
     assert client.calls[0][2]["interactive_max"] == 12
+
+
+async def test_open_device_reaches_the_sidecar_body_only_when_given(monkeypatch):
+    """US-20：走查 /h5/ 时把设备名送到 sidecar；不带 device 的旧请求体保持逐字节不变。"""
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    client, holder = _fake_httpx(resp=_Resp(200, _session_ok()))
+    monkeypatch.setattr(bst, "httpx", holder)
+
+    await bst.run_browser_session_tool(Ctx(), "browser_open", {"path": "/orders"})
+    assert "device" not in client.calls[0][2]
+
+    await bst.run_browser_session_tool(Ctx(), "browser_open",
+                                       {"path": "/h5/", "device": "iPhone 14"})
+    assert client.calls[1][2]["device"] == "iPhone 14"
 
 
 # --------------------------------------------------- open 的 expect 通道（规格 US-06、裁定 R-41）
