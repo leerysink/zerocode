@@ -1077,6 +1077,76 @@ async def test_an_unknown_handle_is_masked_like_a_sensitive_one():
     assert lonely_hits == 1 and "hunter2" not in lonely[0]["function"]["arguments"]
 
 
+async def test_the_unknown_mask_never_copies_the_token_shape():
+    """未知即遮**不认句柄长相**（本次改动第 3 节，压在 C-1 那条 Critical 上）。
+
+    sidecar 的 `REF_RE` 这次从序号换成了 `r` + 6 位随机令牌。后端这里若还留一份形状正则
+    （原先是 `^e\\d+$`），换形状的那一刻所有 target 都会被判成「不是句柄」→ 未知即遮静默失效
+    → 口令明文进 `message.tool_args`，而**一条测试都不会红**——两侧各一份正则就是这种锁步耦合。
+    现在的判据只看开头：`/` 起头的是 navigate 的 path，其余一律当句柄。于是三种形状同命：
+    新令牌、旧序号、什么形状都不像的自由文本，只要不在轮初清单里就遮。
+    """
+    refs = [{"ref": "rd2k7qx", "role": "textbox", "name": "用户名", "sensitive": False}]
+    for unknown in ("rz4xwnt",         # 新形状、这一轮没发出去过（第一步返回的清单里才有）
+                    "e9",              # 旧序号形状：模型从历史消息里抄一个句柄是完全现实的形状
+                    "用户名框",         # 自由文本：判不出句柄就从严，不猜它是不是
+                    "r", "r0"):        # 畸形得连形状都没有
+        out, hits = bst.redact_sensitive_step_args(
+            [_tool_call("browser_step", action="fill", target=unknown, value="hunter2")], refs)
+        assert hits == 1, unknown
+        assert json.loads(out[0]["function"]["arguments"])["value"] == "<redacted:sensitive_input>"
+    # 只有 navigate 的 path 不进这条规则：它的 target 不是句柄，读历史的人要能看出去了哪
+    kept, kept_hits = bst.redact_sensitive_step_args(
+        [_tool_call("browser_step", action="navigate", target="/login", value="hunter2")], refs)
+    assert kept_hits == 0 and "hunter2" in kept[0]["function"]["arguments"]
+    # 清单里查得到的非 sensitive 句柄照旧放行（一刀切会把备注的可读性一起毁掉）——
+    # 用**新形状**的令牌钉一次：判定与形状无关，换形状没有把「已知放行」改成「已知也遮」。
+    listed, listed_hits = bst.redact_sensitive_step_args(
+        [_tool_call("browser_step", action="fill", target="rd2k7qx", value="alice")], refs)
+    assert listed_hits == 0 and json.loads(listed[0]["function"]["arguments"])["value"] == "alice"
+    # 反向闸：后端这一侧不许再出现第二份「认句柄长相」的正则。
+    # 按模块里编译过的正则逐条问一次「你能匹配上一个令牌吗」——比对着某个具体写法字符串更耐改：
+    # `_IP_PORT_RE` 那类与本判定无关的正则照旧放行，而任何形状判据一旦复制过来就当场红。
+    import inspect
+    import re as _re
+
+    source = inspect.getsource(bst)
+    assert "_REF_HANDLE_RE" not in source          # 那份 `^e\d+$` 不许以任何形式回来（含改名后）
+    assert "NAVIGATE_PATH_PREFIX" in source        # 判据只有一个：以 / 开头的是 navigate 的 path
+    accepted = [p.pattern for p in list(vars(bst).values()) if isinstance(p, _re.Pattern)
+                and p.fullmatch("rd2k7qx")]
+    assert accepted == []
+
+
+async def test_a_stale_token_comes_back_as_ref_invalid_with_list_and_shot(monkeypatch, tmp_path):
+    """令牌查不到那条出口在**后端这一跳**的形状：那句中文 + 新清单 + 自动附图（US-09 / R-26）。
+
+    sidecar 那一层的同一格在 `tests/test_browser_sessions.py`；这里要钉的是后端读了它之后
+    仍然把它当「点不动」而不是「断言没过」：`ok:false`、没有 `passed` 键、扣一步、
+    并把新清单认作下一步的判定源。
+    """
+    monkeypatch.setenv("ZEROCODE_DATA_DIR", str(tmp_path))
+    stale_refs = [{"ref": "rd2k7qx", "role": "button", "name": "结算", "sensitive": False}]
+    fresh = [{"ref": "r4xwntk", "role": "button", "name": "结算", "sensitive": False}]
+    seen = _shot_env(monkeypatch, replies=_step_data(
+        ok=False, error="ref 无效或页面已变化，请用最新清单里的 ref", interactive=fresh))
+    ctx = Ctx()
+    ctx.run_state["browser_session"] = "abc"
+    ctx.run_state["browser_refs"] = stale_refs
+    out = await bst.run_browser_session_tool(
+        ctx, "browser_step", {"action": "click", "target": "rd2k7qx"})
+    assert out["ok"] is False and "passed" not in out
+    assert out["error"] == "ref 无效或页面已变化，请用最新清单里的 ref"
+    assert [i["ref"] for i in out["interactive"]] == ["r4xwntk"]
+    assert out["steps_charged"] is True
+    assert out["screenshot"]["url"].startswith("/api/browser/shots/7/")   # 失败自动补现场图
+    assert seen == ["abc"]
+    # 新清单成为下一步的判定源（旧令牌从此在这份账上查无此号，只会走未知即遮）
+    assert ctx.run_state["browser_refs"] == fresh
+    assert ctx.run_state["browser_log"][-1]["ok"] is False
+    assert ctx.run_state["browser_log"][-1]["target_name"] == "结算"      # 动作之前那份清单里查到的
+
+
 async def test_every_step_after_the_first_is_masked_even_on_a_listed_plain_ref():
     """位次从严（裁定 R-35，C-1 残留）：同一条消息里第 2 个及以后的 `browser_step` 一律按 sensitive 遮。
 

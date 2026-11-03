@@ -689,13 +689,15 @@ def _step_failure(ctx, data: dict, *, target_netloc: str, display_netloc: str,
 #   · `_step` 写 `browser_log` 时对 sensitive 目标的 value 遮断（Task 5）；
 #   · `redact_sensitive_step_args` 对落库/推送的同一份 value 遮断（裁定 R-33）；
 #   · `ref_display_name` 回显这一步的元素名（裁定 R-32，US-22）。
-# 不拿动作之后的新快照做后两件：ref 是按采集顺序现编的、每次重渲染全部作废（规格 §6.2），
-# 用新快照反查 `e7` 会标到另一个元素上——名字画错比不画更糟，遮断遮错对象就是明文泄漏。
+# 不拿动作之后的新快照做后两件：ref 是每次扫描重生成的随机令牌、旧令牌在新清单里必然查不到
+# （规格 §6.2），拿新快照反查旧句柄只会得到一个空名字——而名字画错比不画更糟，遮断遮错对象就是
+# 明文泄漏，判定源因此恒为「动作之前」那一份。
 # 参数侧还多两条「清单说了也不算」的从严（`is_sensitive_ref_or_unknown` 与位次规则，Critical C-1
 # 的裁定 R-34 / R-35 / R-36 / R-38）：它在派发之前跑，天生只能拿到本轮开始时那份清单，而一条消息里发两个 step 时
-# 第二步面对的是「已经被第一步改写过、但这一行写不出来」的页面——第二步的 ref 既可能全新（旧清单
-# 查无此号），也可能复用旧索引（每次重渲染从头重编，规格 §6.2：旧清单里的 `e2` 是搜索框，
-# 展开表单后的 `e2` 是口令框）。两条合起来的效果是：只有**本条消息在这一步之前没有别的浏览器调用
+# 第二步面对的是「已经被第一步改写过、但这一行写不出来」的页面——第二步的 ref 只能来自第一步
+# 返回的新清单，那份参数侧永远看不到（令牌形状下它恒为「轮初清单查无此号」，正好落在未知即遮上；
+# 位次规则不是被它替代：清单里**查得到**的那个令牌，指向的节点也可能在两次采集之间被 Vue 就地
+# 改成口令框，见 §8 R-37）。两条合起来的效果是：只有**本条消息在这一步之前没有别的浏览器调用
 # 改写过页面**的那条 step，才按轮初清单判（改写者含 `_open`，裁定 R-36；那条 open 的 `arguments`
 # 是空串或半截 JSON 也算，裁定 R-38——畸形 args 在派发端被换成 `{}`，而 path 缺省就是合法调用）。
 def is_sensitive_ref(refs, ref: str) -> bool:
@@ -706,9 +708,19 @@ def is_sensitive_ref(refs, ref: str) -> bool:
                and item.get("sensitive") for item in list(refs or []))
 
 
-# 句柄形态：`e` + 数字，sidecar 按采集顺序现编的 ref。参数侧的「未知即遮」只认这个形态，
-# 于是 navigate 的 path（`/login`）天然被排除在外——它不是 ref，无从判定也谈不上风险。
-_REF_HANDLE_RE = re.compile(r"^e\d+$")
+# 句柄与 navigate 的 path 怎么分：**只看开头，不看句柄长什么样**。
+# 句柄是 sidecar 每次扫描重生成的随机短令牌（`browser/session_core.py::new_ref_tokens`），
+# 它的形状正则活在那一侧、用于 `selector_for` 拼选择器前的那道闸。这里以前是**第二个字面量**
+# （`^e\d+$`），于是「改令牌形状」成了一次跨进程的锁步同步：漏改的这一侧不会红任何测试，
+# 症状却是未知句柄从此不遮（判据是「像不像句柄」，形状一变就全部判成「不是句柄」→ 放行）——
+# 正是 C-1 那条 Critical 防线的静默失效方向。以 `/` 开头的是 navigate 的路径，其余一律当句柄，
+# 令牌格式将来再怎么变都不影响这条线。
+NAVIGATE_PATH_PREFIX = "/"
+
+
+def _is_navigate_target(target: str) -> bool:
+    """这个 target 是 navigate 的 path 吗（path 恒以单个 `/` 开头，见 `normalize_path`）。"""
+    return target.startswith(NAVIGATE_PATH_PREFIX)
 
 
 def _ref_is_listed(refs, ref: str) -> bool:
@@ -727,29 +739,34 @@ def is_sensitive_ref_or_unknown(refs, target: str) -> bool:
     并行调用）。第二步的 target 只能来自第一步的返回值——那份清单参数侧永远看不到。旧口径下
     「click 展开带口令框的表单 + 紧接着 fill 那个新 ref」这一路，value 会明文进
     `message.tool_args` 与 WS `tool_call` 事件，而结果侧（读各步动作前的清单）照常遮断，
-    正是「一处遮一处不遮就是漏」。而且模型不必猜中 ref：登录页 e1=用户名、e2=口令这种编号
-    本来就可预测。
+    正是「一处遮一处不遮就是漏」。
 
     未知即遮的代价只是「一个查不到名字的 ref 填的内容不落明文」，反向的代价是凭据进库（US-19）。
     已知且非 sensitive 的仍然放行——一刀切会把「这一步填了什么备注」一起毁掉。
     结果侧不套这条：它读的就是各步动作前的那份清单，ref 恒在清单里，语义保持不变。
 
-    但「存在即信任」本身仍有残留：ref 每次重渲染从头重编（规格 §6.2），`click` 展开出来的口令框
-    常常正落在旧清单已有的索引上（旧 `e2` 搜索框 → 新 `e2` 口令框），这一支在这里判 False、
-    却该遮。收口它的是调用方的位次规则（`redact_sensitive_step_args`，裁定 R-35），
-    本函数只看清单、管不到「这条调用是本轮第几条」，所以不在这里判。
+    句柄身份**不按形状认**（理由见 `_is_navigate_target` 上方那段）：只要不是 navigate 的 path，
+    就当它是一句句柄参与未知即遮。这也顺带修掉了旧形状的一个可预测性——编号时代的
+    「登录页 e1=用户名、e2=口令」那种猜中，现在猜不到了（令牌每次扫描重生成），但参数侧
+    「天生看不到当步清单」这件事一点没变，所以这条从严照旧。
+
+    「存在即信任」的残留也还在，只是形状换了：清单里查得到的那个令牌指向的节点可能在两次采集
+    之间被 Vue 就地改过类型（`:type` 一翻，搜索框就变成口令框，而 `data-zc-ref` 不是 Vue 管的
+    属性），这一支在这里判 False、却该遮。收口它的是调用方的位次规则
+    （`redact_sensitive_step_args`，裁定 R-35），本函数只看清单、管不到「这条调用是本轮第几条」，
+    所以不在这里判。
     """
     if not target:
         return False
-    if not _REF_HANDLE_RE.match(target):
-        return False                      # path 或自由文本：不是句柄，不进未知即遮
+    if _is_navigate_target(target):
+        return False                      # navigate 的 path：不是句柄，不进未知即遮
     if is_sensitive_ref(refs, target):
         return True
     return not _ref_is_listed(refs, target)
 
 
 def ref_display_name(refs, ref: str) -> str:
-    """按「动作之前」那份清单查 ref 的元素名，取不到就返回空串（卡片自行回落「句柄 e7」）。
+    """按「动作之前」那份清单查 ref 的元素名，取不到就返回空串（卡片自行回落「句柄 r7kqmbt」）。
 
     名字是页面派生文本，过与清单同一条遮断闸（`_interactive_items` 用的就是 `_redact` +
     `REF_NAME_MAX_CHARS`）：`run_state["browser_refs"]` 存的是未遮断的原始清单，直接 echo
@@ -769,7 +786,7 @@ def _step_echo(action: str, shown_target: str, expect, target_name: str = "") ->
     少了这几个字段，「这一步动的哪个 ref」只能回头翻上一条消息记录；`expect` 只在真的给了
     时出现，没判定就不假装判过（同 `_shape_state` 对 `passed` 的处理）。
     `target_name` 同理只在查得到时出现（裁定 R-32，US-22 的「目标元素名」）：元素名缺席时
-    卡片回落显示「句柄 e7」，比编一个名字诚实。
+    卡片回落显示「句柄 r7kqmbt」，比编一个名字诚实。
     """
     out = {"action": action, "target": shown_target}
     if target_name:
@@ -789,7 +806,7 @@ def redact_sensitive_step_args(tool_calls, refs) -> tuple[list[dict], int]:
 
     为什么通用遮断不够（裁定 R-33，US-19 的「我在应用里输入的口令不会明文留在聊天记录里」）：
     `redact_tool_calls_args` 走的是按**凭据形态**匹配的规则表，`admin123`、`hunter2` 这类
-    不成形态的字符串它一个都抓不住，于是 `{"action":"fill","target":"e2","value":"hunter2"}`
+    不成形态的字符串它一个都抓不住，于是 `{"action":"fill","target":"r7kqmbt","value":"hunter2"}`
     会原样进 `message.tool_args`，并被通用的 ToolCallBlock 明文打印出来。Task 4/5 只遮了
     结果侧的 `browser_log`，参数侧这半边的缺口在两轮审查里都没进 diff。
 
@@ -801,10 +818,14 @@ def redact_sensitive_step_args(tool_calls, refs) -> tuple[list[dict], int]:
     位次从严（R-35，收 C-1 残留）：`refs` 是**本轮开始时**那份清单（`loop.py` 在派发前一次读死，
     整轮不变），它只对**本条消息在这一步之前没有别的浏览器调用改写过页面**的那条 `browser_step`
     权威。之后的每一条面对的是「已经被前几条调用换过一遍、但落库这行写在派发之前、写不出来它长
-    什么样」的清单，而四种失效形状都在这份旧清单上判不出来：新出现的 ref（旧清单查无此号，由
-    「未知即遮」兜）、**复用旧索引**的 ref（旧 `e2=搜索框`、`click` 展开后 `e2=口令框`，未知即遮
-    兜不到，因为它在清单里），**同一条消息里换页**（`browser_open` 之后 `e2` 是新页的元素，
-    裁定 R-36），以及**args 为空/畸形却仍被派发的前序浏览器调用**（它照样开了一页、照样换了清单，
+    什么样」的清单，而失效形状都在这份旧清单上判不出来：新出现的 ref（旧清单查无此号，由
+    「未知即遮」兜——令牌每次扫描重生成，第二条起的 target 只能来自第一条返回的新清单，
+    因此恒在轮初那份里查不到，这一支现在是**两条规则同时兜**的，位次从严不退居二线，见下），
+    **清单里查得到、但节点被就地改了类型**的 ref（Vue 常常是就地打补丁而不是重建节点，
+    `:type` 一翻同一个 `<input>` 就从搜索框变成口令框，而 `data-zc-ref` 不是 Vue 管的属性，
+    节点活着它就活着——未知即遮兜不到，因为它在清单里，§8 R-37 记的就是这一支），
+    **同一条消息里换页**（`browser_open` 之后的 target 是新页的元素，裁定 R-36），
+    以及**args 为空/畸形却仍被派发的前序浏览器调用**（它照样开了一页、照样换了清单，
     裁定 R-38——所以位次按名字数，不按 args 能否解析数）。与其猜那份清单长什么样，不如一律按
     sensitive 处理。
     代价是同轮多调用时非口令的 fill 也显示成占位符（每次走查 0–2 条的量级），
@@ -930,8 +951,8 @@ async def _step(ctx, args: dict) -> dict:
     # 事后按新清单查，元素可能已经跟着重渲染换过人，这一步填进去的口令就会明文落进消息历史（US-19）。
     # 同一个判定也供 loop 的参数侧遮断使用（`redact_sensitive_step_args`），两处必须一起遮。
     sensitive = is_sensitive_ref(ctx.run_state.get("browser_refs"), payload_ref)
-    # 元素名同样取动作之前那份清单（裁定 R-32）：新快照里的 `e7` 已经是另一个元素，
-    # 拿它标「这一步动的谁」会画出假目标。
+    # 元素名同样取动作之前那份清单（裁定 R-32）：新快照里的令牌是这一轮现生成的，
+    # 旧句柄在里面根本查不到，拿它标「这一步动的谁」只会画出空目标。
     target_name = ref_display_name(ctx.run_state.get("browser_refs"), payload_ref)
 
     payload = {"action": action, "ref": payload_ref, "value": value, "path": payload_path,
@@ -1053,7 +1074,8 @@ async def _close(ctx, _args: dict) -> dict:
                 # 缺 ok 键的旧条目（open 那一条）按「推进了」读。
                 "ok": bool(s.get("ok", True)),
                 "passed": s.get("passed")}
-        # 元素名同理（M-6）：句柄按规格 §6.2 早已作废，读报告的人手上没有清单能对回 `e7` 是谁。
+        # 元素名同理（M-6）：句柄按规格 §6.2 早已作废（每次扫描换一批新令牌），读报告的人手上
+        # 没有任何一份清单能对回那个令牌是谁。
         # log 里存的那份已过 `ref_display_name` 的遮断闸，这里照 error/note 的形状再过一遍
         # `_redact`——报告是会被原样贴进消息历史的那一份，纵深防御。
         if s.get("target_name"):
