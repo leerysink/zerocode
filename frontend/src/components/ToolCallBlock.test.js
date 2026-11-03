@@ -6,6 +6,7 @@ import { h } from 'vue'
 import { mount } from '@vue/test-utils'
 
 import ToolCallBlock from './ToolCallBlock.vue'
+import DiffBlock from './DiffBlock.vue'
 
 const CollapseStub = {
   name: 'a-collapse',
@@ -68,5 +69,34 @@ describe('ToolCallBlock 的澄清收口标题', () => {
   it('其余工具不受影响', () => {
     expect(headerOf({ name: 'write_file', args: { path: 'a.txt' }, result: { ok: true } }))
       .toBe('🔧 write_file')
+  })
+})
+
+describe('ToolCallBlock 把变更身份交给内联 diff', () => {
+  function mountBlock(msg, sessionId) {
+    return mount(ToolCallBlock, {
+      props: { msg, sessionId },
+      global: { stubs: { 'a-collapse': CollapseStub, 'a-collapse-panel': PanelStub } },
+    })
+  }
+
+  it('消息带记录 id 时把 id 与会话 id 一起给 DiffBlock，聊天流里那条 diff 才跳得进详情整页', () => {
+    const wrapper = mountBlock({
+      name: 'write_file',
+      diff: '--- a/a.txt', diff_path: 'a.txt', diff_action: 'create', diff_change_id: 345,
+    }, 12)
+    const block = wrapper.findComponent(DiffBlock)
+
+    expect(block.exists()).toBe(true)
+    expect(block.props('changeId')).toBe(345)
+    expect(block.props('sessionId')).toBe(12)
+  })
+
+  it('边界：消息没有记录 id（刷新后的历史、不落库的调用点）时不编造，DiffBlock 自然不给按钮', () => {
+    const wrapper = mountBlock({ name: 'write_file', diff: '--- a/a.txt', diff_path: 'a.txt' }, 12)
+    const block = wrapper.findComponent(DiffBlock)
+
+    expect(block.exists()).toBe(true)
+    expect(block.find('.zc-diff-open').exists()).toBe(false)
   })
 })

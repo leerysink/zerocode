@@ -6,7 +6,8 @@
 //   编辑收口到工作台：这里只给「在编辑器中打开」，新标签带 ?name=&file= 跳到工作台并定位该文件。
 // 「打开文件夹」按 fs.open_folder_mode 分流：默认直接新标签打开内置文件管理器整页（/workspaces/{id}/files）；
 //   显式选 auto 时同机访问才调后端本机文件管理器（POST /api/fs/open-folder），直开失败也降级到内置，见 utils/openFolder.js。
-// 「变更记录」tab：GET /api/sessions/{id}/file-changes（id 倒序），逐条 DiffBlock 显示 path+action+diff。
+// 「变更记录」tab：GET /api/sessions/{id}/file-changes（id 倒序），逐条 DiffBlock 显示 path+action+diff；
+//   侧栏那么宽放不下两侧全文，所以每条右上给「查看具体」，新标签打开整页对比（地址收口在 utils/openFolder）。
 import { computed, onMounted, ref, watch } from 'vue'
 import { message } from 'ant-design-vue'
 import { FolderOpenOutlined, ReloadOutlined } from '@ant-design/icons-vue'
@@ -205,7 +206,15 @@ onMounted(loadTree)
         <a-spin v-else-if="changesLoading" class="zc-fp-loading" />
         <a-empty v-else-if="!changes.length" description="暂无变更" />
         <div v-else class="zc-fp-changes">
-          <DiffBlock v-for="c in changes" :key="c.id" :diff="c.diff" :path="c.path" :action="c.action" />
+          <DiffBlock
+            v-for="c in changes"
+            :key="c.id"
+            :diff="c.diff"
+            :path="c.path"
+            :action="c.action"
+            :session-id="store.currentSessionId"
+            :change-id="c.id"
+          />
         </div>
       </a-tab-pane>
       <a-tab-pane key="memory" tab="记忆">

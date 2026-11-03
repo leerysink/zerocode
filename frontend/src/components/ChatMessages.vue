@@ -177,7 +177,9 @@ onMounted(scrollToBottom)
           <PageInspectCard v-else-if="isPageCard(m, i)" :msg="m" :progress="liveProgress(m, i)" />
           <BrowserFlowCard v-else-if="isBrowserCard(m, i)" :msg="m" :progress="liveProgress(m, i)" />
           <PreviewCard v-else-if="isPreviewCard(m, i)" :msg="m" :progress="liveProgress(m, i)" />
-          <ToolCallBlock v-else :msg="m" />
+          <!-- 会话 id 兜空串：null 会撞在 [Number,String] 的 props 校验上刷一屏警告，
+               而空串本来就是「跳不过去」的合法取值（DiffBlock 据此不渲染入口） -->
+          <ToolCallBlock v-else :msg="m" :session-id="store.currentSessionId ?? ''" />
         </div>
         <!-- error：红色气泡 + 尾部重试（重发最后一条 user 消息） -->
         <div v-else-if="m.role === 'error'" class="zc-msg is-error">

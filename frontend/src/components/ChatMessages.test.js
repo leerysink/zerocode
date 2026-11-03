@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 import { describe, it, expect, vi } from 'vitest'
-import { h } from 'vue'
+import { h, nextTick } from 'vue'
 import { mount } from '@vue/test-utils'
 import { createPinia, setActivePinia } from 'pinia'
 
@@ -704,4 +704,15 @@ it('压缩提示条：进行中带转圈，定稿与历史投影都只留灰字'
   const projected = mountMessages([{ id: null, seq: 2, role: 'notice', kind: 'compacted', content: null }])
   expect(projected.find('.zc-notice-spin').exists()).toBe(false)
   expect(projected.text()).toContain('已压缩上下文')
+})
+
+it('工具调用块拿到当前会话 id（聊天流里的内联 diff 靠它跳变更详情整页）', async () => {
+  const w = mountMessages([
+    { role: 'tool', name: 'write_file', result: { ok: true }, diff: '--- a/a.txt', diff_change_id: 345 },
+  ])
+  useChatStore().currentSessionId = 12
+  // mountMessages 自己建 pinia，会话 id 只能在挂载后写；写完要等一次重渲染才落到 props 上
+  await nextTick()
+
+  expect(w.findComponent(ToolCallBlock).props('sessionId')).toBe(12)
 })

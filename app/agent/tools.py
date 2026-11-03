@@ -101,15 +101,20 @@ async def _record_change(ctx: ToolContext, path: str, action: str, before: str, 
     before, _ = redact_sensitive(before)
     after, _ = redact_sensitive(after)
     diff = _unified_diff(path, before, after)
+    change_id = None
     if ctx.session_factory is not None:
         async with ctx.session_factory() as s:
-            await s.execute(text(
+            # RETURNING id：事件里要带上这一行的 id，聊天流里的内联 diff 才跳得进详情整页
+            # （地址是 /sessions/{会话}/changes/{记录}）。不落库的调用点没有 id 可给，如实给 None——
+            # 前端据此不渲染跳转入口，而不是给一个点了没反应的按钮。
+            change_id = (await s.execute(text(
                 "INSERT INTO file_change (session_id, message_id, path, action, before_content, after_content, diff) "
-                "VALUES (:sid, :mid, :p, :a, :b, :af, :d)"),
+                "VALUES (:sid, :mid, :p, :a, :b, :af, :d) RETURNING id"),
                 {"sid": ctx.session_id, "mid": msg_id, "p": path, "a": action,
-                 "b": before, "af": after, "d": diff})
+                 "b": before, "af": after, "d": diff})).scalar()
             await s.commit()
-    await ctx.send({"type": "file_change", "path": path, "action": action, "diff": diff})
+    await ctx.send({"type": "file_change", "path": path, "action": action, "diff": diff,
+                    "change_id": change_id})
 
 
 def _memory_target_id(args: dict):

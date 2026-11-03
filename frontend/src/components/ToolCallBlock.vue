@@ -5,7 +5,11 @@
 import { computed } from 'vue'
 import DiffBlock from './DiffBlock.vue'
 
-const props = defineProps({ msg: { type: Object, required: true } })
+const props = defineProps({
+  msg: { type: Object, required: true },
+  // 会话 id 由宿主传进来（本组件不碰 store：它现在只吃一条归一化后的消息，好测也好复用）
+  sessionId: { type: [Number, String], default: '' },
+})
 
 const toolName = computed(() => props.msg.name || 'tool')
 const args = computed(() => props.msg.args ?? null)
@@ -46,6 +50,8 @@ const pretty = (v) => JSON.stringify(v, null, 2)
           :diff="msg.diff"
           :path="msg.diff_path || ''"
           :action="msg.diff_action || ''"
+          :session-id="sessionId"
+          :change-id="msg.diff_change_id ?? ''"
         />
       </a-collapse-panel>
     </a-collapse>

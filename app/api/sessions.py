@@ -194,3 +194,28 @@ async def list_file_changes(request: Request, session_id: int):
             "SELECT id, path, action, diff, created_at FROM file_change "
             "WHERE session_id=:i ORDER BY id DESC"), {"i": session_id})).mappings().all()
     return [dict(r) for r in rows]
+
+@router.get("/{session_id}/file-changes/{change_id}")
+async def get_file_change(request: Request, session_id: int, change_id: int):
+    """单条变更的详情：只有这里带 before/after 全文。
+
+    列表接口不带全文是刻意的——侧栏一次拉几十条，把每条的两份全文一起拖回来会把聊天页的首屏
+    变成文件下载；逐行对比（行号、折叠段原文、以及前端「diff 与全文对不对得上」的回验）
+    只在整页里发生，就只在整页里取。
+    三列同源：_record_change 先遮凭据、再据遮后文本算 diff，所以全文与 diff 说的是同一件事，
+    这里不新增明文出口（遮断口径与列表里的 diff 完全一致）。
+    归属仍走会话闸门：记录号单独摆出去不构成直取全库的口子。"""
+    uid = request.state.actor["id"]
+    async with request.app.state.session_factory() as s:
+        await _require_session(s, session_id, uid)
+        row = (await s.execute(text(
+            "SELECT fc.id, fc.path, fc.action, fc.diff, fc.before_content, fc.after_content, "
+            "       fc.created_at, w.id AS workspace_id, w.name AS workspace_name "
+            "FROM file_change fc "
+            "JOIN chat_session cs ON cs.id = fc.session_id "
+            "JOIN workspace w ON w.id = cs.workspace_id "
+            "WHERE fc.id=:c AND fc.session_id=:i"),
+            {"c": change_id, "i": session_id})).mappings().first()
+    if not row:
+        raise HTTPException(404, "变更记录不存在")
+    return dict(row)

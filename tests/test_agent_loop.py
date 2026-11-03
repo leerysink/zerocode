@@ -83,6 +83,30 @@ async def test_write_file_flow(test_engine, tmp_path):
     assert n == 1
 
 @pytest.mark.asyncio
+async def test_file_change_event_carries_row_id(test_engine, tmp_path):
+    # WS 的 file_change 事件要带落库行 id：聊天流里那条内联 diff 也要能跳「查看具体」整页，
+    # 地址是 /sessions/{会话}/changes/{记录}。事件里没有 id，就只能给一个点了没反应的按钮。
+    turns = [done(None, [tool_call("c1", "write_file", path="a.txt", content="hi")]), done("写好了")]
+    sid, status, evs, sf = await run_once(test_engine, tmp_path, turns)
+    fc = next(e for e in evs if e["type"] == "file_change")
+    async with sf() as s:
+        row_id = (await s.execute(sql(
+            "SELECT id FROM file_change WHERE session_id=:i"), {"i": sid})).scalar()
+    assert fc["change_id"] == row_id
+
+@pytest.mark.asyncio
+async def test_file_change_event_without_db_still_sent(test_engine, tmp_path):
+    # 不落库的调用点（session_factory 为空）仍要收到事件，只是没有 id 可给——
+    # 前端据此不渲染跳转入口，不能因为拿不到 id 就把 diff 本身也吞掉
+    from app.agent.tools import ToolContext, execute_tool
+    sid = await mk_session(test_engine, tmp_path)
+    rec = Recorder()
+    ctx = ToolContext(root=tmp_path, session_id=sid, session_factory=None, send=rec)
+    await execute_tool(ctx, "write_file", {"path": "n.txt", "content": "x\n"})
+    fc = [e for e in rec.events if e["type"] == "file_change"]
+    assert fc and fc[-1]["change_id"] is None and fc[-1]["diff"]
+
+@pytest.mark.asyncio
 async def test_ask_user_resume(test_engine, tmp_path):
     async def ask_ok(session_id, questions, timeout):
         return {"answers": [{"options": ["方案A"]}]}

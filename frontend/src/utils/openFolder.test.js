@@ -2,7 +2,7 @@
 // 纯函数化是为了把三种取值 × 各种访问地址的组合全部钉死，不用挂组件。
 // 内置那一路现在是个独立页面（新标签打开），地址拼接与被拦截的返回值也一起钉在这里。
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { isLocalHostname, openWorkspaceFilesPage, resolveOpenFolderMode, workspaceFilesPath } from './openFolder'
+import { fileChangePath, isLocalHostname, openFileChangePage, openWorkspaceFilesPage, resolveOpenFolderMode, workspaceFilesPath } from './openFolder'
 
 describe('isLocalHostname', () => {
   it('回环形态判为本机（浏览器与后端同机，explorer 开在用户眼前）', () => {
@@ -136,5 +136,47 @@ describe('openWorkspaceFilesPage 新标签打开整页', () => {
       '/workspaces/7/files?name=%E7%94%B2&file=docs%2Fguide.md',
       '/workspaces/7/files',
     ])
+  })
+})
+
+describe('fileChangePath 变更详情整页地址', () => {
+  it('会话与记录两个 id 都按字符串直传，19 位大整数不经 Number 不丢精度', () => {
+    expect(fileChangePath(12, 345)).toBe('/sessions/12/changes/345')
+    expect(fileChangePath('12', '345')).toBe('/sessions/12/changes/345')
+    expect(fileChangePath('2026092201000900123', '2026092201000988888'))
+      .toBe('/sessions/2026092201000900123/changes/2026092201000988888')
+  })
+
+  it('边界：任一段 id 不合法就不给地址（宁可不打开标签，也不开一个必然 404 的页面）', () => {
+    for (const bad of [undefined, null, '', ' ', 'abc', '1.5', '1e3', '-7', {}, []]) {
+      expect(fileChangePath(bad, 345)).toBe('')
+      expect(fileChangePath(12, bad)).toBe('')
+    }
+  })
+})
+
+describe('openFileChangePage 新标签打开变更详情', () => {
+  afterEach(() => vi.unstubAllGlobals())
+
+  it('按记录命名窗口：同一条记录反复点复用那一个标签，看不同条各开一个', () => {
+    const open = vi.fn(() => ({}))
+    vi.stubGlobal('open', open)
+
+    expect(openFileChangePage(12, 345)).toBe(true)
+    expect(open).toHaveBeenCalledWith('/sessions/12/changes/345', 'zerocode-change-345')
+  })
+
+  it('被浏览器拦截（open 返回 null）时如实报 false，让调用方去提示', () => {
+    vi.stubGlobal('open', vi.fn(() => null))
+    expect(openFileChangePage(12, 345)).toBe(false)
+  })
+
+  it('边界：id 不合法时一个标签都不开，也不报错', () => {
+    const open = vi.fn(() => ({}))
+    vi.stubGlobal('open', open)
+
+    expect(openFileChangePage(12, '')).toBe(false)
+    expect(openFileChangePage('', 345)).toBe(false)
+    expect(open).not.toHaveBeenCalled()
   })
 })

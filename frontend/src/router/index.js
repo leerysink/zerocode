@@ -41,6 +41,12 @@ const routes = [
     component: () => import('../views/WorkspaceFilesView.vue'),
   },
   {
+    // 变更记录详情整页；地址同样收在 utils/openFolder.js 的 fileChangePath，与路由表钉成一条
+    path: '/sessions/:sessionId/changes/:changeId',
+    name: 'session-file-change',
+    component: () => import('../views/FileChangeDetailView.vue'),
+  },
+  {
     path: '/store',
     name: 'store',
     component: () => import('../views/StoreView.vue'),
