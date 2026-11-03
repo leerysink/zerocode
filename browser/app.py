@@ -565,11 +565,13 @@ async def _rescan(s: Session, limit: int, started: float) -> dict:
 
 
 def _consume_new_items(s: Session) -> None:
-    """把本步产生的增量**丢掉并记账**（裁定 R-45，发现项 F-7）。
+    """把本步产生的增量**丢掉并记账**（裁定 R-45，发现项 F-7 与第 2 批补的 F-11）。
 
-    本模块那三条不经过 `_step_state` 的出口都不打算回状态，其中两条走这里：动作名不认识、
-    navigate 的 path 形状非法。第三条（会话已经不在了）没有账可消费——收集器与三份 seen 集合
-    都跟着那个 Session 一起没了，「下一步」在那个会话上根本不存在。
+    本模块那几条不经过 `_step_state` 的出口都不打算回状态，其中三条走这里：动作名不认识、
+    navigate 的 path 形状非法、`step` 最外层那句「步骤执行后页面读取失败」（它只补采一份
+    `interactive`，增量键一个也不回，第 1 波把这第四处漏了）。
+    其余（会话已经不在了、`_page_is_gone` 分诊后摘掉会话）没有账可消费——收集器与三份 seen
+    集合都跟着那个 Session 一起没了，「下一步」在那个会话上根本不存在。
     可页面在这期间照样可能报错（上一异步任务正好落地），而那批错误如果不在这里被消费掉，
     就会活到下一步、被 `take_new_items` 当成「本步新增」报出去——模型于是把上一步的错记到
     下一步头上，US-04 那个「这个错是不是我这一步搞出来的」的核心信号正好毁在这儿。
@@ -656,7 +658,7 @@ async def step(sid: str, req: StepRequest):
     if s is None:
         # 会话没了不扣步数（US-12）：Agent 什么也没做成，扣账只会让它更早撞上限。
         # 这一条没有增量可消费：收集器与三份 seen 集合都跟着那个 Session 一起没了，
-        # 「下一步」在那个会话上根本不存在（裁定 R-45 管的是另外两条还带着会话对象的出口）。
+        # 「下一步」在那个会话上根本不存在（裁定 R-45 管的是还带着会话对象的那几条出口）。
         return {"ok": False, "error": SESSION_GONE_MESSAGE, "session_gone": True,
                 "steps_charged": False}
     touch(s)
@@ -701,6 +703,13 @@ async def step(sid: str, req: StepRequest):
         # 「回 steps_charged:true」与注册表里多出的那一步始终一一对应。
         if s.steps == steps_before:
             charge(s)
+        # 本批补的第四条出口（裁定 R-45 的同款，发现项 F-11）：这一支同样不经 `_step_state`，
+        # 所以本步刚落地的 console / pageerror / 失败请求如果不在这里被消费掉，就会活到下一步、
+        # 被 `take_new_items` 当成「本步新增」报出去——模型把这一步的崩溃记到下一步头上，
+        # US-04 那个「这个错是不是我这一步搞出来的」的核心信号正好毁在这儿。
+        # 而这一支恰恰是最常「带着崩溃离场」的一支（执行后页面正在重渲染，错误正落在这帧里）。
+        # `fresh` 那份快照只回 `interactive`，不做整份 `_step_state`，所以消费必须单独发生。
+        _consume_new_items(s)
         result = {"ok": False, "error": f"步骤执行后页面读取失败: {_short(e)}",
                   "steps_charged": True}
         try:

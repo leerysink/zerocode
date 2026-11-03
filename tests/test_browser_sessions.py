@@ -1434,3 +1434,58 @@ def test_a_gone_session_has_no_ledger_to_consume(client):
         "session_gone"] is True
     body = _step(client, sid, action="click", ref="rd2k7qx").json()
     assert body["ok"] is True and body["console_new"] == []
+
+
+def test_the_after_action_read_failure_exit_consumes_the_ledger(client):
+    """第 2 批发现项 F-11：第 1 波漏的第四条同款出口——`step` 最外层 except。
+
+    这一支回的是「步骤执行后页面读取失败」，只补采一份 `interactive`，增量键一个也不回，
+    因此它和第 1 波那三条一样不经 `_step_state`：本步落地的 console / pageerror 如果不在
+    这里被消费掉，下一步的 `console_new` 就会把它当「本步新增」报出去。
+    而这一支恰恰是最常带着崩溃离场的一支——动作把页面点崩了才会读不回来，US-04 那个
+    「这个错是不是我这一步搞出来的」的核心信号正好毁在这儿，所以它比前几条更不能漏。
+    """
+    class ReRenderingPage(FakePage):
+        """第一次点击之后那一次采集抛错，再采一帧就恢复正常（复用既有替身形状）。
+
+        只炸第一次：这一步要走的是「读不回」那条出口，而下一步必须正常回状态，
+        否则 `*_new` 缺席是因为那条出口又走了一遍，而不是因为账被记掉了。
+        """
+
+        def __init__(self):
+            super().__init__(url=OPEN_URL, nodes=NODES)
+            self.broken_reads_left = 0
+            self.clicks = 0
+
+        async def click(self, sel, timeout=None):
+            await super().click(sel, timeout=timeout)
+            self.clicks += 1
+            if self.clicks == 1:
+                self.broken_reads_left = 1
+
+        async def evaluate(self, script, *a):
+            if self.broken_reads_left:
+                self.broken_reads_left -= 1
+                raise RuntimeError("Execution context was destroyed, most likely because of "
+                                   "a navigation.")
+            return await super().evaluate(script, *a)
+
+    sid = _opened(client, ReRenderingPage)
+    s = sessions.SESSIONS[sid]
+    # 本步产生的三份增量：真机上就是点击触发的脚本抛错 + 收尾的 setTimeout 报 console。
+    s.collectors.console.append({"level": "error", "text": "这一步点崩了"})
+    s.collectors.page_errors.append("这一步的未捕获异常")
+    s.collectors.failed.append({"method": "GET", "url": "http://other.example/x", "status": 500,
+                                "type": "fetch"})
+    body = _step(client, sid, action="click", ref="rd2k7qx").json()
+    assert body["ok"] is False and "步骤执行后页面读取失败" in body["error"]
+    assert body["steps_charged"] is True
+    # 这条出口本来就不回增量形状（`interactive` 之外只有 ok/error/steps_charged）。
+    assert "console_new" not in body and "page_errors_new" not in body
+    assert "failed_requests_new" not in body
+    nxt = _step(client, sid, action="click", ref="rd2k7qx").json()
+    assert nxt["ok"] is True
+    # 核心断言：本步的三份错都不许出现在下一步的 `*_new` 里（归因不许错位一步）。
+    assert nxt["console_new"] == []
+    assert nxt["page_errors_new"] == []
+    assert nxt["failed_requests_new"] == []
