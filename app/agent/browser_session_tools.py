@@ -549,8 +549,23 @@ async def _open(ctx, args: dict) -> dict:
     # 收口报告的 url 同样用 display_url（裁定 R-16）：这份日志会进 browser_close 的返回值。
     # replaced_sessions 顺手写进 open 那一条（裁定 R-25）：browser_log 恰好在这一次 open 被重置，
     # 所以活下来的这条自然带上整个 run 的替换数——收口报告因此能自己说清它覆盖的是哪个会话。
+    # 「这一次 open 有没有声明断言」单独记一笔（裁定 R-42），每次 open 覆写而不是只写 True：
+    # browser_log 在这里被重置，标记必须与它描述同一次 open，否则上一次 open 的声明会替这一次的
+    # 空账说话。记的是**声明**这个动作，与「有没有拿到判定结论」分开——两者只在 sidecar 与后端
+    # 版本错位时才分家（那份镜像是单独打包的，`passed` 键可能整个缺席）。
+    declared_expect = bool(args.get("expect"))
+    ctx.run_state["browser_open_declared_expect"] = declared_expect
+    open_passed = data.get("passed")
     ctx.run_state["browser_log"] = [{"seq": 0, "action": "open", "target": path,
-                                     "passed": None, "url": display_url,
+                                     # open 声明过 expect 时把真结论记进账（裁定 R-42）：改前这一条恒
+                                     # None，`_close` 的两本账因此完全看不见 open 的断言——「只在 open 上
+                                     # 声明 expect」的 run 会被说成「未声明任何断言」（真机复现见
+                                     # probe-results-2.json 的 C1_open/C5_close）；open 的断言没过时更糟，
+                                     # 那次失败连 `steps_failed` 都进不去。没声明 expect 时仍记 None：
+                                     # 不假装判过（与 `_shape_state` 给不给 `passed` 键同一个口径）。
+                                     "passed": (None if not declared_expect or open_passed is None
+                                                else bool(open_passed)),
+                                     "url": display_url,
                                      "replaced_sessions":
                                          int(ctx.run_state.get("browser_sessions_replaced") or 0)}]
     out = _shape_state(ctx, data, opened=True, url=display_url, status=status,
@@ -1008,7 +1023,10 @@ async def _step(ctx, args: dict) -> dict:
 
 async def _close(ctx, _args: dict) -> dict:
     """US-07：收口报告说事实——走了几步（含点不动的步）、几步断言失败、几步点不动、失败在哪步、
-    覆盖第几个会话。断言账（`steps_failed`）与动作账（`steps_action_failed`）各报各的数。"""
+    覆盖第几个会话。断言账（`steps_failed`）与动作账（`steps_action_failed`）各报各的数。
+
+    断言那本账从 R-42 起也覆盖 browser_open 上声明的 expect：那一句同样是本 run 做过的判定，
+    看不见它就会把「断言没过」说成「未声明任何断言」。"""
     sid = str(ctx.run_state.get("browser_session") or "")
     steps = list(ctx.run_state.get("browser_log") or [])
     if sid:
@@ -1021,9 +1039,12 @@ async def _close(ctx, _args: dict) -> dict:
     # 只靠 `steps_total - steps_failed` 反推的话，「12 次点不动 + 一次 open」会被读成
     # 「12 步都推进了」，而它们连一次都没走到位。
     action_failed = [s for s in steps if s.get("ok") is False]
-    # 真跑过判定的步：`passed` 非 None 才说明那一步带 expect。open 那条与没给 expect 的步
-    # 都是 None，所以这个数就是「本 run 声明过几条断言」。
+    # 真跑过判定的步：`passed` 非 None 才说明那一步带了 expect 且拿到了结论。没给 expect 的步、
+    # 点不动的那一步都是 None；open 那条也只在它自己声明过 expect 时才带结论（裁定 R-42）。
     declared = [s for s in steps if s.get("passed") is not None]
+    # open 那一次的「声明」单独记在 run_state 上（裁定 R-42）：上面那条 log 只在真拿到结论时才写
+    # passed，声明过却拿不到结论（sidecar 与后端版本错位）时 `declared` 数不到它。
+    open_declared = bool(ctx.run_state.get("browser_open_declared_expect"))
     report = []
     for s in steps:
         item = {"seq": s.get("seq"), "action": s.get("action"),
@@ -1054,14 +1075,20 @@ async def _close(ctx, _args: dict) -> dict:
         report.append(item)
     replaced = int(ctx.run_state.get("browser_sessions_replaced") or 0)
     opens = int(ctx.run_state.get("browser_opens") or 0)
-    # 汇总行的三档措辞（裁定 R-31 第 1 条）：「断言没过」/「声明过的都过了」/「压根没声明断言」。
-    # 中间那档只在 `declared` 非空时才成立：一个 expect 都没写过的 run 讲「所有已声明的断言均通过」
-    # 字面为真，但模型对 browser_close 的默认读法就是看这一行、不逐条翻 report，
+    # 汇总行的措辞（裁定 R-31 第 1 条 + R-42）：「断言没过」/「声明过的都过了」/「声明过却没拿到
+    # 结论」/「压根没声明断言」。
+    # 「均通过」那档只在 `declared` 非空时才成立：一个 expect 都没写过的 run 讲「所有已声明的断言均
+    # 通过」字面为真，但模型对 browser_close 的默认读法就是看这一行、不逐条翻 report，
     # 于是「从未验证」会被讲成「验证过且全绿」。
+    # 「未声明任何断言」那档反过来（R-42）：open 上声明过的断言此前不进两本账，于是那句「本次走查
+    # 未声明任何断言」是一句假话——断言确实做了。它既不能说「均通过」（那份判定结论根本没拿到），
+    # 也不能说「未声明」，只能照实说「声明过、这次没拿到判定结论」。
     if failed:
         hint = "以下断言未通过：" + ", ".join(str(f.get("seq")) for f in failed)
     elif declared:
         hint = "所有已声明的断言均通过"
+    elif open_declared:
+        hint = "browser_open 声明过断言，但这次没拿到它的判定结论（结论要自己读页面文本判断）"
     else:
         hint = "本次走查未声明任何断言（各步只做了动作，结论要自己读页面文本判断）"
     if action_failed:

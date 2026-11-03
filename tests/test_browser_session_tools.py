@@ -2379,6 +2379,110 @@ async def test_close_hint_counts_action_failures_even_without_any_expect(monkeyp
     assert "未声明任何断言" in out["hint"]                 # 两个缺口都要说出口
 
 
+# ------------------------------------------------------ open 上声明 expect 与收口措辞（裁定 R-42）
+
+async def _open_expect_run(monkeypatch, open_reply, *, open_args=None):
+    """跑通「只在 browser_open 上声明 expect」这条路径：open → 一步不带 expect 的 click → close。
+
+    真机复现的形状就是这一条（probe-results-2.json 的 C1_open/C5_close）：open 带着
+    `text_contains` 且 `passed:true`，随后 close 的 hint 却说「本次走查未声明任何断言」。
+    下面几条措辞钉都跑在这个形状上，各条只换 open 的回包与 open 的参数。
+    """
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    monkeypatch.setattr(bst, "_sidecar_open", lambda url, **kw: _aget((open_reply, "")))
+    monkeypatch.setattr(bst, "_sidecar_delete", lambda sid: _aget(True))
+    monkeypatch.setattr(bst, "_sidecar_step", lambda sid, payload: _aget((_step_data(), "")))
+    ctx = Ctx()
+    await bst.run_browser_session_tool(
+        ctx, "browser_open", open_args or {"path": "/orders", "expect": _EXPECT})
+    await bst.run_browser_session_tool(ctx, "browser_step", {"action": "click", "target": "e1"})
+    return ctx, await bst.run_browser_session_tool(ctx, "browser_close", {})
+
+
+async def test_close_hint_does_not_deny_an_expect_declared_only_on_open(monkeypatch):
+    """裁定 R-42：open 声明过 expect 且通过时，收口不能讲「本次走查未声明任何断言」。
+
+    改前 open 那条 log 恒 `passed:null`，`_close` 的两本账都看不见它，于是那句「未声明」是假话——
+    断言确实做了、也确实过了。模型对 close 的默认读法只看汇总行，这句话会把它引向
+    「这次走查一句验证都没做」，用户看到的收口报告也跟着少了一条真实证据。
+    """
+    ctx, out = await _open_expect_run(monkeypatch, _session_ok(passed=True, note=""))
+    assert ctx.run_state["browser_open_declared_expect"] is True
+    assert out["report"][0]["action"] == "open"
+    assert out["report"][0]["passed"] is True               # open 的真结论进账（R-42 允许的那处数据变更）
+    assert out["steps_failed"] == 0 and out["steps_total"] == 2
+    assert "未声明任何断言" not in out["hint"]
+    assert "均通过" in out["hint"]
+
+
+async def test_close_hint_names_the_failed_expect_declared_on_open(monkeypatch):
+    """比「谎称未声明」更糟的一档：open 的断言没过，而改前的收口报告连这个数都数不到。
+
+    `steps_failed` 只数 `passed is False`，open 那条恒 null 时「首屏没等到那句文案」这个最硬的
+    失败信号既进不了账、也进不了汇总行——收口报告因此讲成一句「未声明任何断言」。
+    """
+    ctx, out = await _open_expect_run(
+        monkeypatch, _session_ok(passed=False, note="页面文本未包含「订单列表」"))
+    assert ctx.run_state["browser_open_declared_expect"] is True
+    assert out["report"][0]["passed"] is False
+    assert out["steps_failed"] == 1
+    assert "以下断言未通过：0" in out["hint"]                # seq 0 就是 open 那一条
+    assert "未声明任何断言" not in out["hint"]
+    assert "均通过" not in out["hint"]
+
+
+async def test_close_hint_still_says_unasserted_when_no_expect_anywhere(monkeypatch):
+    """反向钉（R-42 不能收掉 R-31 那一半）：真的一条断言都没声明时仍要说「未声明任何断言」。
+
+    这条是 R-31 空真那一半的既有防线：把「未声明」那档放宽成默认口径，就等于凭空造出一句
+    「已验证通过」。open 不带 expect 时标记落 `False`，open 那条也保持 `passed:null`。
+    """
+    ctx, out = await _open_expect_run(monkeypatch, _session_ok(), open_args={"path": "/orders"})
+    assert ctx.run_state["browser_open_declared_expect"] is False
+    assert out["report"][0]["passed"] is None               # 没声明就不假装判过
+    assert "均通过" not in out["hint"]
+    assert "未声明任何断言" in out["hint"]
+
+
+async def test_close_hint_reports_a_missing_verdict_not_a_blank_when_sidecar_omits_passed(
+        monkeypatch):
+    """标记那份独立的活：声明过 expect、却没拿到判定结论（sidecar 镜像与后端版本错位）。
+
+    那份镜像单独打包，回包里没有 `passed` 键时 log 记不上结论、`declared` 数不到它——此时
+    「均通过」是说过头（结论根本没拿到），「未声明」是假话，只能照实说「声明过、没拿到结论」。
+    """
+    ctx, out = await _open_expect_run(monkeypatch, _session_ok())
+    assert ctx.run_state["browser_open_declared_expect"] is True
+    assert out["report"][0]["passed"] is None
+    assert "未声明任何断言" not in out["hint"]
+    assert "均通过" not in out["hint"]
+    assert "没拿到它的判定结论" in out["hint"]
+
+
+async def test_reopen_without_expect_clears_the_open_declaration_flag(monkeypatch):
+    """标记每次 open 覆写，不是只写 True：browser_log 在这里重置，两者必须描述同一次 open。
+
+    open(带 expect)→close→open(不带 expect) 这条路径上，留着上一次的标记会让收口替一个从没做过
+    判定的会话说出「均通过」——与 R-42 要修的那句假话方向相反、一样是假。
+    """
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    monkeypatch.setattr(bst, "_sidecar_open",
+                        lambda url, **kw: _aget((_session_ok(passed=True, note=""), "")))
+    monkeypatch.setattr(bst, "_sidecar_delete", lambda sid: _aget(True))
+    ctx = Ctx()
+    await bst.run_browser_session_tool(ctx, "browser_open",
+                                       {"path": "/orders", "expect": _EXPECT})
+    await bst.run_browser_session_tool(ctx, "browser_close", {})
+    assert ctx.run_state["browser_open_declared_expect"] is True
+    monkeypatch.setattr(bst, "_sidecar_open", lambda url, **kw: _aget((_session_ok(), "")))
+    await bst.run_browser_session_tool(ctx, "browser_open", {"path": "/orders"})
+    out = await bst.run_browser_session_tool(ctx, "browser_close", {})
+    assert ctx.run_state["browser_open_declared_expect"] is False
+    assert out["sessions_opened"] == 2
+    assert "均通过" not in out["hint"]
+    assert "未声明任何断言" in out["hint"]
+
+
 async def test_close_redacts_report_targets(monkeypatch):
     """收口报告里的 target 也是自由文本：模型可能把凭据当目标名写进日志。"""
     ctx = Ctx()
