@@ -103,8 +103,8 @@ const action = computed(() => {
 })
 // target 只有 ref 或 path 两种形态（spec §5.1：navigate 时 target 改填 path）。
 // 元素名读后端 echo 的 `target_name`（裁定 R-32，US-22）——它取的是**动作之前**那份清单。
-// 刻意不拿本步结果里的 interactive 反查：那是**动作之后**的新快照，而 ref 是按采集顺序现编的、
-// 每次重渲染全部作废（规格 §6.2），用它标「这一步动的谁」会把目标画成另一个元素。
+// 刻意不拿本步结果里的 interactive 反查：那是**动作之后**的新快照，而 ref 是每次扫描重生成的一批
+// 随机令牌，旧句柄在里面必然查不到（规格 §6.2），用它标「这一步动的谁」只会画出空目标。
 const target = computed(() => {
   const t = result.value?.target
   return typeof t === 'string' ? t : ''
@@ -113,13 +113,19 @@ const targetName = computed(() => {
   const n = result.value?.target_name
   return typeof n === 'string' ? n.trim() : ''
 })
+// 句柄与 path 怎么分：**只看开头，不看句柄长什么样**。令牌形状归 sidecar 的
+// `browser/session_core.py::REF_RE` 管，这里再抄一份形状正则就是第三处判据——漏改的一侧
+// 不会红任何测试，症状是历史行安静地退回裸打印。口径与后端 `is_sensitive_ref_or_unknown`
+// 一致：`/` 开头的是 navigate 的路径，其余一律当句柄。
+const isNavigatePath = (t) => t.startsWith('/')
+const handleLabel = (t) => (isNavigatePath(t) ? t : `句柄 ${t}`)
 const stepLabel = computed(() => {
   if (!result.value || (!action.value && !target.value)) return ''
   const text = ACTION_TEXT[action.value] || action.value
   if (!target.value) return text || '执行动作'
-  // 名字查不到就回落句柄：编一个不存在的名比只显示 e7 更糟
+  // 名字查不到就回落句柄：编一个不存在的名比只显示一个令牌更糟
   const who = targetName.value ? `${targetName.value}（句柄 ${target.value}）`
-    : (/^e\d+$/.test(target.value) ? `句柄 ${target.value}` : target.value)
+    : handleLabel(target.value)
   return text ? `${text} ${who}` : who
 })
 const expectLabel = computed(() => {
@@ -220,12 +226,12 @@ function rowTone(item) {
 function rowLabel(item) {
   const a = ACTION_TEXT[item.action] || item.action || '步骤'
   const t = typeof item.target === 'string' && item.target ? item.target : ''
-  // M-6：报告的行也不能只留一个作废句柄。按规格 §6.2，那些 ref 早就作废，读报告的人手上没有
-  // 任何一份清单能对回 `e7` 是谁。名字取 report 项的 `target_name`（后端 _step 算好的那一份，
+  // M-6：报告的行也不能只留一个作废句柄。按规格 §6.2 那些令牌每扫一次就整批换掉，读报告的人手上
+  // 没有任何一份清单能对回它是谁。名字取 report 项的 `target_name`（后端 _step 算好的那一份，
   // 来自动作之前的清单），查不到——包括 Task 5/6 期间没有这个字段的历史行——照旧回落句柄 / path。
   const n = typeof item.target_name === 'string' ? item.target_name.trim() : ''
   if (!t) return a
-  const who = n ? `${n}（句柄 ${t}）` : (/^e\d+$/.test(t) ? `句柄 ${t}` : t)
+  const who = n ? `${n}（句柄 ${t}）` : handleLabel(t)
   return `${a} ${who}`
 }
 function rowVerdict(item) {

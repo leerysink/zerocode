@@ -371,6 +371,39 @@ describe('BrowserFlowCard', () => {
     expect(stale.find('.zc-page-step').text()).not.toContain('退出登录')
   })
 
+  it('句柄回落照旧画得出随机令牌，且分句柄与 path 不看句柄长相', () => {
+    // 令牌每次扫描整批换发（规格 §6.2），形状只在 sidecar 的 session_core 定义一处。
+    // 前端过去抄过一份 `^e\d+$`：令牌格式一变它就会安静地退回「裸打印」，所以现在的判据
+    // 只有「是不是 / 开头」。这一条同时钉住 report 行与步骤行共用同一把尺。
+    const step = mountCard({
+      name: 'browser_step',
+      result: {
+        ok: false, action: 'click', target: 'r7kqmbt',
+        error: 'ref 无效或页面已变化，请用最新清单里的 ref',
+      },
+    })
+    expect(step.find('.zc-page-step').text()).toContain('点击 句柄 r7kqmbt')
+    const nav = mountCard({
+      name: 'browser_step',
+      result: { ok: true, action: 'navigate', target: '/orders?id=4', passed: null },
+    })
+    expect(nav.find('.zc-page-step').text()).toContain('跳转 /orders?id=4')
+    const closed = mountCard({
+      name: 'browser_close',
+      result: {
+        ok: true,
+        report: [
+          { seq: 1, action: 'click', target: 'r7kqmbt', ok: false, passed: null,
+            error: 'ref 无效或页面已变化，请用最新清单里的 ref' },
+          { seq: 2, action: 'navigate', target: '/orders?id=4', ok: true, passed: null },
+        ],
+      },
+    })
+    const rows = closed.findAll('[data-test="report-row"]')
+    expect(rows[0].text()).toContain('点击 句柄 r7kqmbt')
+    expect(rows[1].text()).toContain('跳转 /orders?id=4')
+  })
+
   it('不渲染 args 里的 fill 值（口令只该以遮断后的形态出现）', () => {
     const w = mountCard({
       name: 'browser_step',

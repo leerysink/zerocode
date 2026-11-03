@@ -19,7 +19,7 @@
 - **三个交互工具**：`browser_open(path?, expect?)` / `browser_step(action, target, value?, expect?)` / `browser_close()`。与 `preview_page` 并存，后者继续作为「改完看一眼」的便宜选项。
 - **sidecar 变成有状态服务**：新增进程内 session 注册表。活页面（Playwright context + page）留在 sidecar 内存，后端只持 `session_id ↔ chat_session` 绑定、步数额度与收口责任。**`session_id` 不进模型参数面**——沿用既有铁律「应用身份由服务端解析，schema 里没有 app_id」。
 - **等待改为按条件等**：给了 `expect` 就轮询等到满足或超时（默认 3s、上限 8s）；没给只等一个短 networkidle 窗口。固定 sleep 不再是唯一的等待手段。
-- **元素句柄用 ref，不用 CSS selector**：每次返回一份精简的**交互元素清单**（role + accessible name + ref + sensitive 标记），上限 40 条。模型下一步用 ref 指元素。理由是应用是 Vue SPA，scoped 样式类的哈希值不可预测，让模型写选择器等于让它瞎猜。
+- **元素句柄用 ref，不用 CSS selector**：每次返回一份精简的**交互元素清单**（role + accessible name + ref + sensitive 标记），上限 40 条。模型下一步用 ref 指元素。理由是应用是 Vue SPA，scoped 样式类的哈希值不可预测，让模型写选择器等于让它瞎猜。ref 是**每次扫描重生成的随机短令牌**（形状 `r7kqmbt`），不是按采集顺序排的序号——序号会在每次重打时从头排，旧句柄因此在新清单里大概率仍然合法，拿它去点是**静默点到另一个元素**而不是响亮失败（真机复现，见 §15「ref 失效」与 §6.2）。
 - **断言沿用 `db_query` 的 expect 口径**：给了就工具判 `passed`，不给则模型自己读结果。
 - **截图默认不给，断言失败与动作失败自动给**：一张 1280×800 PNG 的 token 不便宜，而失败的那一刻正是唯一值得看现场的时刻。口径是「这一步没能往前推进」（裁定 R-26），不是只指断言。
 - **动作全放开、不逐次确认**：dev 是沙箱，改坏了可重置。边界靠「只能开在当前应用 dev origin」+ 步数额度 + 收口报告守，不靠弹框。
@@ -29,7 +29,7 @@
 ### 跑通一条路径
 
 - **US-01** 作为 Agent，我调 `browser_open({"path": "/orders"})`，得到 `session_id`（对我不可见）、页面标题、可见文本、交互元素清单、初始 console 与失败请求，以及 `steps_left`。
-- **US-02** 作为 Agent，我用 `browser_step({"action": "click", "target": "e7"})` 点清单里那个 ref 为 e7 的按钮，返回同一形状的新状态。
+- **US-02** 作为 Agent，我用 `browser_step({"action": "click", "target": "r7kqmbt"})` 点清单里那个句柄为 r7kqmbt 的按钮，返回同一形状的新状态。
 - **US-03** 作为 Agent，我在 step 里带 `expect: {"type": "text_contains", "value": "订单已创建"}`，工具在超时窗口内轮询判定，返回 `passed: true/false`；不带 expect 时不判定，我自己读。
 - **US-04** 作为 Agent，每步返回的 `console` 与 `failed_requests` 只含**上一步以来新增**的条目，所以我能判断「这个错是不是我这一步搞出来的」，也不必重读同一批旧错误。（字段名是 `console_new` / `failed_requests_new`；裁定 R-27 之后未捕获异常也记同一本增量账，叫 `page_errors_new`。）
 - **US-05** 作为 Agent，断言失败时结果自动附带一张截图；断言通过时没有截图，省 token。（裁定 R-26 把口径放宽成「这一步没能往前推进」：**动作层面的失败**——ref 失效、点不动——同样自动附图。）
@@ -71,7 +71,7 @@
 | 触发时点 | 按需。用户明确要求验证、或 Agent 判断这是交付前最后一关时跑；不每次改完自动跑 |
 | 动作确认 | 不逐次确认。dev 是沙箱，边界靠 origin 锁定 + 步数额度 + 收口报告 |
 | 动作集 | 6 个：`click` `fill` `press` `select` `scroll_into_view` `navigate`。hover / drag / upload 第一版不做 |
-| 元素定位 | 交互元素清单 + `data-zc-ref` 打标，ref 只在最近一次返回内有效，每次 step 后全部重打 |
+| 元素定位 | 交互元素清单 + `data-zc-ref` 打标，ref 是每次扫描重生成的随机短令牌、只在最近一次返回内有效，每次 step 后全部重打 |
 | 断言 | 4 种：`text_contains` `element_visible` `url_matches` `no_new_console_error`。可选，沿用 `db_query` 的 expect 口径 |
 | 等待 | 给 expect 就轮询等到满足或超时（默认 3s、上限 8s）；没给只等短 networkidle |
 | 截图 | step 默认不带；断言失败与动作失败各自动带一张（R-26），`screenshot: true` 永远优先 |
@@ -100,7 +100,7 @@
  "description": "对当前浏览器会话执行一个动作并返回新状态；ref 只在上一次返回的清单内有效",
  "parameters": {"type": "object", "properties": {
    "action": {"type": "string", "enum": ["click","fill","press","select","scroll_into_view","navigate"]},
-   "target": {"type": "string", "description": "上一次清单里的 ref；navigate 时改填 path"},
+   "target": {"type": "string", "description": "上一次清单里的 ref（形如 r7kqmbt 的一次性令牌，整批换发）；navigate 时改填 path"},
    "value":  {"type": "string", "description": "fill 的文本 / press 的键名 / select 的选项值"},
    "expect": {"type": "object", "properties": {
      "type":  {"type": "string", "enum": ["text_contains","element_visible","url_matches","no_new_console_error"]},
@@ -122,13 +122,13 @@
 
 ```json
 {"ok": true,
- "action": "click", "target": "e7", "target_name": "提交订单",
+ "action": "click", "target": "r7kqmbt", "target_name": "提交订单",
  "passed": true, "expect": {"type": "text_contains", "value": "订单已创建"}, "note": "",
  "session": "active", "status": "running",
  "url": "http://localhost:8210/orders", "title": "订单列表",
  "text": "……（截断后可见文本）",
- "interactive": [{"ref": "e1", "role": "button", "name": "新建", "disabled": false, "sensitive": false},
-                 {"ref": "e2", "role": "textbox", "name": "备注", "sensitive": false}],
+ "interactive": [{"ref": "r4xwntk", "role": "button", "name": "新建", "disabled": false, "sensitive": false},
+                 {"ref": "r9jzpsk", "role": "textbox", "name": "备注", "sensitive": false}],
  "interactive_truncated": false,
  "console_new": [], "failed_requests_new": [], "page_errors_new": [],
  "dialog": null,
@@ -144,8 +144,11 @@
   `name` 的实际优先级是 `aria-label > label > placeholder > title > textContent`（都截 60 字）：
   `textContent` 排在四个属性之后，与本文早期草案的写法相反，以 `session_core.INTERACTIVE_JS` 为准。
 - `target` 回显的是**模型给的那个字符串**（ref 或 navigate 的 path），不是元素对象；元素名另开
-  `target_name` 一个键（裁定 R-32），且它取的是**动作之前**那份清单——新快照里的 `e7` 已经是另一个
-  元素，拿它标「这一步动的谁」会画出假目标。查得到才写这个键，查不到就不写（卡片自行回落「句柄 e7」）。
+  `target_name` 一个键（裁定 R-32），且它取的是**动作之前**那份清单——新快照里的令牌是这一轮
+  现生成的，旧句柄在里面根本查不到（§6.2），拿它标「这一步动的谁」只会画出一个空目标。
+  查得到才写这个键，查不到就不写（卡片自行回落「句柄 r7kqmbt」那样的令牌回显）。
+  回落文案**不按句柄长相分句柄与 path**：只有 `/` 开头的是 navigate 的路径，其余一律当句柄——
+  令牌形状只在 sidecar 的纯函数层定义一处，前端或后端抄一份形状正则就成了第三处锁步同步点。
 - `passed` 只在给了 `expect` 时出现；不给则 `passed` / `note` 两个字段一起缺席，模型自判。
   给了 `expect` 时 `note` 键**恒在**：`judge_expect` 通过时也返回一句失败措辞，所以通过那一步是空串。
   open 那一面是同一对字段、同一道闸（`_shape_state`，裁定 R-41）：`browser_open` 带 `expect` 时返回值里
@@ -222,7 +225,9 @@
 2. **空闲回收**：后台巡检每 10s 扫一次（`SWEEP_INTERVAL_SECONDS`），`now - last_used > ZEROCODE_BROWSER_SESSION_TTL_SECONDS` 的 session 关闭 context 并移除。**打开中的会话（`Session.opening`）不参与空闲判定**：一次 open 里最长的 await 就是 `goto` 本身（`timeout_ms` 上限 120000，外面还套 +5s 宽限 = 125s > TTL 120s），逐 await 边界补 `touch` 修不到中间那一百多秒——真修掉的后果是巡检在 `goto` 还没返回时关掉 context，报出去的「页面打开失败」成了失真文案。巡检循环自己炸了不退出：一次异常把任务摘掉，注册表里的 context 就只能等进程退出，而 `mem_limit: 1g` 会先一步到。
 3. **origin 固化**：session 创建时记下目标 origin（折成 `scheme://host[:port]`，不带 path），`navigate` 只允许同 origin 的相对 path；主文档导航仍走 `allow_request`，跳出即阻断。
 
-ref 实现：采集时给每个交互元素写 `data-zc-ref="eN"`，step 时按属性选择器找回。**每次 step 后重新打标，旧 ref 全部作废**——采集脚本一进页面就先清掉上一轮所有该属性再按当次遍历顺序重打，而 Vue 重建 DOM 节点会连属性一起丢掉，所以「ref 只在最近一次返回内有效」不是约定，是物理事实。副作用：ref 由采集顺序现编，同一个 `e2` 在两份清单里可以是两个元素，因此后端两处 sensitive 判定只认「动作之前」那份清单（§7、§8 R-37）。
+ref 实现：`browser/session_core.py::new_ref_tokens()` 每次扫描生成一批**互不相同的随机短令牌**（形状 `r` + 6 位，字母表 `abcdefghjkmnpqrstuvwxyz23456789`，去掉 `0 o 1 l i` 这类易混字符；池大小 = 遍历上限 200，两处同值有测试钉住），整份数组作为参数传给打标脚本（`page.evaluate(INTERACTIVE_JS, tokens)`），脚本按元素顺序取 `tokens[i]` 并 `setAttribute` 同一个值。**令牌在 Python 侧生成、JS 不摇随机数**是刻意的：唯一性与形状策略必须在纯函数层可单测，而且只能有一处。字符集刻意不含任何需要转义进 CSS 属性选择器的字符，所以 `selector_for` 拼 `[data-zc-ref="…"]` 之前只需判形状。
+
+**每次 step 后重新打标，旧 ref 全部作废，而且「作废」是机制检测得到的事**——采集脚本一进页面就先清掉上一轮所有该属性，再领一批**新令牌**重打，所以上一轮发出去的句柄在新清单里必然查不到，落回 `{"ok": false, "error": "ref 无效或页面已变化，请用最新清单里的 ref"}` 那条既带回新清单又自动附图的出口（§5.3）。这条曾经是假的：序号形状下旧序号在新清单里**大概率仍然合法**，机制只能报「成功」，于是静默点到另一个元素（真机复现，见 §15）。副作用（「ref 只在最近一次返回内有效」仍是物理事实）：Vue 重建 DOM 节点会连属性一起丢掉，而令牌每轮整批换发意味着后端两处 sensitive 判定与元素名回显**只能**认「动作之前」那份清单（§7、§8 R-37）——同一个令牌在新清单里重现是概率性的小数事件（量级见 §8 那条尾注，不是数学上的零），反查因此只会得到空名字。
 
 ### 6.3 等待策略
 
@@ -275,12 +280,14 @@ ref 实现：采集时给每个交互元素写 `data-zc-ref="eN"`，step 时按�
 - 截图与 `fill` value 的遮断都不是完备的：非 password 命名的敏感输入（身份证号、密钥明文框）不在 sensitive 判定内，只能靠规则表兜。
 - 动作可以改 dev 数据且**不回滚**：与 `db_write` 同一口径——遇错即停，已成功的不撤销。收口报告只报事实，不承诺恢复。
 - 拖拽类交互点不到（第一版无 `drag`）。这类应用上 Agent 会得到「元素不可点击」而不是假成功，属已知能力边界。
+- **旧句柄的失效是概率性的，不是数学上不可能撞上**：令牌每次扫描换发一批（约 200 个），令牌空间是 31^6 ≈ 8.9 亿，所以某个旧令牌在新扫描里**重现**的量级约 `200 / 8.9e8 ≈ 2e-7`（一次走查十几步、几步旧令牌，累计仍是 1e-6 量级以下）。撞上的后果退回序号时代那格「静默点到另一个元素」，但不再是**大概率**事件而是尾注事件；本版本接受它，不改成「扫描间不重用的持久映射表」（那会把「不留第二份会漂的副本」这条 §6.2 前提换掉，还会让 TTL/并发上限重新变成必须正确回收的状态）。要彻底封死只能给每次扫描加一个会话内自增前缀——那是又一次「稳定」，而稳定正是本条要修的病根。
 - 活 session 期间页面 JS 可持续运行（定时器、WebSocket），最坏影响是 sidecar 自身资源占用，由 TTL 与上限约束。
 
 **三条由七轮修复挣出来、本版本未修的风险（措辞按最终实现，不淡化）**
 
 - **R-37：非浏览器调用触发 HMR 之后，「动作前那份清单」在参数侧与结果侧一起过期。**
   `fs_write` / `edit_file` 改源码、`preview_restart` 起新栈（以及外延点名的 `preview_page`——它自己不改页面，但同样不刷新 `browser_refs`）让 dev 预览重渲染之后，`run_state["browser_refs"]` **不会**更新，于是两侧读到的是同一份过期清单。此时**两侧同结论**，不违反 §7 的一致性口径，但**绝对判定是错的**：Vue 常常是就地打补丁而不是重建节点（`:type` 一翻，同一个 `<input>` 就从搜索框变成口令框，而 `data-zc-ref` 不是 Vue 管的属性，节点活着它就活着），于是真实口令框可以被填、值可以明文进 `message.tool_args`。堵它需要一条新裁定（「写源码 / 重启预览就作废轮初清单」），**且不得用「清空 `browser_refs`」实现**——参数侧对空清单判「未知」会遮，结果侧对空清单判 False 不遮，那会当场造出新的两侧分家。本版本未修，留待后续规格（裁定 R-40 登记）。
+  ref 改成每次扫描换发的随机令牌（§6.2）之后，这一条的**范围收窄但一条没少**：「同一个旧句柄在新清单里指向另一个元素」那一半没有了（旧令牌在新清单里必然查不到，因此落进参数侧的「未知即遮」）；剩下的正是这里写的这一半——**轮初清单里查得到的那个令牌**，它的节点被就地改了类型，两侧同判 False，绝对判定仍然是错的。
 - **R-39：不可解析的 `arguments` 一律「不遮不改」，这是全工具共用的既有设计。**
   `app/agent/redact.py` 的 `rewrite_tool_calls_args` 对 JSON 解析失败的条目原样返回。可复现形状：同一条消息里两个调用**共用一个流式 `index`** 时，`app/agent/llm.py` 会把它们的 args 字符串拼接成一条（`slot["function"]["arguments"] += ...`），解析失败、但原文里的凭据照样进 `message.tool_args`（派发端把它换成 `{}`，动作实际没跑）。**它不属于 R-37 / C-1 那一族**——两侧对同一个 value 给的是同一个结论，不构成「一处遮一处不遮」。堵它要先决定「不可解析的 args 是否整串换成占位符」，影响面是全工具共用路径，**须另立规格**，不在本分支夹带。
 - **明文落盘的出口只有一处，别把「两侧一致」读成「有一侧兜底」。**
@@ -389,7 +396,7 @@ ref 实现：采集时给每个交互元素写 `data-zc-ref="eN"`，step 时按�
 | 大型栈登录 | **部分已验**。遮断机制在真 HTTP 往返下成立：sensitive 框 fill → `value_redacted:true` 且 `browser_log` 里查不到明文；非 sensitive 框 fill → 值 `第一单` 照旧保留（**没有一刀切**）。**登录态跨步保持、真实 `admin123`、`message.tool_args` 落库面**三项未跑（需真实大型栈应用；前两项由 `tests/test_agent_loop.py` 的真 loop 测试覆盖，非真机） |
 | 带原生 confirm 的删除 | **已验（sidecar 层）**。`dialog:{type:confirm, message:"确认删除这一行？", handled:"dismissed"}`，且页面文本里**没有**「已删除」。前端那句提示的渲染由 `BrowserFlowCard.test.js` 覆盖，未人眼看 |
 | 断言故意写错 | **未跑真机**。由 `tests/test_browser_session_tools.py` 覆盖 |
-| ref 失效 | **⚠️ 真机跑出一个设计属性，与「响亮失败」的预期不符**：探针里拿旧 ref 再点，返回的是 **`ok:true`**，因为 ref 是**按序号**重打的、旧序号在新清单里**大概率仍然存在**（实测 `stale_ref_still_exists_in_new_list:true`）。本次侥幸仍指向同一元素（`now_points_at:"备注"`，集合顺序未变）；**一旦可交互集合的顺序变了，旧 ref 会静默点到另一个元素**，而不是回「ref 无效」。规格 §6.2 说「旧 ref 全部作废」，但机制检测不到「作废」这件事。**未修，需裁定**（最窄改法：把序号换成每次扫描随机的短令牌，使旧 ref 必然查不到而响亮失败；代价是 `REF_RE` 与一批测试要跟着改） |
+| ref 失效 | **已修（原为「未修，需裁定」）**：序号形状下拿旧 ref 再点回的是 `ok:true`——旧序号在新清单里**大概率仍然合法**（实测 `stale_ref_still_exists_in_new_list:true`），本次侥幸仍指向同一元素，顺序一变就静默点到另一个元素。现在 ref 是每次扫描重生成的随机短令牌（§6.2），旧令牌在新扫描里必然查不到，落回 `ok:false` +「ref 无效或页面已变化，请用最新清单里的 ref」，照旧带回新清单并自动附图（§5.3 那条早就写好、生产里几乎不可达的路径）。**本轮的验证面**：`tests/test_browser_session_core.py`（令牌唯一性/形状/字符集、`selector_for` 只认新形状）+ `tests/test_browser_sessions.py`（sidecar 层替身 page 钉「旧令牌 → 查不到 → 带回新清单」）。**真机那一跑仍待补**：见本节末「Deferred live steps」，验收点就是「拿旧令牌去点必须回 `ok:false` + 那句中文 + 带回新清单」。 |
 | 步数耗尽 | **未跑真机**。由单测覆盖。`steps_used` / `steps_total` 两本账的口径差异已在真机侧观察到并确认（`steps_total:3` vs `steps_used:2`，差的就是 open 那一行） |
 | sidecar 中途重启 | **等价路径已验**（用 `DELETE` 制造会话消失，未真重启容器）：`{ok:false, session_gone:true, steps_charged:false}` + 那句中文。真重启未跑 |
 | 拖拽类应用 | **未跑真机**（无拖拽类样本应用） |
@@ -403,4 +410,11 @@ ref 实现：采集时给每个交互元素写 `data-zc-ref="eN"`，step 时按�
 
 **本轮真机另外复现的一条**（原表没有，属 §14 的 R-42）：只在 `browser_open` 上声明 `expect` 且 `passed:true` 的 run，`browser_close` 的 `hint` 曾输出「本次走查未声明任何断言」——**实测复现的假话**，已在 `32c012d` 修掉（open 的断言结论进那本账，`steps_failed` 口径随之含 open）。
 
-**尚未验证、合回前必须补的三格**：刷新后步骤卡仍在（人眼看 UI）、拖拽类应用、断言故意写错的自动附图。**另有一项待裁定**：ref 序号复用导致的静默错点（见「ref 失效」那一行）。
+**尚未验证、合回前必须补的三格**：刷新后步骤卡仍在（人眼看 UI）、拖拽类应用、断言故意写错的自动附图。**原列的第四项「ref 序号复用导致的静默错点」已按 §6.2 修掉**（随机令牌），代码与单测/替身层测试在场，**只剩真机那一跑**（下表末 Deferred live steps）。
+
+### Deferred live steps（本轮按 R-8 不重建镜像、不起容器、不打真 sidecar HTTP）
+
+1. **验收点**：探针页 open → 记下清单里的某个令牌 → 让页面重渲染（改变可交互集合的**顺序**，例如插入/删除一个按钮）→ 拿**旧令牌**去 `click`。必须回 `ok:false` +「ref 无效或页面已变化，请用最新清单里的 ref」，且带回**新清单**（令牌与旧的那一份整批不同）并自动附一张现场图；`steps_charged:true`。旧实现在这格回 `ok:true` 并静默点到另一个元素。
+2. 同一跑里对照确认：新清单里查不到旧令牌的**属性也确实被清掉了**（`document.querySelectorAll('[data-zc-ref]')` 的取值集合与上一轮无交集）。
+3. 大 DOM 页（>200 个可交互节点）跑一次 open，确认 `interactive_truncated:true` 照旧出声——令牌池与遍历上限同值这条关系在真机上不漂。
+4. 登录页跑一次「fill 口令 → 下一步 fill 备注」，确认只有口令那一步 `value_redacted:true`，备注照旧明文（令牌换发没有把「已知非 sensitive 放行」变成一刀切）。
