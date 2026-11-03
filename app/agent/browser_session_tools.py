@@ -392,6 +392,27 @@ def _interactive_items(ctx, raw) -> tuple[list[dict], int]:
     return out, hits_total
 
 
+def _empty_list_hint(interactive: list) -> str:
+    """清单为空时替模型把「这是工具的边界、不是应用的属性」说出口（第 2 批 5a）。
+
+    真机实测（`probe/probe-results-7.json`）：`<div draggable="true">` 匹配不上打标脚本的
+    任何一个选择器，于是 agent 看到的交互清单是**空的**。它读到的是「这个页面没有可操作元素」，
+    而不是「我不会拖拽」——这是最坏的一种「不行」：看起来像应用的属性，其实是工具的边界，
+    而模型会据此往「这个应用没按钮 / 应用坏了」那个结论走。规格 §5.3 与 §15 此前承诺的是
+    「诚实的元素不可点击」，那份诚实只有页面里存在别的目标、模型去打那个 draggable 时才成立；
+    清单为空时先前一个字都没说。
+    点名的是**已知不做项**（拖拽 / 上传 / hover，规格 §11），不是穷举：将来加动作时这句
+    会落后，所以 §8 把它登记成残余风险。文本是后端自有的常量、不含地址，不过任何清洗闸。
+    """
+    return "" if interactive else (
+        "可交互元素清单为空，这不代表页面没有可操作部件：打标脚本只认按钮 / 链接 / 输入框"
+        "这类控件，拖拽（draggable / 自己监听 mouse 事件的排序）、文件上传、hover 才出现的东西"
+        "都不在清单里，而这三类本功能第一版不做。"
+        "别据此判定应用没有功能或已经坏了；要验证这类交互，改读页面文本、"
+        "或走 db 查询 / 预览日志那侧的证据，必要时请用户手工确认。"
+    )
+
+
 def _shape_dialog(raw) -> tuple[dict | None, int]:
     """弹窗整块形状保留（US-11 要靠 `type`/`handled` 判断「删除其实没发生」），正文过遮断。
 
@@ -476,6 +497,11 @@ def _shape_state(ctx, data: dict, *, opened: bool, url: str, status: str,
                        _sidecar_text(data.get("note"), NOTE_MAX_CHARS,
                                      target_netloc=target_netloc,
                                      display_netloc=display_netloc)[0])
+    # 清单为空这件事必须由后端说出来（第 2 批 5a）：不说就是模型读到的「这个页面没有可操作元素」，
+    # 而它十有八九是拖拽 / 上传 / hover 那一类打标脚本认不出的部件——工具的边界被读成应用的属性。
+    hint = _empty_list_hint(interactive)
+    if hint:
+        out["hint"] = hint
     return out
 
 
@@ -638,7 +664,10 @@ async def _open(ctx, args: dict) -> dict:
         # 不能静默换掉：模型会以为自己还在同一个会话上，而步数账与 browser_log 都是那个 run 的。
         # 只报事实，不带旧 session_id（ADR-0037：session_id 不进任何模型可见出口）。
         out["auto_closed_previous"] = True
-        out["hint"] = "上一个浏览器会话已在本次 open 前自动关闭（一个 run 只保留一个会话），旧 ref 全部作废"
+        auto_hint = "上一个浏览器会话已在本次 open 前自动关闭（一个 run 只保留一个会话），旧 ref 全部作废"
+        # 两条 hint 可以同时成立（首屏清单为空 + 自动关掉了上一个会话）：接在后面写，
+        # 直接赋值会把空清单那句盲区提示整条盖掉——那正是第 2 批 5a 要说的话。
+        out["hint"] = f"{out['hint']}；{auto_hint}" if out.get("hint") else auto_hint
     # 裁定 R-41③ 作废（控制器改判）：open 带 expect 而 `passed:false` 正属于 R-26 那句「这一步
     # 没能往前推进」，就该自动附一张现场图。改判的两条理由：原裁定给的依据是事实错误（前端读
     # `result.screenshot`，与卡的 name 判定无关，open 卡本来就能画图）；而模型此前连「显式要一张」
@@ -765,6 +794,11 @@ def _step_failure(ctx, data: dict, *, target_netloc: str, display_netloc: str,
            "steps_charged": charged,
            "steps_left": _steps_left(ctx),
            **signals}
+    # 失败那一步重采回来的清单同样可能是空的（第 2 批 5a）：这时「点不动」的原因与
+    # 「这一页根本没有可点的东西」在模型眼里长一样，而前者该换 ref、后者是能力边界。
+    hint = _empty_list_hint(interactive)
+    if hint:
+        out["hint"] = hint
     return {**out, **extra}
 
 

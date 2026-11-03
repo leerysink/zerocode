@@ -2959,3 +2959,78 @@ async def test_open_echoes_a_declared_expect(monkeypatch):
     monkeypatch.setattr(bst, "_sidecar_open", lambda url, **kw: _aget((_session_ok(), "")))
     plain = await bst.run_browser_session_tool(Ctx(), "browser_open", {"path": "/orders"})
     assert "expect" not in plain
+
+
+# ---------------------------------------------------------------------------
+# 第 2 批 5a：交互清单为空时点名「已知的能力边界」（拖拽 / 上传 / hover）。
+# 真机实测（probe/probe-results-7.json）：`<div draggable="true">` 匹配不上打标脚本的
+# 任何选择器，agent 于是看到一份**空清单**。它读到的是「这页没有可操作元素」，而不是
+# 「我不会拖拽」——最坏的一种「不行」：工具的边界被读成应用的属性。
+# ---------------------------------------------------------------------------
+
+_BLIND_SPOTS = ("拖拽", "上传", "hover")
+
+
+async def test_an_empty_interactive_list_names_the_known_blind_spots(monkeypatch):
+    ctx = Ctx()
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    monkeypatch.setattr(bst, "_sidecar_open",
+                        lambda url, **kw: _aget((_session_ok(interactive=[]), "")))
+    out = await bst.run_browser_session_tool(ctx, "browser_open", {})
+    assert out["ok"] is True and out["interactive"] == []
+    assert "清单为空" in out["hint"]
+    for word in _BLIND_SPOTS:
+        assert word in out["hint"], word
+    # 反面也要钉住：这句话不许被写成「这个应用没有功能」——那是模型本来就会自己下的结论。
+    assert "不代表页面没有可操作部件" in out["hint"]
+    blob = json.dumps(out, ensure_ascii=False)
+    assert "sid-123" not in blob and "session_id" not in blob   # 新键不开新泄漏面
+
+
+async def test_a_nonempty_list_does_not_claim_the_page_has_no_controls(monkeypatch):
+    """清单非空就不该有这句：页面上明明有按钮，说「清单为空」是把事实说反。"""
+    ctx = Ctx()
+    ctx.run_state["browser_session"] = "abc"
+    _step_env(monkeypatch, _step_data())
+    out = await bst.run_browser_session_tool(
+        ctx, "browser_step", {"action": "click", "target": "e1"})
+    assert out["ok"] is True and out["interactive"]
+    assert "清单为空" not in out.get("hint", "")
+
+
+async def test_the_blind_spot_hint_also_rides_the_action_failure_shape(monkeypatch):
+    """点不动 + 当场重采回空清单：「该换 ref」与「这页没有可点的东西」在模型眼里长一样。"""
+    ctx = Ctx()
+    ctx.run_state["browser_session"] = "abc"
+    ctx.run_state["browser_refs"] = [{"ref": "e7", "role": "button", "name": "出牌",
+                                      "sensitive": False}]
+
+    async def fake_step(sid, payload):
+        return ({"ok": False, "error": "元素不可点击或动作失败: timeout",
+                 "interactive": [], "steps_charged": True}, "")
+
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    monkeypatch.setattr(bst, "_sidecar_step", fake_step)
+    _no_shot(monkeypatch)
+    out = await bst.run_browser_session_tool(
+        ctx, "browser_step", {"action": "click", "target": "e7"})
+    assert out["ok"] is False and out["interactive"] == []
+    for word in _BLIND_SPOTS:
+        assert word in out["hint"], word
+
+
+async def test_the_auto_closed_hint_and_the_empty_list_hint_do_not_overwrite_each_other(
+        monkeypatch):
+    """两条 hint 能同时成立（二次 open 且首屏清单为空）：赋值式写法会把新加的那句整条盖掉。"""
+    ctx = Ctx()
+    ctx.run_state["browser_session"] = "sid-123"
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    monkeypatch.setattr(bst, "_sidecar_delete", lambda sid: _aget(True))
+
+    async def opener(url, **kw):
+        return _session_ok(session_id="sid-456", interactive=[]), ""
+
+    monkeypatch.setattr(bst, "_sidecar_open", opener)
+    out = await bst.run_browser_session_tool(ctx, "browser_open", {})
+    assert out["auto_closed_previous"] is True
+    assert "自动关闭" in out["hint"] and "清单为空" in out["hint"]
