@@ -689,7 +689,7 @@ def _step_failure(ctx, data: dict, *, target_netloc: str, display_netloc: str,
 #   · `_step` 写 `browser_log` 时对 sensitive 目标的 value 遮断（Task 5）；
 #   · `redact_sensitive_step_args` 对落库/推送的同一份 value 遮断（裁定 R-33）；
 #   · `ref_display_name` 回显这一步的元素名（裁定 R-32，US-22）。
-# 不拿动作之后的新快照做后两件：ref 是每次扫描重生成的随机令牌、旧令牌在新清单里必然查不到
+# 不拿动作之后的新快照做后两件：ref 是每次扫描重生成的随机令牌、旧令牌在新清单里几乎必然查不到
 # （规格 §6.2），拿新快照反查旧句柄只会得到一个空名字——而名字画错比不画更糟，遮断遮错对象就是
 # 明文泄漏，判定源因此恒为「动作之前」那一份。
 # 参数侧还多两条「清单说了也不算」的从严（`is_sensitive_ref_or_unknown` 与位次规则，Critical C-1
