@@ -567,7 +567,7 @@ async def _rescan(s: Session, limit: int, started: float) -> dict:
 def _consume_new_items(s: Session) -> None:
     """把本步产生的增量**丢掉并记账**（裁定 R-45，发现项 F-7）。
 
-    本模块有三条不经过 `_step_state` 的出口都不打算回状态，其中两条走这里：动作名不认识、
+    本模块那三条不经过 `_step_state` 的出口都不打算回状态，其中两条走这里：动作名不认识、
     navigate 的 path 形状非法。第三条（会话已经不在了）没有账可消费——收集器与三份 seen 集合
     都跟着那个 Session 一起没了，「下一步」在那个会话上根本不存在。
     可页面在这期间照样可能报错（上一异步任务正好落地），而那批错误如果不在这里被消费掉，
@@ -656,7 +656,7 @@ async def step(sid: str, req: StepRequest):
     if s is None:
         # 会话没了不扣步数（US-12）：Agent 什么也没做成，扣账只会让它更早撞上限。
         # 这一条没有增量可消费：收集器与三份 seen 集合都跟着那个 Session 一起没了，
-        # 「下一步」在那个会话上根本不存在（裁定 R-45 管的是另外两条还活着会话的出口）。
+        # 「下一步」在那个会话上根本不存在（裁定 R-45 管的是另外两条还带着会话对象的出口）。
         return {"ok": False, "error": SESSION_GONE_MESSAGE, "session_gone": True,
                 "steps_charged": False}
     touch(s)

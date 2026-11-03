@@ -610,7 +610,7 @@ async def _open(ctx, args: dict) -> dict:
     out = _shape_state(ctx, data, opened=True, url=display_url, status=status,
                        target_netloc=target_netloc, display_netloc=display_netloc)
     # 写日志的顺序排在 `_shape_state` **之后**（发现项 S-1，与 `_step` 成功支同一写法）：
-    # open 那条此前只有「断言未通过」五个字的形状可用，`note` 从来没进过账，而模型看到的是
+    # open 那一条此前只留下「断言未通过」这个事实，`note` 从来没进过账，而模型看到的是
     # 「页面文本未包含『订单列表』」——首屏没等到文案正是本功能的立项场景（规格 US-06），
     # 收口报告与步骤卡上那一行却什么都没说。这里复用模型这一步看到的已清洗文本，不另调一次
     # `_sidecar_text`（两处各写一遍迟早分家）。通过的那一条不写：`_shape_state` 给的是空串。
