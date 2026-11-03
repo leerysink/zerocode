@@ -43,6 +43,18 @@ const appLabel = computed(() => {
   return [app.slug, app.stack].filter(Boolean).join(' · ')
 })
 
+const identity = computed(() => {
+  const id = result.value?.identity
+  if (!id || !id.kind || id.kind === 'none') return null
+  return id
+})
+const identityLabel = computed(() => {
+  const id = identity.value
+  if (!id) return ''
+  if (id.label) return id.label
+  return id.kind === 'admin' ? '以 admin 身份验证' : '匿名（未登录）'
+})
+
 const url = computed(() => (result.value?.ok ? result.value?.url : ''))
 const pageTitle = computed(() => (result.value?.ok ? result.value?.title : ''))
 const text = computed(() => (result.value?.ok ? result.value?.text || '' : ''))
@@ -65,6 +77,7 @@ const notes = computed(() => {
   const r = result.value
   if (!r) return []
   const out = []
+  if (r.identity?.kind === 'anonymous' && r.identity.note) out.push(`身份：${r.identity.note}`)
   if (r.redacted) out.push(`已遮断 ${r.redacted} 处凭据`)
   if (r.truncated) out.push('内容较长，已按预算截断')
   if (r.screenshot_note) out.push(r.screenshot_note)
@@ -79,6 +92,8 @@ const loadingLine = computed(() => props.progress?.line || '正在打开预览�
     <div class="zc-page-head">
       <span class="zc-page-title">{{ title }}</span>
       <span class="zc-page-tool">{{ name }}</span>
+      <span v-if="identity" class="zc-page-identity" :class="`is-${identity.kind}`"
+            :title="identity.note || ''">{{ identityLabel }}</span>
       <span v-if="issues" class="zc-page-badge">{{ issues }} 个问题</span>
       <a v-if="url" class="zc-page-link" :href="url" target="_blank" rel="noopener">打开预览</a>
     </div>
@@ -190,6 +205,20 @@ const loadingLine = computed(() => props.progress?.line || '正在打开预览�
   background: rgba(161, 124, 91, 0.12);
   border-radius: 999px;
   padding: 1px 8px;
+}
+.zc-page-identity {
+  font-size: 11px;
+  border-radius: 999px;
+  padding: 1px 8px;
+  white-space: nowrap;
+}
+.zc-page-identity.is-admin {
+  color: #3f6b52;
+  background: rgba(82, 160, 107, 0.14);
+}
+.zc-page-identity.is-anonymous {
+  color: #8a6b3f;
+  background: rgba(217, 154, 60, 0.16);
 }
 .zc-page-link {
   margin-left: auto;

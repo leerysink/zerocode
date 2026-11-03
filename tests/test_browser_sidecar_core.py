@@ -1,9 +1,12 @@
 """浏览器 sidecar 纯函数测试：不需要 playwright 或 sidecar 进程。"""
+import json
+import re
 import socket
 
-from browser.inspect_core import (allow_request, clean_text, is_ip_literal, is_private_host,
-                                  parse_allowed_hosts, pick_connect_ip, rewrite_url_host,
-                                  shape_result, validate_target)
+from browser.inspect_core import (allow_request, build_session_script, clean_text, is_ip_literal,
+                                  is_private_host, origin_string, parse_allowed_hosts,
+                                  pick_connect_ip, rewrite_url_host, shape_result,
+                                  validate_target)
 
 
 def test_parse_allowed_hosts_defaults_and_trim():
@@ -130,3 +133,39 @@ def test_allow_request_uses_the_rewritten_origin():
                          is_main_navigation=False) is True
     assert allow_request(target, "http://host.docker.internal:8213/src/main.js",
                          is_main_navigation=True) is False
+
+
+def test_build_session_script_writes_raw_token_to_localstorage():
+    script = build_session_script("eyJhbGciOiJIUzI1NiJ9.abc.def")
+    assert 'localStorage.setItem("token", "eyJhbGciOiJIUzI1NiJ9.abc.def")' in script
+
+
+def test_build_session_script_empty_token_returns_empty_script():
+    for raw in (None, "", "   ", 123, {"token": "x"}):
+        assert build_session_script(raw) == ""
+
+
+def test_build_session_script_guards_to_target_origin():
+    script = build_session_script("jwt-1", "http://127.0.0.1:8241")
+    assert 'if (location.origin !== "http://127.0.0.1:8241") return;' in script
+    assert build_session_script("jwt-1", "") == build_session_script("jwt-1")
+
+
+def test_origin_string_matches_location_origin_shape():
+    assert origin_string("http://127.0.0.1:8241/orders?x=1") == "http://127.0.0.1:8241"
+    assert origin_string("http://host.docker.internal:8213/") == "http://host.docker.internal:8213"
+    assert origin_string("https://example.com/a") == "https://example.com"
+    assert origin_string("https://example.com:443/a") == "https://example.com"
+    assert origin_string("http://[::1]:8241/x") == "http://[::1]:8241"
+    assert origin_string("ftp://example.com/x") == ""
+    assert origin_string("http://example.com:bad/x") == ""
+
+
+def test_build_session_script_escapes_breakout_and_control_chars():
+    token = 'a"b\\c\nd</script><script>alert(1)</script>\u2028\u2029'
+    script = build_session_script(token)
+    assert "</script>" not in script and "<script>" not in script
+    assert "\\u003c" in script and "\\u2028" in script and "\\u2029" in script
+    match = re.search(r'localStorage\.setItem\("token", (".*")\);', script)
+    assert match, script
+    assert json.loads(match.group(1)) == token

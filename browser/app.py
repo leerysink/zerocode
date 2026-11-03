@@ -14,9 +14,9 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from playwright.async_api import async_playwright
 
-from .inspect_core import (allow_request, host_of, is_ip_literal, origin_of,
-                           parse_allowed_hosts, pick_connect_ip, rewrite_url_host,
-                           shape_result, validate_target)
+from .inspect_core import (allow_request, build_session_script, host_of, is_ip_literal,
+                           origin_of, origin_string, parse_allowed_hosts, pick_connect_ip,
+                           rewrite_url_host, shape_result, validate_target)
 
 MAX_CONCURRENCY = 2
 DEFAULT_WAIT_MS = 1200
@@ -35,6 +35,8 @@ class InspectRequest(BaseModel):
     url: str
     wait_ms: int = DEFAULT_WAIT_MS
     timeout_ms: int = DEFAULT_TIMEOUT_MS
+    # 验证会话的 JWT（ADR-0038）：后端代登后只递 token，不递口令；缺省即匿名检查。
+    session_token: str | None = None
 
 
 def _clamp(value, default: int, lo: int, hi: int) -> int:
@@ -85,8 +87,9 @@ async def inspect(req: InspectRequest):
     timeout_ms = _clamp(req.timeout_ms, DEFAULT_TIMEOUT_MS, 10000, TIMEOUT_MS_MAX)
     async with _sem:
         try:
-            return await asyncio.wait_for(_inspect(url, wait_ms, timeout_ms),
-                                          timeout=timeout_ms / 1000 + 5)
+            return await asyncio.wait_for(
+                _inspect(url, wait_ms, timeout_ms, req.session_token),
+                timeout=timeout_ms / 1000 + 5)
         except asyncio.TimeoutError:
             return {"ok": False, "timed_out": True, "error": "页面检查超时"}
         except Exception as e:  # noqa: BLE001 - 任何浏览器异常都必须是可读结果
@@ -115,7 +118,8 @@ async def _connect_url(url: str) -> str:
     return rewrite_url_host(url, ip) if ip else url
 
 
-async def _inspect(url: str, wait_ms: int, timeout_ms: int) -> dict:
+async def _inspect(url: str, wait_ms: int, timeout_ms: int,
+                   session_token: str | None = None) -> dict:
     connect_url = await _connect_url(url)
     started = time.monotonic()
     context = await _browser.new_context(
@@ -125,6 +129,10 @@ async def _inspect(url: str, wait_ms: int, timeout_ms: int) -> dict:
         ignore_https_errors=False,
     )
     try:
+        script = build_session_script(session_token, origin_string(connect_url))
+        if script:
+            # 页面脚本执行前写入目标 origin 的 localStorage.token；token 只进这一个 context。
+            await context.add_init_script(script)
         return await _inspect_in_context(context, connect_url, wait_ms, timeout_ms, started)
     finally:
         await context.close()

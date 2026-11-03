@@ -448,3 +448,16 @@ Agent 通过 `ask_user` 向用户提问、通过 `confirm_request` 请求放行�
 承载 `preview_page` 的独立容器：headless Chromium + Playwright，无 docker.sock、无平台库凭据、
 非 root、限资源；后端只经内部 HTTP 调用它，它只经 host-gateway 访回应用 dev 端口。
 它不是应用运行时的一部分，也不走网关；后端容器内不运行浏览器（ADR-0031）。
+
+## 登录态（一词两义，用全名不许裸写）
+
+「让浏览器验证拿到登录态」同时指两件不同的事，方向相反，讨论时必须写全名：
+
+- **宿主登录态（host browser state）**：用户自己那个 Chrome/Edge 里的 cookie、localStorage、
+  扩展与已登录 tab。它跑在用户机器上，sidecar 跑在服务器上，两者不在同一台进程里。
+  本项目**不获取**它：既非能力所需，也已由规格非目标明令排除。
+- **验证会话（verification session）**：为验证而新建立的应用自身登录身份，由服务端取得、
+  只活在 sidecar 的那个 context 里，随 context 销毁。它解决的是「Agent 打开的是业务页还是
+  登录页」，与用户本机无关（ADR-0038）。
+
+「已登录的预览页」「真实登录态」这类说法本身是歧义源，落到文档时统一改写成上面两个全名之一。

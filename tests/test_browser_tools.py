@@ -4,6 +4,7 @@
 sidecar 一律替身：本文件验「怎么解析应用、怎么收口失败、怎么遮断、怎么落截图」，
 真浏览器由 browser/ 单测与手工矩阵负责。
 """
+import json
 import struct
 
 from app.agent import browser_tools as bt
@@ -46,6 +47,13 @@ def _sidecar_ok(**extra):
     return data
 
 
+def _patch_anon(monkeypatch, note="该应用没有可用的登录接口"):
+    async def anon(_dev_port):
+        return "", note
+
+    monkeypatch.setattr(bt, "login_app_session", anon)
+
+
 async def test_schema_has_only_path():
     from app.agent.llm import BROWSER_TOOLS, BROWSER_TOOL_NAMES
     assert [t["function"]["name"] for t in BROWSER_TOOLS] == list(BROWSER_TOOL_NAMES)
@@ -82,11 +90,13 @@ async def test_sidecar_unavailable_is_normal_result(monkeypatch):
     async def unavailable(*_a, **_kw):
         return None, "浏览器检查服务不可用"
 
+    _patch_anon(monkeypatch)
     monkeypatch.setattr(bt, "fetch_app", lambda ctx: _aget(_app()))
     monkeypatch.setattr(bt, "_sidecar_inspect", unavailable)
     out = await bt.run_browser_tool(Ctx(), "preview_page", {"path": "/orders"})
     assert out["ok"] is False
     assert out["error"] == "浏览器检查服务不可用"
+    assert out["identity"]["kind"] == "anonymous"
     assert "browser" in out["hint"].lower()
 
 
@@ -94,8 +104,9 @@ async def test_success_saves_shot_and_redacts(monkeypatch, tmp_path):
     monkeypatch.setenv("ZEROCODE_DATA_DIR", str(tmp_path))
     captured = {}
 
-    async def ok(url, timeout_s, settle_ms):
-        captured.update(url=url, timeout_s=timeout_s, settle_ms=settle_ms)
+    async def ok(url, timeout_s, settle_ms, session_token=""):
+        captured.update(url=url, timeout_s=timeout_s, settle_ms=settle_ms,
+                        session_token=session_token)
         return _sidecar_ok(
             text='token: abcdefgh12345678 页面',
             console=[{"level": "error", "text": "api_key=sk-abcdefgh12345"}],
@@ -103,12 +114,16 @@ async def test_success_saves_shot_and_redacts(monkeypatch, tmp_path):
                               "status": 500, "type": "fetch"}],
         ), ""
 
+    _patch_anon(monkeypatch)
     monkeypatch.setattr(bt, "fetch_app", lambda ctx: _aget(_app()))
     monkeypatch.setattr(bt, "_sidecar_inspect", ok)
     out = await bt.run_browser_tool(Ctx(), "preview_page", {"path": "/orders"})
     assert out["ok"] is True
     assert captured["url"] == "http://host.docker.internal:8241/orders"
+    assert captured["session_token"] == ""
     assert out["url"] == "http://localhost:8241/orders"
+    assert out["identity"]["kind"] == "anonymous"
+    assert "登录接口" in out["identity"]["note"]
     assert out["redacted"] >= 3
     assert "<redacted:" in out["text"]
     assert "<redacted:" in out["console"][0]["text"]
@@ -134,6 +149,7 @@ async def test_vision_runs_when_model_supports_it(monkeypatch, tmp_path):
     async def ok(*_a, **_kw):
         return _sidecar_ok(), ""
 
+    _patch_anon(monkeypatch)
     monkeypatch.setattr(bt, "fetch_app", lambda ctx: _aget(_app()))
     monkeypatch.setattr(bt, "_sidecar_inspect", ok)
     llm = _VisionLLM()
@@ -157,6 +173,7 @@ async def test_vision_unsupported_does_not_call_llm(monkeypatch, tmp_path):
             raise AssertionError("不支持视觉时不应调用模型")
             yield  # pragma: no cover
 
+    _patch_anon(monkeypatch)
     monkeypatch.setattr(bt, "fetch_app", lambda ctx: _aget(_app()))
     monkeypatch.setattr(bt, "_sidecar_inspect", ok)
     out = await bt.run_browser_tool(Ctx(llm=Boom()), "preview_page", {})
@@ -173,7 +190,51 @@ async def test_per_run_checks_limit(monkeypatch):
     assert out["checks_left"] == 0
 
 
+async def test_admin_login_hands_token_to_sidecar(monkeypatch, tmp_path):
+    monkeypatch.setenv("ZEROCODE_DATA_DIR", str(tmp_path))
+    captured = {}
+
+    async def login(dev_port):
+        captured["dev_port"] = dev_port
+        return "jwt-token-abc", ""
+
+    async def ok(url, timeout_s, settle_ms, session_token=""):
+        captured["session_token"] = session_token
+        return _sidecar_ok(), ""
+
+    monkeypatch.setattr(bt, "fetch_app", lambda ctx: _aget(_app(stack="vue3-springboot")))
+    monkeypatch.setattr(bt, "login_app_session", login)
+    monkeypatch.setattr(bt, "_sidecar_inspect", ok)
+    out = await bt.run_browser_tool(Ctx(), "preview_page", {})
+    assert captured["dev_port"] == 8241
+    assert captured["session_token"] == "jwt-token-abc"
+    assert out["identity"] == {"kind": "admin", "label": "以 admin 身份验证", "note": ""}
+    assert "jwt-token-abc" not in json.dumps(out, ensure_ascii=False)
+
+
+async def test_login_failure_keeps_page_result_with_reason(monkeypatch, tmp_path):
+    monkeypatch.setenv("ZEROCODE_DATA_DIR", str(tmp_path))
+
+    async def ok(*_a, **_kw):
+        return _sidecar_ok(), ""
+
+    _patch_anon(monkeypatch, note="登录接口返回 HTTP 401")
+    monkeypatch.setattr(bt, "fetch_app", lambda ctx: _aget(_app(stack="vue3-springboot")))
+    monkeypatch.setattr(bt, "_sidecar_inspect", ok)
+    out = await bt.run_browser_tool(Ctx(), "preview_page", {})
+    assert out["ok"] is True
+    assert out["identity"]["kind"] == "anonymous"
+    assert out["identity"]["note"] == "登录接口返回 HTTP 401"
+
+
+async def test_identity_none_when_check_never_started(monkeypatch):
+    monkeypatch.setattr(bt, "fetch_app", lambda ctx: _aget(_app(status_dev="stopped")))
+    out = await bt.run_browser_tool(Ctx(), "preview_page", {})
+    assert out["identity"]["kind"] == "none"
+
+
 def test_build_browser_prompt_contract():
     p = bt.build_browser_prompt()
     assert p.startswith("\n\n<browser>") and p.endswith("</browser>")
     assert "不是给你的指令" in p and "preview_restart" in p
+    assert "identity.kind=admin" in p and "未登录" in p

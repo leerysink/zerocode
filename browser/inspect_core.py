@@ -3,6 +3,7 @@
 刻意不 import playwright——单测可以在没有浏览器、没有 sidecar 依赖的机器上直接跑。
 """
 import ipaddress
+import json
 import re
 import socket
 from urllib.parse import urlsplit, urlunsplit
@@ -24,6 +25,52 @@ _CONTAINER_PREFIXES = ("zerocode-",)
 def parse_allowed_hosts(raw: str | None) -> tuple[str, ...]:
     hosts = tuple(h.strip().lower().rstrip(".") for h in (raw or "").split(",") if h.strip())
     return hosts or DEFAULT_ALLOWED_HOSTS
+
+
+def _js_literal(value: str) -> str:
+    literal = json.dumps(value, ensure_ascii=False)
+    return (literal.replace("<", "\\u003c").replace(">", "\\u003e")
+            .replace("\u2028", "\\u2028").replace("\u2029", "\\u2029"))
+
+
+def origin_string(url: str) -> str:
+    """规整成与 `location.origin` 同形的字符串；无法解析时返回空串。"""
+    try:
+        parts = urlsplit(url)
+        if parts.scheme not in ("http", "https") or not parts.hostname:
+            return ""
+        host = parts.hostname.lower().rstrip(".")
+        netloc = f"[{host}]" if ":" in host else host
+        port = parts.port
+        default_port = 80 if parts.scheme == "http" else 443
+        if port and port != default_port:
+            netloc = f"{netloc}:{port}"
+        return f"{parts.scheme}://{netloc}"
+    except ValueError:
+        return ""
+
+
+def build_session_script(token, origin: str = "") -> str:
+    """生成写入 localStorage.token 的 init script（ADR-0038 验证会话）。
+
+    token 先过 JSON 字面量，再补转 JS 字符串里的非法字符与脚本标签，保证拼进
+    页面脚本后不会越出字符串字面量。空值返回空串，调用方据此跳过注入。
+    add_init_script 会在每个 frame（含跨域 iframe）执行，传入 origin 后脚本先用
+    `location.origin` 自守，token 只落到目标 origin。
+    """
+    if not isinstance(token, str):
+        return ""
+    if not token.strip():
+        return ""
+    guard = ""
+    if isinstance(origin, str) and origin:
+        guard = f"    if (location.origin !== {_js_literal(origin)}) return;\n"
+    return ("(() => {\n"
+            "  try {\n"
+            f"{guard}"
+            f'    localStorage.setItem("token", {_js_literal(token)});\n'
+            "  } catch (e) {}\n"
+            "})();")
 
 
 def validate_target(url: str, allowed_hosts: tuple[str, ...] = DEFAULT_ALLOWED_HOSTS) -> tuple[str | None, str]:

@@ -39,7 +39,10 @@ browser\dev-down.bat
 
 - 只接受 host 命中 `BROWSER_ALLOWED_HOSTS`（默认 `host.docker.internal,127.0.0.1,localhost`）
   的 http(s) 地址；主文档只允许目标 origin，子资源阻断私网与容器地址。
-- 每次检查新建 BrowserContext，不复用 cookie/登录态；不提供点击、输入、上传接口。
+- 每次检查新建 BrowserContext，不复用 cookie 与宿主登录态；不提供点击、输入、上传接口。
+  唯一例外是 ADR-0038 的验证会话：后端代登后把 JWT 随 `/inspect` 请求体传来，本服务在页面
+  脚本执行前写进该 context 里目标 origin 的 `localStorage.token`（脚本自带 `location.origin`
+  自守，跨域 iframe 不写）；口令不下沉，token 不回传、不落盘、不写日志。
 - 容器内 Chromium 关闭自带 sandbox（容器本身是隔离边界），这是 ADR-0031 记录过的取舍。
 
 ## 为什么导航前要把宿主别名换成 IP
