@@ -15,7 +15,8 @@ import warnings
 from browser.inspect_core import (allow_request, clean_text, is_ip_literal, is_private_host,
                                   parse_allowed_hosts, pick_connect_ip, rewrite_url_host,
                                   shape_result, validate_target)
-from browser.session_core import INTERACTIVE_JS
+from browser.session_core import (INTERACTIVE_JS, INTERACTIVE_JS_SCAN_MAX, REF_RE, REF_TOKEN_POOL,
+                                  REF_TOKEN_SPACE)
 
 
 def test_parse_allowed_hosts_defaults_and_trim():
@@ -282,9 +283,9 @@ class _Dialog:
 
 
 INTERACTIVE_NODES = [
-    {"ref": "e1", "role": "button", "name": "提交订单"},
-    {"ref": "e2", "role": "textbox", "name": ""},          # 无名条目：shape_interactive 丢掉
-    {"ref": "e3", "role": "textbox", "name": "密码", "type": "password"},
+    {"ref": "rk2m7xt", "role": "button", "name": "提交订单"},
+    {"ref": "rwq4jbn", "role": "textbox", "name": ""},          # 无名条目：shape_interactive 丢掉
+    {"ref": "rp9zsdw", "role": "textbox", "name": "密码", "type": "password"},
 ]
 
 
@@ -307,6 +308,7 @@ class _Page:
         self.handlers = {}
         self.screenshot_calls = []
         self.evaluated = []
+        self.evaluate_args = []
         self.goto_calls = []
         self.waited = []
 
@@ -329,8 +331,9 @@ class _Page:
     async def title(self):
         return "订单"
 
-    async def evaluate(self, script):
+    async def evaluate(self, script, arg=None):
         self.evaluated.append(script)
+        self.evaluate_args.append(arg)
         return self._nodes if script == INTERACTIVE_JS else self._text
 
     async def screenshot(self, **kwargs):
@@ -456,6 +459,34 @@ async def test_attach_listeners_dismisses_dialogs_and_reports_them():
     assert "dialog" not in state             # 弹窗由 step 端点单独回报，采集器不替它做归属
 
 
+async def test_collect_page_state_hands_the_labeling_script_a_fresh_token_pool():
+    """打标脚本不再自己编号：令牌由采集器生成、整份数组当参数传进去（规格 §6.2）。
+
+    三条各钉一件事，缺一条就是这次改动要修的那个静默错点的另一种形态：
+    - 条数 = 遍历上限（池小于 SCAN_MAX 的话脚本会越界拿到 undefined）；
+    - 彼此互不相同（同一次扫描里两个元素撞同一个句柄，点哪一个纯看运气）；
+    - 两次采集发出去的不是同一批（旧句柄因此在新一页的清单里必然查不到）。
+    """
+    page = _Page()
+    other = _Page()
+    await collect_page_state(page, _collectors_with_events(),
+                             started=time.monotonic(), timed_out=False)
+    await collect_page_state(other, _collectors_with_events(),
+                             started=time.monotonic(), timed_out=False)
+
+    def tokens_of(fake):
+        index = fake.evaluated.index(INTERACTIVE_JS)
+        return fake.evaluate_args[index]
+
+    first, second = tokens_of(page), tokens_of(other)
+    assert len(first) == REF_TOKEN_POOL == INTERACTIVE_JS_SCAN_MAX
+    assert len(set(first)) == len(first)
+    assert all(REF_RE.fullmatch(token) for token in first)
+    assert set(first) != set(second)
+    assert len(set(first) | set(second)) == 2 * REF_TOKEN_POOL   # 两次整批采集 400 个令牌，零重复
+    assert REF_TOKEN_SPACE > 400 * 400        # 空间远大于「一次走查的总令牌数」量级，见规格 §8
+
+
 async def test_collect_page_state_keeps_the_key_contract():
     """键集合契约：shape_result 的 10 个旧键一个不许少，新增的就是这三个（I-2a）。
 
@@ -476,7 +507,7 @@ async def test_collect_page_state_keeps_the_key_contract():
                                        "type": "xhr", "blocked": True}]
     assert out["timed_out"] is False
     # 无名元素被丢掉，password 输入框标成 sensitive
-    assert [i["ref"] for i in out["interactive"]] == ["e1", "e3"]
+    assert [i["ref"] for i in out["interactive"]] == ["rk2m7xt", "rp9zsdw"]
     assert out["interactive"][1]["sensitive"] is True
     assert out["interactive_truncated"] is False
     assert out["truncated"] is False

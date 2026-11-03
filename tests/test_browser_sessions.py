@@ -6,6 +6,7 @@ Playwright 真能不能点中由 Step 16 的真机走查负责（本次按 R-8 �
 """
 import base64
 import importlib.util
+import re
 import sys
 import time
 import types
@@ -30,7 +31,8 @@ with warnings.catch_warnings():
     from fastapi.testclient import TestClient
 
 from browser import sessions
-from browser.session_core import INTERACTIVE_JS
+from browser.session_core import (INTERACTIVE_JS, INTERACTIVE_JS_SCAN_MAX, REF_RE,
+                                  new_ref_tokens)
 
 # app.collect_page_state 采正文用的脚本字面量（R-1：它是唯一采集器）。假 page 靠它区分
 # 「取交互节点」和「取可见正文」两种调用。
@@ -101,11 +103,30 @@ class FakeDialog:
         self.accepted = True
 
 
+class FakeLocator:
+    """Playwright 的 `page.locator(sel)`：这里只用到 `count()`——「这个属性在不在页面上」，不等待。
+
+    替身按「上一次采集打完的句柄集合」回答，等价于真浏览器打完标之后的那份 DOM：`ref_is_present`
+    判在场、`click` 才点得动，两处读同一个集合，就不会出现「count 放行而 click 撞墙」这种
+    替身自己漂开的形状。
+    """
+
+    def __init__(self, page, selector):
+        self._page = page
+        self._selector = selector
+
+    async def count(self):
+        return 1 if self._page.holds_the_ref(self._selector) else 0
+
+
 class FakePage:
     def __init__(self, url="http://h:8210/", text="首页", nodes=None):
         self.url = url
         self.text = text
         self.nodes = [] if nodes is None else nodes
+        # 这一轮真正打在页面上的句柄集合：每次采集整批换发（`evaluate` 里更新），
+        # 上一轮那一批随这次重打一起消失——就是旧令牌查不到的物理原因。
+        self.stamped: set[str] = {str(n.get("ref")) for n in self.nodes}
         self.clicked: list[str] = []
         self.filled: list[tuple[str, str]] = []
         self.handlers: dict = {}
@@ -124,11 +145,25 @@ class FakePage:
         self.pageerror_on_goto: list[str] = []
         self.dialog_on_click: str | None = None
         self.redirect_to: str | None = None
+        # 打标脚本每次采集收到的令牌数组（采集器应当在 Python 侧生成、整份传进来）
+        self.tokens_seen: list[list[str]] = []
+
+    REF_SELECTOR = re.compile(r'^\[data-zc-ref="([a-z0-9]+)"\]$')
+
+    def holds_the_ref(self, selector: str) -> bool:
+        """这个属性选择器指的元素在不在「页面上」（替身用 `stamped` 建模 DOM 的打标状态）。"""
+        match = self.REF_SELECTOR.fullmatch(selector or "")
+        return bool(match) and match.group(1) in self.stamped
+
+    def locator(self, selector):
+        return FakeLocator(self, selector)
 
     async def evaluate(self, script, *a):
         if self.evaluate_error is not None:
             raise self.evaluate_error
         if script == INTERACTIVE_JS:
+            self.tokens_seen.append(list(a[0]) if a else [])
+            self.stamped = {str(n.get("ref")) for n in self.nodes}
             return self.nodes
         # 采集器只该问这两件事（R-1 的另一面：`snapshot_state` 是薄封装，不会自己另发明
         # 第三种取法）。真出现第三种就是采集口径漂了，宁可在这里响亮失败。
@@ -136,6 +171,7 @@ class FakePage:
         return self.text
 
     async def click(self, sel, timeout=None):
+        self._must_hold(sel)
         self.clicked.append(sel)
         if self.dialog_on_click is not None:
             await self.handlers["dialog"](FakeDialog("confirm", self.dialog_on_click))
@@ -143,16 +179,29 @@ class FakePage:
             raise self.click_error
 
     async def fill(self, sel, value, timeout=None):
+        self._must_hold(sel)
         self.filled.append((sel, value))
 
     async def press(self, sel, key, timeout=None):
+        self._must_hold(sel)
         self.clicked.append(f"{sel}+{key}")
 
     async def select_option(self, sel, value):
+        self._must_hold(sel)
         self.filled.append((sel, value))
 
     async def scroll_into_view_if_needed(self, sel):
+        self._must_hold(sel)
         self.clicked.append(f"scroll:{sel}")
+
+    def _must_hold(self, sel):
+        """页面上没有这个句柄就是「匹配不到元素」，替身硬失败而不是让它点成功。
+
+        放行判据（`ref_is_present`）与动作走的是同一份 DOM 状态：两边各判一次的话，
+        「count 说在、click 撞墙」这种替身自己漂开的形状会一路绿到生产。
+        """
+        if not self.holds_the_ref(sel):
+            raise AssertionError(f"替身页面上没有这个句柄：{sel}")
 
     async def goto(self, url, **kw):
         if self.goto_error is not None:
@@ -202,11 +251,12 @@ class FakeBrowser:
     """`_startup` 造出来的那个浏览器的替身：每次 new_context 给一个新 page。
 
     `page_factory` 让单个测试决定页面行为（节点、正文、goto 失败），而不必替整个文件
-    换掉夹具。
+    换掉夹具。默认那份页面带着 `NODES` 打好的标——不建模「页面上一个可点元素都没有」，
+    否则端点测试里绝大多数「点得动」的期望会凭空落进句柄查不到那一支。
     """
 
     def __init__(self, page_factory=None):
-        self.page_factory = page_factory or (lambda: FakePage(url=OPEN_URL))
+        self.page_factory = page_factory or (lambda: FakePage(url=OPEN_URL, nodes=NODES))
         self.contexts: list[FakeContext] = []
         self.closed = False
 
@@ -365,27 +415,71 @@ from browser import sessions as S  # noqa: E402  brief 原文如此：同模块�
 
 async def test_resolve_target_rejects_bad_ref():
     _put()
-    assert S.resolve_target("e1; x") is None
+    # 合法令牌后面拼注入字符：形状闸必须在拼进选择器之前挡下
+    assert S.resolve_target("rd2k7qx; x") is None
+    assert S.resolve_target('rd2k7qx"][x') is None
     assert S.resolve_target("") is None
-    sel = S.resolve_target("e7")
-    assert sel == '[data-zc-ref="e7"]'
+    # 旧形状（按采集顺序排的序号）**必须**判非法：留着它，模型抄一个上一轮的句柄还能点下去，
+    # 「旧句柄必然查不到」这条验收就没了（规格 §6.2 / §15）
+    assert S.resolve_target("e1") is None
+    assert S.resolve_target("e7") is None
+    sel = S.resolve_target("rk2m7xt")
+    assert sel == '[data-zc-ref="rk2m7xt"]'
+
+
+async def test_ref_is_present_answers_from_the_page_and_fails_open():
+    """`ref_is_present` 是「旧令牌查不到」唯一的检测点，它自己不许新增失败模式。
+
+    - 页面上没有这个属性 → False，端点据此回「ref 无效或页面已变化」（而不是让模型等满一次
+      可点超时、再把同一件事报成「元素不可点击」）；
+    - 数本身炸了（页面正在导航、执行上下文被换掉）→ **放行**，交给动作去撞它自己的超时。
+      这里若判成 False，一次正常的点击就会被说成一句作废的句柄。
+    """
+    class _Counting:
+        def __init__(self, n):
+            self._n = n
+
+        async def count(self):
+            return self._n
+
+    class _PageThatCounts:
+        def __init__(self, n):
+            self._n = n
+
+        def locator(self, selector):
+            return _Counting(self._n)
+
+    class _PageThatCannotAnswer:
+        def locator(self, selector):
+            raise RuntimeError("Execution context was destroyed, most likely because of "
+                               "a navigation.")
+
+    s = _put()
+    s.page = _PageThatCounts(1)
+    assert await S.ref_is_present(s, '[data-zc-ref="rd2k7qx"]') is True
+    s.page = _PageThatCounts(0)
+    assert await S.ref_is_present(s, '[data-zc-ref="rd2k7qx"]') is False
+    s.page = _PageThatCannotAnswer()
+    assert await S.ref_is_present(s, '[data-zc-ref="rd2k7qx"]') is True
 
 
 async def test_perform_action_dispatches_each_kind():
     s = _put()
-    await S.perform_action(s, "click", '[data-zc-ref="e1"]', None, 3000)
-    await S.perform_action(s, "fill", '[data-zc-ref="e2"]', "hello", 3000)
-    await S.perform_action(s, "press", '[data-zc-ref="e3"]', "Enter", 3000)
-    await S.perform_action(s, "scroll_into_view", '[data-zc-ref="e4"]', None, 3000)
-    assert s.page.clicked == ['[data-zc-ref="e1"]', '[data-zc-ref="e3"]+Enter',
-                              'scroll:[data-zc-ref="e4"]']
-    assert s.page.filled == [('[data-zc-ref="e2"]', "hello")]
+    # 这一层不管打标，动作只认选择器；替身因此要把这四个句柄当成「页面上在场」的
+    s.page.stamped = {"rd2k7qx", "r4xwntk", "rp9zsdw", "r7kqmbt"}
+    await S.perform_action(s, "click", '[data-zc-ref="rd2k7qx"]', None, 3000)
+    await S.perform_action(s, "fill", '[data-zc-ref="r4xwntk"]', "hello", 3000)
+    await S.perform_action(s, "press", '[data-zc-ref="rp9zsdw"]', "Enter", 3000)
+    await S.perform_action(s, "scroll_into_view", '[data-zc-ref="r7kqmbt"]', None, 3000)
+    assert s.page.clicked == ['[data-zc-ref="rd2k7qx"]', '[data-zc-ref="rp9zsdw"]+Enter',
+                              'scroll:[data-zc-ref="r7kqmbt"]']
+    assert s.page.filled == [('[data-zc-ref="r4xwntk"]', "hello")]
 
 
 async def test_perform_action_unknown_is_a_value_error():
     s = _put()
     with pytest.raises(ValueError):
-        await S.perform_action(s, "teleport", '[data-zc-ref="e1"]', None, 3000)
+        await S.perform_action(s, "teleport", '[data-zc-ref="rd2k7qx"]', None, 3000)
 
 
 async def test_expect_poll_passes_when_text_lands_late():
@@ -499,9 +593,9 @@ async def test_snapshot_state_delegates_to_the_shared_collector(monkeypatch):
 # ---------------------------------------------------------------------------
 
 NODES = [
-    {"ref": "e1", "role": "button", "name": "新建订单"},
-    {"ref": "e2", "role": "textbox", "name": "备注"},
-    {"ref": "e3", "role": "textbox", "name": "口令", "type": "password"},
+    {"ref": "rd2k7qx", "role": "button", "name": "新建订单"},
+    {"ref": "r4xwntk", "role": "textbox", "name": "备注"},
+    {"ref": "rp9zsdw", "role": "textbox", "name": "口令", "type": "password"},
 ]
 
 
@@ -648,7 +742,7 @@ def test_open_with_expect_polls_until_the_text_lands(client):
         "url": OPEN_URL, "expect": {"type": "text_contains", "value": "订单已创建"}}).json()
     assert body["passed"] is True
     assert body["note"] == ""            # 通过时不许带回失败措辞（携带项：那个三元判断）
-    assert [i["ref"] for i in body["interactive"]] == ["e1", "e2", "e3"]
+    assert [i["ref"] for i in body["interactive"]] == ["rd2k7qx", "r4xwntk", "rp9zsdw"]
     assert body["interactive"][2]["sensitive"] is True
     # 轮询到第 3 帧才满足：固定 sleep 一次定生死的话读到的还是动画那两句
     assert sessions.SESSIONS[body["session_id"]].page.ticks >= 3
@@ -669,7 +763,7 @@ def test_open_reports_gone_and_leaves_no_session_when_goto_fails(client):
 
 
 def test_step_on_unknown_session_reports_session_gone(client):
-    r = _step(client, "nope", action="click", ref="e1")
+    r = _step(client, "nope", action="click", ref="rd2k7qx")
     assert r.status_code == 200
     body = r.json()
     assert body["ok"] is False
@@ -692,14 +786,96 @@ def test_delete_closes_the_context_and_is_idempotent(client):
 
 def test_step_rejects_illegal_ref(client):
     sid = _opened(client, lambda: FakePage(url=OPEN_URL, nodes=NODES))
-    r = _step(client, sid, action="click", ref='e1"][x')
+    r = _step(client, sid, action="click", ref='rd2k7qx"][x')
     body = r.json()
     assert body["ok"] is False
     assert "ref" in body["error"]
     # 当场附带最新交互清单（US-09）：不给的话 Agent 要多花一次往返才知道该指哪儿
-    assert [i["ref"] for i in body["interactive"]] == ["e1", "e2", "e3"]
+    assert [i["ref"] for i in body["interactive"]] == ["rd2k7qx", "r4xwntk", "rp9zsdw"]
     assert body["steps_charged"] is True
     assert sessions.SESSIONS[sid].steps == 1
+
+
+class ScanningPage(FakePage):
+    """替身里「真会重新打标」的那一页：节点按**传进来的令牌**现造，每轮整批换发。
+
+    真脚本就是这个形状（`INTERACTIVE_JS` 取 `tokens[i]` 并 `setAttribute` 同一个值）。
+    静态 `nodes=` 的替身标不出「换了一批令牌」这件事，而本次改动要验收的恰恰是它。
+    """
+
+    ELEMENTS = (("button", "新建订单"), ("textbox", "备注"), ("textbox", "口令"))
+
+    def __init__(self):
+        super().__init__(url=OPEN_URL, nodes=[])
+
+    async def evaluate(self, script, *a):
+        if script != INTERACTIVE_JS:
+            return await super().evaluate(script, *a)
+        if self.evaluate_error is not None:
+            raise self.evaluate_error
+        tokens = list(a[0]) if a else []
+        self.tokens_seen.append(tokens)
+        self.nodes = [{"ref": token, "role": role, "name": name,
+                       **({"type": "password"} if name == "口令" else {})}
+                      for token, (role, name) in zip(tokens, self.ELEMENTS)]
+        self.stamped = {str(n["ref"]) for n in self.nodes}
+        return self.nodes
+
+
+def test_a_stale_token_from_the_previous_scan_fails_loudly_and_brings_the_new_list(client):
+    """本次改动的验收点（规格 §6.2 / §15「ref 失效」那一行）。
+
+    序号形状下这一格回的是 **`ok:true`**：旧序号在新清单里大概率仍然合法，于是静默点到另一个
+    元素（真机实测 `stale_ref_still_exists_in_new_list:true`）。令牌形状下旧令牌在新扫描里查不到，
+    必须落到既有的那条「ref 无效或页面已变化」出口：`ok:false` + 那句中文 + 当场带回**新清单**
+    （省一次往返，US-09）+ 这一步照样扣额度。自动附图在后端那一层按 R-26 的口径补（`ok:false`
+    那一支），`tests/test_browser_session_tools.py` 里钉着。
+    """
+    client.fake_browser.page_factory = ScanningPage
+    opened = _open(client).json()
+    sid = opened["session_id"]
+    old_refs = [i["ref"] for i in opened["interactive"]]
+    assert len(old_refs) == 3 and all(REF_RE.fullmatch(r) for r in old_refs)
+
+    # 先确认「新令牌点得动」：否则下面那条失败可能只是因为替身压根点不动
+    fresh = _step(client, sid, action="click", ref=old_refs[0]).json()
+    assert fresh["ok"] is True, fresh
+    page = sessions.SESSIONS[sid].page
+    assert page.clicked[-1] == f'[data-zc-ref="{old_refs[0]}"]'
+
+    # 这一步之后页面又重扫了一次（`_after_action` 采集），令牌整批换发
+    new_refs = [i["ref"] for i in fresh["interactive"]]
+    assert new_refs and set(new_refs).isdisjoint(old_refs)
+
+    stale = _step(client, sid, action="click", ref=old_refs[1])
+    body = stale.json()
+    assert stale.status_code == 200, stale.text
+    assert body["ok"] is False
+    assert body["error"] == "ref 无效或页面已变化，请用最新清单里的 ref"
+    # 带回的是**这一轮**的清单，不是旧的那一份
+    assert [i["ref"] for i in body["interactive"]] == [n["ref"] for n in page.nodes]
+    assert {i["ref"] for i in body["interactive"]}.isdisjoint(old_refs)
+    assert body["steps_charged"] is True
+    # 没有把「查不到」误报成「点不动」：模型对两者的下一步不一样
+    assert "元素不可点击" not in body["error"]
+    assert page.clicked[-1] != f'[data-zc-ref="{old_refs[1]}"]'      # 动作根本没被执行
+
+
+def test_the_token_pool_size_is_the_scan_cap_end_to_end(client):
+    """令牌池不够用时不许越界（规格 §6.2）：池与遍历上限同值，触顶照样报截断。
+
+    判据只有一处（`shape_interactive` 看节点数 >= SCAN_MAX）。如果哪天把池调小而不改这里，
+    脚本会先被令牌耗尽卡住、节点数却达不到 SCAN_MAX，模型看到少了条目的清单还写着
+    `interactive_truncated:false`——这条要红的是**同一个测试**，不是等真机发现。
+    """
+    from browser.session_core import REF_TOKEN_POOL
+
+    assert REF_TOKEN_POOL == INTERACTIVE_JS_SCAN_MAX
+    sid = _opened(client)
+    page = sessions.SESSIONS[sid].page
+    # 采集器确实把「按遍历上限那么大的一批令牌」交给了打标脚本
+    assert len(page.tokens_seen[-1]) == INTERACTIVE_JS_SCAN_MAX
+    assert len(set(page.tokens_seen[-1])) == INTERACTIVE_JS_SCAN_MAX
 
 
 def test_step_returns_incremental_console_only(client):
@@ -711,18 +887,18 @@ def test_step_returns_incremental_console_only(client):
 
     sid = _opened(client, factory)
     s = sessions.SESSIONS[sid]
-    body = _step(client, sid, action="click", ref="e1").json()
+    body = _step(client, sid, action="click", ref="rd2k7qx").json()
     assert body["ok"] is True and body["steps_charged"] is True
     assert body["console_new"] == []
     assert "console" not in body          # 全量清单已经被增量取代，别两份一起发
-    assert s.page.clicked == ['[data-zc-ref="e1"]']
+    assert s.page.clicked == ['[data-zc-ref="rd2k7qx"]']
 
     s.collectors.console.append({"level": "error", "text": "这一步才炸的"})
-    second = _step(client, sid, action="fill", ref="e2", value="备注内容").json()
+    second = _step(client, sid, action="fill", ref="r4xwntk", value="备注内容").json()
     assert second["console_new"] == [{"level": "error", "text": "这一步才炸的",
                                       "truncated": False}]
     assert second["failed_requests_new"] == []
-    assert s.page.filled == [('[data-zc-ref="e2"]', "备注内容")]
+    assert s.page.filled == [('[data-zc-ref="r4xwntk"]', "备注内容")]
     assert s.steps == 2
 
 
@@ -734,7 +910,7 @@ def test_step_new_items_respect_the_shaping_budget(client):
                                for i in range(45))
     # page_errors 的同一条尺（裁定 R-27）：10 条 / 单条 1000 字，预算只在 shape_result 定义一次
     s.collectors.page_errors.extend(f"e{i} " + "x" * 1200 for i in range(12))
-    body = _step(client, sid, action="click", ref="e1").json()
+    body = _step(client, sid, action="click", ref="rd2k7qx").json()
     assert len(body["console_new"]) == 40
     assert body["truncated"] is True
     assert all(i["truncated"] is True for i in body["console_new"])
@@ -753,16 +929,16 @@ def test_page_errors_new_replays_nothing_already_reported(client):
     sid = _opened(client, lambda: FakePage(url=OPEN_URL, nodes=NODES))
     s = sessions.SESSIONS[sid]
     s.collectors.page_errors.append("Uncaught TypeError: 这一步崩的")
-    first = _step(client, sid, action="click", ref="e1").json()
+    first = _step(client, sid, action="click", ref="rd2k7qx").json()
     assert first["page_errors_new"] == ["Uncaught TypeError: 这一步崩的"]
     # 与 console 同一口径：全量那份已经被增量取代，别两份一起发
     assert "page_errors" not in first
 
-    second = _step(client, sid, action="click", ref="e1").json()
+    second = _step(client, sid, action="click", ref="rd2k7qx").json()
     assert second["page_errors_new"] == []      # 上一步报过的不在本步
 
     s.collectors.page_errors.append("Uncaught ReferenceError: 这一步才崩")
-    third = _step(client, sid, action="click", ref="e1").json()
+    third = _step(client, sid, action="click", ref="rd2k7qx").json()
     assert third["page_errors_new"] == ["Uncaught ReferenceError: 这一步才崩"]
 
 
@@ -777,7 +953,7 @@ def test_open_bills_the_first_screen_page_errors(client):
     opened = _open(client).json()
     # open 那一面仍是全量 `page_errors`（Task 2 起的既有契约，与 step 的增量键名刻意不同）
     assert opened["page_errors"] == ["Uncaught TypeError: 首屏就崩了"]
-    body = _step(client, opened["session_id"], action="click", ref="e1").json()
+    body = _step(client, opened["session_id"], action="click", ref="rd2k7qx").json()
     assert body["page_errors_new"] == []
     assert sessions.SESSIONS[opened["session_id"]].page_errors_seen == {
         ("", "Uncaught TypeError: 首屏就崩了")}
@@ -785,10 +961,10 @@ def test_open_bills_the_first_screen_page_errors(client):
 
 def test_step_with_expect_marks_passed_and_note(client):
     sid = _opened(client, lambda: FakePage(url=OPEN_URL, text="订单已创建", nodes=NODES))
-    ok = _step(client, sid, action="click", ref="e1",
+    ok = _step(client, sid, action="click", ref="rd2k7qx",
                expect={"type": "text_contains", "value": "订单已创建"}).json()
     assert ok["passed"] is True and ok["note"] == "" and ok["steps_charged"] is True
-    bad = _step(client, sid, action="click", ref="e1",
+    bad = _step(client, sid, action="click", ref="rd2k7qx",
                 expect={"type": "text_contains", "value": "不会出现的话"},
                 timeout_ms=500).json()
     # 走通了但断言不过 = ok:true + passed:false（动作成功与业务断言是两件事）
@@ -798,13 +974,13 @@ def test_step_with_expect_marks_passed_and_note(client):
 
 def test_step_without_expect_has_no_passed_key(client):
     sid = _opened(client)
-    body = _step(client, sid, action="click", ref="e1").json()
+    body = _step(client, sid, action="click", ref="rd2k7qx").json()
     assert "passed" not in body and "note" not in body
 
 
 def test_step_unknown_action_is_not_charged(client):
     sid = _opened(client)
-    body = _step(client, sid, action="teleport", ref="e1").json()
+    body = _step(client, sid, action="teleport", ref="rd2k7qx").json()
     assert body == {"ok": False, "error": "未知动作: teleport", "steps_charged": False}
     assert sessions.SESSIONS[sid].steps == 0
 
@@ -812,10 +988,10 @@ def test_step_unknown_action_is_not_charged(client):
 def test_step_unclickable_element_charges_and_rescans(client):
     sid = _opened(client, lambda: FakePage(url=OPEN_URL, nodes=NODES))
     sessions.SESSIONS[sid].page.click_error = TimeoutError("element is not visible")
-    body = _step(client, sid, action="click", ref="e1").json()
+    body = _step(client, sid, action="click", ref="rd2k7qx").json()
     assert body["ok"] is False
     assert "元素不可点击或动作失败" in body["error"]
-    assert [i["ref"] for i in body["interactive"]] == ["e1", "e2", "e3"]
+    assert [i["ref"] for i in body["interactive"]] == ["rd2k7qx", "r4xwntk", "rp9zsdw"]
     assert body["steps_charged"] is True
     assert sessions.SESSIONS[sid].steps == 1
 
@@ -836,7 +1012,7 @@ def test_action_failure_reports_the_new_items_of_the_broken_step(client):
     s.collectors.console.append({"level": "error", "text": "点完就报的错"})
     s.collectors.failed.append({"method": "GET", "url": "http://127.0.0.1:8210/api/orders",
                                 "status": 500, "type": "fetch", "blocked": False})
-    body = _step(client, sid, action="click", ref="e1").json()
+    body = _step(client, sid, action="click", ref="rd2k7qx").json()
     assert body["ok"] is False and "元素不可点击或动作失败" in body["error"]
     # 形状仍是「点不动」：`passed` 这个键一个字都不许出现在这条响应里（与断言失败分家）
     assert "passed" not in body and "note" not in body
@@ -849,7 +1025,7 @@ def test_action_failure_reports_the_new_items_of_the_broken_step(client):
 
     # 记账就在失败这一步做完：下一步不许把这批旧账当「本步新增」重播一遍
     s.page.click_error = None
-    second = _step(client, sid, action="click", ref="e1").json()
+    second = _step(client, sid, action="click", ref="rd2k7qx").json()
     assert second["ok"] is True
     assert second["page_errors_new"] == [] and second["console_new"] == []
     assert second["failed_requests_new"] == []
@@ -860,7 +1036,7 @@ def test_dead_page_is_reported_as_gone_and_dropped(client):
     sid = _opened(client, lambda: FakePage(url=OPEN_URL, nodes=NODES))
     sessions.SESSIONS[sid].page.click_error = RuntimeError(
         "Target page, context or browser has been closed")
-    body = _step(client, sid, action="click", ref="e1").json()
+    body = _step(client, sid, action="click", ref="rd2k7qx").json()
     assert body["ok"] is False and body["session_gone"] is True
     assert body["steps_charged"] is False
     # 裁定 R-29 之后失败响应带采集状态，但「会话没了」那条分诊仍在采集之前：页面物理上不存在，
@@ -896,7 +1072,7 @@ def test_step_after_action_read_failure_is_readable_not_a_500(client):
             return await super().evaluate(script, *a)
 
     sid = _opened(client, ReRenderingPage)
-    r = _step(client, sid, action="click", ref="e1")
+    r = _step(client, sid, action="click", ref="rd2k7qx")
     assert r.status_code == 200, r.text      # 不是 500：工具失败一律是带原因的正常结果
     body = r.json()
     assert body["ok"] is False
@@ -905,7 +1081,7 @@ def test_step_after_action_read_failure_is_readable_not_a_500(client):
     assert body["steps_charged"] is True     # 动作确实执行过，账也已经落下
     assert sessions.SESSIONS[sid].steps == 1
     # 尽力重采拿到了清单（US-09 省一次往返）；会话没有被摘掉——读不回一帧不等于会话没了
-    assert [i["ref"] for i in body["interactive"]] == ["e1", "e2", "e3"]
+    assert [i["ref"] for i in body["interactive"]] == ["rd2k7qx", "r4xwntk", "rp9zsdw"]
     assert "session_gone" not in body
     assert sid in sessions.SESSIONS
 
@@ -915,7 +1091,7 @@ def test_step_omits_the_ref_list_when_the_retry_also_fails(client):
     sid = _opened(client, lambda: FakePage(url=OPEN_URL, nodes=NODES))
     sessions.SESSIONS[sid].page.evaluate_error = RuntimeError(
         "Execution context was destroyed, most likely because of a navigation.")
-    r = _step(client, sid, action="click", ref="e1")
+    r = _step(client, sid, action="click", ref="rd2k7qx")
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["ok"] is False and "步骤执行后页面读取失败" in body["error"]
@@ -933,12 +1109,12 @@ def test_step_dialog_is_reported_once_and_only_for_that_step(client):
 
     sid = _opened(client, factory)
     page = sessions.SESSIONS[sid].page
-    first = _step(client, sid, action="click", ref="e1").json()
+    first = _step(client, sid, action="click", ref="rd2k7qx").json()
     assert first["dialog"] == {"type": "confirm", "message": "确认删除全部订单？",
                                "handled": "dismissed"}
     assert first["ok"] is True           # 弹窗不改变「动作确实执行了」这件事
     page.dialog_on_click = None
-    second = _step(client, sid, action="click", ref="e1").json()
+    second = _step(client, sid, action="click", ref="rd2k7qx").json()
     assert second["dialog"] is None
 
 
@@ -951,12 +1127,12 @@ async def test_a_dialog_raised_after_the_step_is_still_reported(client):
     """
     sid = _opened(client, lambda: FakePage(url=OPEN_URL, nodes=NODES))
     page = sessions.SESSIONS[sid].page
-    assert _step(client, sid, action="click", ref="e1").json()["dialog"] is None
+    assert _step(client, sid, action="click", ref="rd2k7qx").json()["dialog"] is None
     await page.handlers["dialog"](FakeDialog("confirm", "稍后才弹的"))
-    body = _step(client, sid, action="click", ref="e2").json()
+    body = _step(client, sid, action="click", ref="r4xwntk").json()
     assert body["dialog"] == {"type": "confirm", "message": "稍后才弹的",
                               "handled": "dismissed"}
-    assert _step(client, sid, action="click", ref="e2").json()["dialog"] is None
+    assert _step(client, sid, action="click", ref="r4xwntk").json()["dialog"] is None
 
 
 def test_open_reports_a_dialog_raised_during_load(client):
@@ -970,7 +1146,7 @@ def test_open_reports_a_dialog_raised_during_load(client):
     body = _open(client).json()
     assert body["dialog"] == {"type": "alert", "message": "本站已被劫持",
                               "handled": "dismissed"}
-    step = _step(client, sid, action="click", ref="e1").json()
+    step = _step(client, sid, action="click", ref="rd2k7qx").json()
     assert step["dialog"] is None          # 不会串到下一步
 
 
@@ -1004,7 +1180,7 @@ def test_navigation_timeout_still_returns_the_current_state(client):
 def test_get_sessions_is_a_diagnostic_view(client):
     assert client.get("/sessions").json() == {"active": []}
     sid = _opened(client)
-    _step(client, sid, action="click", ref="e1")
+    _step(client, sid, action="click", ref="rd2k7qx")
     active = client.get("/sessions").json()["active"]
     assert len(active) == 1
     assert active[0]["session_id"] == sid
@@ -1047,20 +1223,21 @@ def test_screenshot_on_a_dead_session_is_reported_as_gone(client):
 
 def test_interactive_max_can_shrink_but_never_exceed_the_cap(client):
     """40 条上限是规格钉死的：请求可以把清单调小，不能把它调大。"""
-    many = [{"ref": f"e{i}", "role": "button", "name": f"按钮{i}"} for i in range(1, 46)]
+    many = [{"ref": ref, "role": "button", "name": f"按钮{i}"}
+            for i, ref in enumerate(new_ref_tokens(45), start=1)]
     sid = _opened(client, lambda: FakePage(url=OPEN_URL, nodes=many))
-    assert len(_step(client, sid, action="click", ref="e1").json()["interactive"]) == 40
-    small = _step(client, sid, action="click", ref="e1", interactive_max=5).json()
+    assert len(_step(client, sid, action="click", ref="rd2k7qx").json()["interactive"]) == 40
+    small = _step(client, sid, action="click", ref="rd2k7qx", interactive_max=5).json()
     assert len(small["interactive"]) == 5
     assert small["interactive_truncated"] is True
-    greedy = _step(client, sid, action="click", ref="e1", interactive_max=5000).json()
+    greedy = _step(client, sid, action="click", ref="rd2k7qx", interactive_max=5000).json()
     assert len(greedy["interactive"]) == 40
 
 
 def test_settle_ms_is_bounded_and_optional(client):
     sid = _opened(client, lambda: FakePage(url=OPEN_URL, nodes=NODES))
     page = sessions.SESSIONS[sid].page
-    _step(client, sid, action="click", ref="e1", settle_ms=999999)
+    _step(client, sid, action="click", ref="rd2k7qx", settle_ms=999999)
     assert page.waited.count(("timeout", S.SETTLE_MS_MAX)) == 1   # 裁到 5000，不照单全收
 
 
@@ -1089,7 +1266,7 @@ async def test_idle_session_is_swept_and_the_next_step_reports_gone(client):
     assert await sessions.sweep_expired() == [sid]
     assert sessions.SESSIONS == {}
     assert context.closed is True                 # 回收是真的把 context 关了，不是只删表
-    body = _step(client, sid, action="click", ref="e1").json()
+    body = _step(client, sid, action="click", ref="rd2k7qx").json()
     assert body["session_gone"] is True and body["steps_charged"] is False
 
 

@@ -1,17 +1,106 @@
 """浏览器 session 纯函数（规格 docs/specs/2026-11-02-agent-browser-interaction.md §6.2）。
 
-刻意不依赖 playwright：ref/敏感/增量/断言/回收这五类判定必须能在没浏览器的机器上跑。
+刻意不依赖 playwright：ref 令牌/敏感/增量/断言/回收这五类判定必须能在没浏览器的机器上跑。
 """
-from browser.session_core import (INTERACTIVE_JS, INTERACTIVE_JS_SCAN_MAX, REF_ATTR, can_open,
-                                  expired, is_sensitive, judge_expect, new_only, selector_for,
-                                  shape_interactive)
+import pytest
+
+from browser.session_core import (INTERACTIVE_JS, INTERACTIVE_JS_SCAN_MAX, REF_ATTR, REF_RE,
+                                  REF_TOKEN_ALPHABET, REF_TOKEN_LENGTH, REF_TOKEN_POOL,
+                                  REF_TOKEN_SPACE, can_open, expired, is_sensitive, judge_expect,
+                                  new_only, new_ref_tokens, selector_for, shape_interactive)
+
+# 句柄字母表里**没有**的字符，外加一切需要转义进 CSS 属性选择器的字符。
+# 这两个集合的差集是令牌能被安全拼进 `[data-zc-ref="…"]` 的全部理由，也是 `selector_for`
+# 只判形状就够了的前提。
+CSS_UNSAFE = '`~!@#$%^&*()+=[]{}\\|;:\'"<>/?,. \t\r\n'
+CONFUSABLES = "0o1liI"
 
 
-def test_selector_for_accepts_only_generated_refs():
-    assert selector_for("e12") == f'[{REF_ATTR}="e12"]'
-    # 模型可控的只有 ref 字符串，任何需要转义的形状都当非法处理，不拼进选择器
-    # "e0" 是「编号从 0 起」的漂移形状：ref 必须从 e1 起，否则浏览器发出去的每个 ref 都被自己拒收
-    for bad in ("", "e", "e0", "e1; x", 'e"][', "e" + "9" * 7, None, 12):
+def test_new_ref_tokens_are_unique_and_take_the_pinned_shape():
+    tokens = new_ref_tokens(50)
+    assert len(tokens) == 50
+    # 同一次扫描内不得重复：两个元素拿到同一个句柄的话，点哪一个纯看运气
+    assert len(set(tokens)) == 50
+    for token in tokens:
+        assert REF_RE.fullmatch(token), token
+        assert selector_for(token) == f'[{REF_ATTR}="{token}"]'
+
+
+def test_new_ref_tokens_drop_repeats_from_the_randomness_source():
+    """used 集合这条本身要能被钉住：喂一份**会重复**的随机源，重复的那几个必须被跳过、继续往后抽。
+
+    真随机数下这条永远测不出来（31^6 的空间里撞一次属于要专门构造的事件），所以「把去重去掉」
+    这次变异不会红任何一条按正常调用写的测试——它就是靠这条红的。
+    """
+    scripted = iter(["rdupxxa"] * 3 + ["ruqk7bx", "rdupxxa", "rmt4sdw", "rzn2qbx"])
+    drawn = []
+
+    def picker():
+        token = next(scripted)
+        drawn.append(token)
+        return token
+
+    tokens = new_ref_tokens(3, picker=picker)
+    # 第一个照收，连着两个重复被跳过，再收一个、又一个重复被跳过、再收一个就够数了
+    assert tokens == ["rdupxxa", "ruqk7bx", "rmt4sdw"]
+    assert len(set(tokens)) == 3
+    assert len(drawn) == 6                # 抽了 6 次只留 3 个：去重是在「继续往后抽」而不是少发
+
+
+def test_new_ref_token_pool_covers_the_js_scan_cap():
+    """令牌池与遍历上限必须同值，否则「池用完」与「触顶」是两件事。
+
+    遍历到第 201 个元素时如果池里没令牌了，脚本要么越界拿到 `undefined`、要么少采而不报
+    truncated——`shape_interactive` 的封顶判据看的是节点数 >= SCAN_MAX，两处数字漂开就等于
+    对模型宣称「清单是完整的」。
+    """
+    assert REF_TOKEN_POOL == INTERACTIVE_JS_SCAN_MAX
+    default_pool = new_ref_tokens()
+    assert len(default_pool) == INTERACTIVE_JS_SCAN_MAX == len(set(default_pool))
+    # 池比令牌空间大时「互不相同」做不到——在这里响亮报错，而不是让脚本拿着重复令牌静默打标
+    with pytest.raises(ValueError):
+        new_ref_tokens(REF_TOKEN_SPACE + 1)
+
+
+def test_new_ref_tokens_never_repeat_within_one_process_run_and_are_roughly_stable_across_two():
+    """**跨**扫描不重复是概率性的，不是数学上的（规格 §8 那条尾注）。
+
+    这里能确定的是「两次扫描不可能发出同一批」以及「600 个令牌彼此不同」这一现实量级；
+    真正的「旧令牌在新扫描里查不到」的验收在 sidecar 层那条替身 page 的测试里（那里扫描是
+    可控的），不在这里靠运气断言。
+    """
+    a, b = new_ref_tokens(300), new_ref_tokens(300)
+    assert set(a) != set(b)
+    assert len(set(a) | set(b)) == 600     # 600 个令牌、空间 31^6：撞上属于要专门构造的事件
+
+
+def test_ref_token_charset_is_css_safe_and_free_of_confusables():
+    assert len(REF_TOKEN_ALPHABET) == 31
+    assert REF_TOKEN_LENGTH == 6
+    assert REF_TOKEN_SPACE == 31 ** 6
+    for ch in CONFUSABLES:
+        assert ch not in REF_TOKEN_ALPHABET, ch
+    for ch in CSS_UNSAFE:
+        assert ch not in REF_TOKEN_ALPHABET, ch
+    # 生成的令牌同样不许带需要转义的字符：字符集改了、这道闸跟着红，才有意义
+    for token in new_ref_tokens(120):
+        assert not any(ch in CSS_UNSAFE for ch in token), token
+
+
+def test_selector_for_accepts_only_generated_tokens():
+    good = new_ref_tokens(3)
+    for token in good:
+        assert selector_for(token) == f'[{REF_ATTR}="{token}"]'
+    # 非自生成形状一律拒绝、绝不拼进选择器（这道闸只换了判据，没有放松）。
+    # 每一条都刻意取**长度也对**的形状，除了它要试的那一个坏点——否则拒收可能只是因为
+    # 长度不对，字符集那道闸（防的就是把选择器提前闭合）等于没被测过。
+    old_shapes = ("e1", "e7", "e12", "e1; x")               # 序号形状的旧句柄
+    wrong_charset = ("rd2k70x", "r0abcde", "rabcde0", "roooooo", "riiiiii", "rllllll",
+                     "rD2K7QX", "rABCDEF")                 # 大小写与字母表外的字符
+    # 分号 / 引号 / 方括号 / 百分号 / 换行 / 反斜杠：每个都是 `r` + 6 位，坏在字符而不是长度
+    css_injection = ("rd2k7x;", "rd2k7q\"", "rd2k7][", "rd2k%7q", "rd2k7q\n", "rd2k7q\\")
+    for bad in ("", None, 12, "rd2k7q", "rd2k7qxx", "d2k7qxx", "r" + "a" * 7,
+                "r" + "a" * 100, "RAAAAA A", *old_shapes, *wrong_charset, *css_injection):
         assert selector_for(bad) is None, bad
 
 
@@ -20,18 +109,21 @@ def _node(ref, role, name, **extra):
 
 
 def test_shape_interactive_caps_and_marks():
-    nodes = [_node(f"e{i}", "button", f"按钮{i}") for i in range(1, 46)]
+    pool = new_ref_tokens(45)
+    nodes = [_node(ref, "button", f"按钮{i}") for i, ref in enumerate(pool, start=1)]
     items, truncated = shape_interactive(nodes, limit=40)
     assert len(items) == 40
     assert truncated is True
-    assert items[0] == {"ref": "e1", "role": "button", "name": "按钮1", "disabled": False,
+    # 清单里的 ref 就是脚本发回来的那一个令牌：这里重新编号或改写会让旧 ref 指向另一个元素
+    assert items[0] == {"ref": pool[0], "role": "button", "name": "按钮1", "disabled": False,
                         "sensitive": False}
 
 
 def test_shape_interactive_drops_unnamed_and_keeps_disabled():
-    nodes = [_node("e1", "button", ""), _node("e2", "button", "删除", disabled=True)]
+    pool = new_ref_tokens(2)
+    nodes = [_node(pool[0], "button", ""), _node(pool[1], "button", "删除", disabled=True)]
     items, truncated = shape_interactive(nodes, limit=40)
-    assert [i["ref"] for i in items] == ["e2"]      # 没名字的点了也不知道点的啥，不进清单
+    assert [i["ref"] for i in items] == pool[1:]     # 没名字的点了也不知道点的啥，不进清单
     assert items[0]["disabled"] is True
     assert truncated is False
 
@@ -56,7 +148,7 @@ def test_new_only_returns_only_unseen_and_updates_set():
 
 def test_judge_expect_text_and_element_and_url():
     snap = {"text": "订单已创建，共 4 条", "url": "http://h:8210/orders?id=4",
-            "interactive": [{"ref": "e3", "role": "button", "name": "导出"}]}
+            "interactive": [{"ref": "r7kqmbt", "role": "button", "name": "导出"}]}
     assert judge_expect({"type": "text_contains", "value": "订单已创建"}, snap, [])[0] is True
     assert judge_expect({"type": "text_contains", "value": "失败"}, snap, [])[0] is False
     assert judge_expect({"type": "element_visible", "value": "导出"}, snap, [])[0] is True
@@ -113,8 +205,12 @@ def test_shape_interactive_marks_the_js_scan_cap():
 
     采到 SCAN_MAX 个节点意味着「后面还有没看过的元素」，即便这一批里只有 3 个带名字
     （`named > budget` 为假）也不能对模型宣称清单完整——否则它会以为整页就这几个可点。
+    令牌池与 SCAN_MAX 同值，所以「池用完」这一支由同一个判据报出来，不必第二条信号。
     """
-    nodes = [_node(f"e{i}", "button", "提交" if i <= 3 else "") for i in range(1, 201)]
+    pool = new_ref_tokens(INTERACTIVE_JS_SCAN_MAX)
+    nodes = [_node(ref, "button", "提交" if i <= 3 else "")
+             for i, ref in enumerate(pool, start=1)]
+    assert len(nodes) == INTERACTIVE_JS_SCAN_MAX
     items, truncated = shape_interactive(nodes, limit=40)
     assert len(items) == 3
     assert truncated is True
@@ -149,8 +245,32 @@ def test_expired_boundary():
 
 def test_interactive_js_marks_with_the_attr_selector_for_reads():
     # 打标属性名一旦和 REF_ATTR 漂移，浏览器发出的 ref 会被 selector_for 全数判非法，
-    # 而症状出现在另一个文件里。只锚这一处字面量：不断言 JS 源码里的编号表达式，太脆。
+    # 而症状出现在另一个文件里。只锚这一处字面量：不断言 JS 源码里的取值表达式，太脆。
     assert f"const attr = '{REF_ATTR}'" in INTERACTIVE_JS
+
+
+def test_interactive_js_reads_the_ref_token_from_one_local_variable():
+    """令牌是**传进来的参数**，不是脚本自己编的，且一次取值两处共用。
+
+    脚本里摇随机数会出现「同一个扫描内两个元素撞同一个句柄」而没人能单测它；序号则复活
+    旧句柄静默错点那个缺陷。取值表达式只写一次：`out.push({ref…})` 与 `setAttribute(attr, ref)`
+    各算一遍的话，报出去的句柄和页面上标的就不是同一个，点的是隔壁那个元素。
+    """
+    assert INTERACTIVE_JS.lstrip().startswith("(tokens) =>")
+    assert "Math.random" not in INTERACTIVE_JS
+    assert "tokens[out.length]" in INTERACTIVE_JS
+    assert INTERACTIVE_JS.count("tokens[out.length]") == 1
+    assert "el.setAttribute(attr, ref)" in INTERACTIVE_JS
+
+
+def test_interactive_js_never_indexes_past_the_token_pool():
+    """令牌不够用时不许静默越界（越界拿到 `undefined` 会把「undefined」当句柄打出去）。
+
+    口径与遍历上限同一条：并列判、同一处 break，因此触顶仍然落在 `shape_interactive`
+    那句 `len(raw_nodes) >= SCAN_MAX` 上，清单照旧报 truncated。
+    """
+    assert "out.length >= SCAN_MAX || out.length >= pool" in INTERACTIVE_JS
+    assert "const pool = Array.isArray(tokens) ? tokens.length : 0;" in INTERACTIVE_JS
 
 
 def test_interactive_js_carries_the_python_scan_cap():

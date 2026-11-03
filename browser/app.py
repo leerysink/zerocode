@@ -20,12 +20,12 @@ from playwright.async_api import async_playwright
 from .inspect_core import (allow_request, clean_text, host_of, is_ip_literal, origin_of,
                            parse_allowed_hosts, pick_connect_ip, rewrite_url_host,
                            shape_result, validate_target)
-from .session_core import (INTERACTIVE_JS, INTERACTIVE_MAX_DEFAULT, can_open,
+from .session_core import (INTERACTIVE_JS, INTERACTIVE_MAX_DEFAULT, can_open, new_ref_tokens,
                            shape_interactive)
 from .sessions import (ACTIONS, SESSIONS, SETTLE_MS_MAX, STEP_TIMEOUT_MS_DEFAULT,
                        STEP_TIMEOUT_MS_MAX, Session, active_summary, await_expect, charge,
-                       drop, max_sessions, navigation_url, new_session_id,
-                       origin_url, perform_action, resolve_target, snapshot_state,
+                       drop, max_sessions, navigation_url, new_session_id, origin_url,
+                       perform_action, ref_is_present, resolve_target, snapshot_state,
                        sweep_expired, take_dialog, take_new_items, touch)
 
 MAX_CONCURRENCY = 2
@@ -41,6 +41,10 @@ VIEWPORT_HEIGHT = 800
 ERROR_TEXT_MAX = 300
 SESSION_GONE_MESSAGE = "浏览器会话已结束，请重新 browser_open"
 SESSION_FULL_MESSAGE = "浏览器服务已满（活会话达上限），请等前一个走查结束"
+# 「上一轮的句柄」与「这个元素点不动」必须是两句话（规格 §5.3 的两行）：前者要模型去新清单里
+# 换一个 ref，后者要它去看遮挡。形状非法与「形状合法但页面上查不到」是同一件事的两种命中方式，
+# 共用这一句——令牌每次扫描整批换发，旧的那个在这一轮 DOM 里必然不存在（规格 §6.2）。
+REF_STALE_MESSAGE = "ref 无效或页面已变化，请用最新清单里的 ref"
 # 会话巡检周期（规格 §6.2 第二条不变式）：10s 是「空闲 120s 回收」这条上限的分辨率，
 # 再长会让超限的 context 多活几十秒，再短只是白烧 CPU。
 SWEEP_INTERVAL_SECONDS = 10
@@ -326,7 +330,10 @@ async def collect_page_state(page, collectors: Collectors, *, started: float,
     """
     title = await page.title()
     text = await page.evaluate("document.body ? document.body.innerText : ''")
-    nodes = await page.evaluate(INTERACTIVE_JS)
+    # 令牌在 Python 侧生成后整份传给脚本（`session_core.new_ref_tokens`）：唯一性与形状策略
+    # 只在纯函数层定义一处，JS 不摇随机数。每次采集都是全新的一批，所以上一轮发出去的旧句柄
+    # 在这一页上必然查不到——「旧 ref 作废」由此变成机制能检测到的事，而不只是一句约定。
+    nodes = await page.evaluate(INTERACTIVE_JS, new_ref_tokens())
     interactive, inter_truncated = shape_interactive(nodes, interactive_limit)
     # 截图取在裁剪之前：elapsed_ms 原本就含截图耗时，挪到之后会让这个数凭空变小。
     shot = await page.screenshot(type="png", full_page=False) if include_screenshot else None
@@ -613,8 +620,11 @@ async def step(sid: str, req: StepRequest):
             return await _do_navigate(s, req, limit, timeout_ms, started)
         selector = resolve_target(req.ref)
         if selector is None:
-            return await _action_failure(s, limit, started,
-                                         "ref 无效或页面已变化，请用最新清单里的 ref")
+            return await _action_failure(s, limit, started, REF_STALE_MESSAGE)
+        if not await ref_is_present(s, selector):
+            # 形状合法、页面上查不到 = 拿的是上一轮的句柄。在这里当场判出来，不拿一次
+            # 3s 的可点超时去换同一个结论（`ref_is_present` 只数不等待）。
+            return await _action_failure(s, limit, started, REF_STALE_MESSAGE)
         try:
             await perform_action(s, req.action, selector, req.value, timeout_ms)
         except Exception as e:  # noqa: BLE001 - 点不动是常态结果，不是工具异常

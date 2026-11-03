@@ -132,6 +132,23 @@ def resolve_target(ref) -> str | None:
     return selector_for(ref)
 
 
+async def ref_is_present(s: Session, selector: str) -> bool:
+    """这个句柄在当前页面上还找得到吗——**只数一次，不等待**。
+
+    它是「旧 ref 全部作废」这句话的机制（规格 §6.2）：令牌每次扫描整批换发，上一轮发出去的那一个
+    在这一轮的 DOM 里必然查不到，而 `selector_for` 只看形状、看不出「查不到」。缺了这一层，
+    拿旧令牌去点会花满可点等待、落进「元素不可点击或动作失败」——同一件事被报成两种原因，
+    而模型对两者的下一步不一样（该换句柄 vs 该去看是不是被遮挡）。
+
+    数本身出错（页面正在导航、执行上下文被换掉）时**放行**，交给动作去撞它自己的超时：
+    这条只是把一句准话提前，不该顺手新增一种失败模式。
+    """
+    try:
+        return (await s.page.locator(selector).count()) > 0
+    except Exception:  # noqa: BLE001 - 判据读不出来就当在场，语义退回改动前
+        return True
+
+
 def origin_url(url: str) -> str:
     """把任意 URL 折成 `scheme://host[:port]` 形式的 origin 字符串。
 

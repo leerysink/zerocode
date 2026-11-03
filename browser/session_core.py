@@ -1,13 +1,28 @@
-"""浏览器 session 的纯函数层：ref、敏感判定、增量裁剪、expect 判定、回收判定。
+"""浏览器 session 的纯函数层：ref 令牌、敏感判定、增量裁剪、expect 判定、回收判定。
 
 刻意不 import playwright（同 `inspect_core.py` 的口径）：这些判定要在没有浏览器的
 机器上跑单测，也要能被 sidecar 端点与将来的集成测试共用。
 """
 import re
+import secrets
 from urllib.parse import urlsplit
 
 REF_ATTR = "data-zc-ref"
-REF_RE = re.compile(r"^e[1-9]\d{0,5}$")
+# ref 是**每次扫描重新生成的随机短令牌**，不是按采集顺序排的序号。
+# 序号那套在真机上跑出一个静默缺陷（规格 §15「ref 失效」）：每次采集都从头重排，于是上一轮
+# 发给模型的旧 ref 在新清单里大概率仍然是一个合法序号，拿它去点会**点到另一个元素**而不是
+# 响亮失败——顺序一变就删错行、点错按钮。令牌让旧 ref 在新页面上必然查不到，落回既有的
+# 「ref 无效或页面已变化」那条出口（带回新清单 + 自动附图）。
+REF_PREFIX = "r"
+REF_TOKEN_LENGTH = 6
+# 字母表去掉易混字符（`0 o 1 l i`）：句柄会出现在日志、步骤卡和模型的回述里，
+# 把 `l` 看成 `1` 的代价是一次无法解释的错点。
+REF_TOKEN_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789"
+REF_TOKEN_SPACE = len(REF_TOKEN_ALPHABET) ** REF_TOKEN_LENGTH
+# 只认这一形状。字符集刻意不含任何需要转义进 CSS 属性选择器的字符（无引号、反斜杠、方括号、
+# 空白、`#` `.` 等）——这正是令牌能被安全拼进 `[data-zc-ref="..."]` 的前提；
+# `selector_for` 那道「非自生成形状一律拒绝」的闸因此只需要判形状。
+REF_RE = re.compile(rf"^{REF_PREFIX}[{REF_TOKEN_ALPHABET}]{{{REF_TOKEN_LENGTH}}}$")
 SENSITIVE_NAME_RE = re.compile(r"(token|secret|password|passwd|api[_-]?key|code)", re.IGNORECASE)
 INTERACTIVE_MAX_DEFAULT = 40
 # 浏览器侧一次遍历的节点上限（Task 1 携带项）：Python 侧的 40 条只裁「给模型看几条」，
@@ -15,11 +30,48 @@ INTERACTIVE_MAX_DEFAULT = 40
 # 在 read_only + mem_limit 1g 的容器里这就是一次自伤。上限取 40 的 5 倍：留足「无名条目
 # 被 Python 丢掉后仍能凑满 40 条」的余量，又不必在每次采集里为整页 DOM 买单。
 INTERACTIVE_JS_SCAN_MAX = 200
+# 一次扫描发出的令牌池 = 一次扫描最多能标的元素数。两个数**必须相等**（有测试钉住）：
+# 「池用完」与「遍历触顶」是同一件事的两种说法，分开写的话池先耗尽会让 `shape_interactive`
+# 的封顶判据（按节点数 >= SCAN_MAX）静默失效——模型看到少了条目的清单却写着 truncated:false。
+REF_TOKEN_POOL = INTERACTIVE_JS_SCAN_MAX
+
+
+def _draw_ref_token() -> str:
+    return REF_PREFIX + "".join(secrets.choice(REF_TOKEN_ALPHABET)
+                                for _ in range(REF_TOKEN_LENGTH))
+
+
+def new_ref_tokens(count: int = REF_TOKEN_POOL, picker=None) -> list[str]:
+    """为一次扫描生成 `count` 个互不相同的句柄令牌，顺序与打标脚本的元素顺序一一对应。
+
+    刻意在 Python 侧生成、把数组当参数喂给脚本，不在 JS 里摇随机数：唯一性与形状策略要留在
+    纯函数层可单测，而且这套策略只能有一处（两处各摇一次的后果是同一次扫描里两个元素拿到
+    同一个句柄，点哪一个全看运气）。
+    `picker` 是「抽一个令牌」这个动作的接缝（同 `sessions.await_expect` 的 `clock` / `sleeper`
+    口径）：生产不传；测试用它喂一份**会重复**的随机源，好把下面那条 used 去重本身钉住——
+    真随机数下这条永远测不出来（31^6 的空间里撞一次属于要专门构造的事件）。
+    """
+    draw = _draw_ref_token if picker is None else picker
+    pool = max(int(count), 0)
+    if pool > REF_TOKEN_SPACE:
+        # 池比令牌空间还大时「互不相同」根本做不到。这不是会发生的量（31^6 ≈ 8.9 亿，
+        # 扫描上限 200），但要发生也只能在这里响亮报错——不能让脚本拿着重复令牌静默打标。
+        raise ValueError(f"令牌池 {pool} 超过句柄令牌空间 {REF_TOKEN_SPACE}")
+    used: set[str] = set()
+    tokens = []
+    while len(tokens) < pool:
+        token = draw()
+        if token in used:
+            continue        # 抽到重复就换一个，绝不把同一个句柄标给两个元素
+        used.add(token)
+        tokens.append(token)
+    return tokens
 
 
 def selector_for(ref) -> str | None:
     """把 ref 换成属性选择器。非自生成形状一律拒绝——ref 来自模型可控的参数面，
-    拼进选择器前必须确认它只会是我们自己发出去的那种形状。"""
+    拼进选择器前必须确认它只会是我们自己发出去的那种形状（形状与字符集见 `REF_RE` 上方：
+    令牌字母表不含需要转义进 CSS 属性选择器的字符，判过形状就可以直接拼）。"""
     if not isinstance(ref, str) or not REF_RE.fullmatch(ref):
         return None
     return f'[{REF_ATTR}="{ref}"]'
@@ -39,9 +91,9 @@ def is_sensitive(*, input_type: str, name: str, label: str) -> bool:
 def shape_interactive(nodes: list[dict], limit: int = INTERACTIVE_MAX_DEFAULT):
     """把浏览器采回的原始节点裁成给模型看的清单。
 
-    丢掉没有可辨识名称的条目：Agent 拿到一个 name 为空的 ref 只会瞎点。`ref` 由浏览器侧
-    脚本按采集顺序生成（见 `INTERACTIVE_JS`），这里不重新编号——重编号会让模型手上的旧 ref
-    指向另一个元素，比失效更糟。
+    丢掉没有可辨识名称的条目：Agent 拿到一个 name 为空的 ref 只会瞎点。`ref` 由 Python 侧
+    一次扫描生成一批随机令牌、脚本按顺序取（见 `new_ref_tokens` 与 `INTERACTIVE_JS`），
+    这里不改写它——改名或重编号都会让模型手上的旧 ref 指向另一个元素，比失效更糟。
     """
     budget = max(int(limit), 1)
     items = []
@@ -64,6 +116,8 @@ def shape_interactive(nodes: list[dict], limit: int = INTERACTIVE_MAX_DEFAULT):
         })
     # 浏览器侧遍历封顶也算截断，而且要单独算：采到 SCAN_MAX 说明后面还有没看过的元素，
     # 哪怕这一屏里只有 3 个带名字（named > budget 为假）也不能对模型说「清单是完整的」。
+    # 令牌池与 SCAN_MAX 同值（`REF_TOKEN_POOL`），所以「令牌用完」必然同时满足这个判据，
+    # 不需要第二条截断信号。
     return items, (named > budget or len(raw_nodes) >= INTERACTIVE_JS_SCAN_MAX)
 
 
@@ -184,30 +238,39 @@ def expired(last_used: float, now: float, ttl_seconds: int) -> bool:
 
 
 # 一次遍历同时完成采集与打标：分两趟会让第二趟选到的元素与第一趟不一致
-# （Vue 的异步渲染就发生在那两次往返之间）。旧属性先清掉——上一轮的 ref 必须作废。
+# （Vue 的异步渲染就发生在那两次往返之间）。旧属性先清掉——上一轮的 ref 必须作废，
+# 而「作废」要能被机制真的检测到，靠的是新令牌与旧令牌几乎不可能相同（`new_ref_tokens`），
+# 不是靠序号从头重排（旧序号在新清单里照样合法，于是会静默点到另一个元素）。
+# 令牌由 Python 侧生成、整个数组当参数传进来：脚本自己**不摇随机数**，
+# 唯一性与形状策略只在 `session_core` 这一处定义。
 # 脚本里的 attr 字面量必须与 REF_ATTR 同值：改了 REF_ATTR 忘了这里，每个点击都会被
 # selector_for 判非法，症状出现在另一个文件里，很难定位。
 # 遍历上限用占位符从 Python 常量注入，不在 JS 里再写一遍字面量：两处数字漂开的话，
 # `shape_interactive` 的「采到封顶」判据会静默失效，模型看到的清单少了条目却写着 truncated:false。
 _INTERACTIVE_JS_TEMPLATE = """
-() => {
+(tokens) => {
   const SEL = ['a[href]', 'button', 'input', 'select', 'textarea',
                '[role=button]', '[role=link]', '[role=menuitem]', '[role=tab]',
                '[role=checkbox]', '[role=radio]', '[role=combobox]', '[role=switch]',
                '[onclick]', '[tabindex]:not([tabindex="-1"])'].join(',');
   const attr = 'data-zc-ref';
   const SCAN_MAX = __ZC_SCAN_MAX__;
+  const pool = Array.isArray(tokens) ? tokens.length : 0;
   for (const el of document.querySelectorAll('[' + attr + ']')) el.removeAttribute(attr);
   const out = [];
   for (const el of document.querySelectorAll(SEL)) {
-    if (out.length >= SCAN_MAX) break;
+    // 两个封顶并列判：SCAN_MAX 是资源闸，pool 是令牌池。后者只是防越界（越界会拿到
+    // undefined 并把「undefined」当句柄打出去），因为池与 SCAN_MAX 同值，触顶时
+    // `shape_interactive` 的封顶判据仍然成立、清单照旧报 truncated。
+    if (out.length >= SCAN_MAX || out.length >= pool) break;
     const r = el.getBoundingClientRect();
     if (r.width === 0 && r.height === 0) continue;
     const label = el.getAttribute('aria-label')
       || (el.labels && el.labels[0] ? el.labels[0].textContent : '')
       || el.getAttribute('placeholder') || el.getAttribute('title') || '';
     const text = (el.textContent || '').trim().slice(0, 60);
-    const ref = 'e' + (out.length + 1);
+    // 一个局部变量算一次、回传与 setAttribute 两处共用：两处各写一遍就会标一个、报一个。
+    const ref = tokens[out.length];
     out.push({
       ref,
       tag: el.tagName.toLowerCase(),
