@@ -5,11 +5,12 @@ networks:
     external: true
 services:
   migrate:
-    image: zerocode-sqlrunner:1
+    image: zerocode-sqlrunner:2
     environment:
       TARGET_DB: ${PROD_DB}
       TARGET_USER: ${PROD_USER}
       TARGET_PASSWORD: ${PROD_PASSWORD}
+      TARGET_ENV: prod
     volumes:
       - ../schema:/schema:ro
       - ../sqlchange:/sql:ro

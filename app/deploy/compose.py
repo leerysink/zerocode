@@ -144,11 +144,12 @@ volumes:
 """
 
 _MIGRATE_SVC = """  migrate:
-    image: zerocode-sqlrunner:1
+    image: zerocode-sqlrunner:2
     environment:
       TARGET_DB: ${DEV_DB}
       TARGET_USER: ${DEV_USER}
       TARGET_PASSWORD: ${DEV_PASSWORD}
+      TARGET_ENV: dev
     volumes:
       - ../schema:/schema:ro
       - ../sqlchange:/sql:ro
@@ -265,11 +266,12 @@ __BUILD_FRONTEND__
 """
 
 _MIGRATE_PROD = """  migrate:
-    image: zerocode-sqlrunner:1
+    image: zerocode-sqlrunner:2
     environment:
       TARGET_DB: ${PROD_DB}
       TARGET_USER: ${PROD_USER}
       TARGET_PASSWORD: ${PROD_PASSWORD}
+      TARGET_ENV: prod
     volumes:
       - ../schema:/schema:ro
       - ../sqlchange:/sql:ro

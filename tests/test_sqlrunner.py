@@ -164,7 +164,131 @@ async def test_run_sh_record_failure_guard():
     """
     src = RUN_SH.read_text(encoding="utf-8")
     assert re.search(
-        r'if ! \$PSQL -q -c "INSERT INTO sqlchange_history.*?FAIL RECORD \$base.*?exit 2',
+        r'if ! \$PSQL -q -c "INSERT INTO sqlchange_history.*?FAIL RECORD \$rel.*?exit 2',
         src, re.S), "成功分支 UPSERT 未做返回码守卫（FAIL RECORD + exit 2）"
     # OK 行必须在守卫之后：防「先 OK 后 exit 2」的自相矛盾回退
-    assert src.index('echo "OK $base"') > src.index("FAIL RECORD")
+    assert src.index('echo "OK $rel"') > src.index("FAIL RECORD")
+
+
+# ---- 数据轨三段（ADR-0039：公共段 + dev 段 + prod 段）----
+
+SHARED = """-- V20261101_01_shared.sql
+-- 用途：公共段建表并落一行  影响：t_seg
+CREATE TABLE IF NOT EXISTS t_seg (who VARCHAR(20));
+INSERT INTO t_seg VALUES ('shared');
+"""
+DEV_ONLY = """-- V20261101_02_demo.sql
+-- 用途：dev 段演示行（与 prod 段同名不同内容）  影响：t_seg
+INSERT INTO t_seg VALUES ('dev');
+"""
+PROD_ONLY = """-- V20261101_02_demo.sql
+-- 用途：prod 段上线行  影响：t_seg
+INSERT INTO t_seg VALUES ('prod');
+"""
+
+
+def _write_segments():
+    """公共段 1 个 + dev 段/prod 段各 1 个**同名**文件（内容不同）。"""
+    _write({"V20261101_01_shared.sql": SHARED})
+    for seg, text in (("dev", DEV_ONLY), ("prod", PROD_ONLY)):
+        d = SQL_DIR / seg
+        d.mkdir()
+        (d / "V20261101_02_demo.sql").write_text(text, encoding="utf-8", newline="")
+
+
+async def _query(cred, sql):
+    from sqlalchemy import text as _text
+    from sqlalchemy.ext.asyncio import create_async_engine
+    eng = create_async_engine(
+        f"postgresql+asyncpg://{cred['user']}:{cred['password']}@localhost:5433/{cred['db']}")
+    try:
+        async with eng.connect() as c:
+            return [tuple(r) for r in (await c.execute(_text(sql))).fetchall()]
+    finally:
+        await eng.dispose()
+
+
+async def test_dev_runs_shared_plus_dev_segment(cred):
+    """dev 库只跑「公共段 + dev 段」，prod 段的文件对它永不可见。"""
+    _write_segments()
+    r = await sqlrun.run_sqlchange(SQL_DIR.parent, "dev", cred)
+    assert r["ok"] is True, r["log"]
+    assert "OK V20261101_01_shared.sql" in r["log"]
+    assert "OK dev/V20261101_02_demo.sql" in r["log"]
+    assert "prod" not in r["log"]
+    assert {row[0] for row in await _query(cred, "SELECT who FROM t_seg")} == {"shared", "dev"}
+
+
+async def test_history_keys_are_relative_and_same_base_name_does_not_collide(cred):
+    """两段同名文件的 basename 相同：记账必须是**相对 sqlchange/ 的路径**，否则同一库里撞主键、
+    还会把另一段的文件误判成篡改。"""
+    _write_segments()
+    assert (await sqlrun.run_sqlchange(SQL_DIR.parent, "dev", cred))["ok"]
+    r = await sqlrun.run_sqlchange(SQL_DIR.parent, "prod", cred)
+    assert r["ok"] is True, r["log"]
+    # 公共段已记账 → SKIP；prod 段是新增 → OK（与 dev 段同 basename 也不互撞）
+    assert "SKIP V20261101_01_shared.sql" in r["log"]
+    assert "OK prod/V20261101_02_demo.sql" in r["log"]
+    rows = await _query(cred, "SELECT filename FROM sqlchange_history")
+    # 三条独立记账（不设顺序断言：ORDER BY 走库的 collation，非 ASCII 序，与执行顺序无关）
+    assert {row[0] for row in rows} == {
+        "V20261101_01_shared.sql", "dev/V20261101_02_demo.sql", "prod/V20261101_02_demo.sql"}
+    assert {row[0] for row in await _query(cred, "SELECT who FROM t_seg")} == {
+        "shared", "dev", "prod"}
+
+
+async def test_anchor_query_order_matches_execution_order(cred):
+    """anchor 取数顺序必须等于 run.sh 的实际执行顺序——商店前缀约束 L 的前提。
+
+    平台 PG 实例是 en_US.utf8 collation：默认 `ORDER BY filename` 把 `prod/…` 排到 `V…` 之前，
+    run.sh 却按字节序先跑公共段。三段落地后这个分叉会真咬人——追加一个顶层 D 文件就能让
+    「上一版序列是本版前缀」判定假红、上架被拒（ADR-0039）。
+    """
+    from app.store import anchor as anchor_mod
+    _write_segments()
+    r = await sqlrun.run_sqlchange(SQL_DIR.parent, "prod", cred)
+    assert r["ok"] is True, r["log"]
+    executed = [ln.split("OK ", 1)[1].strip() for ln in r["log"].splitlines()
+                if ln.startswith("OK ")]
+    assert executed == ["V20261101_01_shared.sql", "prod/V20261101_02_demo.sql"]
+    assert [row[0] for row in await _query(cred, anchor_mod.HISTORY_SQL)] == executed
+
+
+async def test_segment_tamper_is_detected_per_path(cred):
+    """篡改检测按段路径独立：改 prod 段文件只让 prod 那条红，dev 段仍算已应用。"""
+    _write_segments()
+    assert (await sqlrun.run_sqlchange(SQL_DIR.parent, "dev", cred))["ok"]
+    assert (await sqlrun.run_sqlchange(SQL_DIR.parent, "prod", cred))["ok"]
+    (SQL_DIR / "prod" / "V20261101_02_demo.sql").write_text(
+        PROD_ONLY + "\nSELECT 1;\n", encoding="utf-8", newline="")
+    r = await sqlrun.run_sqlchange(SQL_DIR.parent, "prod", cred)
+    assert r["ok"] is False and r["code"] == 3
+    assert "TAMPER prod/V20261101_02_demo.sql" in r["log"]
+
+
+async def test_invalid_env_fails_closed_before_docker(cred, monkeypatch):
+    """env 不是 dev/prod 时在起容器之前拒：容器侧拿到野值会拼出没人认领的挂载路径。"""
+    calls: list[tuple] = []
+
+    async def _no_docker(*args, **kw):
+        calls.append(tuple(args))
+        return 0, ""
+
+    async def _no_net():
+        calls.append(("ensure_zcnet",))
+
+    monkeypatch.setattr(sqlrun, "_docker", _no_docker)
+    monkeypatch.setattr(sqlrun, "ensure_zcnet", _no_net)
+    _write_segments()
+    with pytest.raises(ValueError):
+        await sqlrun.run_sqlchange(SQL_DIR.parent, "verify", cred)
+    assert calls == []
+
+
+async def test_run_sh_requires_and_selects_env_segment():
+    """run.sh 侧的守卫：目标环境必填并白名单校验，且必须把本环境段并进同一次循环。"""
+    src = RUN_SH.read_text(encoding="utf-8")
+    assert re.search(r'TARGET_ENV="\$\{TARGET_ENV:?', src), \
+        "TARGET_ENV 未做必填（缺值必须让容器红，不许静默只跑公共段）"
+    assert re.search(r'case "\$TARGET_ENV" in dev\|prod', src), "TARGET_ENV 未做 dev|prod 白名单"
+    assert re.search(r'/sql/\$TARGET_ENV/\*\.sql', src), "循环没把本环境段的文件并进来"

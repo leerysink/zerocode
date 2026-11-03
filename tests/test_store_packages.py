@@ -14,6 +14,9 @@ def app_tree(tmp_path):
                 "frontend/src/App.vue", "frontend/node_modules/dep/index.js",
                 "frontend/dist/assets/a.js", "deploy/prod-compose.yml", "deploy/.env",
                 "sqlchange/V20260920_01_init.sql", "sqlchange/V20260920_02_more.sql",
+                # 数据轨环境段（ADR-0039）：锚点里是「dev/x.sql」这样的相对路径，出包要保住目录
+                "sqlchange/dev/D20261104_01_demo.sql",
+                "sqlchange/prod/D20261104_01_online.sql",
                 # 大型栈 dev 预览就地跑 mvn 留下的：几百 MB 编译产物 + 一直在滚的日志
                 "backend/target/classes/com/zerocode/app/BaseApplication.class",
                 "backend/target/demo.jar", "backend/logs/spring.log",
@@ -55,6 +58,40 @@ def test_write_package_excludes_secrets_and_artifacts(tmp_path, app_tree):
     assert "src/frontend/src/views/target/Index.vue" in files, "业务目录不该被裸名屏蔽"
     assert "src/frontend/src/views/logs/Index.vue" in files
     assert "sqlchange/V20260920_02_more.sql" not in files, "未应用的迁移不得进包"
+
+
+def test_write_package_keeps_env_segment_paths(tmp_path, app_tree):
+    """环境段锚点（ADR-0039）：filename 是相对路径 `dev/x.sql`，出包必须落进同名子目录。
+
+    shutil.copy2 不建父目录——漏一次 mkdir 就是上架时「锚点文件缺失」这种看不出所以然的失败。
+    """
+    a = [{"filename": "dev/D20261104_01_demo.sql",
+          "checksum": _md5(app_tree / "sqlchange" / "dev" / "D20261104_01_demo.sql")},
+         {"filename": "prod/D20261104_01_online.sql",
+          "checksum": _md5(app_tree / "sqlchange" / "prod" / "D20261104_01_online.sql")}]
+    pkg = packages.write_package(
+        out_root=tmp_path / "store", slug="demo", version="b1", app_root=app_tree,
+        anchor=a, manifest_extra={"title": "演示", "stack": "vue3-fastapi"})
+    files = {p.relative_to(pkg).as_posix() for p in pkg.rglob("*") if p.is_file()}
+    assert {"sqlchange/dev/D20261104_01_demo.sql",
+            "sqlchange/prod/D20261104_01_online.sql"} <= files
+    assert json.loads((pkg / "manifest.json").read_text(encoding="utf-8"))["anchor"] == a
+
+
+def test_package_carries_dev_segment_even_though_anchor_is_prod_only(tmp_path, app_tree):
+    """dev 段必须随包，但锚点取自 prod 库历史——它永远不会记 `dev/x.sql`，所以不能靠锚点带出去。
+
+    ADR-0039 让买家 dev 库有和作者一样的示例数据（好上手），代价就是这段无锚点把关、原样进包；
+    prod 段与公共段仍逐个校验存在性与 checksum，未应用的顶层文件照旧不进包。
+    """
+    a = _anchor_real(app_tree)      # 只有公共段的 V20260920_01_init.sql
+    pkg = packages.write_package(
+        out_root=tmp_path / "store", slug="demo", version="b1", app_root=app_tree,
+        anchor=a, manifest_extra={"title": "演示", "stack": "vue3-fastapi"})
+    files = {p.relative_to(pkg).as_posix() for p in pkg.rglob("*") if p.is_file()}
+    assert "sqlchange/dev/D20261104_01_demo.sql" in files, "dev 段没随包：买家 dev 库拿不到示例数据"
+    assert "sqlchange/prod/D20261104_01_online.sql" not in files   # 未进锚点的 prod 段仍被挡
+    assert json.loads((pkg / "manifest.json").read_text(encoding="utf-8"))["anchor"] == a
 
 
 def test_package_is_immutable(tmp_path, app_tree):

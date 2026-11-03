@@ -416,6 +416,9 @@ def build_db_prompt() -> str:
         "- 验证数据的套路：db_write 灌入测试数据 → 让用户或代码操作应用 → db_query+expect 断言库内状态。",
         "- db_write 前想清楚每条语句：用户会在确认卡里逐条过目，无 WHERE 的 UPDATE/DELETE 与 DROP/TRUNCATE 会标危险。",
         "- prod 库永远只读；「重建 dev 库」等整库级操作不在你的工具面里，需要时请用户到操作台执行。",
+        "- 数据轨分三段（顶层公共段 / `sqlchange/dev/` / `sqlchange/prod/`）：写 prod 段的种子或回填"
+        "之前，先用 `db_query` 的 prod 环境只读查线上现状——那是你唯一能看见生产数据的窗口，"
+        "查完才知道该不该幂等、要不要和 dev 段成对。",
         "</database>",
     ]
     return "\n".join(lines)

@@ -63,7 +63,8 @@ def _materializer(pkg: Path, rel: dict):
             f"来自应用商店版本 {rel['slug']}@{rel['version']}。\n\n"
             f"- 本机预览：http://localhost:{mapping['DEV_PORT']}\n"
             f"- 数据库：dev = {mapping['DEV_DB']}，prod = {mapping['PROD_DB']}\n"
-            f"- 数据变更：一律写到 `sqlchange/V<日期>_<序号>_<说明>.sql`，**已应用的文件不得修改**\n",
+            f"- 数据变更：演示数据写 `sqlchange/dev/`、上线数据写 `sqlchange/prod/`、两库同内容的写 "
+            f"`sqlchange/` 顶层（ADR-0039），文件名 `D<日期>_<两位序号>_<说明>.sql`，**已应用的文件不得修改**\n",
             encoding="utf-8", newline="")
     return materialize
 

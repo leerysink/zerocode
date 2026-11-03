@@ -333,7 +333,8 @@ async def sql_records(request: Request, app_id: int, env: str = "dev"):
 
 @router.get("/{app_id}/sqlchange/files")
 async def sql_files(request: Request, app_id: int):
-    """待执行清单：文件名升序（= 执行顺序），并标注 dev 库里已记账的那些。
+    """dev 视角的待执行清单：公共段 + dev 段，按真实执行顺序给出**相对 sqlchange/ 的路径**，
+    并标注 dev 库里已记账的那些（ADR-0039：prod 段的文件不在本清单里）。
 
     P2 双轨：glob 由 `V*.sql` 放宽为 `*.sql`，让数据轨 `D*.sql`（与遗留 `V*.sql`）一并入待办清单；
     口径只影响本 UI 列表——商店上架锚点取自 sqlchange_history（DB），与本目录 glob 无关（不伤打包）。"""
@@ -344,7 +345,7 @@ async def sql_files(request: Request, app_id: int):
     except DeployError as e:
         raise _http(e)
     d = root / "sqlchange"
-    files = sorted(p.name for p in d.glob("*.sql")) if d.is_dir() else []
+    files = sqlrun.segment_files(d, "dev") if d.is_dir() else []
     cred = await read_cred(sf, app["slug"], "dev")
     applied: dict[str, dict] = {}
     if cred:

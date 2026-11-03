@@ -38,12 +38,13 @@ networks:
   zcnet: { external: true }            # 平台外部网络，zerocode-pg16 已接入（06 §4.4）
 services:
   migrate:
-    image: zerocode-sqlrunner:1
+    image: zerocode-sqlrunner:2
     environment:                       # 显式映射为 sqlrunner 输入契约（07 §4.3）
+      TARGET_ENV: dev                  # ADR-0039：跑「公共段 + dev 段」，prod compose 写 prod
       TARGET_DB: ${DEV_DB}
       TARGET_USER: ${DEV_USER}
       TARGET_PASSWORD: ${DEV_PASSWORD}
-    volumes: [ ../sqlchange:/sql:ro ]
+    volumes: [ ../sqlchange:/sql:ro ]  # 挂整个目录，dev/ 与 prod/ 子段跟着进去，不必多挂卷
     networks: [zcnet]
     restart: "no"
   backend:
