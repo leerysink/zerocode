@@ -4,9 +4,12 @@
 // 提问卡与确认卡都不是浮在底部的独立控件：它们是消息流的一部分，由对应工具调用行渲染
 // （见 isAskCard / confirmCardState），所以刷新、切会话、重连后都能从历史原样重建。
 // 滚动策略：新消息/新卡片强制滚底；流式增量仅在用户已贴底时跟随，不打断上翻阅读。
+// 右缘提问导航条（prompt rail）：每根横杠对应一次用户提问，悬停看全文、点击滚过去；
+// 位置映射与高亮判定在 promptRailModel，DOM 量测在 useChatPromptRail，本组件只挂锚点与接线。
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useChatStore } from '../stores/chat'
 import { normalizeMessages } from '../stores/messageModel'
+import { useChatPromptRail } from '../composables/useChatPromptRail'
 import MarkdownView from './MarkdownView.vue'
 import ToolCallBlock from './ToolCallBlock.vue'
 import AskUserCard from './AskUserCard.vue'
@@ -16,6 +19,7 @@ import TodoCard from './TodoCard.vue'
 import PreviewCard from './PreviewCard.vue'
 import PageInspectCard from './PageInspectCard.vue'
 import BrowserFlowCard from './BrowserFlowCard.vue'
+import ChatPromptRail from './ChatPromptRail.vue'
 
 const props = defineProps({
   messages: { type: Array, default: () => [] },
@@ -123,89 +127,109 @@ watch(
 )
 watch(() => props.hasSession, scrollToBottom)
 onMounted(scrollToBottom)
+
+// 右缘导航条：量测以 scrollRef 为基准，锚点 data-prompt-index 挂在下面的 user 气泡行上
+const { marks: promptMarks, onScroll, scrollToPrompt } = useChatPromptRail({ scrollRef, view })
 </script>
 
 <template>
-  <div ref="scrollRef" class="zc-chat">
-    <!-- 空态：未选择会话 -->
-    <div v-if="!hasSession" class="zc-empty">
-      <h1 class="zc-empty-title">探索未至之境</h1>
-      <p class="zc-empty-sub">从左侧选择一个会话继续，或新建会话开始探索</p>
-    </div>
-    <template v-else>
-      <div v-if="!view.length && !streaming" class="zc-empty zc-empty-lite">
-        <p class="zc-empty-sub">开始你的第一句话吧</p>
+  <div class="zc-chat-shell">
+    <div ref="scrollRef" class="zc-chat" @scroll="onScroll">
+      <!-- 空态：未选择会话 -->
+      <div v-if="!hasSession" class="zc-empty">
+        <h1 class="zc-empty-title">探索未至之境</h1>
+        <p class="zc-empty-sub">从左侧选择一个会话继续，或新建会话开始探索</p>
       </div>
+      <template v-else>
+        <div v-if="!view.length && !streaming" class="zc-empty zc-empty-lite">
+          <p class="zc-empty-sub">开始你的第一句话吧</p>
+        </div>
 
-      <template v-for="(m, i) in view" :key="i">
-        <!-- user：右侧浅蓝气泡（图片网格在文字之前；queued = 执行中发出的插话，等下一个工具边界注入） -->
-        <div v-if="m.role === 'user'" class="zc-msg is-user">
-          <div class="zc-bubble">
-            <div v-if="m.attachments && m.attachments.length" class="zc-bubble-images">
-              <a-image-preview-group>
-                <a-image v-for="a in m.attachments" :key="a.id" :src="a.url" :alt="a.filename" :width="160" />
-              </a-image-preview-group>
+        <template v-for="(m, i) in view" :key="i">
+          <!-- user：右侧浅蓝气泡（图片网格在文字之前；queued = 执行中发出的插话，等下一个工具边界注入）。
+               data-prompt-index 是导航条的量测与定位锚点，值必须是这里的下标 i。 -->
+          <div v-if="m.role === 'user'" class="zc-msg is-user" :data-prompt-index="i">
+            <div class="zc-bubble">
+              <div v-if="m.attachments && m.attachments.length" class="zc-bubble-images">
+                <a-image-preview-group>
+                  <a-image v-for="a in m.attachments" :key="a.id" :src="a.url" :alt="a.filename" :width="160" />
+                </a-image-preview-group>
+              </div>
+              <span v-if="m.content" class="zc-bubble-text">{{ m.content }}</span>
+              <span v-if="m.queued" class="zc-queued">排队中</span>
             </div>
-            <span v-if="m.content" class="zc-bubble-text">{{ m.content }}</span>
-            <span v-if="m.queued" class="zc-queued">排队中</span>
           </div>
-        </div>
-        <!-- assistant：思考块（reasoning）+ Markdown 渲染（MarkdownView 按 content 缓存，
-             空内容但有思考的历史消息也渲染；纯 tool_calls 空内容行仍不渲染） -->
-        <div v-else-if="m.role === 'assistant' && (m.content || m.reasoning)" class="zc-msg is-assistant">
-          <div class="zc-assistant">
-            <ThinkingBlock v-if="m.reasoning" :thinking="m.reasoning" />
-            <MarkdownView v-if="m.content" class="zc-md" :content="m.content" />
+          <!-- assistant：思考块（reasoning）+ Markdown 渲染（MarkdownView 按 content 缓存，
+               空内容但有思考的历史消息也渲染；纯 tool_calls 空内容行仍不渲染） -->
+          <div v-else-if="m.role === 'assistant' && (m.content || m.reasoning)" class="zc-msg is-assistant">
+            <div class="zc-assistant">
+              <ThinkingBlock v-if="m.reasoning" :thinking="m.reasoning" />
+              <MarkdownView v-if="m.content" class="zc-md" :content="m.content" />
+            </div>
           </div>
-        </div>
-        <!-- notice：压缩进行中（转圈）与完成等系统提示（灰字），居中分隔 -->
-        <div v-else-if="m.role === 'notice'" class="zc-msg is-notice">
-          <span class="zc-notice-text">
-            <a-spin v-if="m.kind === 'compacting'" size="small" class="zc-notice-spin" />
-            {{ m.content }}
-          </span>
-        </div>
-        <!-- tool：ask_user 渲染提问卡；需确认的调用渲染确认卡（待答可交互／已答只读留痕）；
-             todo_write 渲染任务卡；preview_* 渲染预览卡；preview_page 渲染检查卡；
-             browser_open/step/close 渲染步骤流卡（三张卡都要过「有结果或仍是最后一条」那道闸）；
-             其余落回通用折叠块。
-             字段一律是归一化后的 name/args/result，实时与历史同形（见 messageModel.js）。 -->
-        <div v-else-if="m.role === 'tool'" class="zc-msg is-tool">
-          <AskUserCard v-if="isAskCard(m)" :questions="m.questions" :result="m.result" />
-          <ConfirmCard v-else-if="confirmCardState(m)" :msg="m" :state="confirmCardState(m)" :progress="liveProgress(m, i)" />
-          <TodoCard v-else-if="m.name === 'todo_write' && m.args && m.args.todos" :todos="m.args.todos" />
-          <PageInspectCard v-else-if="isPageCard(m, i)" :msg="m" :progress="liveProgress(m, i)" />
-          <BrowserFlowCard v-else-if="isBrowserCard(m, i)" :msg="m" :progress="liveProgress(m, i)" />
-          <PreviewCard v-else-if="isPreviewCard(m, i)" :msg="m" :progress="liveProgress(m, i)" />
-          <!-- 会话 id 兜空串：null 会撞在 [Number,String] 的 props 校验上刷一屏警告，
-               而空串本来就是「跳不过去」的合法取值（DiffBlock 据此不渲染入口） -->
-          <ToolCallBlock v-else :msg="m" :session-id="store.currentSessionId ?? ''" />
-        </div>
-        <!-- error：红色气泡 + 尾部重试（重发最后一条 user 消息） -->
-        <div v-else-if="m.role === 'error'" class="zc-msg is-error">
-          <div class="zc-error">
-            <div class="zc-error-text">{{ m.content }}</div>
-            <a-button type="link" danger size="small" @click="store.retry()">重试</a-button>
+          <!-- notice：压缩进行中（转圈）与完成等系统提示（灰字），居中分隔 -->
+          <div v-else-if="m.role === 'notice'" class="zc-msg is-notice">
+            <span class="zc-notice-text">
+              <a-spin v-if="m.kind === 'compacting'" size="small" class="zc-notice-spin" />
+              {{ m.content }}
+            </span>
           </div>
+          <!-- tool：ask_user 渲染提问卡；需确认的调用渲染确认卡（待答可交互／已答只读留痕）；
+               todo_write 渲染任务卡；preview_* 渲染预览卡；preview_page 渲染检查卡；
+               browser_open/step/close 渲染步骤流卡（三张卡都要过「有结果或仍是最后一条」那道闸）；
+               其余落回通用折叠块。
+               字段一律是归一化后的 name/args/result，实时与历史同形（见 messageModel.js）。 -->
+          <div v-else-if="m.role === 'tool'" class="zc-msg is-tool">
+            <AskUserCard v-if="isAskCard(m)" :questions="m.questions" :result="m.result" />
+            <ConfirmCard v-else-if="confirmCardState(m)" :msg="m" :state="confirmCardState(m)" :progress="liveProgress(m, i)" />
+            <TodoCard v-else-if="m.name === 'todo_write' && m.args && m.args.todos" :todos="m.args.todos" />
+            <PageInspectCard v-else-if="isPageCard(m, i)" :msg="m" :progress="liveProgress(m, i)" />
+            <BrowserFlowCard v-else-if="isBrowserCard(m, i)" :msg="m" :progress="liveProgress(m, i)" />
+            <PreviewCard v-else-if="isPreviewCard(m, i)" :msg="m" :progress="liveProgress(m, i)" />
+            <!-- 会话 id 兜空串：null 会撞在 [Number,String] 的 props 校验上刷一屏警告，
+                 而空串本来就是「跳不过去」的合法取值（DiffBlock 据此不渲染入口） -->
+            <ToolCallBlock v-else :msg="m" :session-id="store.currentSessionId ?? ''" />
+          </div>
+          <!-- error：红色气泡 + 尾部重试（重发最后一条 user 消息） -->
+          <div v-else-if="m.role === 'error'" class="zc-msg is-error">
+            <div class="zc-error">
+              <div class="zc-error-text">{{ m.content }}</div>
+              <a-button type="link" danger size="small" @click="store.retry()">重试</a-button>
+            </div>
+          </div>
+        </template>
+
+        <!-- 流式思考：reasoning_delta 累积期间展示 -->
+        <div v-if="streamingThinking" class="zc-msg is-assistant">
+          <ThinkingBlock :thinking="streamingThinking" streaming />
+        </div>
+
+        <!-- 流式气泡：streamingContent 非空才渲染（仅此气泡随 token 重算 Markdown） -->
+        <div v-if="streaming" class="zc-msg is-assistant">
+          <MarkdownView class="zc-md is-streaming" :content="streaming" />
         </div>
       </template>
-
-      <!-- 流式思考：reasoning_delta 累积期间展示 -->
-      <div v-if="streamingThinking" class="zc-msg is-assistant">
-        <ThinkingBlock :thinking="streamingThinking" streaming />
-      </div>
-
-      <!-- 流式气泡：streamingContent 非空才渲染（仅此气泡随 token 重算 Markdown） -->
-      <div v-if="streaming" class="zc-msg is-assistant">
-        <MarkdownView class="zc-md is-streaming" :content="streaming" />
-      </div>
-    </template>
+    </div>
+    <ChatPromptRail
+      v-if="promptMarks.length"
+      :marks="promptMarks"
+      @select="scrollToPrompt"
+    />
   </div>
 </template>
 
 <style scoped>
-.zc-chat {
+/* 外壳：滚动区与右缘导航条并排。导航条不覆盖在滚动区上，否则挡住原生滚动条 */
+.zc-chat-shell {
   flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+}
+.zc-chat {
+  /* 定位基准：提问行的 offsetTop 要相对滚动内容算，不能跟着外层壳子走 */
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
   min-height: 0;
   overflow-y: auto;
   padding: 24px 28px 16px;
