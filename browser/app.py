@@ -703,7 +703,7 @@ async def step(sid: str, req: StepRequest):
         # 「回 steps_charged:true」与注册表里多出的那一步始终一一对应。
         if s.steps == steps_before:
             charge(s)
-        # 本批补的第四条出口（裁定 R-45 的同款，发现项 F-11）：这一支同样不经 `_step_state`，
+        # 最终修复波第 2 批补的第四条出口（裁定 R-45 的同款，发现项 F-11）：这一支同样不经 `_step_state`，
         # 所以本步刚落地的 console / pageerror / 失败请求如果不在这里被消费掉，就会活到下一步、
         # 被 `take_new_items` 当成「本步新增」报出去——模型把这一步的崩溃记到下一步头上，
         # US-04 那个「这个错是不是我这一步搞出来的」的核心信号正好毁在这儿。
