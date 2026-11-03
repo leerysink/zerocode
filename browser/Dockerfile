@@ -40,7 +40,9 @@ RUN set -eux; \
 RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin browser
 USER 10001
 
-COPY app.py inspect_core.py __init__.py /service/browser/
+# session_core.py / sessions.py 不能漏：app.py 在 import 期就依赖它们，漏了是容器起来即崩、
+# preview_page 只会回「浏览器检查服务不可用」——症状离根因很远。
+COPY app.py inspect_core.py session_core.py sessions.py __init__.py /service/browser/
 WORKDIR /service
 EXPOSE 8101
 CMD ["uvicorn", "browser.app:app", "--host", "0.0.0.0", "--port", "8101"]

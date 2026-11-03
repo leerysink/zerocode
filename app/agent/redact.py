@@ -9,6 +9,9 @@
   （协议结构破坏 = OpenAI 兼容 API 返回 400）。
 - 幂等：已遮断的文本再过一遍，<redacted:kind> 不命中任何规则（_NOT_REDACTED 负向前瞻）。
 - 全量工具生效：所有工具的 args 统一遮，不设白名单。
+- 规则表只按**形态**匹配，抓不住用户自己应用里那些不成形态的口令（admin123 一类）；
+  工具侧要补一刀时借用 `rewrite_tool_calls_args`（同一份结构保持机械动作 + 可选工具白名单），
+  不要再抄一份 JSON 解析（裁定 R-33）。
 """
 
 from __future__ import annotations
@@ -64,18 +67,26 @@ def _redact_deep(obj):
     return obj, 0
 
 
-def redact_tool_calls_args(tool_calls: list[dict]) -> tuple[list[dict], int]:
-    """对一组 tool_calls 的 function.arguments 做凭据遮断。
+def rewrite_tool_calls_args(tool_calls: list[dict], rewrite,
+                            tool_names: tuple[str, ...] | None = None
+                            ) -> tuple[list[dict], int]:
+    """改写 tool_calls 的 function.arguments 的**唯一**机械动作，返回 (新列表, 总改写处数)。
 
-    返回 (遮断后的 tool_calls 新列表, 总脱敏处数)。
-    原始列表不被修改（防御性拷贝）。
-    协议结构（id / type / function.name）保持原样；
-    arguments 仍是合法 JSON 字符串（若原始值不是合法 JSON 则跳过该条不破坏）。
+    `rewrite(parsed_args) -> (新 args, 处数)`；`tool_names` 给了就只改那几个工具，不给就全改。
+    不管改写的是凭据还是别的什么形状，协议结构（id / type / function.name）一律不动、列表长度
+    一律不变、arguments 一律保持合法 JSON——这些是 OpenAI 兼容 API 会不会 400 的分界线，
+    每个新需求各写一遍迟早漏一条，所以只留这一份（裁定 R-33 的参数侧遮断是第二个使用者）。
+
+    原始列表不被修改（防御性拷贝）；处数为 0 时保留**原条目对象**，既省一次重建，
+    也让「已过一遍的文本再过一遍」幂等（见模块头的 `_NOT_REDACTED` 约定）。
     """
     result = []
     total = 0
     for tc in tool_calls:
         fn = tc.get("function", {})
+        if tool_names is not None and fn.get("name") not in tool_names:
+            result.append(tc)
+            continue
         raw_args = fn.get("arguments")
         if not raw_args or not isinstance(raw_args, str):
             result.append(tc)
@@ -86,15 +97,25 @@ def redact_tool_calls_args(tool_calls: list[dict]) -> tuple[list[dict], int]:
             # 畸形 JSON 走既有 ToolError 路径，此处不遮不改
             result.append(tc)
             continue
-        redacted, hits = _redact_deep(parsed)
+        rewritten, hits = rewrite(parsed)
         total += hits
         if hits:
-            new_tc = {**tc, "function": {**fn, "arguments": json.dumps(redacted, ensure_ascii=False)}}
+            new_tc = {**tc, "function": {**fn, "arguments": json.dumps(rewritten, ensure_ascii=False)}}
             result.append(new_tc)
         else:
             # 不含任何敏感形态时原文一字不改
             result.append(tc)
     return result, total
+
+
+def redact_tool_calls_args(tool_calls: list[dict]) -> tuple[list[dict], int]:
+    """对一组 tool_calls 的 function.arguments 做凭据遮断。
+
+    返回 (遮断后的 tool_calls 新列表, 总脱敏处数)。
+    按形态匹配的通用规则表只抓得住「长得像凭据」的串；用户自己应用里那些不成形态的
+    口令（`admin123`、`hunter2`）要靠工具侧的补刀，见 `browser_session_tools`。
+    """
+    return rewrite_tool_calls_args(tool_calls, _redact_deep)
 
 
 def redact_tool_result(result):

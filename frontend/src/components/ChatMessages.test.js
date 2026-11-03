@@ -12,6 +12,7 @@ vi.mock('../api', () => ({
 import ChatMessages from './ChatMessages.vue'
 import ToolCallBlock from './ToolCallBlock.vue'
 import AskUserCard from './AskUserCard.vue'
+import BrowserFlowCard from './BrowserFlowCard.vue'
 import { applyEvent, useChatStore } from '../stores/chat'
 import { DECLINE_ANSWER } from '../stores/messageModel'
 
@@ -369,6 +370,98 @@ describe('preview_page 在消息流里的渲染', () => {
     ])
     expect(w.findAll('.zc-page').length).toBe(1)
     expect(w.text()).not.toContain('正在打开预览页')
+  })
+})
+
+// ---- 交互浏览器三件套的步骤流卡（规格 2026-11-02 §9、US-22 / US-23）----
+
+describe('browser_open / browser_step / browser_close 在消息流里的渲染', () => {
+  // 进度闸门（liveProgress）读 store.toolProgress，所以要真挂载 + 真 pinia；
+  // 与上面预览那组的 mountWithProgress 同形，只是这份不 stub BrowserFlowCard。
+  function mountWithProgress(messages, progress) {
+    setActivePinia(createPinia())
+    useChatStore().toolProgress = progress
+    return mount(ChatMessages, {
+      props: { messages, hasSession: true },
+      global: {
+        stubs: {
+          'a-image': ImageStub, 'a-image-preview-group': GroupStub, 'a-button': ButtonStub,
+          'a-spin': SpinStub,
+          MarkdownView: true, ToolCallBlock: true, AskUserCard: true,
+          ThinkingBlock: true, TodoCard: true,
+        },
+      },
+    })
+  }
+
+  it('三个交互浏览器工具都路由到 BrowserFlowCard', () => {
+    for (const n of ['browser_open', 'browser_step', 'browser_close']) {
+      const w = mountMessages([{ role: 'tool', name: n, result: { ok: true } }])
+      expect(w.findComponent(BrowserFlowCard).exists()).toBe(true)
+      expect(w.findComponent(ToolCallBlock).exists()).toBe(false)
+      expect(w.find('.zc-preview').exists()).toBe(false)
+    }
+  })
+
+  it('名单漂了才落回通用折叠块（漏改的后果是降级，不是静默出错）', () => {
+    const w = mountMessages([{ role: 'tool', name: 'browser_hop', result: { ok: true } }])
+    expect(w.findComponent(BrowserFlowCard).exists()).toBe(false)
+    expect(w.findComponent(ToolCallBlock).exists()).toBe(true)
+  })
+
+  it('实时流里 call 行与 result 行只画一张步骤卡（沿用既有去重闸）', () => {
+    const w = mountMessages([
+      { role: 'tool', name: 'browser_step', args: { action: 'click', target: 'e7' } },
+      { role: 'tool', name: 'browser_step',
+        result: { ok: true, passed: false, note: '页面文本未包含「胜利」', action: 'click', target: 'e7' } },
+    ])
+    expect(w.findAllComponents(BrowserFlowCard)).toHaveLength(1)
+    expect(w.text()).not.toContain('正在执行浏览器步骤')
+    expect(w.text()).toContain('断言没过')
+  })
+
+  it('非最后一条、又没结果的 call 行不画卡（历史卡不复活进度）', () => {
+    const w = mountWithProgress(
+      [{ role: 'tool', name: 'browser_open', args: {} },
+       { role: 'assistant', content: '会话已经开好了' }],
+      { name: 'browser_open', line: '[browser] 正在导航' },
+    )
+    expect(w.findAllComponents(BrowserFlowCard)).toHaveLength(0)
+    expect(w.text()).not.toContain('正在打开浏览器会话')
+    expect(w.text()).not.toContain('正在导航')
+  })
+
+  it('进行中的步骤卡拿得到进度，且有结果后不再拿', () => {
+    const live = mountWithProgress([{ role: 'tool', name: 'browser_step', args: {} }],
+      { name: 'browser_step', line: '[browser] 正在等断言轮询' })
+    expect(live.text()).toContain('正在等断言轮询')
+    const done = mountWithProgress(
+      [{ role: 'tool', name: 'browser_step', result: { ok: true, action: 'click', target: 'e1' } }],
+      { name: 'browser_step', line: '[browser] 正在等断言轮询' })
+    expect(done.text()).not.toContain('正在等断言轮询')
+    expect(done.text()).toContain('这一步走完了')
+  })
+
+  it('历史行形状（tool_name / tool_result）刷新后仍画终态卡（US-23）', () => {
+    const w = mountMessages([
+      { role: 'tool', tool_name: 'browser_close',
+        tool_result: { ok: true, steps_total: 3, steps_failed: 1, steps_action_failed: 1,
+                       report: [{ seq: 1, action: 'click', target: 'e3', ok: false, passed: null,
+                                  error: '元素不可点击，可能被遮挡' }],
+                       hint: '以下断言未通过：2；另有 1 步动作未成功（见 report 的 ok:false 项）' } },
+    ])
+    expect(w.findComponent(BrowserFlowCard).exists()).toBe(true)
+    expect(w.text()).toContain('另有 1 步动作未成功')
+    expect(w.text()).toContain('元素不可点击，可能被遮挡')
+  })
+
+  it('不抢 preview_page 与 preview_* 的卡（三张卡各走各的名单）', () => {
+    const page = mountMessages([{
+      role: 'tool', name: 'preview_page',
+      result: { ok: true, title: '订单', text: 'x', console: [], page_errors: [], failed_requests: [] },
+    }])
+    expect(page.findComponent(BrowserFlowCard).exists()).toBe(false)
+    expect(page.find('.zc-page').exists()).toBe(true)
   })
 })
 
