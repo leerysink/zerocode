@@ -339,6 +339,31 @@ def ensure_prod_build_mirror(root: Path) -> bool:
     return patched
 
 
+# prod 构建的类型闸门（ADR-0036）：大型栈模板曾把 build 写成 `vue-tsc -b && vite build`，
+# 于是类型检查只在整条链最贵的这一步跑——dev 是裸 vite 全程不检查，第一次报红就是发布时，
+# 且一红即整次镜像构建作废。摘掉它 = 与 vue3-fastapi 模板的 `vite build` 对齐。
+_LEGACY_TYPECHECK_BUILD = '"build": "vue-tsc -b && vite build"'
+_VITE_ONLY_BUILD = '"build": "vite build"'
+
+
+def ensure_prod_build_script(root: Path) -> bool:
+    """存量应用 frontend/package.json 的 build 摘掉 vue-tsc 闸门（幂等）。
+
+    只认逐字命中模板的那一行：应用自己改过的构建脚本（哪怕只是加了个 flag）原样放过，
+    不猜意图、不覆盖。`vue-tsc` 留在 devDependencies 里——想自查随时 `npx vue-tsc -b`，
+    而从 package.json 删依赖会让它与 package-lock.json 失配，`npm ci` 当场红。
+    """
+    pkg = root / "frontend" / "package.json"
+    if not pkg.is_file():
+        return False
+    text = pkg.read_text(encoding="utf-8")
+    if _LEGACY_TYPECHECK_BUILD not in text:
+        return False
+    pkg.write_text(text.replace(_LEGACY_TYPECHECK_BUILD, _VITE_ONLY_BUILD),
+                   encoding="utf-8", newline="")
+    return True
+
+
 def _wire_dockerfile_proxy(dockerfile: Path) -> bool:
     """M1 存量 frontend/Dockerfile 缺 `COPY nginx.conf`：在 nginx 基座 FROM 行后补一行（幂等）。
 
@@ -410,6 +435,8 @@ async def publish(sf, app: dict, notify=None, *, force: bool = False,
             await _step(app_id, notify, "✓ 已为存量应用补齐 frontend 生产反代（nginx.conf / Dockerfile COPY 接线）")
         if ensure_prod_build_mirror(root):
             await _step(app_id, notify, "✓ 已为存量应用补齐 prod 构建期依赖镜像源接线（Dockerfile ARG/ENV）")
+        if ensure_prod_build_script(root):
+            await _step(app_id, notify, "✓ 已为存量应用摘掉 prod 构建的类型检查闸门（frontend build → vite build）")
         # 1.x dev/prod 结构等价校验（P1 止血；并入 preflight，不改步序）：
         #     dev 实际结构必须等于 fold(sqlchange 文件)，否则视为漂移，硬阻断发布。
         _skip_verify = str((await deploy_cfg(sf)).get("deploy.skip_schema_parity", "")).lower() in ("1", "true", "yes")

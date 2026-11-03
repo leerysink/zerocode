@@ -1407,6 +1407,47 @@ def test_ensure_prod_build_mirror_wires_both_stages_and_skips_maven(tmp_path):
     assert "NPM_CONFIG_REGISTRY" in (sb / "frontend" / "Dockerfile").read_text(encoding="utf-8")
 
 
+_LEGACY_PKG = ('{\n  "name": "bigapp-frontend",\n  "scripts": {\n    "dev": "vite",\n'
+               '    "build": "vue-tsc -b && vite build",\n    "preview": "vite preview"\n  }\n}\n')
+
+
+def test_ensure_prod_build_script_strips_typecheck_gate(tmp_path):
+    """存量应用的 build 摘掉 vue-tsc 闸门（ADR-0036）：按形状出手、幂等、认不出的形状不碰。
+
+    与镜像源接线同一条保守纪律——判据是那一行逐字模板文本，不是栈名：fastapi 栈的应用即便
+    被谁塞进了这行也该摘，SB 栈里应用自己改过的构建脚本（多一个 flag 都不行）必须原样放过。
+    """
+    pkg = tmp_path / "frontend" / "package.json"
+    pkg.parent.mkdir()
+    pkg.write_text(_LEGACY_PKG, encoding="utf-8")
+    assert prod.ensure_prod_build_script(tmp_path) is True
+    after = pkg.read_text(encoding="utf-8")
+    assert '"build": "vite build"' in after and "vue-tsc" not in after
+    assert '"dev": "vite"' in after                       # 只改 build 那一行，其余原样
+    assert prod.ensure_prod_build_script(tmp_path) is False   # 幂等：第二轮零改动
+
+    custom = '{\n  "scripts": {\n    "build": "vue-tsc -b --force && vite build"\n  }\n}\n'
+    pkg.write_text(custom, encoding="utf-8")
+    assert prod.ensure_prod_build_script(tmp_path) is False
+    assert pkg.read_text(encoding="utf-8") == custom
+
+    bare = tmp_path / "static"
+    bare.mkdir()
+    assert prod.ensure_prod_build_script(bare) is False   # 没有 frontend/package.json 不炸
+
+
+async def test_publish_strips_legacy_typecheck_gate_and_reports_it(monkeypatch, sf, seed, pub_root):
+    """发布 preflight 顺带给存量应用摘掉类型闸门，并播报一条补齐事件（与镜像源接线同构）。"""
+    (pub_root / "frontend" / "package.json").write_text(_LEGACY_PKG, encoding="utf-8")
+    wid, aid = await seed(slug="zcpub", prod_port=8982, dev_port=8983)
+    seams = PubSeams(monkeypatch, pub_root)
+
+    await prod.publish(sf, _pub_app(aid), notify=seams.notify, force=True)
+
+    assert '"build": "vite build"' in (pub_root / "frontend" / "package.json").read_text(encoding="utf-8")
+    assert any("类型检查闸门" in ln for ln in seams.logs)
+
+
 async def test_publish_wires_build_mirror_and_reports_it(monkeypatch, sf, seed, pub_root):
     """存量应用在 preflight 就被补上接线，并播报一条补齐事件（与生产反代补齐同构）。"""
     (pub_root / "backend").mkdir()

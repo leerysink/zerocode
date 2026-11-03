@@ -5,6 +5,7 @@
 这边管整棵树的形状与端到产物契约——模板缺文件、混进构建产物、占位符没被替换，都在这里红。
 """
 import hashlib
+import json
 import re
 from pathlib import Path
 import pytest
@@ -68,6 +69,20 @@ def test_template_shape():
     assert not (TEMPLATE / "frontend" / "vite.config.js").exists()      # vue-tsc 产物不带（A5b）
     # 环境差异走平台注入的环境变量，不留第二份 profile 文件
     assert not (TEMPLATE / "backend" / "src" / "main" / "resources" / "application-dev.yml").exists()
+
+
+def test_template_prod_build_has_no_typecheck_gate():
+    """大型栈的 prod 构建不做类型检查（ADR-0036）：与 vue3-fastapi 栈对齐。
+
+    这里曾是 `vue-tsc -b && vite build`，于是类型错误第一次暴露就在整条链最贵的那一步——
+    dev 是裸 vite 全程不检查，一到发布就整次镜像构建作废。把断言装回来等于重新上那道闸门。
+    `vue-tsc` 仍留在 devDependencies：想自查随时 `npx vue-tsc -b`，从 package.json 删依赖会
+    让它与 package-lock.json 失配，`npm ci` 当场红。
+    """
+    pkg = json.loads((TEMPLATE / "frontend" / "package.json").read_text(encoding="utf-8"))
+    assert pkg["scripts"]["build"] == "vite build"
+    assert pkg["scripts"]["dev"] == "vite"
+    assert "vue-tsc" in pkg["devDependencies"]
 
 
 def test_render_has_no_residue_and_no_foreign_brand(tmp_path):

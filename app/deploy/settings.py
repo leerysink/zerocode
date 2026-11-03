@@ -11,7 +11,7 @@ DEFAULTS = {
     "deploy.health_timeout": 240,
     # 大型应用冷启动要在容器里下载 Maven 依赖（实测 ≈410s），与默认 240s 不是一个量级
     "deploy.health_timeout_large": 900,
-    # 大型栈首次 prod build：容器内下载整套 Maven 依赖 + npm ci + vue-tsc 类型检查（spike 实测 ≈350s 起）
+    # 大型栈首次 prod build：容器内下载整套 Maven 依赖 + npm ci + 前端打包（spike 实测 ≈350s 起）
     "deploy.build_timeout": 600,
     "deploy.build_timeout_large": 1800,
     "deploy.auto_stop_dev_on_exit": True,
