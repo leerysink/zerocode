@@ -28,10 +28,15 @@ const GroupStub = {
     return h('div', { class: 'stub-image-group' }, this.$slots.default ? this.$slots.default() : [])
   },
 }
+// 按钮桩：把 disabled / loading 落到类名上，好断言确认卡「已受理」后不再让人连点
 const ButtonStub = {
   name: 'a-button',
+  props: ['disabled', 'loading'],
   render() {
-    return h('button', this.$slots.default ? this.$slots.default() : [])
+    return h('button', {
+      class: { 'is-loading': !!this.loading, 'is-disabled': !!this.disabled },
+      disabled: !!this.disabled,
+    }, this.$slots.default ? this.$slots.default() : [])
   },
 }
 const SpinStub = {
@@ -238,6 +243,40 @@ describe('预览工具在消息流里的渲染', () => {
     expect(w.text()).toContain('确认重启')
     expect(w.find('.zc-confirm-args').exists()).toBe(false)   // 有 summary 就不甩 args JSON
     expect(w.find('.zc-preview').exists()).toBe(false)        // 待答时确认卡接管，不画「正在重启…」
+  })
+
+  it('待答重启确认卡拿到同名进度：点下去当场有反馈', () => {
+    // 根因回归：确认卡在 v-else-if 链上排在预览卡之前，而 liveProgress 只喂预览/页面卡，
+    // 于是 preview_restart 受理后最长 240s（agent.preview_wait_seconds）的执行期里界面一格
+    // 都不动，按钮还保持着能再点的样子——用户读作「点了没反应」。
+    const w = mountWithProgress(
+      [{ role: 'tool', name: 'preview_restart', args: {}, awaitingConfirm: true,
+         confirmSummary: 'dev 预览正在运行，确定重启？' }],
+      { name: 'preview_restart', line: '[zerocode] → 起栈中' },
+    )
+    expect(w.find('.zc-confirm').exists()).toBe(true)
+    expect(w.text()).toContain('起栈中')
+    expect(w.text()).toContain('已受理')
+    expect(w.find('.zc-confirm-actions button').classes()).toContain('is-loading')
+  })
+
+  it('确认卡没有进度时不装「已受理」（还没点上，按钮得继续可点）', () => {
+    const w = mountWithProgress(
+      [{ role: 'tool', name: 'preview_restart', args: {}, awaitingConfirm: true }],
+      null,
+    )
+    expect(w.text()).toContain('确认重启')
+    expect(w.text()).not.toContain('已受理')
+    expect(w.find('.zc-confirm-actions button').classes()).not.toContain('is-loading')
+  })
+
+  it('进度只认同名那条：别的工具在跑不给这张确认卡装已受理', () => {
+    const w = mountWithProgress(
+      [{ role: 'tool', name: 'preview_restart', args: {}, awaitingConfirm: true }],
+      { name: 'preview_status', line: '[zerocode] → 起栈中' },
+    )
+    expect(w.text()).not.toContain('已受理')
+    expect(w.text()).not.toContain('起栈中')
   })
 
   it('写入确认卡文案一字不变（无 summary 时回落 args 摘要）', () => {

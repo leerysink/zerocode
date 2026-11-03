@@ -78,6 +78,8 @@ function liveProgress(m, i) {
 // 确认卡：待答态一律接管（没有它用户无从批准/拒绝，而此时预览卡只会显示「正在重启…」，
 // 把等决定的场面画成正在执行）；已答态只给非预览工具留痕——预览三件套的结果卡本来就会
 // 表达重启成功/被拒/中断，再叠一张确认卡是同一件事说两遍。
+// 待答态也要吃进度：preview_restart 受理后到结果行回来之间可以有几分钟的执行期（默认最多
+// 等 240s），进度进不了卡片的话用户点完看到的就是「按钮还在、什么都没说」。
 // 状态本身已在归一化阶段推出（m.confirmState），这里只做「画不画」的取舍。
 function confirmCardState(m) {
   if (!m.confirmState || m.confirmState === 'pending') return m.confirmState || null
@@ -153,7 +155,7 @@ onMounted(scrollToBottom)
              字段一律是归一化后的 name/args/result，实时与历史同形（见 messageModel.js）。 -->
         <div v-else-if="m.role === 'tool'" class="zc-msg is-tool">
           <AskUserCard v-if="isAskCard(m)" :questions="m.questions" :result="m.result" />
-          <ConfirmCard v-else-if="confirmCardState(m)" :msg="m" :state="confirmCardState(m)" />
+          <ConfirmCard v-else-if="confirmCardState(m)" :msg="m" :state="confirmCardState(m)" :progress="liveProgress(m, i)" />
           <TodoCard v-else-if="m.name === 'todo_write' && m.args && m.args.todos" :todos="m.args.todos" />
           <PageInspectCard v-else-if="isPageCard(m, i)" :msg="m" :progress="liveProgress(m, i)" />
           <PreviewCard v-else-if="isPreviewCard(m, i)" :msg="m" :progress="liveProgress(m, i)" />

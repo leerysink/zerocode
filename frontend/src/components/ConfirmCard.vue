@@ -11,20 +11,28 @@ import { useChatStore } from '../stores/chat'
 const props = defineProps({
   msg: { type: Object, required: true },
   state: { type: String, required: true },
+  // 临时进度（tool_progress）：只有 preview_restart 会发，且只在该工具**已受理开跑**后才有，
+  // 所以它同时是「后端真的收到了我的点击」的证据——见下方 acked。
+  progress: { type: Object, default: null },
 })
 const store = useChatStore()
 
 const COPY = {
-  write_file: { pending: '写入确认', ok: '确认写入', no: '拒绝', done: '已批准写入' },
-  edit_file: { pending: '修改确认', ok: '确认写入', no: '拒绝', done: '已批准修改' },
-  db_write: { pending: '数据库写入确认', ok: '确认写入', no: '拒绝', done: '已批准写库' },
-  preview_restart: { pending: '重启预览', ok: '确认重启', no: '取消', done: '已确认重启' },
+  write_file: { pending: '写入确认', ok: '确认写入', no: '拒绝', done: '已批准写入', acked: '已受理' },
+  edit_file: { pending: '修改确认', ok: '确认写入', no: '拒绝', done: '已批准修改', acked: '已受理' },
+  db_write: { pending: '数据库写入确认', ok: '确认写入', no: '拒绝', done: '已批准写库', acked: '已受理' },
+  preview_restart: { pending: '重启预览', ok: '确认重启', no: '取消', done: '已确认重启', acked: '已受理，正在重启' },
 }
-const FALLBACK = { pending: '操作确认', ok: '确认', no: '拒绝', done: '已批准' }
+const FALLBACK = { pending: '操作确认', ok: '确认', no: '拒绝', done: '已批准', acked: '已受理' }
 const DECIDED_HEAD = { denied: '已拒绝', cancelled: '已中断' }
 
 const copy = computed(() => COPY[props.msg.name] || FALLBACK)
 const pending = computed(() => props.state === 'pending')
+// 已受理：待答标记还在（结果行没回来），但工具已经在跑了。
+// preview_restart 会把 stop+start+健康探测整段跑完才落结果行（默认最多等 240s），
+// 没有这一格的话，点完「确认重启」到结果到达之间界面一格都不动，用户只能读成「没点上」。
+const acked = computed(() => pending.value && !!props.progress)
+const okLabel = computed(() => (acked.value ? copy.value.acked : copy.value.ok))
 const headText = computed(() => {
   if (!pending.value) return DECIDED_HEAD[props.state] || copy.value.done
   return copy.value.pending
@@ -49,9 +57,10 @@ const bodyText = computed(() => (pending.value ? props.msg.confirmSummary || '' 
     </div>
     <p v-if="bodyText" class="zc-confirm-summary">{{ bodyText }}</p>
     <pre v-else-if="argsSummary" class="zc-confirm-args">{{ argsSummary }}</pre>
+    <div v-if="acked" class="zc-confirm-progress">{{ progress.line }}</div>
     <div v-if="pending" class="zc-confirm-actions">
-      <a-button type="primary" @click="store.confirm(true)">{{ copy.ok }}</a-button>
-      <a-button @click="store.confirm(false)">{{ copy.no }}</a-button>
+      <a-button type="primary" :disabled="acked" :loading="acked" @click="store.confirm(true)">{{ okLabel }}</a-button>
+      <a-button :disabled="acked" @click="store.confirm(false)">{{ copy.no }}</a-button>
     </div>
   </div>
 </template>
@@ -116,6 +125,14 @@ const bodyText = computed(() => (pending.value ? props.msg.confirmSummary || '' 
   color: var(--zc-text);
   white-space: pre-wrap;
   word-break: break-word;
+}
+.zc-confirm-progress {
+  margin-top: 8px;
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: var(--zc-text-sub);
+  white-space: pre-wrap;
+  word-break: break-all;
 }
 .zc-confirm-actions {
   display: flex;
