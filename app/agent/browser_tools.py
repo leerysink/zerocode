@@ -143,6 +143,12 @@ async def _sidecar_inspect(target_url: str, timeout_s: int, settle_ms: int,
     except ValueError:
         return None, f"浏览器检查服务返回异常（HTTP {resp.status_code}）"
     if resp.status_code >= 400:
+        # 形状差异（发现项 F-2，控制器裁定本轮不改）：`detail` 有两种形状——400/409/503 是
+        # str，422（pydantic 校验失败）是 **list**，这里 `_clean(list)` 会把 Python repr 当成
+        # 错误原因喂给模型。今天不可达：`/inspect` 的调用面只送 `{url, wait_ms, timeout_ms}`，
+        # 三个字段都由本模块自己构造，送不出畸形 body。留给将来复用这条路径的人——要按
+        # status_code 分支读的话，现成的读法在
+        # `app/agent/browser_session_tools.py::_reject_reason`（那边就是这么处理 422 的）。
         detail = data.get("detail") if isinstance(data, dict) else None
         return None, f"浏览器检查服务拒绝请求：{_clean(detail or resp.status_code)}"
     if not isinstance(data, dict):

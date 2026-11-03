@@ -118,14 +118,21 @@ def _make_app(apps_root: Path, slug: str, *, name="演示应用", stack="vue3-fa
 
 
 def _make_browser(repo: Path) -> Path:
-    """在假仓库里造 sidecar 源码：打包器只搬运并核对必备文件是否存在。"""
+    """在假仓库里造 sidecar 源码：打包器只搬运并核对必备文件是否存在。
+
+    源文件名单从 `bo.BROWSER_REQUIRED` 遍历生成，不在这里抄第二份：打包器的闸门加一个源文件，
+    这里的假仓库要自己跟上。漏补的表现是全部打包用例一起报「缺文件」，看不出真正的原因。
+    """
     b = repo / "browser"
     b.mkdir()
-    (b / "Dockerfile").write_text("FROM python:3.12-slim\n", encoding="utf-8")
-    (b / "requirements.txt").write_text("fastapi\nplaywright\n", encoding="utf-8")
-    (b / "app.py").write_text("# sidecar stub\n", encoding="utf-8")
-    (b / "inspect_core.py").write_text("# pure helpers stub\n", encoding="utf-8")
-    (b / "__init__.py").write_text("", encoding="utf-8")
+    for rel in bo.BROWSER_REQUIRED:
+        if rel == "Dockerfile":
+            content = "FROM python:3.12-slim\n"
+        elif rel == "requirements.txt":
+            content = "fastapi\nplaywright\n"
+        else:
+            content = f"# {rel} stub\n"
+        (b / rel).write_text(content, encoding="utf-8")
     (b / "docker-compose.yml").write_text("name: zerocode-browser\n", encoding="utf-8")
     (b / "__pycache__").mkdir()
     (b / "__pycache__" / "app.cpython-312.pyc").write_bytes(b"\x00")
@@ -207,7 +214,8 @@ def test_build_produces_every_artifact(fake_repo):
                 "README-deploy.md",
                 "backend/Dockerfile", "backend/requirements.txt", "backend/app/main.py",
                 "browser/Dockerfile", "browser/requirements.txt", "browser/app.py",
-                "browser/inspect_core.py", "browser/__init__.py",
+                "browser/inspect_core.py", "browser/session_core.py", "browser/sessions.py",
+                "browser/__init__.py",
                 "frontend/dist/index.html",
                 "gateway/docker-compose.yml", "gateway/nginx.conf", "gateway/lua/router.lua",
                 "gateway/404.html", "gateway/make-cert.sh", "gateway/certs/.gitkeep",
@@ -1134,6 +1142,97 @@ def test_compose_browser_sidecar_is_contained(fake_repo):
     assert side["networks"] == ["default"]             # 不进 zcnet：它不需要碰应用容器
 
 
+def test_compose_bakes_browser_session_limits(fake_repo):
+    """活 session 的上限与空闲 TTL 必须显式出现在交付包里（ADR-0037 的资源闸）。
+
+    三个原因值得单独钉一条：
+    1. 只靠代码默认值的话，默认值漂了没有任何地方看得见——而 sidecar 现在有活页面了，
+       没有上限与空闲回收就会在 mem_limit 1g 的容器里攒僵尸 context 直到 OOM；
+    2. 加能力时最容易顺手「放宽一点」，所以同一条测试把容器约束再核一遍（一项都不许动）；
+    3. 打包值与 `browser/sessions.py` 的代码默认值必须是同一个数：不一致时服务器上真正生效的
+       是 compose 那一份，代码里的默认值就变成一份会误导人的死文档。
+
+    断言走 YAML 结构而不是文本包含：compose 的注释里合法地写着变量名本身。
+    `browser.sessions` 在函数内 import（它只依赖 stdlib，打包测试照样不碰 docker 和浏览器）：
+    放到模块顶层的话，sidecar 少一个源文件会让本文件全部用例收不了集，盖住该报的那一句。
+    """
+    from browser import sessions
+
+    out = _build(fake_repo)["out"]
+    text = (out / "docker-compose.yml").read_text(encoding="utf-8")
+    side = yaml.safe_load(text)["services"]["browser"]
+    env = side["environment"]
+    assert env[bo.BROWSER_MAX_SESSIONS_ENV] == \
+        f"${{{bo.BROWSER_MAX_SESSIONS_ENV}:-{bo.BROWSER_MAX_SESSIONS_BAKED}}}"
+    assert env[bo.BROWSER_SESSION_TTL_ENV] == \
+        f"${{{bo.BROWSER_SESSION_TTL_ENV}:-{bo.BROWSER_SESSION_TTL_BAKED}}}"
+    assert int(bo.BROWSER_MAX_SESSIONS_BAKED) == sessions.MAX_SESSIONS_DEFAULT
+    assert int(bo.BROWSER_SESSION_TTL_BAKED) == sessions.TTL_SECONDS_DEFAULT
+    # `.env.example` 给同一组变量的裸值示例（compose 的 ${…} 写进 .env 会被当字面量读）
+    example = (out / ".env.example").read_text(encoding="utf-8")
+    for name, value in ((bo.BROWSER_MAX_SESSIONS_ENV, bo.BROWSER_MAX_SESSIONS_BAKED),
+                        (bo.BROWSER_SESSION_TTL_ENV, bo.BROWSER_SESSION_TTL_BAKED)):
+        line = next((l for l in example.splitlines() if l.startswith(name + "=")), "")
+        assert line == f"{name}={value}", f".env.example 里 {name} 应为裸值打包值，实际 {line!r}"
+    # 容器约束一项都没因为「新增可交互能力」而放宽（ADR-0037 明确不放宽任何一项）
+    assert side["read_only"] is True
+    assert list(side["cap_drop"]) == ["ALL"]
+    assert side["pids_limit"] == 256 and side["mem_limit"] == "1g"
+    assert "ports" not in side, "给 sidecar 开宿主端口 = 把能交互的浏览器暴露出去"
+
+
+def test_readme_documents_browser_session_limits(fake_repo):
+    """交付包那份 README 要自己说清「活会话上限 / TTL」（Task 6 → T8 的登记项，本轮收口）。
+
+    compose 与 `.env.example` 里早就有这两个键，运维手上读的却是 README：上一轮只把说明写进
+    仓库内的 `browser/README.md`，交付包里没有那一份，出包后读 README 的人仍然不知道超限是
+    拒绝而不是排队、也不知道 TTL 兜的是没人关的 context。「把上限调大」于是成了一件看不见后果
+    的操作，而容器只有 `mem_limit: 1g`。
+    """
+    readme = (_build(fake_repo)["out"] / "README-deploy.md").read_text(encoding="utf-8")
+    assert bo.BROWSER_MAX_SESSIONS_ENV in readme
+    assert bo.BROWSER_SESSION_TTL_ENV in readme
+    assert "拒绝而不是排队" in readme            # 超限的行为口径
+    assert "mem_limit: 1g" in readme             # 调大的代价写在同一句里，不是另一个文档里
+    assert "浏览器会话已结束" in readme           # TTL 到点时 Agent 实际拿到的那一句
+
+
+def test_local_dev_compose_matches_baked_session_limits():
+    """事实核对（读仓库真文件）：本地 dev 的 sidecar compose 与交付包烘的是同一组资源闸数字。
+
+    两处不一致时，本地永远复现不了「开第 3 个会话被拒」「页面放 2 分钟被回收」这类现象，
+    而它们在服务器上一定会发生。三个数（代码默认 / 交付包 / 本地 dev）在这里钉成一条。
+    """
+    from browser import sessions
+
+    doc = yaml.safe_load((bo.REPO_ROOT / "browser" / "docker-compose.yml").read_text(encoding="utf-8"))
+    env = doc["services"]["browser"]["environment"]
+    assert int(env[bo.BROWSER_MAX_SESSIONS_ENV]) == int(bo.BROWSER_MAX_SESSIONS_BAKED) \
+        == sessions.MAX_SESSIONS_DEFAULT
+    assert int(env[bo.BROWSER_SESSION_TTL_ENV]) == int(bo.BROWSER_SESSION_TTL_BAKED) \
+        == sessions.TTL_SECONDS_DEFAULT
+
+
+def test_browser_required_covers_every_sidecar_source():
+    """事实核对（读仓库真文件）：BROWSER_REQUIRED 要盖住 browser/ 下每一个 .py 源文件。
+
+    名单漏一个文件**不会**让包坏掉——copytree 整目录搬运，文件照样进包。漏的代价是把「有人
+    改名或删掉 sidecar 的一个源文件」从打包期一句中文报错，推迟成服务器上镜像构建失败
+    （Task 2 漏过 session_core.py、Task 3 漏过 sessions.py，都是这一条）。
+    `browser/Dockerfile` 按文件名逐个 COPY，是个白名单，所以顺带核一遍每个源文件都在里面露面。
+
+    这里遍历目录断言，而不是再写一份文件名名单：第二份名单本身就是会漂的双源。
+    """
+    src = bo.REPO_ROOT / "browser"
+    sources = sorted(p.name for p in src.glob("*.py"))
+    assert sources, "browser/ 下一个 .py 都没有：路径漂了，本测试等于没在测"
+    missing = sorted(set(sources) - set(bo.BROWSER_REQUIRED))
+    assert not missing, f"BROWSER_REQUIRED 漏了 {missing}：补进 scripts/build_output.py"
+    dockerfile = (src / "Dockerfile").read_text(encoding="utf-8")
+    not_copied = [name for name in sources if name not in dockerfile]
+    assert not not_copied, f"browser/Dockerfile 没 COPY {not_copied}：容器起来即崩"
+
+
 def test_repo_browser_dockerfile_is_non_root_with_local_context():
     """事实核对（读仓库真文件，不是假仓库桩）：镜像以 uid 10001 运行，且构建上下文是 browser/。
 
@@ -1142,7 +1241,10 @@ def test_repo_browser_dockerfile_is_non_root_with_local_context():
     """
     dk = (bo.REPO_ROOT / "browser" / "Dockerfile").read_text(encoding="utf-8")
     assert "USER 10001" in dk
-    assert "COPY app.py inspect_core.py __init__.py /service/browser/" in dk
+    # COPY 白名单整串钉死（等价替换，不是改松）：app.py 在 import 期就依赖后面那几个模块，
+    # 少拷一个的表现是容器起来即崩、preview_page 恒回「浏览器检查服务不可用」，离根因很远。
+    assert ("COPY app.py inspect_core.py session_core.py sessions.py __init__.py "
+            "/service/browser/") in dk
     assert "COPY browser/" not in dk
     local = (bo.REPO_ROOT / "browser" / "docker-compose.yml").read_text(encoding="utf-8")
     assert "context: ." in local
@@ -1187,10 +1289,15 @@ def test_sidecar_addresses_are_runtime_overridable(fake_repo):
         assert token in readme, f"README 缺 {token}：排障的人搜不到这个变量名"
 
 
-def test_missing_sidecar_source_refuses_packaging(fake_repo):
-    """边界：compose 会在服务器上 build browser/，缺文件等于把失败推到部署现场。"""
-    (fake_repo / "browser" / "inspect_core.py").unlink()
-    with pytest.raises(bo.BuildError, match="inspect_core.py"):
+@pytest.mark.parametrize("name", ("app.py", "inspect_core.py", "session_core.py", "sessions.py"))
+def test_missing_sidecar_source_refuses_packaging(fake_repo, name):
+    """边界：compose 会在服务器上 build browser/，缺文件等于把失败推到部署现场。
+
+    逐个源文件都跑一遍：copytree 是整目录搬运，闸门名单漏一个文件时包**不会**坏，
+    只是那个文件改名/被删后打包期不再吭声（这条就是 R-15 踩过的坑）。
+    """
+    (fake_repo / "browser" / name).unlink()
+    with pytest.raises(bo.BuildError, match=name):
         _build(fake_repo)
 
 

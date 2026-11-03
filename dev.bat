@@ -49,14 +49,15 @@ if errorlevel 1 goto :npm_failed
 :fe_ready
 
 REM ------------------------------------------------------------
-REM 4. Browser sidecar for preview_page (optional)
+REM 4. Browser sidecar for preview_page and interactive walkthroughs (optional)
 REM    It runs in its own container; start it with browser\dev-up.bat.
 REM    The backend defaults to this URL anyway - set explicitly so the
 REM    requirement is visible in this window.
 REM ------------------------------------------------------------
 set "ZEROCODE_BROWSER_URL=http://127.0.0.1:8101"
-echo [info] browser sidecar for preview_page: http://127.0.0.1:8101
+echo [info] browser sidecar for preview_page + browser_step: http://127.0.0.1:8101
 echo        start it separately with browser\dev-up.bat (optional)
+echo        interactive sessions: at most 2 live pages, idle ones recycled after 120s
 
 REM ------------------------------------------------------------
 REM 5. Start backend in its own window.

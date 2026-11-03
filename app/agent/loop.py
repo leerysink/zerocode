@@ -14,6 +14,8 @@ from pathlib import Path
 from app.agent.preview_tools import (build_preview_prompt, confirm_summary, fetch_app,
                                      need_confirm, resolve_session_app)
 from app.agent.browser_tools import build_browser_prompt
+from app.agent.browser_session_tools import (build_browser_session_prompt, close_browser_session,
+                                            redact_sensitive_step_args)
 from app.agent.db_tools import build_db_prompt, db_confirm_summary
 from app.agent.prompts import build_clarify_prompt, build_system_prompt
 from app.agent import clarify as _cl
@@ -108,6 +110,10 @@ class AgentRunner:
         # 本轮历史已内联的图片原始字节合计（_history 构建时写入）：插话带图与历史共用
         # 同一份 MAX_INLINE_BYTES 预算，否则一次运行的内联总量可以越过上限
         self._inline_used = 0
+        # 本 run 的工具上下文（_inner 建好 ctx 时写入）：run 收口时要用它把浏览器会话关掉
+        # （US-21）。放在实例上而不是把 `_inner` 的循环整体缩进 try/finally：一个 runner 只服务
+        # 一次 run（app/api/ws.py 每个 run 新建一个），而收口必须覆盖正常结束/取消/报错三条出口。
+        self._tool_ctx = None
 
     async def _root_of(self, session_id: int):
         async with self.sf() as s:
@@ -171,6 +177,7 @@ class AgentRunner:
     async def run(self, session_id: int, user_text: str, cancel: asyncio.Event,
                   attachment_ids: list[int] | None = None) -> str:
         status = "idle"
+        self._tool_ctx = None      # 每个 run 重新绑定：收口只认本次 run 的会话
         try:
             await self._inner(session_id, user_text, cancel, attachment_ids)
         except _Cancelled:
@@ -182,6 +189,10 @@ class AgentRunner:
         finally:
             await self._set_status(session_id, status)
             await self.send({"type": "status", "status": status})
+            # 浏览器会话收口（规格 2026-11-02 US-21）：模型没调 browser_close 也要发 DELETE，
+            # 否则 sidecar 会在 mem_limit 1g 里攒僵尸 context。放在状态帧之后、且内部全吞：
+            # 一次没收口的清理不该把对话结束的读数拖住最多 10 秒。
+            await close_browser_session(self._tool_ctx)
         return status
 
     async def _set_status(self, session_id, status):
@@ -427,12 +438,15 @@ class AgentRunner:
         app, preview_note = await self._resolve_app(session_id)
         preview_prompt = preview_note or (build_preview_prompt(app["stack"]) if app else None)
         if app:
-            # 数据库指引与工具同生同灭：多应用 fail closed（preview_note）时两者都不注入。
-            # <database> 放在 <preview> 之前；<browser> 跟在 <preview> 之后（system 尾部锚定
-            # </browser>，见 test_agent_loop 的提示词顺序断言）。
+            # 数据库指引与工具同生同灭（多应用 fail closed 时两者都不注入）。块顺序固定：
+            # <database> → <preview> → <browser> → <browser_session>；system 尾部锚定
+            # </browser_session>（见 test_agent_loop 的提示词顺序断言）。
             preview_prompt = (build_db_prompt() + (preview_prompt or "")
-                              + build_browser_prompt())
-        tools = _TOOLS + PREVIEW_TOOLS + DB_TOOLS + BROWSER_TOOLS if app else _TOOLS
+                              + build_browser_prompt() + build_browser_session_prompt())
+        # 交互工具的挂载条件与 preview_page 完全一致（规格 §5.1）：只在解析出唯一应用时挂载，
+        # 非应用工作区连「调了才发现不能用」的假工具都不给。
+        tools = (_TOOLS + PREVIEW_TOOLS + DB_TOOLS + BROWSER_TOOLS + BROWSER_SESSION_TOOLS
+                 if app else _TOOLS)
         # 澄清工具与门禁同生同灭（规格 §4 故事 20）：关掉开关的账户既不该看见 clarify_done，
         # 更不该被一道模型看不见的闸拦下写入——那只会让写文件变成莫名失败。
         clarify_on = _cl.enabled(cfg)
@@ -463,6 +477,7 @@ class AgentRunner:
                           app=app, cfg=cfg, cancel=cancel, deploy_hub=self.deploy_hub,
                           deploy_tasks=self.dev_tasks, run_state=run_state,
                           model_cfg=self.model_cfg, llm=await self._llm_for(cfg))
+        self._tool_ctx = ctx      # run 收口要用它发浏览器会话的 DELETE（见 run 的 finally）
         max_rounds = int(cfg.get("agent.max_tool_rounds", 30))
         # <=0 = 不限工具轮数（与超时参数 <=0 不限制的约定一致），不再 range(0) 零轮即错
         rounds = itertools.count() if max_rounds <= 0 else range(max_rounds)
@@ -488,10 +503,36 @@ class AgentRunner:
                 # 泄露 ≠ 破坏工具本意，fs_write 之类得能把用户真正要写的凭据落盘。
                 original_calls = final["tool_calls"]
                 sanitized_calls, _ = redact_tool_calls_args(original_calls)
-                final["tool_calls"] = sanitized_calls
+                # 参数侧的 sensitive 遮断（裁定 R-33，US-19）：规则表只认凭据**形态**，
+                # `{"action":"fill","target":"r7kqmbt","value":"hunter2"}` 里那种不成形态的口令它抓不住，
+                # 于是它会原样进 message.tool_args 并被通用折叠块明文打印出来。
+                # 判定与 `_step` 写 browser_log 时同口径，但参数侧多两条从严（C-1，裁定 R-34/R-35/R-36/R-38）：
+                # ① 未知句柄也遮（`is_sensitive_ref_or_unknown`）；② 位次从严——`browser_refs`
+                # 这一份是**本轮开始时**的清单（下面取一次就整轮不变），只有**本条消息在这一步之前
+                # 没有别的浏览器调用改写过页面**的那条 `browser_step` 能拿它当权威。改写者不止
+                # `_step`：`_open` 同样往 `browser_refs` 写新页清单，`_close` 之后的 step 填不进表单
+                # 却照样明文落库，所以同一条消息里排在前面的 open / close 也占位次（R-36）；位次按
+                # `function.name` 命中名单就数，
+                # **不看它的 `arguments` 能不能解析**（R-38）：下面那行 `exec_args` 把空串与畸形 JSON
+                # 一律换成 `{}` 照样派发，而 `browser_open` 的 `"required": []` 让 `_open(ctx, {})`
+                # 真的开了一页、真的换了清单。位次 2 起为什么不能再信那份轮初清单——成立的是三支
+                # （发现项 F-10：旧说法里的「复用旧编号」那支**已经作废**，令牌每次扫描整批换发，
+                # 上一轮的 `e2` 在这一轮的页面上根本不存在，它只会命中「未知即遮」，撑不起位次规则）：
+                # 同一条消息里第一条 step 返回的新清单，参数侧这一轮永远读不到；
+                # 清单里查得到的那个令牌，指向的节点可能被 Vue 就地改了类型（搜索框翻成口令框，
+                # 句柄本身还活着，未知即遮兜不到这一支）；
+                # 同一条消息里换过页、或排在前面那条的 args 畸形却仍被派发。
+                # 而落库这行写在派发之前，那份中途清单永远写不出来，所以一律按 sensitive 遮。
+                # 一处遮一处不遮就是漏，验收口径是「两侧对同一个 value 给同一个结论」。
+                # 只改落库/推送那一份（与下面 tool_result 那条同一个形状）：工具执行收
+                # original_calls（原值必须送达 sidecar，否则登录根本填不进去），当轮回注模型的
+                # assistant tool_calls 也留原值——模型下一步重试同一个表单时不能读回占位符。
+                persisted_calls, _ = redact_sensitive_step_args(
+                    sanitized_calls, ctx.run_state.get("browser_refs"))
+                final["tool_calls"] = persisted_calls
                 await add_message(self.sf, session_id, "assistant", content=final.get("content"),
                                   reasoning=final.get("reasoning"),
-                                  tool_args={"tool_calls": sanitized_calls})
+                                  tool_args={"tool_calls": persisted_calls})
                 messages.append({"role": "assistant", "content": final.get("content"),
                                  "tool_calls": sanitized_calls})
                 # 轮次收口：本轮的文字必须在派发工具**之前**固化下发。上面那行已经把它存进库了，
@@ -500,12 +541,12 @@ class AgentRunner:
                 # content 为空则不发：发了前端会 push 一条空 assistant 消息，实时与历史条数就此叉开。
                 if final.get("content"):
                     await self.send({"type": "message_done", "content": final["content"]})
-                # 结构被 redact 原样保留（id/type/name 不变、只改 arguments），按位次配对：
+                # 结构被遮断原样保留（id/type/name 不变、只改 arguments），按位次配对：
                 # exec_tc 供工具真实执行，push_tc 供前端事件展示。等长同序是配对成立的前提，
-                # 加一道廉价护栏：万一将来给 redact 加了过滤分支致列表变短，在这里显式炸，
+                # 加一道廉价护栏：万一将来给遮断加了过滤分支致列表变短，在这里显式炸，
                 # 不要静默丢一个工具调用 / 错位 tool_call_id 配对（OpenAI 兼容 API 会 400）。
-                assert len(sanitized_calls) == len(original_calls)
-                pairs = list(zip(original_calls, sanitized_calls))
+                assert len(persisted_calls) == len(original_calls)
+                pairs = list(zip(original_calls, persisted_calls))
                 for idx, (exec_tc, push_tc) in enumerate(pairs):
                     if cancel.is_set():
                         await self._pair_undispatched(session_id, pairs[idx:])
@@ -681,4 +722,5 @@ class AgentRunner:
 class _Cancelled(Exception):
     pass
 
-from app.agent.llm import PREVIEW_TOOLS, DB_TOOLS, BROWSER_TOOLS, CLARIFY_TOOLS, TOOLS as _TOOLS
+from app.agent.llm import (PREVIEW_TOOLS, DB_TOOLS, BROWSER_TOOLS, BROWSER_SESSION_TOOLS,
+                           CLARIFY_TOOLS, TOOLS as _TOOLS)
