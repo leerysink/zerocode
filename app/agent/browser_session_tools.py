@@ -59,8 +59,17 @@ DELETE_TIMEOUT_SECONDS = 10         # 收口 DELETE 的硬上限：对话结束�
 STEP_TIMEOUT_SECONDS = 90           # 一次 step 的客户端上限：动作 8s + 断言 8s + 采集，留余量
 SHOT_TIMEOUT_SECONDS = 20           # 补一张现场图的上限，比动作短
 
-# 「IP:端口」形态：sidecar 把 host 别名换成容器可达 IP 后，自由文本里就是这一串（R-22）。
-_IP_PORT_RE = re.compile(r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}:(\d{1,5})")
+# 自由文本里出现的内部 host 字面量：`browser/app.py::_connect_url` 把 host 别名换成容器可达 IP
+# 之后，Playwright 与 httpx 的原文里就是这一串（R-22）。三种形状都要认（发现项 F-6）：
+#   ① `IP:端口` —— 最常见，重写后的 connect_url 就是这个形状；
+#   ② 光秃秃的 IPv4 —— 「connect to 192.168.65.254 failed」这类只报 host 的原因；
+#   ③ 方括号里的 IPv6（可带端口） —— `pick_connect_ip` 优先 IPv4，但容器只有 AAAA 记录时
+#      它照样返回 IPv6，而 `rewrite_url_host` 给它补的就是方括号（`http://[fdc4::254]:8241/`）。
+# **故意不认裸 IPv6**（不带方括号的 `fdc4::254`）：那条正则会把「12:34:56」这类时间戳、
+# 甚至版本号一起吞掉，而清洗只作用在 sidecar 报出的地址上，URL 里的 IPv6 恒带方括号
+# （`is_ip_literal`/`origin_url` 两侧都按这个形状处理），代价只是极少数原话里裸写的地址。
+_HOST_LITERAL = r"(?:\d{1,3}\.){3}\d{1,3}|\[[0-9a-fA-F:]{2,45}\]"
+_INTERNAL_HOST_RE = re.compile(rf"(?<![\w.])({_HOST_LITERAL})(?::(\d{{1,5}}))?")
 
 
 def _netloc(url: str) -> str:
@@ -109,6 +118,10 @@ def scrub_known_host(text, *, target_netloc: str, display_netloc: str) -> str:
     写成「参数化 target/display」的纯函数是为了让 `preview_page` 那侧也能复用同一口径；本轮不动
     它的调用点（既有行为，另有测试面，已登记给 Task 8）。
 
+    认哪几种形状（发现项 F-6，正则 `_INTERNAL_HOST_RE` 上方有选型理由）：带端口的 IPv4、
+    **不带端口的 IPv4**、带端口的 IPv6（`[fdc4::254]:8241`，容器只有 AAAA 记录时
+    `pick_connect_ip` 就会给出这种地址）、不带端口的 IPv6。端口对不上的不动——那是别的服务。
+
     边界规则（裁定 R-28，无例外）：**凡 sidecar 报告的 URL 一律清洗，凡页面自身的内容一律
     不清洗**。这条不是「删证据」——`scrub_known_host` 做的是 `target_netloc → display_netloc` 的
     **等价改写**：同一个资源、同一条 path、同一端口语义，把 `http://192.168.65.254:8241/api/orders`
@@ -128,7 +141,17 @@ def scrub_known_host(text, *, target_netloc: str, display_netloc: str) -> str:
     # 端口相同才换：dev 端口是本应用唯一确定的标识，重写掉的只有 host 那一段。
     port = _port_of(target_netloc) or _port_of(display_netloc)
     if port:
-        out = _IP_PORT_RE.sub(lambda m: display_netloc if m.group(1) == port else m.group(0), out)
+        display_host = display_netloc.rsplit(":", 1)[0] if ":" in display_netloc else display_netloc
+
+        def _swap(match: re.Match) -> str:
+            host, found = match.group(1), match.group(2)
+            if found is None:
+                # 原话里没写端口（只报了 host 的失败原因）：换 host 那一段，端口留白——
+                # 这里没有端口可对，等价改写只能做到这一层。
+                return display_host
+            return display_netloc if found == port else match.group(0)
+
+        out = _INTERNAL_HOST_RE.sub(_swap, out)
     return out
 
 
@@ -148,6 +171,28 @@ def _sidecar_text(raw, limit: int, *, target_netloc: str,
     scrubbed = scrub_known_host(raw, target_netloc=target_netloc, display_netloc=display_netloc)
     text, hits, cut = _redact(scrubbed, limit)
     return text, hits, cut
+
+
+# 兜底异常出口（`run_browser_session_tool`）拿不到局部变量：那两个 netloc 是 `_open`/`_step`
+# 在函数体里算的，异常冒泡到统一入口时早就出了作用域，而那里又不该重新 `await fetch_app`
+# （异常本身可能就来自那一步）。所以算出来就顺手记在 run_state 上——`run_state` 不是模型可见面
+# （`session_id` 也存在那儿），存内部地址不构成新出口，只是给下一次异常备好清洗参数。
+_NETLOC_PAIR_KEY = "browser_netloc_pair"
+
+
+def _remember_netlocs(ctx, target_netloc: str, display_netloc: str) -> None:
+    ctx.run_state[_NETLOC_PAIR_KEY] = (target_netloc or "", display_netloc or "")
+
+
+def _crash_reason(ctx, message: str) -> str:
+    """兜底异常出口用的清洗串（发现项 F-5）：与其它九个模型可见出口**同一串**——
+    先换内部 host、再过凭据遮断、最后按上限裁断。
+    """
+    target_netloc, display_netloc = (ctx.run_state.get(_NETLOC_PAIR_KEY) or ("", ""))
+    text, _hits, _cut = _sidecar_text(message, ERROR_MAX_CHARS,
+                                      target_netloc=target_netloc,
+                                      display_netloc=display_netloc)
+    return text
 
 
 def _steps_left(ctx) -> int:
@@ -502,6 +547,7 @@ async def _open(ctx, args: dict) -> dict:
     # 两份 netloc：sidecar 自由文本里出现的内部 host:port 一律换回展示地址（裁定 R-22）。
     display_netloc = _netloc(display_base)
     target_netloc = _netloc(target_url)
+    _remember_netlocs(ctx, target_netloc, display_netloc)
     timeout_s = _int_cfg(ctx.cfg, "agent.browser_timeout_seconds",
                          DEFAULT_OPEN_TIMEOUT_SECONDS, OPEN_TIMEOUT_MIN, OPEN_TIMEOUT_MAX)
     interactive_max = _interactive_max(ctx)
@@ -514,9 +560,14 @@ async def _open(ctx, args: dict) -> dict:
                                             expect=args.get("expect"),
                                             interactive_max=interactive_max)
     if data is None:
-        return _error(scrub_known_host(sidecar_err, target_netloc=target_netloc,
-                                       display_netloc=display_netloc),
-                      status=status, url=display_url,
+        # 发现项 F-4：这条出口此前只过裸 `scrub_known_host`，没有凭据遮断也没有裁剪——
+        # 「清洗闸有三处旁路」里最直白的一处，因为它就在 `_open` 里、离其它出口一步之遥。
+        # 拒绝原因会回显我们发出去的 URL（`validate_target` 的 detail），而 `_sidecar_text`
+        # 那串的顺序是刻意的：先换 host，再遮凭据，最后按上限裁断（裁在 URL 中间会泄半截地址）。
+        reason, _hits, _cut = _sidecar_text(sidecar_err, ERROR_MAX_CHARS,
+                                            target_netloc=target_netloc,
+                                            display_netloc=display_netloc)
+        return _error(reason, status=status, url=display_url,
                       hint=("确认 browser sidecar 已启动（本地开发运行 browser/dev-up.bat）"
                             + reopened_hint))
     if data.get("ok") is not True:
@@ -556,26 +607,50 @@ async def _open(ctx, args: dict) -> dict:
     declared_expect = bool(args.get("expect"))
     ctx.run_state["browser_open_declared_expect"] = declared_expect
     open_passed = data.get("passed")
-    ctx.run_state["browser_log"] = [{"seq": 0, "action": "open", "target": path,
-                                     # open 声明过 expect 时把真结论记进账（裁定 R-42）：改前这一条恒
-                                     # None，`_close` 的两本账因此完全看不见 open 的断言——「只在 open 上
-                                     # 声明 expect」的 run 会被说成「未声明任何断言」（真机复现见
-                                     # probe-results-2.json 的 C1_open/C5_close）；open 的断言没过时更糟，
-                                     # 那次失败连 `steps_failed` 都进不去。没声明 expect 时仍记 None：
-                                     # 不假装判过（与 `_shape_state` 给不给 `passed` 键同一个口径）。
-                                     "passed": (None if not declared_expect or open_passed is None
-                                                else bool(open_passed)),
-                                     "url": display_url,
-                                     "replaced_sessions":
-                                         int(ctx.run_state.get("browser_sessions_replaced") or 0)}]
     out = _shape_state(ctx, data, opened=True, url=display_url, status=status,
                        target_netloc=target_netloc, display_netloc=display_netloc)
+    # 写日志的顺序排在 `_shape_state` **之后**（发现项 S-1，与 `_step` 成功支同一写法）：
+    # open 那条此前只有「断言未通过」五个字的形状可用，`note` 从来没进过账，而模型看到的是
+    # 「页面文本未包含『订单列表』」——首屏没等到文案正是本功能的立项场景（规格 US-06），
+    # 收口报告与步骤卡上那一行却什么都没说。这里复用模型这一步看到的已清洗文本，不另调一次
+    # `_sidecar_text`（两处各写一遍迟早分家）。通过的那一条不写：`_shape_state` 给的是空串。
+    entry = {"seq": 0, "action": "open", "target": path,
+             # open 声明过 expect 时把真结论记进账（裁定 R-42）：改前这一条恒
+             # None，`_close` 的两本账因此完全看不见 open 的断言——「只在 open 上
+             # 声明 expect」的 run 会被说成「未声明任何断言」（真机复现见
+             # probe-results-2.json 的 C1_open/C5_close）；open 的断言没过时更糟，
+             # 那次失败连 `steps_failed` 都进不去。没声明 expect 时仍记 None：
+             # 不假装判过（与 `_shape_state` 给不给 `passed` 键同一个口径）。
+             "passed": (None if not declared_expect or open_passed is None
+                        else bool(open_passed)),
+             "url": display_url,
+             "replaced_sessions":
+                 int(ctx.run_state.get("browser_sessions_replaced") or 0)}
+    if open_passed is False:
+        entry["note"] = out.get("note") or ""
+    ctx.run_state["browser_log"] = [entry]
+    # `expect` 也要回显给模型（发现项 S-2）：后端此前不产这个键，而前端 `expectLabel` 对所有卡
+    # 一视同仁地读它，open 卡因此永远说不出「当时断言的是什么」。给了才写这个键，同
+    # `_step_echo` 的规矩——模型没声明过就不替它编一句声明。
+    if args.get("expect") is not None:
+        out["expect"] = args["expect"]
     if closed_previous:
         # 不能静默换掉：模型会以为自己还在同一个会话上，而步数账与 browser_log 都是那个 run 的。
         # 只报事实，不带旧 session_id（ADR-0037：session_id 不进任何模型可见出口）。
         out["auto_closed_previous"] = True
         out["hint"] = "上一个浏览器会话已在本次 open 前自动关闭（一个 run 只保留一个会话），旧 ref 全部作废"
-    return out
+    # 裁定 R-41③ 作废（控制器改判）：open 带 expect 而 `passed:false` 正属于 R-26 那句「这一步
+    # 没能往前推进」，就该自动附一张现场图。改判的两条理由：原裁定给的依据是事实错误（前端读
+    # `result.screenshot`，与卡的 name 判定无关，open 卡本来就能画图）；而模型此前连「显式要一张」
+    # 的逃生口都没有（schema 里没有 `screenshot`），唯一补救是花一步 `browser_step` 去要图——那会
+    # 扣步数额度，而规格 §6.3 刚声明 open 不占额度。
+    # 走的是**同一个** `_attach_shot`：不新开闸口，`screenshot: true` 那一条永远优先。
+    sid = str(ctx.run_state.get("browser_session") or "")
+    if not sid:
+        # sidecar 没回 session_id（版本错位的极端形状）：会话没绑上，这张图无处可取，
+        # 但断言结论已经拿到了，不该因为补不到图把它一起丢掉（`_capture_shot` 的同款口径）。
+        return out
+    return await _attach_shot(ctx, sid, args, data, out)
 
 
 async def _capture_shot(ctx, sid: str) -> dict | None:
@@ -598,7 +673,7 @@ async def _capture_shot(ctx, sid: str) -> dict | None:
             "width": saved["width"], "height": saved["height"], "bytes": saved["bytes"]}
 
 
-def _needs_shot(args: dict, data: dict) -> bool:
+def _needs_shot(args: dict, data: dict, *, sensitive_fill: bool = False) -> bool:
     """该不该补一张现场图（规格 §5.3 表格里带 `screenshot` 的那两行，裁定 R-26）。
 
     口径是「这一步没能往前推进」：断言未通过（`ok:true, passed:false`）与动作层面的失败
@@ -609,15 +684,25 @@ def _needs_shot(args: dict, data: dict) -> bool:
     仍不附图的是「往前推进了」的那一类（`ok:true` 且没有失败断言）：一次成功走查每步一张图
     会把 token 成本翻几倍，而模型想看现场可以显式 `screenshot: true`（这一条永远优先）。
     会话没了（`session_gone`）不到这里来：页面物理上已不存在，那次调用只能换回一句「会话已结束」。
+
+    `sensitive_fill` 是新裁定（审查者构造出台账里没有的 US-19 漏路径）：指向 `sensitive` 元素的
+    `fill` 失败时**不**自动补图。`sensitive` 判定里除 `type=password` 之外全是**按名称命中关键词**
+    的非掩码输入框（`token`/`secret`/`code`/`api_key`），那些框里的字是明文渲染的，于是同一句口令
+    会在三个出口里出现：`tool_args` 的占位符、`browser_log` 的占位符、而第三处就是这张自动补的
+    现场图——聊天里那张卡上是一张清晰的截图，还落盘在会话目录。占位符遮得再严，图一补就前功尽弃。
+    显式 `screenshot: true` 仍然给：那是模型自己的选择，不是本功能替它做的。
     """
     if args.get("screenshot"):
         return True
+    if sensitive_fill:
+        return False
     return data.get("ok") is False or data.get("passed") is False
 
 
-async def _attach_shot(ctx, sid: str, args: dict, data: dict, result: dict) -> dict:
+async def _attach_shot(ctx, sid: str, args: dict, data: dict, result: dict,
+                       *, sensitive_fill: bool = False) -> dict:
     """该补图时才补图：断言失败与动作失败各自动附一张（US-05 / 裁定 R-26），`screenshot: true` 显式要。"""
-    if not _needs_shot(args, data):
+    if not _needs_shot(args, data, sensitive_fill=sensitive_fill):
         return result
     shot = await _capture_shot(ctx, sid)
     result["screenshot"] = shot
@@ -946,11 +1031,15 @@ async def _step(ctx, args: dict) -> dict:
         return reject
     display_netloc = _netloc(info["display_base"])
     target_netloc = _netloc(f"http://{browser_target_host()}:{info['dev_port']}")
+    _remember_netlocs(ctx, target_netloc, display_netloc)
 
     # sensitive 判定用**动作之前**那份清单（`browser_refs` = 上一次返回给模型的清单）：
     # 事后按新清单查，元素可能已经跟着重渲染换过人，这一步填进去的口令就会明文落进消息历史（US-19）。
     # 同一个判定也供 loop 的参数侧遮断使用（`redact_sensitive_step_args`），两处必须一起遮。
     sensitive = is_sensitive_ref(ctx.run_state.get("browser_refs"), payload_ref)
+    # 补图也要用同一个「动作之前」的判定（新裁定，理由见 `_needs_shot`）：fill 命中 sensitive 时
+    # 这张图会把框里的明文一起拍下来，而那一支 sensitive 靠的是名称关键词、框本身不掩码。
+    sensitive_fill = sensitive and action == "fill"
     # 元素名同样取动作之前那份清单（裁定 R-32）：新快照里的令牌是这一轮现生成的，
     # 旧句柄在里面根本查不到，拿它标「这一步动的谁」只会画出空目标。
     target_name = ref_display_name(ctx.run_state.get("browser_refs"), payload_ref)
@@ -1007,7 +1096,8 @@ async def _step(ctx, args: dict) -> dict:
                               "ok": False, "error": failure["error"], "passed": None,
                               "url": (_display_url_for(info["display_base"], data["url"])
                                       if data.get("url") else _last_logged_url(ctx))})
-        return await _attach_shot(ctx, sid, args, data, failure)
+        return await _attach_shot(ctx, sid, args, data, failure,
+                                  sensitive_fill=sensitive_fill)
 
     steps_charged = bool(data.get("steps_charged", True))
     if steps_charged:
@@ -1039,7 +1129,8 @@ async def _step(ctx, args: dict) -> dict:
     if data.get("passed") is False:
         entry["note"] = result.get("note") or ""
     _append_log(ctx, entry)
-    return await _attach_shot(ctx, sid, args, data, {**result, **echo})
+    return await _attach_shot(ctx, sid, args, data, {**result, **echo},
+                              sensitive_fill=sensitive_fill)
 
 
 async def _close(ctx, _args: dict) -> dict:
@@ -1156,7 +1247,10 @@ async def run_browser_session_tool(ctx, name: str, args: dict) -> dict:
         return _error(f"未知浏览器会话工具: {name}")
     except Exception as e:  # noqa: BLE001
         logger.exception("浏览器会话工具 %s 执行异常", name)
-        return _error(f"浏览器会话工具执行异常: {e}")
+        # 发现项 F-5：这是第十个模型可见出口，此前一句 f"…{e}" 直接进返回值、不过任何闸。
+        # 异常原文里可能带着 httpx/Playwright 抄进去的内部地址，也可能带着用户填进表单的口令
+        # （某个下游库把它写进了异常消息），因此与其余九个出口走同一串清洗（`_crash_reason`）。
+        return _error(_crash_reason(ctx, f"浏览器会话工具执行异常: {e}"))
 
 
 def build_browser_session_prompt() -> str:
@@ -1175,7 +1269,10 @@ def build_browser_session_prompt() -> str:
         "- 目标应用有开场动画或首屏异步渲染时，browser_open 也带 expect：等那句文案出现再返回，"
         "别读动画中段的中间态，也别让用户为了看清首屏去关动画。",
         "- 断言不过返回 ok:true + passed:false，点不动返回 ok:false——两种形状，下一步该换 ref"
-        "还是该改断言由它决定。两者都自动附一张现场图，不必再要 screenshot。",
+        "还是该改断言由它决定。两者都自动附一张现场图，不必再要 screenshot；往 sensitive 输入框"
+        "fill 失败时不自动附图（那些框里的字是明文渲染的，一张图就把口令泄进聊天），"
+        "真要现场就显式 screenshot: true。",
+        "- browser_open 带 expect 而首屏没等到时也自动附一张首屏图；正常首屏想留档就显式要。",
         "- 每步的 console_new / page_errors_new 只含新增：前者判「这个错是不是我这一步搞出来的」，"
         "后者是未捕获异常，非空就说明这一步把页面点崩了。",
         "- dialog 非空说明页面弹了原生确认框且已按取消处理——你以为的删除可能根本没删。",

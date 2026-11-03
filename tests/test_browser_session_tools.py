@@ -119,7 +119,7 @@ async def test_session_schema_exposes_no_session_id():
     from app.agent.llm import BROWSER_SESSION_TOOLS
     props = {t["function"]["name"]: set(t["function"]["parameters"]["properties"])
              for t in BROWSER_SESSION_TOOLS}
-    assert props["browser_open"] == {"path", "expect"}
+    assert props["browser_open"] == {"path", "expect", "screenshot"}
     assert props["browser_close"] == set()
     assert "session_id" not in props["browser_step"]
     assert props["browser_step"] == {"action", "target", "value", "expect", "screenshot"}
@@ -619,21 +619,85 @@ async def test_open_expect_does_not_charge_the_step_budget(monkeypatch):
     assert stepped["steps_left"] == bst.DEFAULT_MAX_STEPS - 1
 
 
-async def test_failed_open_expect_attaches_no_scene_shot(monkeypatch):
-    """R-26 的「失败自动附图」只覆盖 step：open 不是「一步」，它的形状里没有 `steps_charged`，
-    前端步骤卡也不按 open 的返回值找图。
+def _open_shot_env(monkeypatch, *, reply, shot=None):
+    """`_sidecar_open` + `_sidecar_screenshot` 两个替身，回数与 step 那侧的 `_shot_env` 同形。"""
+    seen: list[str] = []
 
-    首屏没等到文案时页面通常已经渲染完（动画还在动），一张图说明不了「等到什么时候算完」，
-    而断言结论 `passed:false` + note 才是那条信号。真要现场，模型可以 close 后重开或下一步显式要。
-    """
-    seen = _no_shot(monkeypatch)
+    async def fake_shot(sid):
+        seen.append(sid)
+        return shot if shot is not None else (
+            {"ok": True, "screenshot_b64": _shot_b64(), "screenshot_width": 1280,
+             "screenshot_height": 800}, "")
+
     monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
-    monkeypatch.setattr(bst, "_sidecar_open", lambda url, **kw: _aget(
-        (_session_ok(passed=False, note="页面文本未包含「订单列表」"), "")))
-    out = await bst.run_browser_session_tool(Ctx(), "browser_open", {"expect": _EXPECT})
+    monkeypatch.setattr(bst, "_sidecar_open", lambda url, **kw: _aget((reply, "")))
+    monkeypatch.setattr(bst, "_sidecar_screenshot", fake_shot)
+    return seen
+
+
+async def test_failed_open_expect_attaches_a_scene_shot(monkeypatch, tmp_path):
+    """裁定 R-41③ 作废（控制器改判）：open 带 expect 而 `passed:false` 时自动附一张现场图。
+
+    改前的这条测试钉的是反方向，理由写的是「R-26 只覆盖 step、前端步骤卡不按 open 的返回值找图」。
+    那句依据是事实错误：前端读的是 `result.screenshot`，与卡叫什么名字无关，open 卡本来就能画图；
+    而 R-26 的口径是「这一步没能往前推进就附图」，「首屏没等到那句文案」正属此列——它还是本功能
+    的立项场景（US-06，自带开场动画的应用）。
+    更要紧的是逃生口：改前模型连「显式要一张」都做不到（`browser_open` 的 schema 里没有
+    `screenshot`），唯一补救是花一步 `browser_step` 去要图，而那会扣步数额度——规格 §6.3 刚声明
+    open 不占额度。走的是**同一个** `_attach_shot`，没有新开闸口。
+    """
+    monkeypatch.setenv("ZEROCODE_DATA_DIR", str(tmp_path))
+    ctx = Ctx()
+    seen = _open_shot_env(monkeypatch, reply=_session_ok(
+        passed=False, note="页面文本未包含「订单列表」"))
+    out = await bst.run_browser_session_tool(ctx, "browser_open", {"expect": _EXPECT})
     assert out["ok"] is True and out["passed"] is False
+    assert out["screenshot"]["url"].startswith("/api/browser/shots/7/")
+    assert out["screenshot"]["width"] == 1280 and out["screenshot"]["bytes"] == len(_png())
+    assert (tmp_path / "browser_shots" / "7"
+            / out["screenshot"]["url"].rsplit("/", 1)[1]).is_file()
+    assert seen == ["sid-123"]                       # 补的就是刚绑上的那个会话
+    # 补图既不占步数也不占 open 额度（与 step 那侧的同一口径）
+    from app.agent import browser_tools as bt
+    assert ctx.run_state["browser_steps_used"] == 0
+    assert out["checks_left"] == bt.DEFAULT_MAX_CHECKS - 1
+
+
+async def test_open_without_expect_attaches_no_shot(monkeypatch):
+    """反向钉：没声明 expect 的 open 仍不附图——R-41③ 作废只覆盖「这一步没往前推进」那一格。
+
+    open 每次成功都画一张的话，token 成本按会话数翻倍，而模型本来就能用 `screenshot: true`
+    显式要（下一条钉的就是这条口子）。
+    """
+    ctx = Ctx()
+    seen = _open_shot_env(monkeypatch, reply=_session_ok())
+    out = await bst.run_browser_session_tool(ctx, "browser_open", {"path": "/orders"})
+    assert out["ok"] is True and "passed" not in out
     assert "screenshot" not in out and "screenshot_note" not in out
     assert seen == []
+
+
+async def test_open_can_be_asked_explicitly_for_a_screenshot(monkeypatch, tmp_path):
+    """`browser_open` 的 `screenshot: true` 是模型自己的逃生口（审查指出改前它连这个都没有）。"""
+    monkeypatch.setenv("ZEROCODE_DATA_DIR", str(tmp_path))
+    ctx = Ctx()
+    seen = _open_shot_env(monkeypatch, reply=_session_ok())
+    out = await bst.run_browser_session_tool(
+        ctx, "browser_open", {"path": "/orders", "screenshot": True})
+    assert out["screenshot"]["height"] == 800
+    assert seen == ["sid-123"]
+    assert ctx.run_state["browser_steps_used"] == 0    # 要图不花步数额度
+
+
+async def test_open_reports_a_missing_shot_without_losing_the_verdict(monkeypatch):
+    """补图失败不许把已经拿到手的断言结论一起带走（`_capture_shot` 的既有口径，open 这一侧同形）。"""
+    ctx = Ctx()
+    seen = _open_shot_env(monkeypatch, reply=_session_ok(
+        passed=False, note="页面文本未包含「订单列表」"), shot=(None, "浏览器服务不可用"))
+    out = await bst.run_browser_session_tool(ctx, "browser_open", {"expect": _EXPECT})
+    assert out["passed"] is False and out["screenshot"] is None
+    assert "截图" in out["screenshot_note"]
+    assert seen == ["sid-123"]
 
 
 # --------------------------------------------------------------------------- 双形状契约
@@ -787,6 +851,7 @@ async def test_assertion_note_is_scrubbed_like_the_error(monkeypatch):
         return _session_ok(passed=False,
                            note="URL 不匹配：实际停在 http://192.168.65.254:8241/orders"), ""
 
+    _no_shot(monkeypatch)          # open 的断言失败现在会自动补图，本条不验截图
     monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
     monkeypatch.setattr(bst, "browser_target_host", lambda: "host.docker.internal")
     monkeypatch.setattr(bst, "_sidecar_open", fake_open)
@@ -846,6 +911,7 @@ async def test_refs_are_stored_unredacted_for_the_sensitive_check(monkeypatch):
 async def test_passed_assertion_does_not_carry_a_failure_note(monkeypatch):
     """`session_core.judge_expect` 通过时也返回一句失败措辞（Task 1 记为携带项）：
     少了「note 只在 passed 为假时给」这一句三元判断，模型会收到 passed:true + 一句不匹配说明。"""
+    _no_shot(monkeypatch)          # passed:false 那一支现在会自动补现场图，本条不验它
     monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
     note = "页面文本未包含「订单已创建」"
 
@@ -1106,7 +1172,8 @@ async def test_the_unknown_mask_never_copies_the_token_shape():
     assert listed_hits == 0 and json.loads(listed[0]["function"]["arguments"])["value"] == "alice"
     # 反向闸：后端这一侧不许再出现第二份「认句柄长相」的正则。
     # 按模块里编译过的正则逐条问一次「你能匹配上一个令牌吗」——比对着某个具体写法字符串更耐改：
-    # `_IP_PORT_RE` 那类与本判定无关的正则照旧放行，而任何形状判据一旦复制过来就当场红。
+    # `_INTERNAL_HOST_RE`（清洗内部地址用）那类与本判定无关的正则照旧放行，
+    # 而任何形状判据一旦复制过来就当场红。
     import inspect
     import re as _re
 
@@ -2123,6 +2190,81 @@ async def test_a_broken_image_does_not_become_a_step_failure(monkeypatch, tmp_pa
     assert out["ok"] is True and out["passed"] is False and out["screenshot"] is None
 
 
+async def test_failed_fill_on_a_sensitive_ref_attaches_no_shot(monkeypatch):
+    """新增裁定（US-19 的漏路径，审查者构造出台账里没有的一条）：sensitive 的 fill 失败不自动补图。
+
+    `sensitive` 判定里除 `type=password` 之外全是**按名称命中关键词**的非掩码输入框
+    （`token`/`secret`/`code`/`api_key`），那些框里的字是明文渲染的。于是同一句口令会出现在三个
+    出口：`tool_args` 的占位符、`browser_log` 的占位符、以及这张自动补的现场图——聊天里那张卡上是
+    一张清晰的截图，还落盘在会话目录。参数侧与结果侧遮得再严，图一补就前功尽弃。
+    """
+    ctx = Ctx()
+    ctx.run_state["browser_session"] = "abc"
+    ctx.run_state["browser_refs"] = [{"ref": "e2", "role": "textbox", "name": "api_key",
+                                      "sensitive": True}]
+    seen = _shot_env(monkeypatch, replies=_step_data(ok=False, error="元素不可点击或动作失败"))
+    out = await bst.run_browser_session_tool(
+        ctx, "browser_step", {"action": "fill", "target": "e2", "value": "sk-live-abcdef123456"})
+    assert out["ok"] is False
+    assert "screenshot" not in out and "screenshot_note" not in out
+    assert seen == []
+    # 只是不附图，这一步的账一点没少：扣步数、进收口报告，报告项里也没有 screenshot 这一格。
+    assert out["steps_charged"] is True
+    entry = ctx.run_state["browser_log"][-1]
+    assert entry["ok"] is False and entry["action"] == "fill" and entry["target"] == "e2"
+    assert "screenshot" not in entry
+
+
+async def test_failed_fill_on_an_ordinary_ref_still_attaches_a_shot(monkeypatch, tmp_path):
+    """反向钉：不补图只针对 sensitive 的 fill，不许顺手把 R-26 那一格缩小到整类 fill。
+
+    「点不动/填不进」的普通一步正是最需要看现场的时刻（规格 §5.3 那一行本来就带 screenshot）。
+    """
+    monkeypatch.setenv("ZEROCODE_DATA_DIR", str(tmp_path))
+    ctx = Ctx()
+    ctx.run_state["browser_session"] = "abc"
+    ctx.run_state["browser_refs"] = [{"ref": "e2", "role": "textbox", "name": "备注",
+                                      "sensitive": False}]
+    seen = _shot_env(monkeypatch, replies=_step_data(ok=False, error="元素不可点击或动作失败"))
+    out = await bst.run_browser_session_tool(
+        ctx, "browser_step", {"action": "fill", "target": "e2", "value": "普通备注"})
+    assert out["ok"] is False and out["screenshot"]["bytes"] == len(_png())
+    assert seen == ["abc"]
+
+
+async def test_explicit_screenshot_on_a_sensitive_fill_still_gives_the_shot(monkeypatch, tmp_path):
+    """显式 `screenshot: true` 永远优先：那是模型自己的选择，不是本功能替它做的。"""
+    monkeypatch.setenv("ZEROCODE_DATA_DIR", str(tmp_path))
+    ctx = Ctx()
+    ctx.run_state["browser_session"] = "abc"
+    ctx.run_state["browser_refs"] = [{"ref": "e2", "role": "textbox", "name": "token",
+                                      "sensitive": True}]
+    seen = _shot_env(monkeypatch, replies=_step_data(ok=False, error="元素不可点击或动作失败"))
+    out = await bst.run_browser_session_tool(
+        ctx, "browser_step", {"action": "fill", "target": "e2", "value": "tk-a",
+                              "screenshot": True})
+    assert out["screenshot"]["width"] == 1280
+    assert seen == ["abc"]
+
+
+async def test_failed_click_on_a_sensitive_ref_still_attaches_a_shot(monkeypatch, tmp_path):
+    """这一条只收 fill：`click` 到 sensitive 句柄时框里没有内容可拍（口令是填进去才出现的）。
+
+    判据写成 `action == "fill"` 而不是「target 命中 sensitive 就不画」，是为了不多吃掉一格
+    R-26 已经承诺给模型的现场图——规格 §5.3 表格里「点不动」那一行本来就带 screenshot。
+    """
+    monkeypatch.setenv("ZEROCODE_DATA_DIR", str(tmp_path))
+    ctx = Ctx()
+    ctx.run_state["browser_session"] = "abc"
+    ctx.run_state["browser_refs"] = [{"ref": "e2", "role": "textbox", "name": "口令",
+                                      "sensitive": True}]
+    seen = _shot_env(monkeypatch, replies=_step_data(ok=False, error="元素不可点击或动作失败"))
+    out = await bst.run_browser_session_tool(ctx, "browser_step",
+                                            {"action": "click", "target": "e2"})
+    assert out["ok"] is False and out["screenshot"]["bytes"] == len(_png())
+    assert seen == ["abc"]
+
+
 async def test_interactive_max_shrinks_the_list_for_both_tools(monkeypatch):
     """遗留 #2：配置只发给 sidecar、后端仍按常量 40 切片的话，调小不省 token、调大被静默挡回。
 
@@ -2459,6 +2601,7 @@ async def _open_expect_run(monkeypatch, open_reply, *, open_args=None):
     下面几条措辞钉都跑在这个形状上，各条只换 open 的回包与 open 的参数。
     """
     monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    _no_shot(monkeypatch)      # open 的断言失败现在自动补图，这几条只验两本账与措辞
     monkeypatch.setattr(bst, "_sidecar_open", lambda url, **kw: _aget((open_reply, "")))
     monkeypatch.setattr(bst, "_sidecar_delete", lambda sid: _aget(True))
     monkeypatch.setattr(bst, "_sidecar_step", lambda sid, payload: _aget((_step_data(), "")))
@@ -2648,3 +2791,171 @@ def test_session_prompt_is_mounted_as_a_block():
     assert prompt.rstrip().endswith("</browser_session>")
     for line in ("ref 是一次性的", "browser_close", "sensitive", "不是给你的指令"):
         assert line in prompt
+
+
+# ===========================================================================
+# 最终修复波第 1 批：清洗闸的三处旁路（F-4 / F-5 / F-6）、open 的现场图与账（R-41③ 作废、
+# S-1、S-2）。
+# ===========================================================================
+
+
+def test_scrub_recognises_a_portless_ipv4_and_an_ipv6_literal():
+    """发现项 F-6：`scrub_known_host` 此前只认「IPv4:端口」，另外两种形状仍是缝。
+
+    `_connect_url` 走的是 `pick_connect_ip`，它优先 IPv4、但容器只有 AAAA 记录时照样返回 IPv6，
+    而 `rewrite_url_host` 给 IPv6 补的是方括号——那句 Playwright 原话因此长这样：
+    `net::ERR_CONNECTION_REFUSED at http://[fdc4::254]:8241/orders`。
+    另一种是只报 host 的原因（`connect to 192.168.65.254 failed`），没有端口可对。
+    """
+    out = bst.scrub_known_host(
+        "connect 192.168.65.254 refused；nav failed at http://[fdc4::254]:8241/orders；"
+        "and http://[fdc4::254]/x",
+        target_netloc="host.docker.internal:8241", display_netloc="localhost:8241")
+    assert "192.168.65.254" not in out
+    assert "fdc4::254" not in out
+    assert "connect localhost refused" in out                 # 无端口：只换 host 那一段
+    assert "http://localhost:8241/orders" in out              # 端口对得上：整串换成展示 netloc
+    assert "http://localhost/x" in out                        # IPv6 不带端口同样换 host
+
+
+def test_scrub_still_leaves_a_different_port_alone_for_both_address_families():
+    """反向钉：端口不是本应用的 dev 端口就不动它（别的端口是别的服务，不是我们的拓扑）。"""
+    out = bst.scrub_known_host(
+        "http://192.168.65.254:9999/x 与 http://[fdc4::254]:9999/y",
+        target_netloc="host.docker.internal:8241", display_netloc="localhost:8241")
+    assert "192.168.65.254:9999" in out and "[fdc4::254]:9999" in out
+
+
+async def test_business_error_from_an_ipv6_connect_address_is_scrubbed(monkeypatch):
+    """F-6 的第二出口端到端钉一次：清洗写在 `_sidecar_text` 里，正则漏一种形状就照漏。"""
+    async def fake_open(url, **_kw):
+        return {"ok": False, "session_gone": True,
+                "error": ("Page.goto: net::ERR_CONNECTION_REFUSED at "
+                          "http://[fdc4::254]:8241/orders")}, ""
+
+    _no_shot(monkeypatch)
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    monkeypatch.setattr(bst, "browser_target_host", lambda: "host.docker.internal")
+    monkeypatch.setattr(bst, "_sidecar_open", fake_open)
+    out = await bst.run_browser_session_tool(Ctx(), "browser_open", {"path": "/orders"})
+    blob = json.dumps(out, ensure_ascii=False)
+    assert "fdc4::254" not in blob
+    assert "localhost:8241/orders" in out["error"]
+    assert "ERR_CONNECTION_REFUSED" in out["error"]
+
+
+async def test_open_transport_rejection_passes_all_three_gates(monkeypatch):
+    """发现项 F-4：`_open` 的传输/拒绝出口此前只过裸 `scrub_known_host`——没遮断、没裁剪。
+
+    它旁边那句注释写的正是「任何一个新的模型可见出口都从 `_sidecar_text` 走」，而这条就在同一个
+    函数里、离其它出口一步之遥，偏偏是裸调用。拒绝原因会回显我们发出去的整条 URL，
+    而异常/日志文本里带进一句口令是完全可能的（下游库把请求体抄进了消息）。
+    """
+    async def fake_open(url, **_kw):
+        return None, ("host 不在允许清单: http://192.168.65.254:8241/orders?pwd=hunter2x "
+                      + "内部诊断文本" * 200)
+
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    monkeypatch.setattr(bst, "browser_target_host", lambda: "host.docker.internal")
+    monkeypatch.setattr(bst, "_sidecar_open", fake_open)
+    out = await bst.run_browser_session_tool(Ctx(), "browser_open", {"path": "/orders"})
+    blob = json.dumps(out, ensure_ascii=False)
+    assert "192.168.65.254" not in blob                   # 闸一：host 清洗
+    assert "hunter2x" not in blob                         # 闸二：凭据遮断
+    assert len(out["error"]) <= bst.ERROR_MAX_CHARS + len("…（已截断）")   # 闸三：裁剪
+    assert "localhost:8241" in out["error"]               # 等价改写，原因本身还在
+
+
+async def test_the_tenth_exit_passes_the_same_gates(monkeypatch):
+    """发现项 F-5：`run_browser_session_tool` 的兜底 `_error(f"…{e}")` 是第十个模型可见出口。
+
+    前九个都写在 `browser_session_tools` 的清洗闸后面，只有这一条在统一入口里裸拼异常原文。
+    netloc 那一对由 `_open`/`_step` 记在 `run_state` 上（异常冒泡到这一层时局部变量早出了作用域），
+    所以这条测试先真跑一次 open、再让下一句炸，而不是手工把参数塞进去。
+    """
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    monkeypatch.setattr(bst, "_sidecar_open", lambda url, **kw: _aget((_session_ok(), "")))
+    ctx = Ctx()
+    assert (await bst.run_browser_session_tool(ctx, "browser_open", {}))["ok"] is True
+
+    async def boom(_ctx, _args):
+        raise RuntimeError("connect http://192.168.65.254:8241/orders failed: password=hunter2 "
+                           + "噪声" * 400)
+
+    monkeypatch.setattr(bst, "_open", boom)
+    out = await bst.run_browser_session_tool(ctx, "browser_open", {})
+    blob = json.dumps(out, ensure_ascii=False)
+    assert out["ok"] is False
+    assert "192.168.65.254" not in blob
+    assert "hunter2" not in blob
+    assert "localhost:8241" in out["error"]
+    assert len(out["error"]) <= bst.ERROR_MAX_CHARS + len("…（已截断）")
+    assert "执行异常" in out["error"]                     # 清洗不删原因
+
+
+async def test_a_crash_before_the_first_open_still_masks_and_clips(monkeypatch):
+    """还没有任何 open 时那对 netloc 无从得知：此时保证的是遮断与裁剪，不是 host 清洗。
+
+    这一条钉兜底出口的**下限**：内部地址在这一支可能留形（没有可对出的展示地址，等价改写就
+    无从谈起），但凭据一定进不了模型上下文、长度一定有界。
+    """
+    async def boom(_ctx, _args):
+        raise ValueError("bad row from http://192.168.65.254:8241 with api_key=sk-abcdefgh12345")
+
+    monkeypatch.setattr(bst, "_open", boom)
+    out = await bst.run_browser_session_tool(Ctx(), "browser_open", {})
+    assert "sk-abcdefgh12345" not in out["error"]
+    assert len(out["error"]) <= bst.ERROR_MAX_CHARS + len("…（已截断）")
+
+
+async def test_open_expect_failure_records_the_note_in_the_log(monkeypatch):
+    """发现项 S-1：open 的断言原因要写进 `browser_log`，收口报告与步骤卡都从那儿读。
+
+    改前 `_open` 写日志的键集里没有 `note`，而 `_step` 成功支在 `passed:false` 时会写。
+    后果是收口报告与卡片上 open 那一行只有「断言未通过」五个字，模型看到的却是
+    「页面文本未包含『订单列表』」——而首屏没等到文案正是本功能的立项场景（US-06）。
+    写法与 `_step` 一致：日志排在 `_shape_state` **之后**，复用模型看到的那一份已清洗文本。
+    """
+    ctx = Ctx()
+    _no_shot(monkeypatch)
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    monkeypatch.setattr(bst, "_sidecar_open", lambda url, **kw: _aget((
+        _session_ok(passed=False, note="页面文本未包含「订单列表」"), "")))
+    monkeypatch.setattr(bst, "_sidecar_delete", lambda sid: _aget(True))
+    out = await bst.run_browser_session_tool(ctx, "browser_open", {"expect": _EXPECT})
+    entry = ctx.run_state["browser_log"][0]
+    assert entry["action"] == "open" and entry["passed"] is False
+    assert entry["note"] == "页面文本未包含「订单列表」"
+    assert out["note"] == entry["note"]                   # 同一份文本，不另调一次清洗
+    closed = await bst.run_browser_session_tool(ctx, "browser_close", {})
+    assert closed["report"][0]["note"] == "页面文本未包含「订单列表」"
+    assert closed["steps_failed"] == 1
+
+
+async def test_open_with_a_passing_expect_records_no_note(monkeypatch):
+    """通过的那一条不写 `note`（与 `_step` 同口径）：`_shape_state` 给它的是空串，写进账里就是噪声。"""
+    _no_shot(monkeypatch)
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    monkeypatch.setattr(bst, "_sidecar_open",
+                        lambda url, **kw: _aget((_session_ok(passed=True, note=""), "")))
+    ctx = Ctx()
+    await bst.run_browser_session_tool(ctx, "browser_open", {"expect": _EXPECT})
+    assert "note" not in ctx.run_state["browser_log"][0]
+
+
+async def test_open_echoes_a_declared_expect(monkeypatch):
+    """发现项 S-2：`browser_open` 的返回值要带上 `expect`——前端 `expectLabel` 对所有卡一视同仁地读它。
+
+    后端不产这个键，open 卡因此永远说不出「当时断言的是什么」，用户只看到「断言未通过」。
+    规矩与 step 相同：**给了才写**，没声明过就不替模型编一句声明。
+    """
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    monkeypatch.setattr(bst, "_sidecar_open",
+                        lambda url, **kw: _aget((_session_ok(passed=True, note=""), "")))
+    out = await bst.run_browser_session_tool(Ctx(), "browser_open",
+                                             {"expect": _EXPECT, "path": "/orders"})
+    assert out["expect"] == _EXPECT
+
+    monkeypatch.setattr(bst, "_sidecar_open", lambda url, **kw: _aget((_session_ok(), "")))
+    plain = await bst.run_browser_session_tool(Ctx(), "browser_open", {"path": "/orders"})
+    assert "expect" not in plain

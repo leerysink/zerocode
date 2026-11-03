@@ -185,7 +185,9 @@ BROWSER_SESSION_TOOLS = [
                         "可交互元素清单（ref 只在最近一次返回内有效）；expect 给了就等首屏满足再返回"),
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string", "description": "同源相对路径，默认 /"},
-            "expect": BROWSER_EXPECT_SCHEMA},
+            "expect": BROWSER_EXPECT_SCHEMA,
+            "screenshot": {"type": "boolean",
+                           "description": "是否附首屏截图，默认 false；expect 未通过时自动附一张"}},
             "required": []}}},
     {"type": "function", "function": {
         "name": "browser_step",
