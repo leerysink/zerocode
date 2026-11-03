@@ -8,6 +8,11 @@
 //   · `ok === false` → 「点不动」（动作层失败），另有 `error`，`passed` 恒 null。
 //   · `ok === true && passed === false` → 「走了但结果不对」（业务断言没过），另有 `note`。
 //   · `passed` 是 `null | bool`：没给 expect 也是 null，不假装判过。
+// 两种例外形状（第 2 批补的分支，都在上面那两个判据之外）：
+//   · 被中断：`{"cancelled": true}`（`app/agent/loop.py` 派发被打断时写的那一份），无 ok/passed
+//     → 走「已停止等待」的中性态，与 `PreviewCard` 同一口径；绝不许落到「这一步走完了」。
+//   · 本地拒绝：后端四条什么都没做成的出口只有 `ok:false` + `error` + `steps_charged:false`，
+//     无 `action`/`status` → 走「这一步没执行 / 未执行」，绝不许说成「点不动」。
 // 这两件事在本项目里从头到尾都是分开的账（`steps_failed` 只数后者、`steps_action_failed` 只数前者），
 // 所以卡片上既不同色也不同文案——糊成一个红就等于把这条不变量在最后一米抹掉。
 // 两种失败形状都可能带 `screenshot`（裁定 R-26），存在就有 url / width / height / bytes。
@@ -51,10 +56,27 @@ const name = computed(() => props.msg.name ?? props.msg.tool_name ?? 'browser_st
 const actionFailed = computed(() => result.value?.ok === false)
 const expectFailed = computed(() => result.value?.ok === true && result.value?.passed === false)
 const expectPassed = computed(() => result.value?.ok === true && result.value?.passed === true)
+// 后端那四条「什么都没做成」的本地拒绝（发现项 F-3）：还没有会话 / 本 run 步数已用完 /
+// navigate 的 path 非法 / 非 navigate 少了 target。它们排在 `_sidecar_step` 之前（裁定 R-24：
+// 被拒绝的调用不许留下副作用），形状只有 `ok:false` + `error` + `steps_charged:false`，
+// 既无 `status` 也无 `action`/`target`。真打到 sidecar 那一侧的失败（含传输失败、会话已结束）
+// 都带 `_step_echo` 那份自述，`action` 必在场——所以「没扣步数且没有自述」就是「这一步没执行」。
+// 缺这一支的后果：US-13 那句「本 run 步数已用完」在用户看的那张卡上被冠以一句它没做过的事
+// （「这一步点不动」+ 徽标「动作失败」），而 `error` 原文就在同一张卡正文里，两张嘴说反话。
+const notExecuted = computed(() => {
+  const r = result.value
+  return !!r && r.ok === false && r.steps_charged === false && !r.action
+})
 
+// 被中断的那一次（发现项 F-1）：`app/agent/loop.py` 派发被打断时写回的是裸 `{"cancelled": true}`
+// ——没有 ok、没有 passed、也没有 error，这张卡此前的每一档判据都盯着 ok/passed 的取值，
+// 于是它一路落到最后的 `return '这一步走完了'`，被画成**绿色成功态**：用户看到「这一步走完了」，
+// 实际是「这一步根本没跑完」。下面两支照 `PreviewCard.vue` 的做法与文案口径写（'muted' +
+// 「已停止等待」），不另造说法——两张卡对同一件事的说法必须一致，测试直接比那两个字面量。
 const tone = computed(() => {
   const r = result.value
   if (!r) return 'info'
+  if (r.cancelled) return 'muted'
   if (r.ok === false) return r.status && r.status !== 'running' ? 'muted' : 'error'
   if (r.passed === false) return 'warn'
   if (name.value === 'browser_close') {
@@ -67,10 +89,12 @@ const tone = computed(() => {
 const title = computed(() => {
   const r = result.value
   if (!r) return RUNNING_TITLE[name.value] || '正在操作浏览器…'
+  if (r.cancelled) return '已停止等待'
   if (name.value === 'browser_close') return '本次走查收口'
   if (r.ok === false) {
     if (r.session_gone) return '浏览器会话已结束'
     if (r.status && r.status !== 'running') return '预览未就绪'
+    if (notExecuted.value) return '这一步没执行'
     return name.value === 'browser_open' ? '浏览器会话没打开' : '这一步点不动'
   }
   if (r.passed === false) return '走通了，但断言没过'
@@ -80,10 +104,16 @@ const title = computed(() => {
 
 // 徽标：两种失败各一个说法与一个颜色（`is-action` 红 / `is-expect` 琥珀），
 // 共用 `data-test="badge-fail"` 让「这一步有没有坏」一次问清。
+// 「没执行」那一支仍归 `is-action` 红（它确实是一次失败的工具调用，只是失败在发起之前），
+// 但措辞不能替它编造「点不动」这个动作层的事实。
+// 中断态不需要自己的分支：`{"cancelled": true}` 既不是 `ok:false` 也不是 `passed:false`，
+// 这里本来就没有一支会点亮它（变异自查 M7 验过：删掉一个显式的 cancelled 短路，全组照绿）。
 const badge = computed(() => {
   const r = result.value
   if (!r) return null
-  if (r.ok === false) return { cls: 'is-action', text: '动作失败' }
+  if (r.ok === false) {
+    return { cls: 'is-action', text: notExecuted.value ? '未执行' : '动作失败' }
+  }
   if (r.passed === false) return { cls: 'is-expect', text: '断言没过' }
   if (name.value === 'browser_close' && closeActionFailed.value) {
     return { cls: 'is-action', text: `点不动 ${closeActionFailed.value} 步` }

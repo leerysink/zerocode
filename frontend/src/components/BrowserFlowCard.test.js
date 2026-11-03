@@ -435,4 +435,83 @@ describe('BrowserFlowCard', () => {
     expect(w.text()).toContain('预览未运行：先用 preview_restart 启动')
     expect(w.find('.zc-page-link').exists()).toBe(false)   // 失败时不给一个打得开的链接
   })
+
+  it('被中断那一次（{"cancelled": true}）画成中性「已停止等待」，不许是绿色成功态（F-1）', () => {
+    // `app/agent/loop.py` 在派发被打断时写回的就是这一份裸形状：没有 ok、没有 passed、没有 error。
+    // 改前它一路落到最后的 `return '这一步走完了'`，用户看到的是「这一步走完了」的绿色卡，
+    // 实际发生的是「这一步根本没跑完」——本功能用户可见面上最贵的一处假话。
+    for (const toolName of ['browser_step', 'browser_open', 'browser_close']) {
+      const w = mountCard({ name: toolName, result: { cancelled: true } })
+      expect(w.find('.zc-page').classes()).toContain('is-muted')
+      expect(w.find('.zc-page').classes()).not.toContain('is-ok')
+      expect(w.text()).toContain('已停止等待')
+      expect(w.text()).not.toContain('这一步走完了')
+      expect(w.text()).not.toContain('本次走查收口')
+      expect(w.find('[data-test="badge-fail"]').exists()).toBe(false)
+    }
+  })
+
+  it('中断态的措辞与 PreviewCard 同源，不各写一套（F-1 的「别自创」）', () => {
+    // 两张卡对同一件事（同一份 `{"cancelled": true}`）的说法必须一致。DOM 上比不出「谁抄了谁」，
+    // 所以直接断两份源码里那句文案逐字相同：任何一侧改口，这一条就红。
+    const read = (f) => readFileSync(fileURLToPath(new NodeURL(f, import.meta.url)), 'utf8')
+    const flow = read('./BrowserFlowCard.vue')
+    const preview = read('./PreviewCard.vue')
+    expect(flow.length).toBeGreaterThan(0)
+    expect(preview.length).toBeGreaterThan(0)
+    const cancelledTitle = (src) => (src.match(/r\.cancelled\) return '([^']+)'/) || [])[1] || ''
+    expect(cancelledTitle(flow)).not.toBe('')
+    expect(cancelledTitle(flow)).toBe(cancelledTitle(preview))
+    expect(flow).toContain("if (r.cancelled) return 'muted'")
+    expect(preview).toContain("if (r.cancelled) return 'muted'")
+  })
+
+  it('四条本地拒绝说「这一步没执行」，不说「这一步点不动」（F-3）', () => {
+    // 后端那四条（无会话 / 步数用尽 / navigate path 非法 / 缺 target）排在 `_sidecar_step` 之前，
+    // 连一次动作都没发起，形状是 `steps_charged:false` 且没有 `action`。
+    // US-13「本 run 步数已用完」被冠以「这一步点不动」+ 徽标「动作失败」，就是这张卡在说假话。
+    const rejected = [
+      { ok: false, error: '还没有浏览器会话，先 browser_open', steps_charged: false },
+      { ok: false, error: '本 run 步数已用完，请 browser_close 收口', steps_left: 0,
+        steps_charged: false },
+      { ok: false, error: 'path 必须是同源相对路径（以 / 开头）', steps_left: 11,
+        steps_charged: false },
+      { ok: false, error: 'click 需要 target：上一次清单里的 ref', steps_left: 11,
+        steps_charged: false },
+    ]
+    for (const result of rejected) {
+      const w = mountCard({ name: 'browser_step', result })
+      expect(w.text()).toContain('这一步没执行')
+      expect(w.text()).not.toContain('这一步点不动')
+      expect(w.find('[data-test="badge-fail"]').text()).toBe('未执行')
+      expect(w.text()).toContain(result.error)             // 原因原文仍然在场
+      expect(w.text()).toContain('这一步没有扣步数额度')
+    }
+  })
+
+  it('判据是「有没有发起过动作」：带 action 自述的失败仍说点不动，session_gone 仍排第一（F-3）', () => {
+    // 反向钉：把 `notExecuted` 写成只看 `steps_charged === false` 的话，这两条都会退回「没执行」——
+    // 前者是真打到 sidecar 的动作层失败（该说点不动），后者是会话已结束（该说会话已结束），
+    // 传输失败那条也带 `_step_echo`，同样不在本地拒绝那一档。
+    const stuck = mountCard({
+      name: 'browser_step',
+      result: { ok: false, error: '元素不可点击或动作失败: intercepts pointer events', action: 'click',
+                target: 'r7kqmbt', steps_charged: true },
+    })
+    expect(stuck.text()).toContain('这一步点不动')
+    expect(stuck.find('[data-test="badge-fail"]').text()).toBe('动作失败')
+    const gone = mountCard({
+      name: 'browser_step',
+      result: { ok: false, error: '浏览器会话已结束，请重新 browser_open', session_gone: true,
+                action: 'click', target: 'r7kqmbt', steps_charged: false },
+    })
+    expect(gone.text()).toContain('浏览器会话已结束')
+    expect(gone.text()).not.toContain('这一步没执行')
+    const transport = mountCard({
+      name: 'browser_step',
+      result: { ok: false, error: '浏览器服务不可用', action: 'click', target: 'r7kqmbt',
+                steps_charged: false },
+    })
+    expect(transport.text()).toContain('这一步点不动')
+  })
 })
