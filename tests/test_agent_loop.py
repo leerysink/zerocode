@@ -939,7 +939,9 @@ async def test_two_steps_in_one_round_mask_a_ref_that_was_plain_at_round_start(t
 
     修法不是去猜那份中途清单长什么样（落库行写在派发之前，天生写不出来），而是**位次从严**：
     只有位次 1 那条的轮初清单是权威的——本条消息在这一步之前没有别的**浏览器调用**改写过页面
-    （改写者含 `_open`，裁定 R-36）；第 2 条及以后一律按 sensitive 处理。
+    （改写者含 `_open`，裁定 R-36；而「排在前面那条」按 `function.name` 数、不看它的 args 能否
+    解析，裁定 R-38——见下面 `test_an_open_with_empty_arguments_in_one_round_holds_the_ordinal`
+    那条同族测试）；第 2 条及以后一律按 sensitive 处理。
     这里同样钉「两侧对同一个 value 给同一个结论」，并顺手钉住第 ① 步那条 click 不被改坏。
     """
     from app.agent import browser_session_tools as bst
