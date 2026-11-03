@@ -22,6 +22,12 @@ STEP_TIMEOUT_MS_DEFAULT = 3000
 STEP_TIMEOUT_MS_MAX = 8000
 SETTLE_MS_MAX = 5000
 ACTIONS = ("click", "fill", "press", "select", "scroll_into_view", "navigate")
+# 一次 open 的最坏预算（秒）：导航超时上限（`app.TIMEOUT_MS_MAX` 120000ms 换算成 120s）再套上
+# `asyncio.wait_for` 的宽限（`app.SIDECAR_WAIT_GRACE_SECONDS` 5s）。`sweep_expired` 给 `opening`
+# 会话的容忍就按这个数放大。两个常量各自的定义处在 app.py，这里按字面量写死是因为本模块不能反向
+# import app（app 在模块期就 import 本文件，反向 import 会成环）；有一条测试把这三个数钉在一起，
+# 改任何一处都会红，不会再出现「app 那边把宽限调到 30s、这里还在按 125s 判」的静默漂移。
+OPEN_BUDGET_SECONDS = 125
 
 
 @dataclass
@@ -50,6 +56,7 @@ class Session:
     # （timeout_ms 上限 120000，外面还套了 wait_for 的 +5s 宽限 = 125s > TTL 120s，巡检每 10s
     # 一跳必然落在中间）。让它算「空闲」的后果是在 goto 还没返回时把 context 关掉，最终报出去
     # 的「页面打开失败」就成了失真文案——真相是被自家巡检杀的。
+    # 放宽不是豁免：超出 `OPEN_BUDGET_SECONDS` 的 `opening` 会话照旧回收（裁定 R-43）。
     opening: bool = False
 
 
@@ -95,13 +102,22 @@ async def drop(session_id: str) -> bool:
 async def sweep_expired(now: float | None = None, ttl_seconds: int | None = None) -> list[str]:
     """回收空闲超阈值的 session，返回被回收的 id。由 app 的后台巡检每 10s 调一次。
 
-    `opening` 的会话不算空闲，也不参与回收：它的 `last_used` 本来就不反映活跃度（见字段注释），
-    而打开路径自己带超时与 `drop`，不会靠巡检兜底。
+    `opening` 的会话**阈值放大**而不是整条跳过巡检（裁定 R-43）。原先这里写的是「打开路径自己带
+    超时与 `drop`，不会靠巡检兜底」——那句只在正常协程里成立：
+    `app.open_session` 的 `finally` 负责清 `opening`，而一个真卡死的 Playwright 调用对
+    `CancelledError` 不敏感时 `finally` 永不执行，那个标记就永远留在那儿，这条出口于是再没有
+    任何回收路径。后果是整功能级 outage：`max_sessions` 默认 2，两次 wedge 之后 sidecar 永久
+    回「浏览器服务已满」，直到人工重启容器；后端 `close_browser_session` 只对**已绑定**的 sid 发
+    DELETE，而 wedge 发生在绑定之前，所以连自愈的入口都没有。
+    放宽的方向也要保住：一次 open 的最坏预算（`OPEN_BUDGET_SECONDS`）本来就比 TTL 长，
+    在它之内仍然算「在打开、不算空闲」——否则就是拿巡检去杀一个正在等响应的页面，
+    报出去的原因还会失真成「页面打开失败」（见 `Session.opening` 的字段注释）。
     """
     moment = time.monotonic() if now is None else now
     ttl = session_ttl() if ttl_seconds is None else ttl_seconds
     gone = [sid for sid, s in SESSIONS.items()
-            if not s.opening and expired(s.last_used, moment, ttl)]
+            if expired(s.last_used, moment,
+                       ttl + OPEN_BUDGET_SECONDS if s.opening else ttl)]
     for sid in gone:
         await drop(sid)
     return gone

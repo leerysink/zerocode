@@ -33,6 +33,11 @@ DEFAULT_WAIT_MS = 1200
 WAIT_MS_MAX = 5000
 DEFAULT_TIMEOUT_MS = 45000
 TIMEOUT_MS_MAX = 120000
+# `asyncio.wait_for` 套在浏览器调用外面的宽限：让内层自己先给出原因（导航超时那句比
+# 「超时」更可读），只有内层连原因都吐不出来时才由这里兜底。
+# 这个数与 `TIMEOUT_MS_MAX` 之和就是 `sessions.OPEN_BUDGET_SECONDS`——巡检对 `opening` 会话的
+# 容忍长度，改这里必须一起改那边（有测试钉住三者的关系）。
+SIDECAR_WAIT_GRACE_SECONDS = 5
 # 视口与截图尺寸共用一个来源：`collect_page_state` 回传的宽高必须就是这次截图的宽高，
 # 两处各写一遍 1280/800 的话，前端按宽高做坐标换算迟早和图对不上。
 VIEWPORT_WIDTH = 1280
@@ -190,7 +195,7 @@ async def inspect(req: InspectRequest):
     async with _sem:
         try:
             return await asyncio.wait_for(_inspect(url, wait_ms, timeout_ms),
-                                          timeout=timeout_ms / 1000 + 5)
+                                          timeout=timeout_ms / 1000 + SIDECAR_WAIT_GRACE_SECONDS)
         except asyncio.TimeoutError:
             return {"ok": False, "timed_out": True, "error": "页面检查超时"}
         except Exception as e:  # noqa: BLE001 - 任何浏览器异常都必须是可读结果
@@ -250,7 +255,13 @@ class Collectors:
         self.dialog: dict | None = None
 
     def snapshot(self) -> dict:
-        """session 路径每步取一次的全量视图；`/inspect` 一次性检查直接读字段，不走这里。"""
+        """一次性取回四项收集的当前全量视图。
+
+        今天没有生产调用点，别再写成「session 路径每步取一次」：会话路径读的是**裸字段**
+        （`collect_page_state` 直接取 `console`/`failed`/`page_errors`，增量由
+        `sessions.take_new_items` 算），`/inspect` 也直接读字段。留着它是因为它是「这个收集器
+        此刻攒了什么」的完整视图，形状与 step 响应的全量分支一致，测试按它验收集器本身。
+        """
         return {"console": list(self.console), "page_errors": list(self.page_errors),
                 "failed": list(self.failed), "dialog": self.dialog}
 
@@ -393,7 +404,11 @@ def _ms(started: float) -> int:
 # ---------------------------------------------------------------------------
 
 
-# 三种响应形状，Task 4 的后端要按 status_code 分支读（读串了会拿到空错误串）：
+# 三种响应形状，Task 4 的后端要按 status_code 分支读（读串了会拿到空错误串）。
+# **这一份契约属于 session 端点的整个调用面**，不是只属于 `POST /sessions`：`/step` 同样吃
+# 422（body 形状不合法时 pydantic 在校验期就拒，端点里的业务分支根本还没跑起来），
+# `/sessions/{sid}/screenshot` 与 DELETE 也走同一套 HTTPException 外壳。后端读法见
+# `app/agent/browser_session_tools.py::_reject_reason`。
 #   400 / 409 / 503 → {"detail": str}     —— 拒绝，走 HTTPException 的固定外壳，没有 ok/error
 #   422             → {"detail": [dict]}  —— 请求体形状不合法（pydantic 校验失败），
 #                                          detail 是**列表**不是字符串，和上面两种别当同一种解析
@@ -413,13 +428,23 @@ async def open_session(req: OpenRequest):
         raise HTTPException(409, SESSION_FULL_MESSAGE)
     timeout_ms = _clamp(req.timeout_ms, DEFAULT_TIMEOUT_MS, 10000, TIMEOUT_MS_MAX)
     connect_url = await _connect_url(url)
-    context = await _browser.new_context(
-        viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
-        device_scale_factor=1,
-        locale="zh-CN",
-    )
-    page = await context.new_page()
-    collectors = await attach_listeners(page, connect_url)
+    # 建 context → 开页 → 挂监听这三步必须在同一个 try 里（裁定 R-44）：后两步抛异常时那个
+    # context 既没进 `SESSIONS` 也没被关——`_abandon` 原本只挂在第二道 `can_open` 那一支，而巡检
+    # 永远看不见不在注册表里的东西。默认上限 2、mem_limit 1g，两次就攒满且不随 TTL 消失。
+    # 失败一律回带原因的正常结果，不把它升级成给后端的 500（与下面 open 主体的口径一致）。
+    context = None
+    try:
+        context = await _browser.new_context(
+            viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
+            device_scale_factor=1,
+            locale="zh-CN",
+        )
+        page = await context.new_page()
+        collectors = await attach_listeners(page, connect_url)
+    except Exception as e:  # noqa: BLE001
+        if context is not None:
+            await _abandon(context)
+        return {"ok": False, "error": f"页面打开失败: {_short(e)}", "session_gone": True}
     s = Session(session_id=new_session_id(), context=context, page=page,
                 origin=origin_url(connect_url), collectors=collectors)
     # 上限的二次判定与登记之间没有任何 await：单线程事件循环里这一对是原子的。缺了它，
@@ -433,7 +458,7 @@ async def open_session(req: OpenRequest):
     s.opening = True
     try:
         return await asyncio.wait_for(_open_step(s, connect_url, req, timeout_ms),
-                                      timeout=timeout_ms / 1000 + 5)
+                                      timeout=timeout_ms / 1000 + SIDECAR_WAIT_GRACE_SECONDS)
     except asyncio.TimeoutError:
         await drop(s.session_id)
         return {"ok": False, "error": "页面打开超时", "timed_out": True, "session_gone": True}
@@ -443,6 +468,8 @@ async def open_session(req: OpenRequest):
     finally:
         # 清标记要走 finally 覆盖每一条出口（正常返回 / 超时 / 异常 / 被 wait_for cancel）：
         # 漏一次这个会话就永远不进巡检，注册表里的 context 能一直占到进程退出——比「早杀一步」糟。
+        # 但 finally 只是**通常情况**：内层协程对 CancelledError 不敏感时（真卡死的 Playwright
+        # 调用）这几行永远跑不到，兜底在 `sessions.sweep_expired` 那条超时保险里（裁定 R-43）。
         s.opening = False
         # 打开本身就能耗掉一整个 TTL，所以收尾时把空闲时钟拨回现在：刚打开完的会话不该在
         # 下一步动作时就撞上「空闲 120s」，那才是这条不变式要保护的场景。
@@ -528,8 +555,27 @@ def _step_state(s: Session, snap: dict) -> dict:
 
 
 async def _rescan(s: Session, limit: int, started: float) -> dict:
-    """只重采清单、不执行动作——ref 失效时当场把最新清单附在错误里（US-09，省一次往返）。"""
+    """重采一次快照——ref 失效时当场把最新状态附在错误里（US-09，省一次往返）。
+
+    它交出去的不止清单：裁定 R-29 之后 `_action_failure` 把这份快照整份交给 `_step_state`，
+    进模型上下文的因此是 title / text / interactive / url 全套。写「只重采清单」的那版注释
+    落后于那次改动，现在按实际行为说。
+    """
     return await snapshot_state(s, limit, started=started)
+
+
+def _consume_new_items(s: Session) -> None:
+    """把本步产生的增量**丢掉并记账**（裁定 R-45，发现项 F-7）。
+
+    本模块有三条不经过 `_step_state` 的出口都不打算回状态，其中两条走这里：动作名不认识、
+    navigate 的 path 形状非法。第三条（会话已经不在了）没有账可消费——收集器与三份 seen 集合
+    都跟着那个 Session 一起没了，「下一步」在那个会话上根本不存在。
+    可页面在这期间照样可能报错（上一异步任务正好落地），而那批错误如果不在这里被消费掉，
+    就会活到下一步、被 `take_new_items` 当成「本步新增」报出去——模型于是把上一步的错记到
+    下一步头上，US-04 那个「这个错是不是我这一步搞出来的」的核心信号正好毁在这儿。
+    宁可这一步看不见（这一步本来就没什么可看的），也不能让下一步归因错位。
+    """
+    take_new_items(s)
 
 
 async def _after_action(s: Session, req: StepRequest, limit: int, timeout_ms: int,
@@ -583,6 +629,9 @@ async def _do_navigate(s: Session, req: StepRequest, limit: int, timeout_ms: int
     url = navigation_url(s.origin, req.path)
     if url is None:
         charge(s)
+        # 这一步没导航成，但增量账照样要消费掉：不消费就是把此刻落在页面上的错误
+        # 留给下一步去认领（裁定 R-45 / F-7）。
+        _consume_new_items(s)
         return {"ok": False, "error": "path 必须是同源相对路径（以 / 开头）",
                 "dialog": take_dialog(s), "steps_charged": True}
     timed_out = False
@@ -606,10 +655,15 @@ async def step(sid: str, req: StepRequest):
     s = SESSIONS.get(sid)
     if s is None:
         # 会话没了不扣步数（US-12）：Agent 什么也没做成，扣账只会让它更早撞上限。
+        # 这一条没有增量可消费：收集器与三份 seen 集合都跟着那个 Session 一起没了，
+        # 「下一步」在那个会话上根本不存在（裁定 R-45 管的是另外两条还活着会话的出口）。
         return {"ok": False, "error": SESSION_GONE_MESSAGE, "session_gone": True,
                 "steps_charged": False}
     touch(s)
     if req.action not in ACTIONS:
+        # 未知动作同样不扣步数，但增量账要在这里消费掉：此刻页面上刚落地的错误如果不记账，
+        # 就会在下一步被当成「本步新增」报出去（裁定 R-45 / F-7）。
+        _consume_new_items(s)
         return {"ok": False, "error": f"未知动作: {req.action or '（空）'}", "steps_charged": False}
     limit = _interactive_limit(req.interactive_max)
     timeout_ms = _clamp(req.timeout_ms, STEP_TIMEOUT_MS_DEFAULT, 500, STEP_TIMEOUT_MS_MAX)

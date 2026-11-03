@@ -1308,3 +1308,129 @@ async def test_open_is_not_swept_away_while_the_page_is_still_loading(client):
     assert sessions.SESSIONS[sid].opening is False
     assert await sessions.sweep_expired(
         now=time.monotonic() + sessions.session_ttl() + 1) == [sid]
+
+
+# ---------------------------------------------------------------------------
+# 最终修复波第 1 批：两处不可回收的槽位泄漏（1a / 1b）与「不消费增量账」的三条出口（F-7）。
+# ---------------------------------------------------------------------------
+
+
+async def test_a_wedged_open_is_swept_once_the_open_budget_is_spent():
+    """裁定 R-43（发现项 1a）：`opening` 不是豁免，超过一次 open 的最坏预算后照旧回收。
+
+    改前的说法是「打开路径自己带超时与 `drop`，不会靠巡检兜底」——那句只在正常协程里成立：
+    内层协程对 `CancelledError` 不敏感时（真卡死的 Playwright 调用）`open_session` 的 `finally`
+    永远跑不到，`opening` 恒 True，这个会话就**再也不进巡检**。后果是整功能级 outage：
+    `max_sessions` 默认 2，两次 wedge 之后 sidecar 永久回「浏览器服务已满」直到人工重启容器，
+    而 `wedge` 发生在后端绑定 sid 之前，`close_browser_session` 连可 DELETE 的对象都没有。
+    """
+    s = _put("s1", opening=True)
+    budget = sessions.session_ttl() + sessions.OPEN_BUDGET_SECONDS
+    # 预算之内：一次 open 的最坏情况本来就比 TTL 长，此刻关掉就是把正在等响应的页面杀了，
+    # 报出去的原因还会失真成「页面打开失败」（既有那条 open 中途巡检的测试钉的是同一件事）。
+    s.last_used = time.monotonic() - (budget - 30)
+    assert await sessions.sweep_expired() == []
+    assert "s1" in sessions.SESSIONS
+    # 预算之外：这就是 wedge，巡检是唯一的兜底。
+    s.last_used = time.monotonic() - (budget + 1)
+    assert await sessions.sweep_expired() == ["s1"]
+    assert s.context.closed is True
+    assert sessions.SESSIONS == {}
+
+
+def test_the_open_budget_is_the_sidecar_timeout_ceiling_plus_the_wait_grace():
+    """`OPEN_BUDGET_SECONDS` 与 app 那两个数必须同值：这里是跨模块的第二个字面量，只能靠测试钉。
+
+    漂开的方向很具体：app 那边把 `wait_for` 的宽限调到 30s，这边还按 125s 判——巡检就会在
+    一次合法但慢的 open 中间把 context 关掉，症状正是那条被杀掉的会话报「页面打开失败」。
+    """
+    assert sessions.OPEN_BUDGET_SECONDS == (_sidecar.TIMEOUT_MS_MAX // 1000
+                                            + _sidecar.SIDECAR_WAIT_GRACE_SECONDS)
+
+
+async def test_open_closes_the_context_when_the_page_cannot_be_created(client, monkeypatch):
+    """发现项 1b：`new_page` 抛异常时那个 context 既没进注册表也没被关。
+
+    改前三步（new_context → new_page → attach_listeners）没有 try 包着，后两者失败就留下一个
+    「不在 `SESSIONS` 里、因此巡检永远看不见」的活 context。默认上限 2、mem_limit 1g，
+    攒两次就把整个服务填满，而且同样没有任何自愈路径（后端连 sid 都没有）。
+    """
+    import browser.app as app_mod
+
+    made: list = []
+
+    class NoPageContext(FakeContext):
+        async def new_page(self):
+            raise RuntimeError("Failed to create a new page")
+
+    async def fake_new_context(**_kw):
+        context = NoPageContext()
+        made.append(context)
+        return context
+
+    monkeypatch.setattr(app_mod._browser, "new_context", fake_new_context)
+    body = client.post("/sessions", json={"url": OPEN_URL}).json()
+    assert body["ok"] is False and body["session_gone"] is True
+    assert "Failed to create a new page" in body["error"]
+    assert made and made[0].closed is True      # 泄漏的那一步：context 被关了
+    assert sessions.SESSIONS == {}              # 也确实没留在注册表里
+
+
+async def test_a_failing_new_context_is_a_readable_result_not_a_500(client, monkeypatch):
+    """三步都在 try 里（含 `new_context` 本身）：Chromium 拒绝建 context 也要回带原因的正常结果。"""
+    import browser.app as app_mod
+
+    async def boom(**_kw):
+        raise RuntimeError("Context creation failed")
+
+    monkeypatch.setattr(app_mod._browser, "new_context", boom)
+    r = client.post("/sessions", json={"url": OPEN_URL})
+    assert r.status_code == 200
+    assert r.json()["ok"] is False and "Context creation failed" in r.json()["error"]
+    assert sessions.SESSIONS == {}
+
+
+def test_an_unaccounted_step_does_not_leak_its_errors_into_the_next(client):
+    """发现项 F-7（裁定 R-45）：未知动作那条出口也要消费增量账。
+
+    那三条不经过 `_step_state` 的出口本来就不回状态，但页面上的错误如果不在这里被记掉，
+    就会活到下一步、被当成「本步新增」报出来——模型于是把上一步的错记到下一步头上，
+    US-04 那个「这个错是不是我这一步搞出来的」的核心信号正好毁在这儿。
+    """
+    sid = _opened(client)
+    s = sessions.SESSIONS[sid]
+    # 上一段异步任务在这一步之后才落地：真机上就是 goto 期间排队的 setTimeout 报错。
+    s.collectors.console.append({"level": "error", "text": "动画收尾时报的错"})
+    body = _step(client, sid, action="nope").json()
+    assert body["ok"] is False and "未知动作" in body["error"]
+    assert "console_new" not in body            # 这条出口本来就不回增量形状
+    nxt = _step(client, sid, action="click", ref="rd2k7qx").json()
+    assert nxt["ok"] is True
+    assert nxt["console_new"] == []             # 本步的错不许出现在下一步的 *_new 里
+
+
+def test_a_rejected_navigation_consumes_the_incremental_ledger(client):
+    """同一族的第二条出口（navigate 的 path 形状非法）：它扣了步数却不回状态，账照样要记掉。"""
+    sid = _opened(client)
+    s = sessions.SESSIONS[sid]
+    s.collectors.page_errors.append("setTimeout 里炸的")
+    s.collectors.failed.append({"method": "GET", "url": "http://other.example/x", "status": 500,
+                                "type": "fetch"})
+    body = _step(client, sid, action="navigate", path="http://other.example/x").json()
+    assert body["ok"] is False and body["steps_charged"] is True
+    assert "page_errors_new" not in body
+    nxt = _step(client, sid, action="click", ref="rd2k7qx").json()
+    assert nxt["page_errors_new"] == [] and nxt["failed_requests_new"] == []
+
+
+def test_a_gone_session_has_no_ledger_to_consume(client):
+    """第三条出口（会话已经没了）无需消费：收集器与三份 seen 集合都跟着那个 Session 一起没了。
+
+    钉住它是为了「三条都处理过」这件事本身可查——将来若有人给这条分支补一份状态形状，
+    这里就是他必须一起改的地方。
+    """
+    sid = _opened(client)
+    assert _step(client, "not-a-session", action="click", ref="rd2k7qx").json()[
+        "session_gone"] is True
+    body = _step(client, sid, action="click", ref="rd2k7qx").json()
+    assert body["ok"] is True and body["console_new"] == []
