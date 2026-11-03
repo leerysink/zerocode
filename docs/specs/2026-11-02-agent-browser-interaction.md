@@ -379,22 +379,28 @@ ref 实现：采集时给每个交互元素写 `data-zc-ref="eN"`，step 时按�
 
 ## 15. 手工矩阵走查记录（2026-11-02）
 
-**逐行实测：待主会话走查回填。** 判定条件已按最终实现写定，跑一条就在「实测」栏补一句现象；发现不符的**另起小标题写清现象**，不要回头改「必须看到」那一栏——那是契约，不是给结果让路的。跑之前注意：需要重建 sidecar 镜像（`docker compose build browser`），且后端全量 pytest 会 down 掉本机 dev 栈。
+判定条件已按最终实现写定。跑之前注意：需要重建 sidecar 镜像（`docker compose build browser`），且后端全量 pytest 会 down 掉本机 dev 栈。
 
-| 项 | 走法 | 必须看到 | 实测 |
-|---|---|---|---|
-| 开场动画应用 | 对 chudadi 打开首页，`browser_open` 直接带 `expect:{type:"text_contains",value:"牌桌"}`（裁定 R-41 已接线，§6.3） | open 等到动画结束、真实首屏出现后才返回，返回值里 `passed:true` 且没有 `note`，**不需要用户关动画**（本功能的立项理由）；这一步**不扣步数额度**、不自动附截图 | 待主会话走查回填 |
-| 大型栈登录 | `fill` 账号 + `fill` 密码（`admin123`）+ `click` 登录 | 后续步骤保持登录态；聊天历史里 `admin123` 已被遮断（`message.tool_args` 与 WS `tool_call` 里是 `<redacted:sensitive_input>`），而登录**真的成功**（原值送达了 sidecar） | 待主会话走查回填 |
-| 带原生 confirm 的删除 | 点一个带确认框的删除 | `dialog.handled:"dismissed"`，卡片提示「页面弹出了确认框，已按取消处理」，且**数据没被删**（别把取消读成成功） | 待主会话走查回填 |
-| 断言故意写错 | `expect` 一个不存在的文案 | `ok:true, passed:false` + 自动附一张截图 + `note` 说清为什么没过 | 待主会话走查回填 |
-| ref 失效 | 用上一次（不是最近一次）返回里的 ref 点 | `ok:false` +「ref 无效或页面已变化，请用最新清单里的 ref」，**当场带回新清单**，也自动附一张图（R-26），且这一步**照样扣步数** | 待主会话走查回填 |
-| 步数耗尽 | 连点 13 步 | 第 13 步回「本 run 步数已用完，请 browser_close 收口」+ `steps_charged:false`；`browser_close` 报告里 `steps_used` = 12（真扣费的步），`steps_total` = 13（**含 open 那一行**，这是 `steps_total` 的既有口径，别按 12 判它错） | 待主会话走查回填 |
-| sidecar 中途重启 | `docker restart zerocode-browser-dev` 后继续 step | `session_gone:true`、`steps_charged:false`、一句「浏览器会话已结束，请重新 browser_open」，不是一句「工具执行异常」；后端已解绑，不再反复打那个死 id | 待主会话走查回填 |
-| 拖拽类应用 | 对拖拽实现的应用 step `click` | 得到诚实的「元素不可点击或动作失败: <原因>」+ 一张现场图，**不是假成功** | 待主会话走查回填 |
-| 重复 open | 同一 run 里 open 两次 | 第二个响应带 `auto_closed_previous:true` 与一句说明；旧 ref 全部作废；步数账**不清零**（per-run）；sidecar 里不留僵尸 context（`GET /sessions` 的 active 数不涨） | 待主会话走查回填 |
-| 刷新后步骤卡仍在 | 走完几步后重载聊天页 | 步骤卡与截图原样重建（实时 ≡ 历史），断言结论、失败原因、弹窗提示都在；截图 URL 仍可取（鉴权口径未变） | 待主会话走查回填 |
-| 删除会话后截图清理 | `DELETE /api/sessions/{id}` | `data/browser_shots/{session_id}/` 目录连同**步骤截图**一并清理 | 待主会话走查回填 |
-| 拓扑不泄漏（Task 4 登记项） | 任一步失败后读结果 | `url` 是展示地址（`preview_url` + path）；`failed_requests_new` / `console_new` / `page_errors_new` / `error` / `note` 里**不出现** `192.168.x.x:端口` 一类的容器内地址；`title` / `text` 保持页面原话不被改写 | 待主会话走查回填 |
-| 动作失败也带文字信号（R-29） | 点一个会抛未捕获异常的按钮 | `ok:false` 的响应里 `page_errors_new` / `console_new` 有内容（不是只能靠图猜），且**没有** `passed` 键 | 待主会话走查回填 |
-| 同一条消息里两个 step | 让模型一轮里发 `click` + 紧跟 `fill`（目标口令框） | 第二条的 `value` 落库是占位符（位次从严 R-35/R-36/R-38），动作照样执行 | 待主会话走查回填 |
-| `_do_navigate` 的 path 非法（§14 登记项 ①） | 走查中用 `navigate` 递一个非法 path（如 `//evil/`） | 该步落进 `browser_close` 报告，但三段增量字段缺席是**已知**的（本轮未修）；不应出现 500 / 空错误串 | 待主会话走查回填 |
+**本轮走查的覆盖面必须先说清，否则这张表会被读成「全绿」。** 已实测的部分是**直打 sidecar HTTP 端点** + **以替身 ctx 直调后端工具层**（`run_browser_session_tool`），页面是一个本地静态探针页（2.5s 开场动画、口令框、原生 confirm、抛未捕获异常的按钮、1.6s 后延迟出现的元素），结果存 `.superpowers/sdd/2026-11-02-agent-browser-interaction/probe/probe-results{,-2}.json`。**没有**跑真实平台后端 + 真实生成应用 + 真实聊天会话，所以「需要人眼看 UI」与「需要真实应用数据面」的行**仍是未验证**，不是通过。
+
+| 项 | 实测 |
+|---|---|
+| 开场动画应用 | **已验（替身页，非 chudadi）**。对照组同时成立：**不带 expect 打开 → 拿到的正是「正在配置组件… 请勿关闭电脑」**，旧病如实复现；**带 expect 打开 → 等 2.61s 越过 2.5s 动画、拿到「牌桌就绪」、`passed:true` 且无 note**。后端工具链同形状 `steps_left` 仍为 12（不扣步数）。chudadi 本尊未跑 |
+| 大型栈登录 | **部分已验**。遮断机制在真 HTTP 往返下成立：sensitive 框 fill → `value_redacted:true` 且 `browser_log` 里查不到明文；非 sensitive 框 fill → 值 `第一单` 照旧保留（**没有一刀切**）。**登录态跨步保持、真实 `admin123`、`message.tool_args` 落库面**三项未跑（需真实大型栈应用；前两项由 `tests/test_agent_loop.py` 的真 loop 测试覆盖，非真机） |
+| 带原生 confirm 的删除 | **已验（sidecar 层）**。`dialog:{type:confirm, message:"确认删除这一行？", handled:"dismissed"}`，且页面文本里**没有**「已删除」。前端那句提示的渲染由 `BrowserFlowCard.test.js` 覆盖，未人眼看 |
+| 断言故意写错 | **未跑真机**。由 `tests/test_browser_session_tools.py` 覆盖 |
+| ref 失效 | **⚠️ 真机跑出一个设计属性，与「响亮失败」的预期不符**：探针里拿旧 ref 再点，返回的是 **`ok:true`**，因为 ref 是**按序号**重打的、旧序号在新清单里**大概率仍然存在**（实测 `stale_ref_still_exists_in_new_list:true`）。本次侥幸仍指向同一元素（`now_points_at:"备注"`，集合顺序未变）；**一旦可交互集合的顺序变了，旧 ref 会静默点到另一个元素**，而不是回「ref 无效」。规格 §6.2 说「旧 ref 全部作废」，但机制检测不到「作废」这件事。**未修，需裁定**（最窄改法：把序号换成每次扫描随机的短令牌，使旧 ref 必然查不到而响亮失败；代价是 `REF_RE` 与一批测试要跟着改） |
+| 步数耗尽 | **未跑真机**。由单测覆盖。`steps_used` / `steps_total` 两本账的口径差异已在真机侧观察到并确认（`steps_total:3` vs `steps_used:2`，差的就是 open 那一行） |
+| sidecar 中途重启 | **等价路径已验**（用 `DELETE` 制造会话消失，未真重启容器）：`{ok:false, session_gone:true, steps_charged:false}` + 那句中文。真重启未跑 |
+| 拖拽类应用 | **未跑真机**（无拖拽类样本应用） |
+| 重复 open | **未跑真机**。但容量闸在真机侧验过：已有 1 个活会话时第 2 个 open 成功、**第 3 个回 409** 且 detail 是「浏览器服务已满（活会话达上限），请等前一个走查结束」 |
+| 刷新后步骤卡仍在 | **未验——需要人眼**。本轮没有起前端 dev server、没有真实聊天会话。这是合回前**必须补**的一格 |
+| 删除会话后截图清理 | **未跑真机**。沿用 `preview_page` 既有机制，未新增代码路径 |
+| 拓扑不泄漏 | **部分已验**：工具返回值里 `url == http://localhost:8642/index.html`（展示地址，非容器 IP）、返回值 JSON 里不含 `session_id`。**`failed_requests_new` 里的子资源 URL 是否带容器地址未跑**（探针页无失败子资源）；`preview_page` 那侧的同类暴露面按裁定未修 |
+| 动作失败也带文字信号（R-29） | **部分已验**：`page_errors_new` 在真机里确实拿到了「牌局状态机崩了」（`console_new` 为空，符合预期——`setTimeout` 里抛的是 pageerror 不是 console.error）。但这一条是在 **`ok:true` 的步**上观察到的；**`ok:false` 那一步带增量**这一支（sidecar 层 R-29 的改动）未单独跑 |
+| 同一条消息里两个 step | **未跑真机**。由 `tests/test_agent_loop.py` 的**真 loop 双调用**测试覆盖（含「args 为空/畸形的 open 也占位次」那一支）。注意真机探针是逐个调用发的，不构成这一行的证据 |
+| `_do_navigate` 的 path 非法 | **已验（sidecar 层）**：绝对 URL 与 `//example.com/x` 都回 `ok:false` +「path 必须是同源相对路径（以 / 开头）」，无 500、无空错误串。**另发现一层记账不一致**：直打 sidecar 时该步 `steps_charged:true`，而后端 `_step` 会先本地校验并回 `false`——生产路径只走后端，故不影响交付，但两层的口径不同值得记一笔 |
+
+**本轮真机另外复现的一条**（原表没有，属 §14 的 R-42）：只在 `browser_open` 上声明 `expect` 且 `passed:true` 的 run，`browser_close` 的 `hint` 曾输出「本次走查未声明任何断言」——**实测复现的假话**，已在 `32c012d` 修掉（open 的断言结论进那本账，`steps_failed` 口径随之含 open）。
+
+**尚未验证、合回前必须补的三格**：刷新后步骤卡仍在（人眼看 UI）、拖拽类应用、断言故意写错的自动附图。**另有一项待裁定**：ref 序号复用导致的静默错点（见「ref 失效」那一行）。
