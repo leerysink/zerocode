@@ -7,9 +7,9 @@
 //   ③ 文件夹折叠与拖动排序的接线：箭头示状态、点组头折叠并跨挂载记忆、按存好的顺序渲染、
 //      按住组头拖动能换位并落盘（顺序/折叠的算法本身见 useSidebarFolders.test.js）。
 // mock 掉 api 层与 antd message，专注组件自身的渲染与交互契约。
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { h, nextTick } from 'vue'
-import { mount, flushPromises } from '@vue/test-utils'
+import { mount, flushPromises, enableAutoUnmount } from '@vue/test-utils'
 import { createPinia, setActivePinia } from 'pinia'
 
 vi.mock('../api', () => ({
@@ -19,11 +19,16 @@ vi.mock('../api', () => ({
   // chat store 使用（loadAll 仍要拉工作区名给文件面板/输入区做名称回显）
   listWorkspaces: vi.fn(), getMessages: vi.fn(), getSessionDetail: vi.fn(),
   listModels: vi.fn(), patchSessionModel: vi.fn(),
+  // 会话状态角标轮询（useSessionLiveStatus）
+  getSessionLiveStatuses: vi.fn(),
   wsUrl: vi.fn(() => 'ws://test'),
 }))
 vi.mock('ant-design-vue', () => ({ message: { success: vi.fn(), error: vi.fn(), warning: vi.fn() } }))
 
-import { listApps, listSessions, listWorkspaces, createSession, renameApp, deleteApp } from '../api'
+import {
+  listApps, listSessions, listWorkspaces, createSession, renameApp, deleteApp,
+  getSessionLiveStatuses,
+} from '../api'
 import { message } from 'ant-design-vue'
 import SideBar from './SideBar.vue'
 import { FOLDERS_STORAGE_KEY } from '../composables/useSidebarFolders'
@@ -122,18 +127,22 @@ function sessions(n, workspaceId = 1) {
   }))
 }
 
-async function mountSideBar({ appRows = [APP], wsRows = [LEGACY_WS], sessionRows, props } = {}) {
+async function mountSideBar({ appRows = [APP], wsRows = [LEGACY_WS], sessionRows, liveRows = [], props } = {}) {
   const pinia = createPinia()
   setActivePinia(pinia)
   listApps.mockResolvedValue({ data: appRows })
   listWorkspaces.mockResolvedValue({ data: wsRows })
   listSessions.mockImplementation(async (wsId) => ({ data: sessionRows ?? sessions(8, wsId) }))
+  getSessionLiveStatuses.mockResolvedValue({ data: { sessions: liveRows } })
   const wrapper = mount(SideBar, { props, global: { plugins: [pinia], stubs: STUBS } })
   await flushPromises()
   const store = useChatStore()
   store.openSession = vi.fn()      // 打开会话要连 WS，与本组断言无关，桩掉
   return { wrapper, store }
 }
+
+// 状态轮询在共享 document 上挂 visibilitychange 监听并续 setTimeout：不自动卸载会串到下一条用例
+enableAutoUnmount(afterEach)
 
 beforeEach(() => {
   vi.clearAllMocks()
@@ -397,5 +406,117 @@ describe('SideBar 受控宽度', () => {
     expect(wrapper.find('.zc-sidebar').element.style.width).toBe('0px')
     expect(wrapper.find('.zc-sidebar').classes()).toContain('is-collapsed')
     expect(wrapper.find('.zc-logo').exists()).toBe(true)
+  })
+})
+
+// ---- 会话状态角标（spec 2026-11-04 US-9~16）----
+
+const liveRow = (id, extra = {}) => ({
+  session_id: id,
+  running: false,
+  waiting: 'none',
+  last_outcome: null,
+  finished_at: null,
+  ...extra,
+})
+const finishedAfterPageOpen = () => Date.now() / 1000 + 60
+
+describe('SideBar 会话状态角标', () => {
+  it('运行中显示转圈，位置在标题之后、时间之前', async () => {
+    const { wrapper } = await mountSideBar({ liveRows: [liveRow(100, { running: true })] })
+    const row = wrapper.findAll('.zc-session')[0]
+    const badge = row.find('.zc-session-status')
+    expect(badge.exists()).toBe(true)
+    expect(badge.classes()).toContain('is-running')
+    expect(badge.attributes('title')).toBe('运行中')
+
+    const kids = [...row.element.children]
+    expect(kids[0].classList.contains('zc-title')).toBe(true)
+    expect(kids[1].classList.contains('zc-session-status')).toBe(true)
+    expect(kids[2].classList.contains('zc-time')).toBe(true)
+  })
+
+  it('等待操作优先于运行中：同一会话只显示黄色', async () => {
+    const { wrapper } = await mountSideBar({
+      liveRows: [liveRow(100, { running: true, waiting: 'ask' })],
+    })
+    const badge = wrapper.find('.zc-session-status')
+    expect(badge.classes()).toContain('is-waiting')
+    expect(badge.classes()).not.toContain('is-running')
+    expect(badge.attributes('title')).toBe('等待你回答或确认')
+  })
+
+  it('页面打开后完成的显示绿色；点击后消除并打开会话', async () => {
+    const { wrapper, store } = await mountSideBar({
+      liveRows: [liveRow(100, { last_outcome: 'completed', finished_at: finishedAfterPageOpen() })],
+    })
+    const badge = wrapper.find('.zc-session-status')
+    expect(badge.classes()).toContain('is-completed')
+    expect(badge.attributes('title')).toBe('已完成')
+
+    await badge.trigger('click')
+    expect(store.openSession).toHaveBeenCalledTimes(1)
+    expect(store.openSession).toHaveBeenCalledWith(100, 1)
+    expect(wrapper.find('.zc-session-status').exists()).toBe(false)
+  })
+
+  it('失败与用户停止显示红色，点击同样消除', async () => {
+    const { wrapper, store } = await mountSideBar({
+      liveRows: [
+        liveRow(100, { last_outcome: 'error', finished_at: finishedAfterPageOpen() }),
+        liveRow(101, { last_outcome: 'cancelled', finished_at: finishedAfterPageOpen() }),
+      ],
+    })
+    const badges = wrapper.findAll('.zc-session-status')
+    expect(badges).toHaveLength(2)
+    expect(badges[0].classes()).toContain('is-failed')
+    expect(badges[0].attributes('title')).toBe('已停止或失败')
+    expect(badges[1].classes()).toContain('is-failed')
+
+    await badges[0].trigger('click')
+    expect(wrapper.findAll('.zc-session-status')).toHaveLength(1)
+    expect(store.openSession).toHaveBeenCalledWith(100, 1)
+  })
+
+  it('页面打开前就结束的执行不补提醒', async () => {
+    const { wrapper } = await mountSideBar({
+      liveRows: [liveRow(100, {
+        last_outcome: 'completed',
+        finished_at: Date.now() / 1000 - 60,
+      })],
+    })
+    expect(wrapper.find('.zc-session-status').exists()).toBe(false)
+  })
+
+  it('当前正在看的会话也显示角标，点击运行态只打开不消除', async () => {
+    const { wrapper, store } = await mountSideBar({ liveRows: [liveRow(100, { running: true })] })
+    store.currentSessionId = 100
+    await nextTick()
+    expect(wrapper.findAll('.zc-session')[0].classes()).toContain('active')
+    const badge = wrapper.find('.zc-session-status')
+    expect(badge.exists()).toBe(true)
+
+    await badge.trigger('click')
+    expect(store.openSession).toHaveBeenCalledWith(100, 1)
+    expect(wrapper.find('.zc-session-status').exists()).toBe(true)
+  })
+
+  it('没有实时事实的会话不显示角标', async () => {
+    const { wrapper } = await mountSideBar({ liveRows: [liveRow(100)] })
+    expect(wrapper.find('.zc-session-status').exists()).toBe(false)
+  })
+
+  it('刷新（重新挂载）后消除记录不保留，结束态重新出现', async () => {
+    const row = liveRow(100, {
+      last_outcome: 'completed',
+      finished_at: finishedAfterPageOpen(),
+    })
+    const first = await mountSideBar({ liveRows: [row] })
+    await first.wrapper.find('.zc-session-status').trigger('click')
+    expect(first.wrapper.find('.zc-session-status').exists()).toBe(false)
+    first.wrapper.unmount()
+
+    const second = await mountSideBar({ liveRows: [row] })
+    expect(second.wrapper.find('.zc-session-status').classes()).toContain('is-completed')
   })
 })

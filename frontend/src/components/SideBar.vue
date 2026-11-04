@@ -9,11 +9,13 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { message } from 'ant-design-vue'
 import {
-  AppstoreOutlined, DeleteOutlined, EllipsisOutlined, FolderOutlined, PlusOutlined,
+  AppstoreOutlined, CheckCircleFilled, ClockCircleOutlined, CloseCircleFilled,
+  DeleteOutlined, EllipsisOutlined, FolderOutlined, LoadingOutlined, PlusOutlined,
   RightOutlined, SettingOutlined, ShopOutlined,
 } from '@ant-design/icons-vue'
 import { createSession, deleteApp, deleteSession, listApps, listSessions, renameApp } from '../api'
 import { useChatStore } from '../stores/chat'
+import { useSessionLiveStatus } from '../composables/useSessionLiveStatus'
 import { useSidebarFolders } from '../composables/useSidebarFolders'
 import { relativeTime } from '../utils/time'
 import NewSessionModal from './NewSessionModal.vue'
@@ -25,6 +27,40 @@ const props = defineProps({
 const panelStyle = computed(() => ({ width: props.collapsed ? '0px' : `${props.width}px` }))
 
 const store = useChatStore()
+
+// ---- 会话状态角标（spec 2026-11-04）----
+// 所有会话都显示（含当前会话）；结束态只提醒「本页打开之后才结束」的那一批，
+// 否则历史里大量 idle 会话会被误当成刚完成。消除只活在本次页面内，不落库。
+const { statuses } = useSessionLiveStatus()
+const pageOpenedAt = Date.now()
+const dismissed = reactive(new Set())
+
+const BADGE_TEXT = {
+  waiting: '等待你回答或确认',
+  running: '运行中',
+  completed: '已完成',
+  failed: '已停止或失败',
+}
+
+function badgeOf(s) {
+  const st = statuses.value[s.id]
+  if (!st) return null
+  // 挂起等人时 run 仍在跑，等待必须压过转圈，否则用户看不出是在等自己
+  if (st.waiting === 'ask' || st.waiting === 'confirm') return 'waiting'
+  if (st.running) return 'running'
+  if (!st.last_outcome) return null
+  if (!(st.finished_at * 1000 > pageOpenedAt)) return null
+  if (dismissed.has(`${s.id}:${st.finished_at}`)) return null
+  return st.last_outcome === 'completed' ? 'completed' : 'failed'
+}
+
+function onBadgeClick(s, wsId) {
+  const state = badgeOf(s)
+  if (state === 'completed' || state === 'failed') {
+    dismissed.add(`${s.id}:${statuses.value[s.id].finished_at}`)
+  }
+  store.openSession(s.id, wsId)
+}
 const showNew = ref(false)
 const loading = ref(true)
 const apps = ref([])
@@ -193,6 +229,19 @@ async function doDelete() {
               @click="store.openSession(s.id, app.workspace_id)"
             >
               <span class="zc-title">{{ s.title }}</span>
+              <span
+                v-if="badgeOf(s)"
+                class="zc-session-status"
+                :class="`is-${badgeOf(s)}`"
+                :title="BADGE_TEXT[badgeOf(s)]"
+                :aria-label="BADGE_TEXT[badgeOf(s)]"
+                @click.stop="onBadgeClick(s, app.workspace_id)"
+              >
+                <loading-outlined v-if="badgeOf(s) === 'running'" spin />
+                <clock-circle-outlined v-else-if="badgeOf(s) === 'waiting'" />
+                <check-circle-filled v-else-if="badgeOf(s) === 'completed'" />
+                <close-circle-filled v-else />
+              </span>
               <span class="zc-time">{{ relativeTime(s.updated_at) }}</span>
               <a-popconfirm title="删除该会话？" @confirm="removeSession(app.workspace_id, s)">
                 <delete-outlined class="zc-del" @click.stop />
@@ -385,6 +434,26 @@ async function doDelete() {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.zc-session-status {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+}
+.zc-session-status.is-running {
+  color: var(--zc-primary);
+}
+.zc-session-status.is-waiting {
+  color: #d9a12a;
+}
+.zc-session-status.is-completed {
+  color: #3f9d5a;
+}
+.zc-session-status.is-failed {
+  color: #c25b5b;
 }
 .zc-time {
   color: var(--zc-text-sub);

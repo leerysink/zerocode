@@ -91,11 +91,14 @@ export function applyEvent(store, ev) {
       store.toolProgress = { name: ev.name, line: ev.line }
       break
     case 'ask_user': {
-      // 提问卡画在 ask_user 调用行上（ADR 0029）。实时流里 tool_call 已先把行建好，这里不动它；
+      // 提问卡画在 ask_user 调用行上（ADR 0029）。实时流里 tool_call 已先把行建好，但行里是
+      // 模型原始参数（可能被二次编码）；事件带的是后端规整后的题目，用它覆盖才能保证出卡。
       // 刷新/切会话后历史里**没有**待答调用的 tool 行（工具行要等答案回来才落库），重连补发的
       // 问题只能自己合成一条——丢弃就等于把题目连同唯一的回答入口一起抹掉，用户答不了也停不掉。
       const open = findOpenToolCall(store.messages, 'ask_user')
-      if (!open) {
+      if (open) {
+        open.args = { questions: ev.questions || [] }
+      } else {
         store.messages.push({ role: 'tool', name: 'ask_user', args: { questions: ev.questions || [] } })
       }
       break

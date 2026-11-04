@@ -114,6 +114,10 @@ class AgentRunner:
         # （US-21）。放在实例上而不是把 `_inner` 的循环整体缩进 try/finally：一个 runner 只服务
         # 一次 run（app/api/ws.py 每个 run 新建一个），而收口必须覆盖正常结束/取消/报错三条出口。
         self._tool_ctx = None
+        # 最近结果（completed/cancelled/error）：数据库 status 把完成与取消都落 idle，
+        # 会话状态角标靠这份内存读数分绿/红。不并入 run() 返回值——既有调用方断言返回
+        # 的是落库状态（"idle"/"error"），改签名会波及整批测试与语义。
+        self.last_outcome = None
 
     async def _root_of(self, session_id: int):
         async with self.sf() as s:
@@ -177,15 +181,18 @@ class AgentRunner:
     async def run(self, session_id: int, user_text: str, cancel: asyncio.Event,
                   attachment_ids: list[int] | None = None) -> str:
         status = "idle"
+        outcome = "completed"
         self._tool_ctx = None      # 每个 run 重新绑定：收口只认本次 run 的会话
         try:
             await self._inner(session_id, user_text, cancel, attachment_ids)
         except _Cancelled:
             await self.send({"type": "error", "message": "已取消"})
             status = "idle"
+            outcome = "cancelled"
         except Exception as e:
             await self.send({"type": "error", "message": str(e)})
             status = "error"
+            outcome = "error"
         finally:
             await self._set_status(session_id, status)
             await self.send({"type": "status", "status": status})
@@ -193,6 +200,7 @@ class AgentRunner:
             # 否则 sidecar 会在 mem_limit 1g 里攒僵尸 context。放在状态帧之后、且内部全吞：
             # 一次没收口的清理不该把对话结束的读数拖住最多 10 秒。
             await close_browser_session(self._tool_ctx)
+            self.last_outcome = outcome
         return status
 
     async def _set_status(self, session_id, status):

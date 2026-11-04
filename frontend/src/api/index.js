@@ -34,6 +34,8 @@ export const createSession = (data) => http.post('/sessions', data) // {workspac
 export const renameSession = (id, title) => http.patch(`/sessions/${id}`, { title })
 export const deleteSession = (id) => http.delete(`/sessions/${id}`)
 export const getMessages = (sessionId) => http.get(`/sessions/${sessionId}/messages`)
+// 会话状态角标：账号级汇总「运行中 / 挂起类型 / 最近结果 + 结束时间」，侧栏 5s 轮询
+export const getSessionLiveStatuses = () => http.get('/sessions/live-status')
 export const getFileChanges = (sessionId) => http.get(`/sessions/${sessionId}/file-changes`)
 // 单条变更的详情：列表接口只带 diff（侧栏一次拉几十条，不该把两份全文一起拖回来），
 // 详情才带 before/after 全文，供变更详情页做逐行回验与折叠段原文。

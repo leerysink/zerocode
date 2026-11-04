@@ -576,6 +576,15 @@ describe('提问卡在消息流里', () => {
       .toEqual([{ question: '选哪个', options: [{ label: 'A' }, { label: 'B' }] }])
   })
 
+  it('questions 被二次编码成 JSON 字符串时仍画出提问卡', () => {
+    const w = mountMessages([
+      { role: 'tool', name: 'ask_user', args: { questions: '[{"question":"选哪个","options":["A"]}]' } },
+    ])
+    expect(w.findComponent(AskUserCard).props('questions'))
+      .toEqual([{ question: '选哪个', options: [{ label: 'A' }] }])
+    expect(w.findComponent(ToolCallBlock).exists()).toBe(false)
+  })
+
   it('结果行到达后不再落回折叠 JSON 块，而是转成只读卡', () => {
     const w = mountMessages([
       { role: 'tool', name: 'ask_user', args: { questions: [{ question: '选哪个' }] }, result: { answers: [{ options: ['A'] }] } },

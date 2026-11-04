@@ -154,6 +154,14 @@ describe('askQuestionsOf 提问载荷整形', () => {
     expect(askQuestionsOf({ question: '选哪个', options: '不是 JSON' }))
       .toEqual([{ question: '选哪个' }])
   })
+  it('questions 被模型二次编码成 JSON 字符串时解回来（与后端 _normalize_questions 同口径）', () => {
+    const raw = JSON.stringify([{ question: '选哪个', options: ['A', 'B'] }])
+    expect(askQuestionsOf({ questions: raw }))
+      .toEqual([{ question: '选哪个', options: [{ label: 'A' }, { label: 'B' }] }])
+  })
+  it('questions 是坏 JSON 字符串时按无题处理，不抛错', () => {
+    expect(askQuestionsOf({ questions: '[{"question":' })).toEqual([])
+  })
   it('没有题目就返回空列表（卡片不渲染，落回折叠块）', () => {
     expect(askQuestionsOf({})).toEqual([])
     expect(askQuestionsOf(null)).toEqual([])
@@ -218,6 +226,20 @@ describe('实时 ≡ 历史（带确认的写入执行）', () => {
       { role: 'tool', name: 'write_file', args: WRITE_ARGS, awaitingConfirm: true },
     ])
     expect(confirmStateOf(marked[0])).toBe('pending')
+  })
+})
+
+// 实时流里 tool_call 先建行，ask_user 事件随后才到；后者带的是后端规整过的题目。
+// 早期实现「已有行就不动」，规整数据被丢掉，坏参数行于是永远画不出卡片。
+describe('ask_user 事件用规整题目覆盖调用行', () => {
+  const CANONICAL = [{ question: '选哪个', options: [{ label: 'A' }] }]
+
+  it('实时：覆盖已开行的参数，不新增重复行', () => {
+    const s = { messages: [], streamingContent: '', streamingThinking: '', toolProgress: null }
+    applyEvent(s, { type: 'tool_call', name: 'ask_user', args: { questions: '[{"question":"旧"}]' } })
+    applyEvent(s, { type: 'ask_user', questions: CANONICAL })
+    expect(s.messages).toHaveLength(1)
+    expect(s.messages[0].args).toEqual({ questions: CANONICAL })
   })
 })
 

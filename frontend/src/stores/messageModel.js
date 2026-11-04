@@ -115,9 +115,19 @@ export function normalizeMessages(list) {
 // 只走 ask_user 事件，不落调用行。这里只做显示用的形状容错：字符串选项包成 {label}，
 // 旧顶层单题参数包成单元素列表。不做后端的校验（多题拒绝是后端的职责，前端不重复一遍）。
 export function askQuestionsOf(args) {
-  const raw = Array.isArray(args?.questions) && args.questions.length
-    ? args.questions
-    : (typeof args?.question === 'string' && args.question.trim() ? [args] : [])
+  let raw = args?.questions
+  // 与后端 _normalize_questions 同口径：模型会把整个题目数组塞成 JSON 字符串
+  // （2026-11-01 实跑撞到）。不接的话实时与历史都会静默落回折叠块，用户无题可答。
+  if (typeof raw === 'string') {
+    try {
+      raw = JSON.parse(raw)
+    } catch {
+      raw = null
+    }
+  }
+  if (!Array.isArray(raw) || !raw.length) {
+    raw = typeof args?.question === 'string' && args.question.trim() ? [args] : []
+  }
   return raw
     .filter((q) => q && typeof q.question === 'string' && q.question.trim())
     .map((q) => {

@@ -119,6 +119,56 @@ async def test_file_change_detail_endpoint(client, tmp_path):
     # 脏 id 不能让 int() 炸成 500
     assert (await client.get(f"/api/sessions/{s['id']}/file-changes/abc")).status_code in (404, 422)
 
+# ---------- 会话状态角标：账号级实时状态 ----------
+
+async def test_live_session_status_reports_hub_facts(client, tmp_path):
+    """角标数据源：hub 内存的 running/挂起/最近结果，不读库里可能滞后的 status。
+    同一会话 ask 与 confirm 都挂起时（理论上不会），ask 优先。"""
+    ws = (await client.post("/api/workspaces", json={"root_path": str(tmp_path)})).json()
+    sid = (await client.post("/api/sessions", json={"workspace_id": ws["id"]})).json()["id"]
+    idle_sid = (await client.post("/api/sessions", json={"workspace_id": ws["id"]})).json()["id"]
+    hub = client.app.state.hub
+    hub.running.add(sid)
+    hub.pending_confirms[sid] = {"tool": "write_file", "args": {}, "summary": ""}
+    hub.last_outcome[sid] = {"outcome": "completed", "finished_at": 123.5}
+    try:
+        rows = (await client.get("/api/sessions/live-status")).json()["sessions"]
+        row = next(r for r in rows if r["session_id"] == sid)
+        assert row["running"] is True
+        assert row["waiting"] == "confirm"
+        assert row["last_outcome"] == "completed"
+        assert row["finished_at"] == 123.5
+        # 库里仍是 idle：证明读数来自 hub，而不是 chat_session.status
+        assert (await client.get(f"/api/sessions/{sid}")).json()["status"] == "idle"
+        # 没有实时事实的会话不出现在列表里（避免每 5 秒把所有会话扫一遍）
+        assert all(r["session_id"] != idle_sid for r in rows)
+
+        hub.pending_asks[sid] = [{"question": "选哪个", "options": []}]
+        rows = (await client.get("/api/sessions/live-status")).json()["sessions"]
+        assert next(r for r in rows if r["session_id"] == sid)["waiting"] == "ask"
+    finally:
+        hub.running.discard(sid)
+        hub.pending_asks.pop(sid, None)
+        hub.pending_confirms.pop(sid, None)
+        hub.last_outcome.pop(sid, None)
+
+
+async def test_live_session_status_scoped_to_owner(two_auth_clients, tmp_path):
+    """账号隔离：别人的会话即使正在跑，也不得出现在我的状态列表里。"""
+    alice, bob = two_auth_clients
+    ws_b = (await bob.post("/api/workspaces", json={"root_path": str(tmp_path)})).json()
+    sid_b = (await bob.post("/api/sessions", json={"workspace_id": ws_b["id"]})).json()["id"]
+    hub = alice.app.state.hub
+    hub.running.add(sid_b)
+    try:
+        alice_rows = (await alice.get("/api/sessions/live-status")).json()["sessions"]
+        assert all(r["session_id"] != sid_b for r in alice_rows)
+        bob_rows = (await bob.get("/api/sessions/live-status")).json()["sessions"]
+        assert any(r["session_id"] == sid_b for r in bob_rows)
+    finally:
+        hub.running.discard(sid_b)
+
+
 # ---------- 交互增强：会话详情 / 模型切换 / messages 带 reasoning ----------
 
 async def test_session_detail(client):

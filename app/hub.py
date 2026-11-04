@@ -29,6 +29,9 @@ class ChatHub:
         self.compacting: set[int] = set()  # 压缩占位（无工具边界可注入，插话要区别对待）
         self.pending: dict[int, list[dict]] = {}  # 执行中插话：{content, attachment_ids, client_msg_id}
         self.run_vision: dict[int, bool] = {}  # 本 run 实际模型是否支持视觉（插话能力门）
+        # 最近结果（会话状态角标数据源）：{outcome: completed|cancelled|error, finished_at: epoch 秒}。
+        # 只活在进程内存：数据库 status 把「完成」与用户取消都落 idle，分不出绿/红。
+        self.last_outcome: dict[int, dict] = {}
         # 需求澄清门禁的会话级解除标记（ADR-0032）：用户点过「自行决定」即置位，
         # 后续每个 run 都不再强制澄清。与挂起点同样是内存态——进程重启后失效（该会话
         # 回到「未解除」状态），这是既有代价，不为它加一层持久化。

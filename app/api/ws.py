@@ -22,7 +22,7 @@ runner 的 send 为单参签名，这里经 hub 会话槽晚绑定转发；LLM �
 模型来源按会话逐级回退：会话绑定 model_config → 默认模型 → 全局 llm.*
 （resolve_model，spec §4.4）。
 """
-import asyncio, json
+import asyncio, json, time
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from sqlalchemy import text as _sql
 from app.agent.llm import OpenAICompatLLM
@@ -235,10 +235,14 @@ async def ws_chat(ws: WebSocket, session_id: int):
                     # 完再加，解析期间到达的第二条 user_message 会看到「未在跑」而再开一个
                     # run（双跑竞态）。status 落库仍紧随其后，保持 watchdog 语义。
                     hub.running.add(session_id)
+                    # 新一轮开始即清掉上一条绿/红：旧结果不再代表现状，留着会让角标在
+                    # 新一轮运行结束后短暂显示过期结论（running 虽优先，但清理更直白）。
+                    hub.last_outcome.pop(session_id, None)
                     if model_cfg_ is not None:  # 图片消息已预解析：先亮能力位再等首个 await
                         hub.run_vision[session_id] = bool(model_cfg_.get("supports_vision"))
                     cancel = asyncio.Event()
                     hub.cancel_events[session_id] = cancel
+                    runner = None
                     try:
                         # 落库 'running' 激活 watchdog（spec §7 崩溃恢复）：此前全仓无代码写
                         # 'running'（schema 默认 idle，runner 终态只写 idle/error），watchdog 的
@@ -271,6 +275,16 @@ async def ws_chat(ws: WebSocket, session_id: int):
                         await runner.run(session_id, user_text_, cancel,
                                          attachment_ids=attachment_ids_)
                     finally:
+                        # 最近结果只活在进程内存：DB status 完成/取消都落 idle，角标分不出绿红。
+                        # 收口放 finally：runner 正常收工、取消、报错三条出口都要留下结论；
+                        # runner 已建但 last_outcome 为空只可能是收口途中异常，按 error 记，
+                        # 宁可红也不留一个永远静止的转圈。runner 未建（解析/落库即失败）时
+                        # 这次 run 从未启动，不制造结果。
+                        if runner is not None:
+                            hub.last_outcome[session_id] = {
+                                "outcome": runner.last_outcome or "error",
+                                "finished_at": time.time(),
+                            }
                         hub.run_vision.pop(session_id, None)
                         hub.running.discard(session_id)
                         hub.cancel_events.pop(session_id, None)

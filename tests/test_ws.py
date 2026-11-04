@@ -82,6 +82,107 @@ def test_ws_plain_flow(client):
     assert types[0] == "session_title" and evs[0]["title"] == "打个招呼"  # 自动命名走在模型输出前
     assert "token" in types and "message_done" in types and "status" in types
 
+def test_ws_records_completed_outcome(client):
+    """角标数据源：chat run 正常收工要在 hub 记下最近结果与结束时间。
+
+    数据库 status 完成与取消都落 idle，分不出绿/红；最近结果只能由运行侧记录。
+    """
+    import time
+    client.app.state.llm_factory = lambda cfg: ScriptedLLM([done("好了")])
+    sid = client.zc_sid
+    with client.websocket_connect(f"/ws/chat/{sid}") as ws:
+        ws.send_json({"type": "user_message", "content": "打个招呼"})
+        for _ in range(8):
+            if ws.receive_json()["type"] == "status":
+                break
+    hub = client.app.state.hub
+    deadline = time.time() + 2
+    while sid not in hub.last_outcome and time.time() < deadline:
+        time.sleep(0.01)
+    rec = hub.last_outcome.get(sid)
+    assert rec is not None
+    assert rec["outcome"] == "completed"
+    assert isinstance(rec["finished_at"], float) and rec["finished_at"] > 0
+
+
+def test_ws_records_cancelled_outcome(client):
+    """用户停止与正常完成在数据库里都是 idle；角标要显示红色只能靠 hub 的结果记录。"""
+    import time
+    client.app.state.llm_factory = lambda cfg: ScriptedLLM([
+        done(None, [{"id": "c1", "function": {
+            "name": "ask_user", "arguments": json.dumps({"question": "?", "options": []})}}])])
+    sid = client.zc_sid
+    hub = client.app.state.hub
+    with client.websocket_connect(f"/ws/chat/{sid}") as ws:
+        ws.send_json({"type": "user_message", "content": "先挂着"})
+        for _ in range(6):
+            if ws.receive_json()["type"] == "ask_user":
+                break
+        ws.send_json({"type": "cancel"})
+        for _ in range(6):
+            if ws.receive_json()["type"] == "status":
+                break
+    deadline = time.time() + 2
+    while sid not in hub.last_outcome and time.time() < deadline:
+        time.sleep(0.01)
+    assert hub.last_outcome[sid]["outcome"] == "cancelled"
+    assert _db_status_dev(sid) == "idle"  # 数据库分不出取消，角标数据源必须是 hub
+
+
+def test_ws_records_error_outcome(client):
+    import time
+    client.app.state.llm_factory = lambda cfg: ScriptedLLM([])  # 第一轮即抛 IndexError
+    sid = client.zc_sid
+    hub = client.app.state.hub
+    with client.websocket_connect(f"/ws/chat/{sid}") as ws:
+        ws.send_json({"type": "user_message", "content": "会失败"})
+        for _ in range(8):
+            if ws.receive_json()["type"] == "status":
+                break
+    deadline = time.time() + 2
+    while sid not in hub.last_outcome and time.time() < deadline:
+        time.sleep(0.01)
+    assert hub.last_outcome[sid]["outcome"] == "error"
+    assert _db_status_dev(sid) == "error"
+
+
+def test_ws_new_run_clears_previous_outcome(client):
+    """上一轮的绿/红不能贴在新一轮头上：run 一开始就清掉旧结果。"""
+    import time
+    calls = {"n": 0}
+
+    def factory(cfg):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return ScriptedLLM([done("第一轮完成")])
+        return ScriptedLLM([
+            done(None, [{"id": "c1", "function": {
+                "name": "ask_user", "arguments": json.dumps({"question": "继续？", "options": []})}}])])
+
+    client.app.state.llm_factory = factory
+    sid = client.zc_sid
+    hub = client.app.state.hub
+    with client.websocket_connect(f"/ws/chat/{sid}") as ws:
+        ws.send_json({"type": "user_message", "content": "第一轮"})
+        for _ in range(8):
+            if ws.receive_json()["type"] == "status":
+                break
+        deadline = time.time() + 2
+        while sid not in hub.last_outcome and time.time() < deadline:
+            time.sleep(0.01)
+        assert hub.last_outcome[sid]["outcome"] == "completed"
+
+        ws.send_json({"type": "user_message", "content": "第二轮"})
+        for _ in range(8):
+            if ws.receive_json()["type"] == "ask_user":
+                break
+        assert sid not in hub.last_outcome
+        ws.send_json({"type": "cancel"})
+        for _ in range(6):
+            if ws.receive_json()["type"] == "status":
+                break
+
+
 def test_ws_autotitles_default_session_on_first_message(client):
     """自动命名（2026-09-21）：「新会话」收到首条用户消息 → 改名并下行 session_title，
     侧栏不必重拉列表即可实时刷新（事件排在模型输出之前）。"""

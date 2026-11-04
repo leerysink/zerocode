@@ -83,6 +83,37 @@ async def list_sessions(request: Request, workspace_id: int):
             "WHERE workspace_id=:w ORDER BY updated_at DESC"), {"w": workspace_id})).mappings().all()
     return [dict(r) for r in rows]
 
+@router.get("/live-status")
+async def live_session_status(request: Request):
+    """账号级实时会话状态（会话状态角标数据源）。
+
+    只读 hub 内存：running / 挂起类型 / 最近结果 + 结束时间。不读 chat_session.status——
+    完成与用户取消都落 idle，数据库分不出绿/红；进程重启后的残留值还会制造幽灵转圈。
+    只返回至少有一样实时事实的会话，侧栏每 5 秒轮询不扫全量历史。
+    """
+    uid = request.state.actor["id"]
+    hub = request.app.state.hub
+    async with request.app.state.session_factory() as s:
+        ids = [r[0] for r in (await s.execute(text(
+            "SELECT cs.id FROM chat_session cs JOIN workspace w ON w.id = cs.workspace_id "
+            "WHERE w.owner_user_id = :u"), {"u": uid})).all()]
+    out = []
+    for sid in ids:
+        running = sid in hub.running
+        waiting = ("ask" if sid in hub.pending_asks
+                   else "confirm" if sid in hub.pending_confirms else "none")
+        rec = hub.last_outcome.get(sid)
+        if not running and waiting == "none" and rec is None:
+            continue
+        out.append({
+            "session_id": sid,
+            "running": running,
+            "waiting": waiting,
+            "last_outcome": rec["outcome"] if rec else None,
+            "finished_at": rec["finished_at"] if rec else None,
+        })
+    return {"sessions": out}
+
 @router.get("/{session_id}")
 async def session_detail(request: Request, session_id: int):
     uid = request.state.actor["id"]
