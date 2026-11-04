@@ -14,7 +14,7 @@ def app_tree(tmp_path):
                 "frontend/src/App.vue", "frontend/node_modules/dep/index.js",
                 "frontend/dist/assets/a.js", "deploy/prod-compose.yml", "deploy/.env",
                 "sqlchange/V20260920_01_init.sql", "sqlchange/V20260920_02_more.sql",
-                # 数据轨环境段（ADR-0039）：锚点里是「dev/x.sql」这样的相对路径，出包要保住目录
+                # 数据轨环境段（ADR-0040）：锚点里是「dev/x.sql」这样的相对路径，出包要保住目录
                 "sqlchange/dev/D20261104_01_demo.sql",
                 "sqlchange/prod/D20261104_01_online.sql",
                 # 大型栈 dev 预览就地跑 mvn 留下的：几百 MB 编译产物 + 一直在滚的日志
@@ -61,7 +61,7 @@ def test_write_package_excludes_secrets_and_artifacts(tmp_path, app_tree):
 
 
 def test_write_package_keeps_env_segment_paths(tmp_path, app_tree):
-    """环境段锚点（ADR-0039）：filename 是相对路径 `dev/x.sql`，出包必须落进同名子目录。
+    """环境段锚点（ADR-0040）：filename 是相对路径 `dev/x.sql`，出包必须落进同名子目录。
 
     shutil.copy2 不建父目录——漏一次 mkdir 就是上架时「锚点文件缺失」这种看不出所以然的失败。
     """
@@ -81,7 +81,7 @@ def test_write_package_keeps_env_segment_paths(tmp_path, app_tree):
 def test_package_carries_dev_segment_even_though_anchor_is_prod_only(tmp_path, app_tree):
     """dev 段必须随包，但锚点取自 prod 库历史——它永远不会记 `dev/x.sql`，所以不能靠锚点带出去。
 
-    ADR-0039 让买家 dev 库有和作者一样的示例数据（好上手），代价就是这段无锚点把关、原样进包；
+    ADR-0040 让买家 dev 库有和作者一样的示例数据（好上手），代价就是这段无锚点把关、原样进包；
     prod 段与公共段仍逐个校验存在性与 checksum，未应用的顶层文件照旧不进包。
     """
     a = _anchor_real(app_tree)      # 只有公共段的 V20260920_01_init.sql

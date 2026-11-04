@@ -1280,7 +1280,7 @@ def test_scan_sqlchange_flags_bad_names(tmp_path):
 
 
 def test_scan_sqlchange_covers_env_segments(tmp_path):
-    """三段命名闸门（ADR-0039）：dev/、prod/ 里的文件按「段/文件名」判定。
+    """三段命名闸门（ADR-0040）：dev/、prod/ 里的文件按「段/文件名」判定。
 
     落在两段之外的嵌套目录（misc/、dev/sub/）必须报违规——run.sh 的 glob 看不见它们，
     「文件写了但从来没跑过」比红一次 preflight 贵得多。

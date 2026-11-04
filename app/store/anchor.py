@@ -13,7 +13,7 @@ from app import config as app_config
 
 # COLLATE "C" 不是风格问题：run.sh 按字节序执行（busybox 的 ls|sort 跑在 C locale），
 # 而平台 PG 实例是 en_US.utf8 collation——默认 ORDER BY 会把 `prod/D….sql` 排到 `V….sql` 之前，
-# 于是「上一版序列必须是新版前缀」（约束 L）会在追加一个顶层 D 文件时假红、上架被拒（ADR-0039）。
+# 于是「上一版序列必须是新版前缀」（约束 L）会在追加一个顶层 D 文件时假红、上架被拒（ADR-0040）。
 HISTORY_SQL = ('SELECT filename, checksum FROM sqlchange_history WHERE success '
                'ORDER BY filename COLLATE "C"')
 

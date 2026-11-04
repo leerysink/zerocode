@@ -1,5 +1,5 @@
 #!/bin/sh
-# app/deploy/sqlrunner/run.sh —— 规格 07 §4.3 执行算法（数据轨三段见 ADR-0039）
+# app/deploy/sqlrunner/run.sh —— 规格 07 §4.3 执行算法（数据轨三段见 ADR-0040）
 # 注意：shebang 必须是文件第一行（否则 ENTRYPOINT 直接 exec 会 ENOEXEC），故路径标记注释置于其后。
 # 注意：本文件在 alpine/busybox 下运行，只能用 POSIX sh 与 busybox 工具集
 #       （date +%s / md5sum / cut / basename / ls / sort），不可用 bash 数组与 [[ ]]。
@@ -35,7 +35,7 @@ if [ -f /schema/schema.sql ]; then
   fi
 fi
 
-# 一次执行的口径固定为「公共段 + 本环境段」（ADR-0039）：另一段的文件对本库永不可见。
+# 一次执行的口径固定为「公共段 + 本环境段」（ADR-0040）：另一段的文件对本库永不可见。
 # 两段文件允许同名（各库各记各的），故记账用相对 /sql 的路径而不是 basename：
 # 用 basename 时 dev/x.sql 与 prod/x.sql 会在同一张 sqlchange_history 上撞主键、误判篡改。
 # 顶层文件名首字符是 V/D（大写），环境目录名小写，`sort` 后公共段天然排在环境段之前。

@@ -40,7 +40,7 @@ services:
   migrate:
     image: zerocode-sqlrunner:2
     environment:                       # 显式映射为 sqlrunner 输入契约（07 §4.3）
-      TARGET_ENV: dev                  # ADR-0039：跑「公共段 + dev 段」，prod compose 写 prod
+      TARGET_ENV: dev                  # ADR-0040：跑「公共段 + dev 段」，prod compose 写 prod
       TARGET_DB: ${DEV_DB}
       TARGET_USER: ${DEV_USER}
       TARGET_PASSWORD: ${DEV_PASSWORD}

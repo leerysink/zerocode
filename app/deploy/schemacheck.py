@@ -107,7 +107,7 @@ async def verify_dev_matches_files(sf, app_dir: Path, slug: str) -> dict:
         return {"ok": False, "diff": {}, "error": "dev 凭据缺失，无法校验等价性"}
     scratch_cred = await scratch.ensure_scratch(sf, slug)
     try:
-        # 环境段（ADR-0039）：本闸门比对的是 dev 库的实际结构，scratch 必须按 dev 段 fold——
+        # 环境段（ADR-0040）：本闸门比对的是 dev 库的实际结构，scratch 必须按 dev 段 fold——
         # 跑成 prod 段会把「dev 有、文件也有」的演示数据算成漂移，每次发布都红。
         mig = await sqlrun.run_sqlchange(app_dir, "dev", scratch_cred)
         if not mig["ok"]:

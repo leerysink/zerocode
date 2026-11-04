@@ -170,7 +170,7 @@ async def test_run_sh_record_failure_guard():
     assert src.index('echo "OK $rel"') > src.index("FAIL RECORD")
 
 
-# ---- 数据轨三段（ADR-0039：公共段 + dev 段 + prod 段）----
+# ---- 数据轨三段（ADR-0040：公共段 + dev 段 + prod 段）----
 
 SHARED = """-- V20261101_01_shared.sql
 -- 用途：公共段建表并落一行  影响：t_seg
@@ -242,7 +242,7 @@ async def test_anchor_query_order_matches_execution_order(cred):
 
     平台 PG 实例是 en_US.utf8 collation：默认 `ORDER BY filename` 把 `prod/…` 排到 `V…` 之前，
     run.sh 却按字节序先跑公共段。三段落地后这个分叉会真咬人——追加一个顶层 D 文件就能让
-    「上一版序列是本版前缀」判定假红、上架被拒（ADR-0039）。
+    「上一版序列是本版前缀」判定假红、上架被拒（ADR-0040）。
     """
     from app.store import anchor as anchor_mod
     _write_segments()

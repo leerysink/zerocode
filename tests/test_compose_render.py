@@ -32,7 +32,7 @@ def test_render_dev_compose_fastapi():
         assert svc in y
     assert "zerocode-sqlrunner:2" in y
     assert "TARGET_DB: ${DEV_DB}" in y and "TARGET_USER: ${DEV_USER}" in y
-    assert "TARGET_ENV: dev" in y                 # 数据轨环境段（ADR-0039）：缺它容器直接红
+    assert "TARGET_ENV: dev" in y                 # 数据轨环境段（ADR-0040）：缺它容器直接红
     assert "8211:5173" in y                      # 仅前端端口对外（规格 05 FR5-06）
     assert "zcnet" in y and "external: true" in y
     assert "service_completed_successfully" in y  # 迁移不过应用不起（规格 07 FR7-04）

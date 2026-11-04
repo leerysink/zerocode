@@ -31,7 +31,7 @@ async def test_reads_only_success_ordered(test_engine):
 
 
 async def test_segment_paths_anchor_in_byte_order(test_engine):
-    """ADR-0039：环境段路径进锚点后，排序必须是字节序（与 run.sh 执行序同源），不是库的 locale 序。
+    """ADR-0040：环境段路径进锚点后，排序必须是字节序（与 run.sh 执行序同源），不是库的 locale 序。
 
     en_US.utf8 collation 把 `prod/…` 排到 `V…` 之前，追加一个顶层文件就会打破「上一版是本版前缀」，
     上架被拒在一条根本没被改过的记录上。

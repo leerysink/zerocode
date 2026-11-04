@@ -295,7 +295,7 @@ async def test_sqlchange_files_and_records(client, dev_app):
 
 
 async def test_sqlchange_files_lists_pending(client, dev_app):
-    """待办清单=公共段+dev 段（ADR-0039）：按真实执行顺序给出，prod 段的文件对 dev 视角不可见。"""
+    """待办清单=公共段+dev 段（ADR-0040）：按真实执行顺序给出，prod 段的文件对 dev 视角不可见。"""
     d = ROOT / "sqlchange"
     d.mkdir(parents=True, exist_ok=True)
     (d / "V20260918_02_b.sql").write_text("-- b\nSELECT 1\n", encoding="utf-8")

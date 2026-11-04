@@ -3,7 +3,7 @@
 
 镜像 zerocode-sqlrunner:2（postgres:16-alpine + /run.sh）：输入 env TARGET_HOST/TARGET_DB/
 TARGET_USER/TARGET_PASSWORD/TARGET_ENV，只读挂载 /sql，跑「公共段 + TARGET_ENV 段」增量迁移并写
-sqlchange_history（记账用相对 sqlchange/ 的路径，ADR-0039）。
+sqlchange_history（记账用相对 sqlchange/ 的路径，ADR-0040）。
 tag 从 :1 bump 到 :2 是刻意的：build_if_missing 只在镜像缺失时构建，沿用 :1 会让宿主上那份陈旧
 镜像带着「不认识 TARGET_ENV」的旧 run.sh 继续被复用，环境段从此静默不跑。
 """
@@ -13,7 +13,7 @@ from app.deploy.provision import ensure_zcnet
 
 IMAGE = "zerocode-sqlrunner:2"
 SQLRUNNER_DIR = Path(__file__).resolve().parent / "sqlrunner"
-# 数据轨的环境段（ADR-0039）：run.sh 用它决定「公共段 + 本环境段」，野值一律拒。
+# 数据轨的环境段（ADR-0040）：run.sh 用它决定「公共段 + 本环境段」，野值一律拒。
 SEGMENT_ENVS = ("dev", "prod")
 
 
@@ -79,7 +79,7 @@ def segment_files(sqlchange_dir: Path, env: str) -> list[str]:
 
     与 run.sh 的 `ls /sql/*.sql /sql/$TARGET_ENV/*.sql | sort` 同口径：顶层文件名首字母是 V/D（大写），
     排序天然早于小写的段目录名，所以「先公共后环境」在全局 sort 下也成立。
-    环境段目录缺失是合法的（存量应用不回填，ADR-0039），此时只剩公共段。
+    环境段目录缺失是合法的（存量应用不回填，ADR-0040），此时只剩公共段。
     """
     if env not in SEGMENT_ENVS:
         raise ValueError(f"segment_files 的 env 只接受 {'/'.join(SEGMENT_ENVS)}，收到 {env!r}")
@@ -93,7 +93,7 @@ def segment_files(sqlchange_dir: Path, env: str) -> list[str]:
 async def run_sqlchange(app_dir: Path, env: str, cred: dict, on_log=None) -> dict:
     """对 <app_dir>/sqlchange 执行一次性迁移容器；cred 为 provision 返回 {db,user,password}。
 
-    env 决定数据轨跑哪一段（ADR-0039）：容器执行「公共段（顶层）+ `<env>/` 段」，另一段对本库不可见。
+    env 决定数据轨跑哪一段（ADR-0040）：容器执行「公共段（顶层）+ `<env>/` 段」，另一段对本库不可见。
     它同时是连库凭据的选择器（`<slug>_dev` / `<slug>_prod`），两者必须一致——传错 env 会把 dev 段
     写进线上库，或让线上种子静默失踪，故非 dev/prod 的取值直接 raise（不起容器）。
     Windows 下 -v 传 D:\\... 形式，Docker Desktop 自行转换挂载路径。
