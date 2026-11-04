@@ -92,9 +92,12 @@ if "!SKIP_FE!"=="1" (
     echo [skip] --skip-frontend: reusing existing frontend\dist
     goto :fe_done
 )
-if exist "frontend\node_modules\vite" goto :fe_build
 where npm >nul 2>nul
 if errorlevel 1 goto :npm_missing
+REM    Probing one node_modules dir proves nothing about the other
+REM    declared deps, so ask npm itself whether the tree is complete.
+call npm ls --prefix frontend --depth=0 >nul 2>nul
+if not errorlevel 1 goto :fe_build
 echo [setup] installing frontend dependencies: npm install ...
 call npm install --prefix frontend
 if errorlevel 1 goto :npm_failed
