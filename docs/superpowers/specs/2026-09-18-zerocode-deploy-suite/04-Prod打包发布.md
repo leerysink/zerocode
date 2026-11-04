@@ -38,7 +38,7 @@ publish(app) = [
   2 build        docker compose -f deploy/prod-compose.yml build
                  （frontend: node build→nginx；backend: 按栈；tag=prod-<version>）
   3 provision    prod 库/角色存在性检查与供给（06，幂等）
-  4 migrate      sqlrunner 跑 sqlchange/*.sql → <slug>_prod（07；失败即中止，旧版本不受影响）
+  4 migrate      sqlrunner 跑 sqlchange 的公共段 + prod 段 → <slug>_prod（07 §8；失败即中止，旧版本不受影响）
   5 deploy       docker compose up -d（frontend/backend 引用新 tag）
   6 health       前后端健康探测（4.3）
   7 record       deploy_record 落库 + 旧版本镜像清理（保留 5）+ status_prod=running

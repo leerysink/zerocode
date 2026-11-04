@@ -30,6 +30,22 @@ async def test_reads_only_success_ordered(test_engine):
     assert [e["checksum"] for e in got] == ["a", "c"]
 
 
+async def test_segment_paths_anchor_in_byte_order(test_engine):
+    """ADR-0040：环境段路径进锚点后，排序必须是字节序（与 run.sh 执行序同源），不是库的 locale 序。
+
+    en_US.utf8 collation 把 `prod/…` 排到 `V…` 之前，追加一个顶层文件就会打破「上一版是本版前缀」，
+    上架被拒在一条根本没被改过的记录上。
+    """
+    url = test_engine.url.render_as_string(hide_password=False)
+    await _seed_history(test_engine, [
+        ("V20261101_01_shared.sql", "s", True),
+        ("prod/V20261101_02_demo.sql", "p", True),
+    ])
+    got = await anchor.read_history(url)
+    assert [e["filename"] for e in got] == [
+        "V20261101_01_shared.sql", "prod/V20261101_02_demo.sql"]
+
+
 async def test_missing_history_table_is_not_swallowed(test_engine):
     """表不存在必须抛，不能返 []：返 [] 会让上架闸门以为「锚点为空」而给出错误原因。"""
     url = test_engine.url.render_as_string(hide_password=False)

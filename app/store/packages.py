@@ -97,7 +97,19 @@ def write_package(*, out_root, slug: str, version: str, app_root: Path,
                 raise DeployError(f"锚点文件缺失: {e['filename']}")
             if anchor_mod.file_md5(f) != e["checksum"]:
                 raise DeployError(f"锚点文件与库内记录不一致: {e['filename']}")
-            shutil.copy2(f, sql_dir / e["filename"])
+            # filename 可能是环境段的相对路径（dev/、prod/，ADR-0040）：copy2 不建父目录
+            dst = sql_dir / e["filename"]
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(f, dst)
+        # dev 段原样随包（ADR-0040）：锚点取的是 prod 库历史，`dev/x.sql` 天然不在其中，
+        # 靠锚点带不出去，而买家 dev 库要拿到作者的示例数据正是三段的意义。代价是这段没有
+        # checksum 把关——prod 段与公共段仍逐个校验，未应用的顶层文件照样不进包。
+        dev_sql = (sorted((src_sql / "dev").glob("*.sql"))
+                   if (src_sql / "dev").is_dir() else [])
+        if dev_sql:
+            (sql_dir / "dev").mkdir(exist_ok=True)
+            for p in dev_sql:
+                shutil.copy2(p, sql_dir / "dev" / p.name)
         for rel, p in _iter_src(Path(app_root)):
             dst = tmp / "src" / rel
             dst.parent.mkdir(parents=True, exist_ok=True)

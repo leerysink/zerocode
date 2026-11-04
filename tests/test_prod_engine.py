@@ -1291,6 +1291,30 @@ def test_scan_sqlchange_flags_bad_names(tmp_path):
     assert prod.scan_sqlchange(tmp_path / "nowhere") == []                   # 目录不存在=无违规
 
 
+def test_scan_sqlchange_covers_env_segments(tmp_path):
+    """三段命名闸门（ADR-0040）：dev/、prod/ 里的文件按「段/文件名」判定。
+
+    落在两段之外的嵌套目录（misc/、dev/sub/）必须报违规——run.sh 的 glob 看不见它们，
+    「文件写了但从来没跑过」比红一次 preflight 贵得多。
+    """
+    d = tmp_path / "sqlchange"
+    # 两段允许同名文件（各库各记各的），命名规则也必然一致
+    for rel in ("D20261104_00_shared.sql", "dev/D20261104_01_menu.sql",
+                "prod/D20261104_01_menu.sql"):
+        p = d / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("SELECT 1", encoding="utf-8")
+    assert prod.scan_sqlchange(tmp_path) == []
+
+    for rel in ("prod/notes.sql", "misc/D20261104_02_stray.sql",
+                "dev/sub/D20261104_03_deep.sql"):
+        p = d / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("x", encoding="utf-8")
+    assert prod.scan_sqlchange(tmp_path) == ["dev/sub/D20261104_03_deep.sql",
+                                             "misc/D20261104_02_stray.sql", "prod/notes.sql"]
+
+
 def test_hub_active_session_ids_snapshot():
     """FR4-09 数据源冒烟：emit 登记表键集的快照（改返回值不得回写内部状态）。"""
     hub = ChatHub()

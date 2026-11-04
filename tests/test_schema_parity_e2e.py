@@ -45,7 +45,7 @@ async def test_verify_scratch_fold_is_green(sf):
     await sqlrun.build_if_missing()
     cred = await provision.create_db_with_role(sf, scratch.verify_db_name(SLUG))
     try:
-        mig = await sqlrun.run_sqlchange(ROOT / SLUG, "verify", cred)
+        mig = await sqlrun.run_sqlchange(ROOT / SLUG, "dev", cred)
         assert mig["ok"] is True
         norm = schemacheck.normalize_dump(await schemacheck.dump_schema(cred))
         assert schemacheck.is_parity(schemacheck.schema_diff(norm, norm)) is True
@@ -71,14 +71,14 @@ async def test_run_sh_folds_schema_then_data(sf):
     await sqlrun.build_if_missing()
     cred = await provision.create_db_with_role(sf, scratch.verify_db_name(SLUG))
     try:
-        first = await sqlrun.run_sqlchange(root, "verify", cred)
+        first = await sqlrun.run_sqlchange(root, "dev", cred)
         assert first["ok"] is True and "FOLD schema.sql" in first["log"]
         # 追加一列再 fold：验证 ADD COLUMN 收敛（重放幂等）
         (root / "schema" / "schema.sql").write_text(
             (root / "schema" / "schema.sql").read_text(encoding="utf-8")
             + "ALTER TABLE demo ADD COLUMN IF NOT EXISTS extra INT;\n",
             encoding="utf-8", newline="")
-        second = await sqlrun.run_sqlchange(root, "verify", cred)
+        second = await sqlrun.run_sqlchange(root, "dev", cred)
         assert second["ok"] is True                 # 再 fold 不报错，新列被补上
         norm = schemacheck.normalize_dump(await schemacheck.dump_schema(cred))
         assert "extra" in norm

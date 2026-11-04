@@ -240,7 +240,9 @@ def compute_schema_diff(root: Path, prev_version: str | None) -> dict | None:
 STEPLIST = ("preflight", "build", "provision", "migrate", "deploy", "health", "record")
 # 迁移文件名规范（07 迁移闸门 + 全局约束「注释不得含分号」）：安全名=词/连字符/点/汉字，不含分号
 # 数据轨 D* 与遗留结构轨 V* 均合法（P2 双轨；破坏性变更由 diff 闸门拦，不靠命名）
-_SQL_NAME = _re.compile(r"^[VD]\d{8}_\d{2}_[\w\-.\u4e00-\u9fff]+\.sql$")
+# 前缀可选的 dev//prod/ 是数据轨的环境段（ADR-0040）：判定用**相对 sqlchange/ 的路径**，
+# 所以两段之外的嵌套目录（misc/x.sql、dev/sub/x.sql）匹配不上，会被闸门报出来。
+_SQL_NAME = _re.compile(r"^(?:dev/|prod/)?[VD]\d{8}_\d{2}_[\w\-.\u4e00-\u9fff]+\.sql$")
 
 
 def next_version() -> str:
@@ -249,12 +251,16 @@ def next_version() -> str:
 
 
 def scan_sqlchange(root: Path) -> list[str]:
-    """sqlchange 目录里不合命名规范的文件名清单（preflight 闸门的数据源；目录不存在=无违规）。"""
+    """数据轨里不合命名规范的文件**相对路径**清单（preflight 闸门的数据源；目录不存在=无违规）。
+
+    递归扫（ADR-0040）：环境段的文件同样要过命名闸，两段之外的嵌套目录更要报出来——run.sh 的
+    glob 看不见它们，「文件写了但从来没被执行」是那种不报错的丢失。
+    """
     d = root / "sqlchange"
     if not d.is_dir():
         return []
-    return sorted(p.name for p in d.iterdir()
-                  if p.suffix == ".sql" and not _SQL_NAME.match(p.name))
+    return sorted(rel for rel in (p.relative_to(d).as_posix() for p in d.rglob("*.sql"))
+                  if not _SQL_NAME.match(rel))
 
 
 async def _step_ev(app_id, notify, rid_step_cb, step: str, state: str) -> None:

@@ -295,15 +295,20 @@ async def test_sqlchange_files_and_records(client, dev_app):
 
 
 async def test_sqlchange_files_lists_pending(client, dev_app):
-    """目录里的 V*.sql 按文件名排序给出，未记账的一律 applied=False（待执行徽章的来源）。"""
+    """待办清单=公共段+dev 段（ADR-0040）：按真实执行顺序给出，prod 段的文件对 dev 视角不可见。"""
     d = ROOT / "sqlchange"
     d.mkdir(parents=True, exist_ok=True)
     (d / "V20260918_02_b.sql").write_text("-- b\nSELECT 1\n", encoding="utf-8")
     (d / "V20260918_01_a.sql").write_text("-- a\nSELECT 1\n", encoding="utf-8")
     (d / "notes.md").write_text("非迁移文件\n", encoding="utf-8")
+    (d / "dev").mkdir()
+    (d / "dev" / "D20260918_03_demo.sql").write_text("-- dev 段\nSELECT 1\n", encoding="utf-8")
+    (d / "prod").mkdir()
+    (d / "prod" / "D20260918_03_online.sql").write_text("-- prod 段\nSELECT 1\n", encoding="utf-8")
 
     got = (await client.get(f"/api/apps/{dev_app}/sqlchange/files")).json()
-    assert [f["filename"] for f in got] == ["V20260918_01_a.sql", "V20260918_02_b.sql"]
+    assert [f["filename"] for f in got] == ["V20260918_01_a.sql", "V20260918_02_b.sql",
+                                            "dev/D20260918_03_demo.sql"]
     assert all(f["applied"] is False and f["success"] is None for f in got)
 
 

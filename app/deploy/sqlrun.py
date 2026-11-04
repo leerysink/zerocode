@@ -1,15 +1,20 @@
 # app/deploy/sqlrun.py
 """sqlrunner 镜像构建与一次性执行（规格 07 §4.3）。退出码：0 成功 / 2 迁移失败 / 3 篡改。
 
-镜像 zerocode-sqlrunner:1（postgres:16-alpine + /run.sh）：输入 env TARGET_HOST/TARGET_DB/
-TARGET_USER/TARGET_PASSWORD，只读挂载 /sql，跑增量迁移并写 sqlchange_history。
+镜像 zerocode-sqlrunner:2（postgres:16-alpine + /run.sh）：输入 env TARGET_HOST/TARGET_DB/
+TARGET_USER/TARGET_PASSWORD/TARGET_ENV，只读挂载 /sql，跑「公共段 + TARGET_ENV 段」增量迁移并写
+sqlchange_history（记账用相对 sqlchange/ 的路径，ADR-0040）。
+tag 从 :1 bump 到 :2 是刻意的：build_if_missing 只在镜像缺失时构建，沿用 :1 会让宿主上那份陈旧
+镜像带着「不认识 TARGET_ENV」的旧 run.sh 继续被复用，环境段从此静默不跑。
 """
 import asyncio
 from pathlib import Path
 from app.deploy.provision import ensure_zcnet
 
-IMAGE = "zerocode-sqlrunner:1"
+IMAGE = "zerocode-sqlrunner:2"
 SQLRUNNER_DIR = Path(__file__).resolve().parent / "sqlrunner"
+# 数据轨的环境段（ADR-0040）：run.sh 用它决定「公共段 + 本环境段」，野值一律拒。
+SEGMENT_ENVS = ("dev", "prod")
 
 
 def docker_available() -> bool:
@@ -69,16 +74,36 @@ async def build_if_missing() -> None:
         raise RuntimeError(f"sqlrunner 镜像构建失败:\n{log}")
 
 
+def segment_files(sqlchange_dir: Path, env: str) -> list[str]:
+    """某环境一次执行会看到的 .sql **相对 sqlchange/ 的路径**（公共段在前、本环境段在后）。
+
+    与 run.sh 的 `ls /sql/*.sql /sql/$TARGET_ENV/*.sql | sort` 同口径：顶层文件名首字母是 V/D（大写），
+    排序天然早于小写的段目录名，所以「先公共后环境」在全局 sort 下也成立。
+    环境段目录缺失是合法的（存量应用不回填，ADR-0040），此时只剩公共段。
+    """
+    if env not in SEGMENT_ENVS:
+        raise ValueError(f"segment_files 的 env 只接受 {'/'.join(SEGMENT_ENVS)}，收到 {env!r}")
+    out = [p.name for p in sorted(sqlchange_dir.glob("*.sql"))]
+    seg = sqlchange_dir / env
+    if seg.is_dir():
+        out += [f"{env}/{p.name}" for p in sorted(seg.glob("*.sql"))]
+    return out
+
+
 async def run_sqlchange(app_dir: Path, env: str, cred: dict, on_log=None) -> dict:
     """对 <app_dir>/sqlchange 执行一次性迁移容器；cred 为 provision 返回 {db,user,password}。
 
-    dev/prod 的差异只体现在传入的 cred（同一入口两条发布线复用），故 env 暂不参与容器参数。
+    env 决定数据轨跑哪一段（ADR-0040）：容器执行「公共段（顶层）+ `<env>/` 段」，另一段对本库不可见。
+    它同时是连库凭据的选择器（`<slug>_dev` / `<slug>_prod`），两者必须一致——传错 env 会把 dev 段
+    写进线上库，或让线上种子静默失踪，故非 dev/prod 的取值直接 raise（不起容器）。
     Windows 下 -v 传 D:\\... 形式，Docker Desktop 自行转换挂载路径。
 
     fail-closed 闸门（审查 I-1）：挂载源目录缺失时 Docker Desktop 会静默补一个空 /sql，run.sh 走
     「空目录=成功」分支退 0 → 绿色空跑击穿 depends_on: migrate 闸门；宿主侧才分得清「缺失 vs 空」，
     故在起任何 docker 命令之前先拒绝（空目录仍合法，按现路径 exit 0）。
     """
+    if env not in SEGMENT_ENVS:
+        raise ValueError(f"run_sqlchange 的 env 只接受 {'/'.join(SEGMENT_ENVS)}，收到 {env!r}")
     sql_dir = app_dir / "sqlchange"
     if not sql_dir.is_dir():
         return {"ok": False, "code": 2,
@@ -98,6 +123,7 @@ async def run_sqlchange(app_dir: Path, env: str, cred: dict, on_log=None) -> dic
         "-e", f"TARGET_DB={cred['db']}",
         "-e", f"TARGET_USER={cred['user']}",
         "-e", f"TARGET_PASSWORD={cred['password']}",
+        "-e", f"TARGET_ENV={env}",
         *mounts,
         IMAGE, on_line=on_log)
     return {"ok": code == 0, "code": code, "log": log}

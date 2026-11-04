@@ -548,6 +548,13 @@ def test_build_db_prompt_states_core_rules():
         assert kw in p, kw
 
 
+def test_build_db_prompt_points_prod_query_at_data_track():
+    """ADR-0040：prod 段的种子由 AI 写，写前唯一的线上事实来源就是 db_query(env=prod)。"""
+    p = db_tools.build_db_prompt()
+    assert "sqlchange/prod/" in p and "prod 段" in p
+    assert "只读" in p
+
+
 # ---------- 审查修复的回归钉（code-review 2026-10-30） ----------
 
 async def test_exception_text_is_redacted_before_reaching_model(monkeypatch):

@@ -30,8 +30,9 @@ def test_render_dev_compose_fastapi():
     assert "name: zc-lailiao-dev" in y
     for svc in ("migrate:", "backend:", "frontend:"):
         assert svc in y
-    assert "zerocode-sqlrunner:1" in y
+    assert "zerocode-sqlrunner:2" in y
     assert "TARGET_DB: ${DEV_DB}" in y and "TARGET_USER: ${DEV_USER}" in y
+    assert "TARGET_ENV: dev" in y                 # 数据轨环境段（ADR-0040）：缺它容器直接红
     assert "8211:5173" in y                      # 仅前端端口对外（规格 05 FR5-06）
     assert "zcnet" in y and "external: true" in y
     assert "service_completed_successfully" in y  # 迁移不过应用不起（规格 07 FR7-04）
@@ -219,8 +220,9 @@ def test_render_prod_compose_fastapi():
     assert doc["networks"]["zcnet"] == {"external": True}
     svc = doc["services"]
     assert set(svc) == {"migrate", "backend", "frontend"}
-    assert svc["migrate"]["image"] == "zerocode-sqlrunner:1"
+    assert svc["migrate"]["image"] == "zerocode-sqlrunner:2"
     assert svc["migrate"]["environment"]["TARGET_DB"] == "${PROD_DB}"       # 闸门指 prod 库
+    assert svc["migrate"]["environment"]["TARGET_ENV"] == "prod"            # 只跑公共段 + prod 段
     assert svc["backend"]["image"] == "zc-lailiao-backend:prod-${PROD_VERSION}"
     assert svc["backend"]["build"] == "../backend"
     assert svc["backend"]["restart"] == "unless-stopped"
@@ -361,7 +363,8 @@ def test_render_dev_compose_springboot_shape():
     assert doc["name"] == "zc-bigapp-dev"
     svc = doc["services"]
     assert set(svc) == {"migrate", "appredis", "backend", "frontend"}
-    assert svc["migrate"]["image"] == "zerocode-sqlrunner:1"      # 迁移闸门与 fastapi 栈完全同形
+    assert svc["migrate"]["image"] == "zerocode-sqlrunner:2"      # 迁移闸门与 fastapi 栈完全同形
+    assert svc["migrate"]["environment"]["TARGET_ENV"] == "dev"
     assert "../schema:/schema:ro" in svc["migrate"]["volumes"]
     assert svc["appredis"]["image"] == "redis:7-alpine"
     assert "ports" not in svc["appredis"]                         # Redis 不出宿主端口，只走 compose 内部网
