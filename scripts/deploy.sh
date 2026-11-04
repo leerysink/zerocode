@@ -56,7 +56,7 @@ done
 . "$LIB" || fail "source $LIB 失败"
 for want in zc_normalize_root zc_valid_password zc_env_render zc_env_backup zc_merge_plan \
             zc_env_gaps zc_pkg_manager zc_busy zc_port_holder_kind zc_port_holder_pid \
-            zc_install_commands zc_needs_rebuild zc_answers_get zc_answers_put \
+            zc_install_commands zc_answers_get zc_answers_put \
             zc_add_docker_group_command zc_untouchables zc_daemon_json_plan zc_daemon_json_write; do
   declare -F "$want" >/dev/null || fail "deploy_lib.sh 里缺 $want——这份 lib 比 deploy.sh 旧，重打包再传"
 done
@@ -175,7 +175,7 @@ done
 ENVF="$DEPLOY_ROOT/.env"
 ANSF="$DEPLOY_ROOT/.deploy-answers"
 # 换根判定（US-18）必须在第 6 步写 .env 之前取旧值：写完之后 .env 里就只剩本次的根了，
-# 再读一次比较会得到「根没变」，于是该 --build 的时候不 build，WORKDIR 停在旧根且全程不报错。
+# 再读一次比较会得到「根没变」，换根提醒整条漏掉——镜像 WORKDIR 停在旧根且全程不报错。
 OLD_ROOT="$(envval DEPLOY_ROOT "$ENVF")"
 [ "$DEPLOY_ROOT" = "$PKG" ] && IN_PLACE=1 || IN_PLACE=0
 ok "部署根 $DEPLOY_ROOT"
@@ -606,15 +606,11 @@ printf '%s\n' "$SVC" | grep -qx browser || fail \
   "compose 里没有 browser 服务：这份 docker-compose.yml 比 preview_page 还旧。把新包的 docker-compose.yml 与 browser/ 目录传上来再重跑（换整份 compose 前先 diff 保住服务器本地改过的默认值）"
 ok "compose 里有 browser sidecar 服务"
 
-# 部署根是运行期取的（ADR-0034）：镜像 WORKDIR 在构建期定值，根变了只 up -d 会让它停在旧根，
-# 症状正是同路径挂载警告过的「新建应用落进容器可写层」，而且全程不报错。
+# 部署根是运行期取的（ADR-0034）：镜像 WORKDIR 在构建期定值，换根必须重建镜像。
 # OLD_ROOT 是第 1 步定的，读的是合并前的 .env——在这里重读会拿到本次刚写进去的新值，判定恒为假。
-REBUILD="$(zc_needs_rebuild "$OLD_ROOT" "$DEPLOY_ROOT")"
-if [ "$REBUILD" = 1 ]; then
-  [ -n "$OLD_ROOT" ] && [ "$OLD_ROOT" != "$DEPLOY_ROOT" ] && {
-    warn "部署根从 $OLD_ROOT 换成 $DEPLOY_ROOT：强制 --build 重建镜像 WORKDIR"
-    warn "换根后记得核对 $DEPLOY_ROOT/apps 里既有工程的位置，与库里的 root_path 是否一致"
-  }
+if [ -n "$OLD_ROOT" ] && [ "$OLD_ROOT" != "$DEPLOY_ROOT" ]; then
+  warn "部署根从 $OLD_ROOT 换成 $DEPLOY_ROOT：本次重建会让镜像 WORKDIR 跟上"
+  warn "换根后记得核对 $DEPLOY_ROOT/apps 里既有工程的位置，与库里的 root_path 是否一致"
 fi
 
 # 预热分两条腿，各管各的镜像，因为「能 pull」这件事只有 compose 自己说得准：
@@ -672,13 +668,12 @@ if [ "$DROP_DB" = 1 ]; then
   warn "旧栈与 pgdata 卷已清除"
 fi
 
-if [ "$REBUILD" = 1 ]; then
-  say "docker compose up -d --build（首次要 build 平台与浏览器镜像；浏览器镜像含 Chromium，几分钟起）"
-  docker compose up -d --build || fail "起栈失败：docker compose logs backend --tail 100（镜像里的依赖装不动就回头看第 7 步的镜像源提示）"
-else
-  say "docker compose up -d（部署根没变，不必重建镜像）"
-  docker compose up -d || fail "起栈失败：docker compose logs backend --tail 100"
-fi
+# 平台代码与前端 dist 都烘在镜像里（backend/Dockerfile 只 COPY backend/app 与 frontend/dist），
+# 部署根里的同名文件只是构建上下文：镜像已存在时 `docker compose up -d` 不会重建，升级就会
+# 静默停在旧镜像——现象是「新包传上去了，控制台还是旧版」（2026-11-04 uni-app 选项实撞）。
+# 所以起栈一律 --build；缓存命中时只多几十秒，比静默不升级便宜得多。
+say "docker compose up -d --build（升级必须重建：平台与浏览器代码都烘在镜像里；浏览器镜像含 Chromium，首次几分钟起）"
+docker compose up -d --build || fail "起栈失败：docker compose logs backend --tail 100（镜像里的依赖装不动就回头看第 7 步的镜像源提示）"
 
 say "等就绪"
 pg=""

@@ -209,15 +209,6 @@ EOF
   esac
 }
 
-zc_needs_rebuild() { # $1=.env 里的旧部署根 $2=本次部署根 ; stdout=1|0
-  local old="${1:-}" new="${2:-}"
-  old="${old%/}"; new="${new%/}"
-  # 读不到旧值时保守选重建：WORKDIR 是构建期烘进镜像的，只 up -d 会让容器内路径与
-  # 宿主挂载分家，症状正是 ADR-0013 警告的「新建应用落进容器可写层」，而且全程不报错。
-  [ -n "$old" ] || { printf '1\n'; return 0; }
-  if [ "$old" = "$new" ]; then printf '0\n'; else printf '1\n'; fi
-}
-
 # ---------------------------------------------------------------- 环境保障（US-10 / US-11）
 
 zc_pkg_manager() { # stdout=apt-get|dnf|yum|none

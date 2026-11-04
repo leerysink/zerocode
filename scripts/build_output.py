@@ -1319,7 +1319,7 @@ def readme_md(presets, deploy_root: str, generated_at: str, dist_stamp: str,
 - **部署根在部署时输入**（ADR-0034）：上面那行 `{deploy_root}` 只是打包时的建议默认值，
   第 1 问就能改成别的路径。compose 的同路径挂载、`.env` 的 `DEPLOY_ROOT`、init.sql 里预置应用的
   `root_path` 三处跟着这一次输入走（种子段带的是 `{{DEPLOY_ROOT}}` 占位符，起栈前才换成真值）。
-  换根的代价不是重打包，而是**重建镜像**（镜像 `WORKDIR` 变了）——脚本自己判定并强制 `--build`；
+  换根的代价不是重打包，而是**重建镜像**（镜像 `WORKDIR` 变了；起栈本来就带 `--build`，见第 7 步）；
   这台机器上已经跑过应用时，还要人工核对新根 `apps/` 里既有工程的位置与库里的 `root_path`
   一致（ADR-0013）。
 - 服务器能访问 Docker Hub 与 **PyPI**：平台与应用栈的基础镜像（`pgvector/pgvector:pg16`、
@@ -1379,7 +1379,7 @@ docker daemon 起不来）、保证发行版 `/etc/wsl.conf` 里 `[boot] systemd
 | 4 运行参数 | `POSTGRES_USER`、`POSTGRES_PASSWORD`、`PLATFORM_PORT`、`PG_PORT`、`ZEROCODE_PREVIEW_HOST`、PyPI / npm / apt 三个镜像源、要不要起中央网关（答「起」才接着问网关域名与 `ZEROCODE_SSL_ENABLE`） | 口令**只进 `.env`**，不进 `.deploy-answers`；升级时直接回车就沿用 `.env` 里的既有值。`ZEROCODE_PREVIEW_HOST` 的打包默认值是 `localhost`（本机演示用的），脚本发现它没被改就换成探测到的宿主 IP |
 | 5 宿主端口 | 控制台端口（起网关时还有 80/443）被占了怎么办 | 占用者是**容器**才问「stop 它腾地方？」（只 stop 不删，`docker start <名字>` 可恢复）；是**宿主进程**就报 PID 让你自己确认再 kill。脚本不代劳 kill，也不劝你改 `PLATFORM_PORT` 买单 |
 | 6 落盘 | 不问：合并 `.env`、铺包或按升级合并、把答案写进 `.deploy-answers` | 升级模式只镜像 `backend/`、`browser/`、`frontend/` 三棵，八项现场产物一个不碰（§4） |
-| 7 起平台栈 | 不问 | 先核 compose 里声明了 `browser` 服务，再预热 `docker pull` 基础镜像——拉不动就当场停，不等 build 卡二十分钟；`DEPLOY_ROOT` 变了自动带 `--build` |
+| 7 起平台栈 | 不问 | 先核 compose 里声明了 `browser` 服务，再预热 `docker pull` 基础镜像——拉不动就当场停，不等 build 卡二十分钟；起栈一律 `up -d --build`：平台代码与前端 dist 都烘在镜像里，只 `up -d` 会静默停在旧镜像 |
 | 8 重放与自检 | 不问：`bash apply-init.sh`，然后从后端容器实探探针与 sidecar | `compose 里有 browser 服务` 不等于 `Chromium 起得来`，自检探的是 `$ZEROCODE_BROWSER_URL/healthz` |
 | 9 中央网关 | 升级时问「要按新的 `gateway/docker-compose.yml` 重建吗」 | 缺证书就自签（生产换 acme.sh）；`gateway/certs/`、`gateway/routes/`、`gateway/.env` 是现场产物，不覆盖也不删 |
 
@@ -1512,8 +1512,8 @@ bash deploy.sh          # 第 1 问选 upgrade
   `gateway/make-cert.ps1`、`gateway/404.html`、`gateway/lua/router.lua`、`gateway/.env.example`。
 - 八项现场产物一个不碰（下表）。
 - `.env` 合并写：只动本次问到的键，既有键与注释原样保留；动之前静默备份 `.env.bak-<UTC>`（留 5 份）。
-- 起栈：`DEPLOY_ROOT` 没变就 `docker compose up -d`，变了自动 `--build`；随后 `bash apply-init.sh`
-  重放全量 init.sql（只补不覆盖）。
+- 起栈：一律 `docker compose up -d --build`（平台代码与前端 dist 都烘在镜像里，镜像已存在时
+  只 `up -d` 不会重建，升级会静默停在旧版）；随后 `bash apply-init.sh` 重放全量 init.sql（只补不覆盖）。
 
 `apps/`、`data/`、`store/`、`gateway/certs/`、`gateway/routes/`、`gateway/.env`、`.env`、
 `.deploy-answers` 加 `pgdata` 卷，**任何一步都不许带 `--delete` 去碰**：包里刻意不含它们。
@@ -1566,7 +1566,7 @@ bash deploy.sh          # 第 1 问选 upgrade
   单独启停（第 9 步会做，升级时是否重建会问你）；它占用宿主 80/443，且证书/私钥只在服务器
   现场生成（`gateway/certs/` 不进包）。acme.sh 续期后要重启（或 reload）网关让 nginx 读到新证书。
 - **部署根可以现场输入，但换根有代价**：镜像 `WORKDIR` 与 `ZEROCODE_GATEWAY_ROUTES` 在构建期定值，
-  换根必然触发一次 `--build`（脚本自动判定，见第 7 步）；机器上已经跑过应用时还要人工核对
+  换根后必须重建镜像（起栈本就带 `--build`，见第 7 步）；机器上已经跑过应用时还要人工核对
   `apps/` 里既有工程与库里的 `root_path` 一致。
 - **没有无人值守入口**（D-11 的代价）：批量部署几台机器就要答几遍题。`bash deploy.sh < /dev/null` 也变不出无人值守——一路回车取的是默认值，而平台库口令没有默认值可取，读不到就停（这是刻意的：口令只认现场输入）。将来真需要非交互，
   给 `deploy.sh` 一个 `--answers` 文件重放入口，别往回加行为 flag。

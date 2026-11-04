@@ -224,18 +224,6 @@ def test_merge_plan_rejects_unknown_mode():
     assert "maybe" in err(r)
 
 
-# ---------------------------------------------------------------- 重建判定
-
-def test_needs_rebuild_when_root_changed():
-    """WORKDIR 是构建期取的：根变了必须 --build，只 up -d 会静默分家（ADR-0034）。"""
-    assert out(sh("zc_needs_rebuild", "/opt/zerocode", "/srv/zc")) == "1"
-    assert out(sh("zc_needs_rebuild", "", "/srv/zc")) == "1"       # 读不到旧值时保守选重建
-
-
-def test_no_rebuild_for_same_root():
-    assert out(sh("zc_needs_rebuild", "/srv/zc", "/srv/zc")) == "0"
-
-
 # ---------------------------------------------------------------- 包管理器与端口判定
 
 @pytest.mark.skipif(host_has("apt-get", "dnf", "yum"), reason="宿主已装包管理器，桩不出「优先级」与「none」这两条分支")

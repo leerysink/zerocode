@@ -344,6 +344,18 @@ def test_repo_deploy_kernel_warms_only_pullable_images():
     assert "pull_bases" in code and "FROM" in code, "构建期基础镜像的预热退化了（境内机真卡点）"
 
 
+def test_repo_deploy_kernel_always_rebuilds_buildable_images():
+    """回归钉（2026-11-04 线上实撞）：平台后端与前端 dist 都烘在镜像里（backend/Dockerfile 只
+    COPY backend/app 与 frontend/dist），镜像已存在时 `docker compose up -d` 不会重建。同根升级
+    因此静默停在旧镜像——新包传上去，控制台还是旧版（uni-app 选项整块消失）。起栈必须无条件
+    带 --build，不许再有「根没变就不重建」的分支。"""
+    kernel = (bo.REPO_ROOT / "scripts" / "deploy.sh").read_text(encoding="utf-8")
+    code = "\n".join(l for l in kernel.splitlines() if not l.lstrip().startswith("#"))
+    assert "docker compose up -d --build" in code, "起栈不再重建镜像：升级会静默留在旧版"
+    assert not re.search(r"docker compose up -d(?! --build)", code), "又出现了不带 --build 的起栈分支"
+    assert "不必重建镜像" not in code
+
+
 def test_repo_deploy_kernel_waits_for_the_daemon_it_just_started():
     """回归钉：`systemctl enable --now docker` / 换 daemon.json 后的 restart 都是异步的，立刻判缺口
     会把「刚装好」报成「环境仍缺 daemon」，新装机器每次死在 2/9。等待必须有界——无界就是卡死。"""
@@ -2112,6 +2124,15 @@ def test_readme_documents_the_packaged_gateway_instead_of_denying_it(fake_repo):
     assert "gateway/certs/" in readme, "没写证书落在哪"
     assert "点进去全 404" in readme            # 排障表里要有这条症状
     assert (out / "gateway" / "docker-compose.yml").is_file()
+
+
+def test_readme_tells_upgraders_up_is_always_build(fake_repo):
+    """README 的升级说明必须与脚本一致：同根升级也要重建镜像。写成「根没变就 up -d」会把人
+    引向「包传了就该生效」的错觉（2026-11-04 uni-app 实撞）。"""
+    out = _build(fake_repo)["out"]
+    readme = (out / "README-deploy.md").read_text(encoding="utf-8")
+    assert "up -d --build" in readme
+    assert "没变就 `docker compose up -d`" not in readme, "README 还在教「根没变不必重建」"
 
 
 # ---------------------------------------------------------------- 网关入包（ADR-0018）
