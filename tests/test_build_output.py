@@ -300,6 +300,26 @@ def test_powershell_skin_ships_as_bom_plus_lf(fake_repo):
     assert "deploy.sh" in raw.decode("utf-8-sig"), "皮里没有调用同一份 deploy.sh（那它就不是皮）"
 
 
+def test_repo_deploy_kernel_never_persists_dnspod_credentials():
+    """DNSPod API 凭据只许 export 给 acme.sh（它自己存 account.conf 供续期），
+    一旦写进 .env / .deploy-answers 就是明文凭据落盘并被下轮部署回显。"""
+    kernel = (bo.REPO_ROOT / "scripts" / "deploy.sh").read_text(encoding="utf-8")
+    assert "read -rs DP_KEY" in kernel, "DP_Key 不再用不回显输入收"
+    for bad in ("put DP_Id", "put DP_Key", "put DP_ID", "put DP_KEY"):
+        assert bad not in kernel, f"凭据被写进运行参数：{bad}"
+    assert "export DP_Id=" in kernel and "DP_Key=" in kernel, "凭据没交给 acme.sh"
+
+
+def test_repo_deploy_kernel_wires_acme_commands_to_the_lib():
+    """网关真证书的拼装只在判定层（有桩测）；执行层不得自己拼 --issue/--install-cert，
+    否则命令与桩测覆盖的两份文本会各自漂移。"""
+    kernel = (bo.REPO_ROOT / "scripts" / "deploy.sh").read_text(encoding="utf-8")
+    assert "zc_acme_issue_cmd" in kernel, "执行层没调 zc_acme_issue_cmd"
+    assert "zc_acme_install_cmd" in kernel, "执行层没调 zc_acme_install_cmd"
+    assert "--issue --server letsencrypt" not in kernel, "内核里又自己拼了一份签发命令"
+    assert "--install-cert" not in kernel, "内核里又自己拼了一份安装命令"
+
+
 def test_repo_deploy_kernel_delegates_predicates_to_the_lib():
     """回归钉：判定逻辑只能住在 deploy_lib.sh（那才有桩测）。内核里再长出一份 busy 判定，
     就等于多一条没人测的分支——2026-10-29 那次 `|| true` 恒真的教训就在这类复制粘贴里。"""

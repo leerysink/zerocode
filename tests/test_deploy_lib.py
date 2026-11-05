@@ -387,6 +387,105 @@ def test_port_holder_pid_extracts_the_number_or_stays_silent():
     assert out(sh("zc_port_holder_pid", stdin="")) == ""
 
 
+# ---------------------------------------------------------------- acme.sh 真证书（判定层）
+
+def test_acme_shquote_handles_embedded_single_quotes():
+    """DNSPod Key / 含空格的部署根都会经 shell 再解释一次，词内单引号必须转义。
+
+    Windows 上 subprocess 的 argv 会经 MSYS 转换，裸单引号传进 bash 会被吃掉；
+    这条用例的探针词改走 stdin，绕开 argv 转换，测的仍是同一段引用逻辑。
+    """
+    probe = ('set -uo pipefail; LIB="${LIB}"; source "$LIB"; '
+             'zc_shquote "$(cat)" "/opt/my apps"')
+    r = sh("bash", "-c", probe, stdin="a'b\n",
+           env={"LIB": LIB.as_posix()})
+    assert out(r) == "'a'\\''b'\n'/opt/my apps'", err(r)
+
+
+def test_acme_dnsapi_only_accepts_supported_providers():
+    assert out(sh("zc_acme_dnsapi", "dnspod")) == "dns_dp"
+    r = sh("zc_acme_dnsapi", "cloudflare")
+    assert r.returncode != 0
+    assert "cloudflare" in err(r)
+
+
+def test_acme_creds_require_both_values():
+    assert sh("zc_acme_creds_ok", "12345", "secret").returncode == 0
+    assert sh("zc_acme_creds_ok", "", "secret").returncode != 0
+    assert sh("zc_acme_creds_ok", "12345", "").returncode != 0
+
+
+def test_acme_shdquote_is_safe_under_eval():
+    """--reloadcmd 外层要再 eval 一次：路径里的 $ ` " \\ 不许被 shell 展开或截断。
+
+    探针词走 stdin：Windows 上 subprocess 的 argv 经 MSYS 转换会吃掉反引号/引号。
+    """
+    probe = 'cd /opt/a$b"c`d\\e && echo hi'
+    script = ('set -uo pipefail; source "$LIB"; IFS= read -r p; '
+              'q="$(zc_shdquote "$p")"; eval "set -- $q"; printf "%s" "$1"')
+    r = sh("bash", "-c", script, stdin=probe + "\n", env={"LIB": LIB.as_posix()})
+    assert out(r) == probe, err(r)
+
+
+def test_gateway_reloadcmd_quotes_a_root_with_spaces_and_sets_cwd():
+    """reloadcmd 会被 acme.sh 存下来由 shell 再解释：部署根合法地含空格时不能拆词；
+    cron 的 cwd 是 HOME，还得先 cd 到 gateway/ 让 compose 的相对挂载找得到。"""
+    cmd = out(sh("zc_gateway_reloadcmd", "/opt/my apps/gateway/docker-compose.yml"))
+    assert cmd == ("cd '/opt/my apps/gateway' && docker compose -f "
+                   "'/opt/my apps/gateway/docker-compose.yml' restart")
+
+
+def test_acme_issue_cmd_covers_apex_and_wildcard_with_letsencrypt():
+    cmd = out(sh("zc_acme_issue_cmd", "/root/.acme.sh/acme.sh", "example.com", "dns_dp"))
+    assert "'/root/.acme.sh/acme.sh' --issue --server letsencrypt --dns dns_dp" in cmd
+    assert "-d 'example.com' -d '*.example.com'" in cmd
+
+
+def test_acme_install_cmd_writes_fixed_cert_names_and_reloads_gateway():
+    reloadcmd = "docker compose -f /opt/my apps/gateway/docker-compose.yml restart"
+    cmd = out(sh("zc_acme_install_cmd", "/root/.acme.sh/acme.sh", "example.com",
+                 "/opt/my apps/gateway/certs/gateway.key",
+                 "/opt/my apps/gateway/certs/gateway.crt", reloadcmd))
+    assert "'/root/.acme.sh/acme.sh' --install-cert -d 'example.com'" in cmd
+    assert "--key-file '/opt/my apps/gateway/certs/gateway.key'" in cmd
+    assert "--fullchain-file '/opt/my apps/gateway/certs/gateway.crt'" in cmd
+    assert cmd.endswith('--reloadcmd "' + reloadcmd + '"')
+
+
+def test_acme_install_cmd_is_independent_of_ambient_acme_bin():
+    """判定层是纯文本函数：环境里别处设的 ACME_BIN / ZC_ACME_BIN 都不该改变产物。"""
+    cmd = out(sh("zc_acme_install_cmd", "/root/.acme.sh/acme.sh", "example.com",
+                 "/opt/zc/certs/gateway.key", "/opt/zc/certs/gateway.crt",
+                 "docker compose restart",
+                 env={"ACME_BIN": "/tmp/evil/acme.sh", "ZC_ACME_BIN": "/tmp/evil2/acme.sh"}))
+    assert "/tmp/evil" not in cmd
+    assert cmd.startswith("'/root/.acme.sh/acme.sh' --install-cert")
+
+
+def test_acme_install_cmd_keeps_reloadcmd_as_one_arg():
+    """reloadcmd 含 &&：外层 eval 会拆裸单引号，必须再包一层双引号让 acme.sh 收到完整一条。"""
+    reloadcmd = "cd '/opt/zc/gateway' && docker compose -f '/opt/zc/gateway/docker-compose.yml' restart"
+    cmd = out(sh("zc_acme_install_cmd", "/root/.acme.sh/acme.sh", "example.com",
+                 "/opt/zc/certs/gateway.key", "/opt/zc/certs/gateway.crt", reloadcmd))
+    assert '--reloadcmd "cd \'/opt/zc/gateway\' && docker compose' in cmd
+    import shlex
+    argv = shlex.split(cmd)
+    assert argv[0] == "/root/.acme.sh/acme.sh"
+    assert argv[-2:] == ["--reloadcmd", reloadcmd], "reloadcmd 被 && 拆开了"
+
+
+def test_acme_commands_are_executable_shell():
+    """issue/install 命令要能被 bash 原样执行（用 : 桩顶掉 acme.sh，跑完不碰网络）。"""
+    issue = out(sh("zc_acme_issue_cmd", "/root/.acme.sh/acme.sh", "example.com", "dns_dp"))
+    install = out(sh("zc_acme_install_cmd", "/root/.acme.sh/acme.sh", "example.com",
+                     "/opt/zc/certs/gateway.key", "/opt/zc/certs/gateway.crt",
+                     "docker compose restart"))
+    for cmd in (issue, install):
+        probe = sh("bash", "-c", "acme.sh() { :; }; export -f acme.sh; " +
+                   cmd.replace("'/root/.acme.sh/acme.sh'", "acme.sh"))
+        assert probe.returncode == 0, err(probe)
+
+
 # ---------------------------------------------------------------- 装 Docker 的命令（US-10 / D-09）
 
 def test_install_commands_apt_branch_installs_the_compose_v2_plugin():

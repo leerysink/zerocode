@@ -1340,8 +1340,9 @@ def readme_md(presets, deploy_root: str, generated_at: str, dist_stamp: str,
   时，网关可以先不起（第 4 步回答 n 即可，Windows 侧的建议默认值就是 n）。
 - 平台库账号需具备建库建角色权限（镜像默认的 `zerocode` 就是超级用户）。
 - 口令请只用字母、数字与 `- _`：它会被原样拼进 asyncpg 连接串，含 `@ : / # % & ?` 会把它截断。
-- TLS 证书**不在包里**（私钥绝不进包）：选了起网关，第 9 步缺证书会用包内 `make-cert.sh` 自签；
-  生产请换成 acme.sh 签的泛域名真证书（§2 末尾「网关」小节）。
+- TLS 证书**不在包里**（私钥绝不进包）：选了起网关，第 4 步默认走 acme.sh + DNSPod DNS-01
+  签 Let's Encrypt 泛域名真证书（现场收 DP_Id/DP_Key，不回显、不落 .env）；也可选自签，
+  或签发失败时自动回退自签。手工换证书的命令见 §2 末尾「网关」小节。
 
 ## 2. 首次部署：一条命令
 
@@ -1381,7 +1382,7 @@ docker daemon 起不来）、保证发行版 `/etc/wsl.conf` 里 `[boot] systemd
 | 6 落盘 | 不问：合并 `.env`、铺包或按升级合并、把答案写进 `.deploy-answers` | 升级模式只镜像 `backend/`、`browser/`、`frontend/` 三棵，八项现场产物一个不碰（§4） |
 | 7 起平台栈 | 不问 | 先核 compose 里声明了 `browser` 服务，再预热 `docker pull` 基础镜像——拉不动就当场停，不等 build 卡二十分钟；起栈一律 `up -d --build`：平台代码与前端 dist 都烘在镜像里，只 `up -d` 会静默停在旧镜像 |
 | 8 重放与自检 | 不问：`bash apply-init.sh`，然后从后端容器实探探针与 sidecar | `compose 里有 browser 服务` 不等于 `Chromium 起得来`，自检探的是 `$ZEROCODE_BROWSER_URL/healthz` |
-| 9 中央网关 | 升级时问「要按新的 `gateway/docker-compose.yml` 重建吗」 | 缺证书就自签（生产换 acme.sh）；`gateway/certs/`、`gateway/routes/`、`gateway/.env` 是现场产物，不覆盖也不删 |
+| 9 中央网关 | 升级时问「要按新的 `gateway/docker-compose.yml` 重建吗」 | 第 4 步选 acme（默认，DNSPod DNS-01 真证书）或自签；现场已有证书则先问是否重签；`gateway/certs/`、`gateway/routes/`、`gateway/.env` 是现场产物，不覆盖也不删 |
 
 `.env` 由脚本从包里的 `.env.example` 起步生成、再合并本次答案，既有键与注释一律保留——**不要**
 手工 `cp .env.example .env`，那等于把服务器现场填的配置顶掉（第 3 步的删库闸门也救不了你，
@@ -1423,10 +1424,12 @@ sidecar 未启动或崩溃时，`preview_page` 会返回「浏览器检查服务
 先签证书，输出必须是 `gateway/certs/gateway.crt` 与 `gateway/certs/gateway.key`（文件名与
 域名无关，换域名/换 CA 都不用改 nginx 配置）：
 
-- **生产（推荐）**：用 acme.sh 走 DNS-01 签泛域名，再用 `--install-cert` 写到上面这对文件名。
-  通配证书要同时申请 `-d '<域名>' -d '*.<域名>'`，DNS 里也要有对应的 `*` 解析。
-- **内网/本机自签**：第 9 步缺证书时脚本就跑的这条命令（在 openresty 镜像里跑 openssl；
-  自签 CA 需要客户端手动信任）：
+- **生产（推荐，第 4 步默认 `acme`）**：deploy.sh 现场收 DNSPod 的 `DP_Id`/`DP_Key`，
+  装 acme.sh 走 DNS-01 同时申请 `-d '<域名>' -d '*.<域名>'`，再用 `--install-cert` 写到
+  上面这对文件名；`--reloadcmd` 会让每月续期后自动重启网关。凭据不进 .env / 应答文件，
+  只由 acme.sh 存进自己的 `account.conf`（续期需要）。也可预先 `export DP_Id=… DP_Key=…`。
+- **内网/本机自签**：第 4 步选 `selfsign`（或 acme 签发失败时自动回退）。自签 CA 需要
+  客户端手动信任，手工等价命令：
   ```bash
   docker run --rm -v "$PWD/gateway/certs:/out" -v "$PWD/gateway/make-cert.sh:/mk.sh" \\
     openresty/openresty:alpine sh -c "tr -d '\\r' < /mk.sh > /tmp/mk.sh; sh /tmp/mk.sh '{gateway_domain}'"

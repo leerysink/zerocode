@@ -365,6 +365,68 @@ zc_daemon_json_keys() { # $1=文件 ; stdout=每行一个顶层键名（够用�
   grep -oE '"[^"]+"[[:space:]]*:' "${1:-}" 2>/dev/null | sed 's/[":[:space:]]//g' | LC_ALL=C sort -u
 }
 
+# ---------------------------------------------------------------- acme.sh 真证书（网关，DNS-01）
+#
+# 判定层只产文本、不碰网络：命令行拼装与引用规则在这里，执行在 deploy.sh 第 9 步。
+# 泛域名必须走 DNS-01；产物名固定 gateway.crt/gateway.key（nginx.conf 读这对，换 CA 不改配置，
+# 见 ADR-0016）。路径允许空格，所以所有词都过 zc_shquote——reloadcmd 会被 acme.sh 存下来由
+# shell 再次执行，引用错一处就是「续期成功、网关还在用旧证书」的静默失效。
+
+zc_shquote() { # $@=任意词 ; stdout=每词一行，单引号安全引用（含词内单引号）
+  local s q="'\\''"
+  for s in "$@"; do
+    printf "'%s'\n" "${s//\'/$q}"
+  done
+}
+
+zc_acme_dnsapi() { # $1=服务商代号 ; stdout=acme.sh 的 dnsapi 名；不认识则非零
+  case "${1:-}" in
+    dnspod) printf 'dns_dp\n' ;;
+    *) printf '不认识 DNS 服务商 %s（当前支持：dnspod）\n' "$1" >&2; return 2 ;;
+  esac
+}
+
+zc_acme_creds_ok() { # $1=API Id $2=API Key ; 0=两者皆非空
+  [ -n "${1:-}" ] && [ -n "${2:-}" ]
+}
+
+zc_shdquote() { # $1=任意词 ; stdout=一个双引号包裹、可被外层 eval 再解释的 shell 词
+  # 双引号层里 $ ` \ " 四类仍会被 shell 解释：部署根允许含这些字符（zc_normalize_root 只
+  # 挡盘符、反斜杠与 | &），不转义就是 eval 时展开变量/执行替换，reloadcmd 静默变形。
+  local s="${1:-}" i ch out='"'
+  for ((i = 0; i < ${#s}; i++)); do
+    ch="${s:i:1}"
+    case "$ch" in
+      '$'|'`'|'\'|'"') out+="\\$ch" ;;
+      *) out+="$ch" ;;
+    esac
+  done
+  printf '%s"\n' "$out"
+}
+
+zc_gateway_reloadcmd() { # $1=docker-compose.yml 绝对路径 ; stdout=acme.sh 续期后重启网关的命令
+  # 两个坑都在这条命令里：① 部署根允许含空格，路径必须自己带引用——reloadcmd 会被
+  # acme.sh 存进配置，续期时再由 shell 解释一次，没引用就会拆词；② cron 的 cwd 是 HOME，
+  # 而 compose 里 ./nginx.conf 等 bind 源是相对 cwd 解析的，不先 cd 到 gateway/ 就会错读。
+  local file="$1" dir="${1%/docker-compose.yml}"
+  printf 'cd %s && docker compose -f %s restart\n' "$(zc_shquote "$dir")" "$(zc_shquote "$file")"
+}
+
+zc_acme_issue_cmd() { # $1=acme.sh路径 $2=域名 $3=dnsapi ; stdout=一条可 eval 的签发命令
+  # --server letsencrypt 是刻意的：acme.sh 默认 CA 已是 ZeroSSL，注册流程要多走 EAB，
+  # 交互部署里多一个会失败的环节；LE 只要邮箱。
+  printf '%s --issue --server letsencrypt --dns %s -d %s -d %s\n' \
+    "$(zc_shquote "$1")" "$3" "$(zc_shquote "$2")" "$(zc_shquote "*.$2")"
+}
+
+zc_acme_install_cmd() { # $1=acme.sh路径 $2=域名 $3=key路径 $4=crt路径 $5=reload命令
+  # reloadcmd 含 &&，必须用一层双引号把它当**单个 argv** 交给 acme.sh；用单引号也会被外层
+  # eval 解释后留下裸 &&，被 shell 当成命令分隔符，acme.sh 只收到 "cd …" 半条。
+  printf '%s --install-cert -d %s --key-file %s --fullchain-file %s --reloadcmd %s\n' \
+    "$(zc_shquote "$1")" "$(zc_shquote "$2")" \
+    "$(zc_shquote "$3")" "$(zc_shquote "$4")" "$(zc_shdquote "$5")"
+}
+
 zc_daemon_json_write() { # $1=文件 $2=逗号分隔的 mirror 列表 ; 只在该文件不存在或只含 registry-mirrors 时落笔
   local file="${1:-}" mirrors="${2:-}" keys url seen m sep i f
   local -a raw_list=() wanted=() existing=()

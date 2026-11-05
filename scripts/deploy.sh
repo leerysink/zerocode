@@ -57,7 +57,9 @@ done
 for want in zc_normalize_root zc_valid_password zc_env_render zc_env_backup zc_merge_plan \
             zc_env_gaps zc_pkg_manager zc_busy zc_port_holder_kind zc_port_holder_pid \
             zc_install_commands zc_answers_get zc_answers_put \
-            zc_add_docker_group_command zc_untouchables zc_daemon_json_plan zc_daemon_json_write; do
+            zc_add_docker_group_command zc_untouchables zc_daemon_json_plan zc_daemon_json_write \
+            zc_acme_dnsapi zc_acme_creds_ok zc_acme_issue_cmd zc_acme_install_cmd \
+            zc_gateway_reloadcmd; do
   declare -F "$want" >/dev/null || fail "deploy_lib.sh 里缺 $want——这份 lib 比 deploy.sh 旧，重打包再传"
 done
 
@@ -465,6 +467,20 @@ if ask_yes "要起中央网关吗（通配域名 HTTPS，占宿主 80/443）" "$
     true|false|1|0|yes|no) put ZEROCODE_SSL_ENABLE "$SSL" ;;
     *) fail "ZEROCODE_SSL_ENABLE 只认 true/false（收到 $SSL）" ;;
   esac
+  CERT_MODE="$(ask_choice '网关证书来源（acme=Let'"'"'s Encrypt 泛域名真证书，需 DNSPod API 凭据；selfsign=内网演示自签）' acme 'acme selfsign')"
+  if [ "$CERT_MODE" = acme ]; then
+    DP_ID="${DP_Id:-}"; DP_KEY="${DP_Key:-}"
+    if zc_acme_creds_ok "$DP_ID" "$DP_KEY"; then
+      ok "沿用环境变量里的 DP_Id / DP_Key（不回显、不落盘）"
+    else
+      # 凭据与 POSTGRES_PASSWORD 同规格：read -rs 不回显，只进本进程环境，绝不写 .env / .deploy-answers。
+      printf '  DNSPod API Id（DP_Id，腾讯云 DNSPod 控制台「密钥管理」里的 ID）：' >&2
+      IFS= read -r DP_ID || DP_ID=""; printf '\n' >&2
+      printf '  DNSPod API Key（DP_Key，不回显）：' >&2
+      IFS= read -rs DP_KEY || DP_KEY=""; printf '\n' >&2
+      zc_acme_creds_ok "$DP_ID" "$DP_KEY" || fail "DNSPod 凭据没给全：DP_Id / DP_Key 都要有，或改用 selfsign"
+    fi
+  fi
 else
   GATEWAY=0
   warn "不起网关：控制台里的应用地址仍是 https://<slug>.<域名> 形态，点进去会 404。"
@@ -736,14 +752,58 @@ done
 if [ "$GATEWAY" = 1 ]; then
   say "9/9 中央网关（独立 compose 项目，读 gateway/.env）"
   [ -n "${DOMAIN:-}" ] || fail "缺 ZEROCODE_GATEWAY_DOMAIN，没法签证书"
-  if [ ! -f gateway/certs/gateway.crt ] || [ ! -f gateway/certs/gateway.key ]; then
-    warn "缺 gateway/certs/gateway.crt|key，用包内脚本自签 *.${DOMAIN}（生产请换 acme.sh DNS-01 真证书）"
+  mkdir -p gateway/certs
+
+  cert_selfsign() {
+    warn "自签 *.${DOMAIN}（仅内网演示：客户端要信任 gateway/certs/ca.crt）"
     docker run --rm -v "$DEPLOY_ROOT/gateway/certs:/out" -v "$DEPLOY_ROOT/gateway/make-cert.sh:/mk.sh" \
       openresty/openresty:alpine sh -c "tr -d '\r' < /mk.sh > /tmp/mk.sh; sh /tmp/mk.sh '$DOMAIN'" \
       || fail "自签证书失败：gateway/make-cert.sh 与 openresty 镜像要能跑起来"
-    warn "自签 CA 在 gateway/certs/ca.crt：客户端要导入「受信任的根证书颁发机构」，否则浏览器报证书链断"
-  else
-    ok "沿用现场已有的 gateway/certs/（升级不重签、不覆盖）"
+  }
+
+  cert_acme() { # 失败返回 1，由调用方决定回退自签，不把整场部署卡死在证书上
+    local acme_home=/root/.acme.sh acme_bin=/root/.acme.sh/acme.sh dnsapi email reloadcmd issue install
+    dnsapi="$(zc_acme_dnsapi dnspod)" || return 1
+    email="${ACME_EMAIL:-admin@${DOMAIN}}"
+    if [ ! -x "$acme_bin" ]; then
+      ok "首次使用，安装 acme.sh 到 $acme_home（注册邮箱 $email）"
+      curl -fsSL https://get.acme.sh | HOME=/root sh -s "email=$email" || { warn "acme.sh 安装失败（查 curl 与网络）"; return 1; }
+      [ -x "$acme_bin" ] || { warn "装完仍找不到 $acme_bin"; return 1; }
+    fi
+    # acme.sh 会把这两个值存进自己的 account.conf（续期要用）；它们不进 .env / .deploy-answers。
+    export DP_Id="${DP_ID:-}" DP_Key="${DP_KEY:-}"
+    warn "DNSPod 凭据由 acme.sh 存进 $acme_home/account.conf（自动续期需要），不会写进 .env 或应答文件"
+    reloadcmd="$(zc_gateway_reloadcmd "$DEPLOY_ROOT/gateway/docker-compose.yml")"
+    issue="$(zc_acme_issue_cmd "$acme_bin" "$DOMAIN" "$dnsapi")"
+    install="$(zc_acme_install_cmd "$acme_bin" "$DOMAIN" \
+      "$DEPLOY_ROOT/gateway/certs/gateway.key" "$DEPLOY_ROOT/gateway/certs/gateway.crt" "$reloadcmd")"
+    ok "签发 $DOMAIN + *.$DOMAIN（DNS-01 / DNSPod）"
+    eval "$issue"   || { warn "acme.sh 签发失败（多为 DNS API 凭据、域名解析或 LE 限流）"; return 1; }
+    eval "$install" || { warn "acme.sh 安装证书失败：证书签出来了但没能写进 gateway/certs/"; return 1; }
+    chmod 600 "$DEPLOY_ROOT/gateway/certs/gateway.key" 2>/dev/null || true
+    ok "真证书已写入 gateway/certs/gateway.crt|key；acme.sh cron 续期后会按 reloadcmd 重启网关"
+  }
+
+  CERT_READY=0
+  if [ -f gateway/certs/gateway.crt ] && [ -f gateway/certs/gateway.key ]; then
+    if ask_yes "现场已有 gateway/certs/gateway.crt|key，要按本次选择重签并覆盖吗？（y/N）" n; then
+      warn "确认重签：会覆盖现有的 gateway.crt / gateway.key"
+    else
+      ok "沿用现场已有的 gateway/certs/（升级不重签、不覆盖）"
+      CERT_READY=1
+    fi
+  fi
+  if [ "$CERT_READY" = 0 ]; then
+    if [ "$CERT_MODE" = acme ]; then
+      if cert_acme; then
+        CERT_READY=1
+      else
+        warn "真证书没拿到，回退自签让网关先起来；域名/certs 文件名不变，修好 DNS API 后重跑即可换真证书"
+        cert_selfsign
+      fi
+    else
+      cert_selfsign
+    fi
   fi
   if [ "$MODE" = upgrade ] && ask_yes "网关容器要按新的 gateway/docker-compose.yml 重建吗？（配置改过才需要，y/N）" n; then
     docker compose -f gateway/docker-compose.yml up -d --force-recreate \
