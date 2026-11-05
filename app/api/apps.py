@@ -443,7 +443,7 @@ async def publish(request: Request, app_id: int, body: PublishIn):
             # _spawn 只挡本进程在跑的任务；publishing 可能是上一进程遗留，按状态再挡一道
             raise DeployError("发布进行中，请等待完成", status=409)
         if not body.force:
-            active = list(request.app.state.hub.active_session_ids())
+            active = list(request.app.state.hub.running_session_ids())
             if active:
                 async with sf() as s:
                     hit = (await s.execute(text(

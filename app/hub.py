@@ -60,8 +60,17 @@ class ChatHub:
             self.emits.pop(session_id, None)
 
     def active_session_ids(self) -> list:
-        """当前有活跃下行流的会话（发布闸门 FR4-09 数据源）：emits 登记表键集快照。"""
+        """当前有活跃下行流的会话：emits 登记表键集快照（只说明 WS 连着，不代表在跑）。"""
         return list(self.emits)
+
+    def running_session_ids(self) -> list:
+        """当前真正在执行 Agent run 的会话（发布闸门 FR4-09 数据源）。
+
+        聊天页开着但会话 idle 时 emits 也非空，拿它当闸门会让普通发布误报「AI 正在
+        修改代码」。run 的生命周期由 running 维护（含断线后仍在后台跑的任务），与
+        /api/sessions/live-status 同源。
+        """
+        return list(self.running)
 
     async def emit_event(self, session_id, event):
         """向指定会话的当前连接下发事件；该会话无连接（槽为空）时静默丢弃。"""

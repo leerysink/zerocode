@@ -94,7 +94,7 @@ async def test_publish_chat_gate_and_spawn_shape(client, monkeypatch, no_preflig
         sid = (await s.execute(text("INSERT INTO chat_session (workspace_id, title) "
                                     "VALUES (:w,'t') RETURNING id"), {"w": wsid})).scalar()
         await s.commit()
-    monkeypatch.setattr(client.app.state.hub, "active_session_ids", lambda: [sid])
+    client.app.state.hub.running.add(sid)       # 该会话的 run 正在执行
 
     r = await client.post(f"/api/apps/{aid}/publish", json={"force": False})
     assert r.status_code == 409 and r.json()["detail"]["code"] == "chat_active"
@@ -145,7 +145,7 @@ async def test_publish_chat_gate_only_own_workspace(client, monkeypatch, no_pref
         sid = (await s.execute(text("INSERT INTO chat_session (workspace_id, title) "
                                     "VALUES (:w,'t') RETURNING id"), {"w": other})).scalar()
         await s.commit()
-    monkeypatch.setattr(client.app.state.hub, "active_session_ids", lambda: [sid])
+    client.app.state.hub.running.add(sid)       # 该会话的 run 正在执行
     try:
         r = await client.post(f"/api/apps/{aid}/publish", json={"force": False})
         assert r.status_code == 202, r.text
@@ -156,6 +156,43 @@ async def test_publish_chat_gate_only_own_workspace(client, monkeypatch, no_pref
             await s.execute(text("DELETE FROM chat_session WHERE id=:i"), {"i": sid})
             await s.execute(text("DELETE FROM workspace WHERE id=:i"), {"i": other})
             await s.commit()
+
+
+async def test_publish_chat_gate_ignores_idle_ws_connection(client, monkeypatch, no_preflight):
+    """聊天页开着（WS 登记了 emits）但会话 idle：不能误报「AI 正在修改代码」。
+
+    FR4-09 的口径是「AI 正在修改代码」，数据源必须是真正在跑的 run（hub.running），
+    而不是「有没有人连着聊天 WS」——否则用户开着聊天页就等于永远需要二次确认。
+    """
+    aid = await _mk(client)
+    called = []
+
+    async def fake_publish(sf, app, notify=None, *, force=False, confirm_destructive=False):
+        called.append(force)
+        return {"status": "running"}
+
+    monkeypatch.setattr(prod_mod, "publish", fake_publish)
+    async with client.app.state.session_factory() as s:
+        wsid = (await s.execute(text("SELECT workspace_id FROM app_project WHERE id=:i"),
+                                {"i": aid})).scalar()
+        sid = (await s.execute(text("INSERT INTO chat_session (workspace_id, title) "
+                                    "VALUES (:w,'t') RETURNING id"), {"w": wsid})).scalar()
+        await s.commit()
+
+    hub = client.app.state.hub
+
+    async def emit(*_args, **_kwargs):
+        return None
+
+    hub.set_emit(sid, emit)                       # 聊天页 WS 还连着，但本会话没有 run 在跑
+    try:
+        assert hub.active_session_ids() == [sid]  # 旧数据源非空（这条断言钉住回归的误报条件）
+        r = await client.post(f"/api/apps/{aid}/publish", json={"force": False})
+        assert r.status_code == 202, r.text
+        await client.app.state.dev_tasks[aid]
+        assert called == [False]
+    finally:
+        hub.drop_emit(sid, emit)
 
 
 async def test_publish_409_when_status_publishing(client, monkeypatch, no_preflight):
