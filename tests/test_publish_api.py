@@ -82,7 +82,7 @@ async def test_publish_chat_gate_and_spawn_shape(client, monkeypatch, no_preflig
     aid = await _mk(client)
     called = []
 
-    async def fake_publish(sf, app, notify=None, *, force=False, confirm_destructive=False):
+    async def fake_publish(sf, app, notify=None, *, force=False, confirm_destructive=False, on_success=None):
         called.append(force)
         return {"status": "running", "version": VERSION, "url": "http://x", "recordId": 1}
 
@@ -116,7 +116,7 @@ async def test_publish_forwards_confirm_destructive(client, monkeypatch, no_pref
     aid = await _mk(client)
     seen = []
 
-    async def cap(sf, app, notify=None, *, force=False, confirm_destructive=False):
+    async def cap(sf, app, notify=None, *, force=False, confirm_destructive=False, on_success=None):
         seen.append((force, confirm_destructive))
         return {"status": "running"}
 
@@ -128,12 +128,33 @@ async def test_publish_forwards_confirm_destructive(client, monkeypatch, no_pref
     assert seen == [(False, True)]        # force 未开、破坏性确认开
 
 
+async def test_publish_success_enqueues_apk_build(client, monkeypatch, no_preflight):
+    """发布成功后把 APK 构建塞给后台 worker（ADR-0042）；失败也不影响发布（引擎侧兜底）。"""
+    aid = await _mk(client)
+    seen: list[dict] = []
+
+    async def fake_publish(sf, app, notify=None, *, force=False, confirm_destructive=False, on_success=None):
+        await on_success()
+        return {"status": "running"}
+
+    async def fake_enqueue(app_id, *, force=False, app=None):
+        seen.append({"app_id": app_id, "force": force})
+        return "queued"
+
+    monkeypatch.setattr(prod_mod, "publish", fake_publish)
+    monkeypatch.setattr(client.app.state.apk_builder, "enqueue", fake_enqueue)
+    r = await client.post(f"/api/apps/{aid}/publish", json={"force": True})
+    assert r.status_code == 202, r.text
+    await client.app.state.dev_tasks[aid]
+    assert seen == [{"app_id": aid, "force": False}]     # 只给 app_id，worker 自己重新读库
+
+
 async def test_publish_chat_gate_only_own_workspace(client, monkeypatch, no_preflight):
     """闸门只看**本应用工作区**的活跃会话：别的应用在改代码不该挡住这次发布。"""
     aid = await _mk(client)
     called = []
 
-    async def fake_publish(sf, app, notify=None, *, force=False, confirm_destructive=False):
+    async def fake_publish(sf, app, notify=None, *, force=False, confirm_destructive=False, on_success=None):
         called.append(app["slug"])
         return {"status": "running"}
 
@@ -167,7 +188,7 @@ async def test_publish_chat_gate_ignores_idle_ws_connection(client, monkeypatch,
     aid = await _mk(client)
     called = []
 
-    async def fake_publish(sf, app, notify=None, *, force=False, confirm_destructive=False):
+    async def fake_publish(sf, app, notify=None, *, force=False, confirm_destructive=False, on_success=None):
         called.append(force)
         return {"status": "running"}
 
@@ -204,7 +225,7 @@ async def test_publish_409_when_status_publishing(client, monkeypatch, no_prefli
     aid = await _mk(client)
     called = []
 
-    async def fake_publish(sf, app, notify=None, *, force=False, confirm_destructive=False):
+    async def fake_publish(sf, app, notify=None, *, force=False, confirm_destructive=False, on_success=None):
         called.append(force)
         return {"status": "running"}
 

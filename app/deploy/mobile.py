@@ -1,20 +1,21 @@
 # app/deploy/mobile.py
-"""移动端分发产物（规格 2026-11-03 US-15…US-18）：H5 地址投影 + APK 平台代管。
+"""移动端分发产物（规格 2026-11-03 H5 + 规格 2026-11-05 APK 壳）。
 
-APK 落点是应用 prod 的 `uploads` 命名卷（prod-compose 里 backend 唯一的持久化位），下载地址
+H5 地址只读 `nics.app_url`（ADR-0016 单点）。APK 从 2026-11-05 起由平台在生产发布后自动
+构建（远程 URL WebView 壳，ADR-0042），落点仍是应用 prod 的 `uploads` 命名卷，下载地址
 `{app_url}/api/uploads/mobile/{slug}.apk` 由应用自己的 nginx → backend 提供（`/uploads/**` 本就
 permitAll）。平台写入**不走**应用模板的 `/api/file/upload`：那条链要应用自己的 JWT，平台没有也不该
 持有终端用户的移动端会话——所以经 `docker compose exec -T backend` 的 stdin 直接灌卷。因此应用前端
 nginx 的 `client_max_body_size 50m` 与 Spring multipart 上限**不在这条链上**（R-5 的更正），
 真正的体积闸门是本模块的 `APK_MAX_BYTES`。
 
-地址投影只读 `nics.app_url`（ADR-0016 单点）：SSL 开是 `https://{slug}.{域名}`，关是
-`http://{PREVIEW_HOST}:{prod_port}`，H5 与 APK 两种形态都跟着它走，前端不得另算一套。
+本模块保留 H5/下载地址投影、产物落卷与体积探测；构建状态与壳参数在 `apkbuild` / `shell`。
 """
+from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
-from app.deploy import engine, nics
+from app.deploy import engine, nics, shell
 from app.deploy.compose import MOBILE_STACK
 from app.deploy.errors import DeployError
 from app.deploy.prod import _prod_compose_args
@@ -48,14 +49,28 @@ def _container_path(slug: str) -> str:
     return f"/uploads/{APK_SUBDIR}/{slug}.apk"
 
 
+def _iso(dt) -> str | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat()
+
+
 async def info(sf, app: dict) -> dict:
-    """弹框数据源：两条环境地址 + APK 现状。prod 没在跑时不去 exec 探文件（容器不在）。"""
+    """弹框数据源：两条环境地址 + APK 现状（构建状态/壳参数/图标）。prod 没在跑时不去 exec 探文件。"""
     if not is_mobile(app):
         raise DeployError("仅移动端应用支持移动端分发", status=400)
     size = None
     if app.get("status_prod") == "running":
         root = await engine._app_root(sf, app)
         size = await _apk_size(root, app["slug"])
+    from app.deploy import apkbuild
+    state = await apkbuild.get_state(sf, app["id"])
+    params = apkbuild.current_params(app)
+    digest = shell.params_hash(params)
+    icon_file = apkbuild.custom_icon_path(app["slug"])
+    icon_ts = icon_file.stat().st_mtime if icon_file else None
     return {
         "stack": app.get("stack"),
         "status_dev": app.get("status_dev"),
@@ -65,28 +80,22 @@ async def info(sf, app: dict) -> dict:
         "apk_url": apk_url(app),
         "apk_size": size,
         "apk_max_bytes": APK_MAX_BYTES,
+        "apk": {
+            "status": state["status"],
+            "error": state["error"],
+            "shell_version": state["shell_version"],
+            "params_stale": state["params_hash"] != digest,
+            "package_name": params["package"],
+            "can_rebuild": app.get("status_prod") == "running" and state["status"] != "building",
+            "requested_at": _iso(state["requested_at"]),
+            "built_at": _iso(state["built_at"]),
+        },
+        "icon": {
+            "custom": icon_file is not None,
+            "url": f"/api/apps/{app['id']}/mobile/icon?v={int(icon_ts) if icon_ts else digest[:12]}",
+            "updated_at": _iso(datetime.fromtimestamp(icon_ts, tz=timezone.utc)) if icon_ts else None,
+        },
     }
-
-
-async def upload_apk(sf, app: dict, file) -> dict:
-    """上传并代管 APK。闸门顺序：栈 → prod 运行 → 后缀 → 体积（快路径读 `UploadFile.size`）。
-
-    `status_prod` 非 running 一律 409（US-17）：不隐式起栈也不隐式发布——上传端点只做它名字里的事。
-    """
-    if not is_mobile(app):
-        raise DeployError("仅移动端应用支持 APK 上传", status=400)
-    if app.get("status_prod") != "running":
-        raise DeployError("正式环境未运行：请先发布并启动正式环境，再上传 APK", status=409)
-    if not (getattr(file, "filename", "") or "").lower().endswith(".apk"):
-        raise DeployError("只支持 .apk 文件", status=400)
-    size = getattr(file, "size", None)
-    if size is not None and size > APK_MAX_BYTES:
-        raise DeployError(f"APK 不能超过 {APK_MAX_MB}MB", status=413)
-    if size == 0:
-        raise DeployError("APK 文件为空", status=400)
-    root = await engine._app_root(sf, app)
-    written = await _save(root, app["slug"], file)
-    return {"ok": True, "apk_url": apk_url(app), "size": written}
 
 
 async def _save(root: Path, slug: str, file) -> int:

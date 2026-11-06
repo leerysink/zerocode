@@ -393,7 +393,7 @@ def _wire_dockerfile_proxy(dockerfile: Path) -> bool:
 
 
 async def publish(sf, app: dict, notify=None, *, force: bool = False,
-                  confirm_destructive: bool = False) -> dict:
+                  confirm_destructive: bool = False, on_success=None) -> dict:
     """七步发布（04 §4.1）：旧容器全程不动，体检过了才切 current_version（§4.3 失败自动回退）。
 
     force 是端点层 chat 闸门（FR4-09）的透传位——引擎不查 hub，「发布进行中/有活跃会话」的 409
@@ -406,6 +406,9 @@ async def publish(sf, app: dict, notify=None, *, force: bool = False,
       · 首版失败（prev 为空）→ None：从来没有过在服版本，物理上跑着的那个不健康新容器
         由 status=unhealthy 承载、由 records.detail 承载，不借 version 字段虚报「已晋升」。
     即：version 与 current_version 同源同值，前端可无条件用它刷新卡片。
+
+    `on_success`（ADR-0042）：发布成功后的尽力回调（移动栈用来入队 APK 构建）。它不参与发布
+    成败判定，抛错只记日志——壳构建失败绝不能把一次成功发布改判成失败。
     """
     app_id = app["id"]
     slug = app["slug"]
@@ -615,6 +618,11 @@ async def publish(sf, app: dict, notify=None, *, force: bool = False,
         out = done_payload(True)
         out["url"] = url
         await _notify(notify, app_id, out)
+        if on_success is not None:
+            try:
+                await on_success()
+            except Exception:  # noqa: BLE001  壳构建只是附加产物，不得反噬发布结果
+                logger.exception("发布成功后的附加动作失败（不影响发布结果） app_id=%s", app_id)
         return {"status": "running", "version": version, "url": url, "recordId": rid}
     except DeployError as e:
         # 一切失败收口：记账 failed → publishing 残留复位 error → 播报 → publish_done(ok=false)

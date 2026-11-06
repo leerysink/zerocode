@@ -756,6 +756,27 @@ async def test_publish_success_sequence(monkeypatch, sf, seed, pub_root):
     assert res["url"] in readme and res["version"] in readme
 
 
+async def test_publish_runs_on_success_hook_and_swallows_failure(monkeypatch, sf, seed, pub_root):
+    """APK 构建钩子挂在发布成功之后：先跑钩子，钩子失败只记日志、不改发布结果（ADR-0042）。"""
+    wid, aid = await seed(slug="zcpub", prod_port=8982, dev_port=8983)
+    seams = PubSeams(monkeypatch, pub_root)
+    seen: list[str] = []
+
+    async def hook():
+        seen.append("built")
+
+    res = await prod.publish(sf, _pub_app(aid), notify=seams.notify, force=True, on_success=hook)
+    assert seen == ["built"]
+    assert res["status"] == "running"
+
+    async def boom():
+        raise RuntimeError("apk builder down")
+
+    res2 = await prod.publish(sf, _pub_app(aid), notify=seams.notify, force=True, on_success=boom)
+    assert res2["status"] == "running"
+    assert (await _db_pair(sf, aid))[1] == "running"
+
+
 async def test_publish_first_time_without_prod_cred_renders_prod_compose(monkeypatch, sf, seed, pub_root):
     """T4 波欠账落点：首次发布（prod 凭据尚未供给）build 前也必须已有 prod-compose.yml。
 

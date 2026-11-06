@@ -270,3 +270,30 @@ async def test_actor_session_migration_replayable(test_engine):
             "INSERT INTO actor (nickname) VALUES ('replay-no-token')"))
         for st in stmts:
             await conn.execute(text(st))
+
+
+# ---------- V20261105_01：Android WebView 壳构建状态（ADR-0042） ----------
+
+async def test_mobile_apk_migration_schema(test_engine):
+    async with test_engine.connect() as conn:
+        t = (await conn.execute(text("SELECT to_regclass('app_mobile_apk')"))).scalar()
+        cols = (await conn.execute(text(
+            "SELECT column_name, is_nullable, column_default FROM information_schema.columns "
+            "WHERE table_name='app_mobile_apk'"))).all()
+    assert t is not None
+    by_name = {c[0]: c for c in cols}
+    assert {"app_id", "status", "error", "shell_version", "params_hash",
+            "requested_at", "built_at", "apk_size", "updated_at"} <= set(by_name)
+    assert by_name["status"][2] == "'idle'::character varying"
+    assert by_name["shell_version"][2] == "0"
+
+
+async def test_mobile_apk_migration_replayable(test_engine):
+    from app.db import split_statements
+    from pathlib import Path
+    stmts = split_statements(
+        Path("changelog/V20261105_01_mobile_apk_build.sql").read_text(encoding="utf-8"))
+    assert len(stmts) == 1
+    async with test_engine.begin() as conn:
+        for st in stmts:
+            await conn.execute(text(st))

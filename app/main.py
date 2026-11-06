@@ -110,6 +110,10 @@ def create_app(database_url: str | None = None) -> FastAPI:
         app.state.dev_tasks = {}
         await run_migrations(engine)
         await _deploy_startup(app)
+        # Android 壳构建队列（ADR-0042）：单 worker 串行；启动时把残留 building 收口成 failed。
+        from app.deploy.apkbuild import ApkBuilder
+        app.state.apk_builder = ApkBuilder(app.state.session_factory)
+        await app.state.apk_builder.start()
         watchdog = asyncio.create_task(_watchdog(engine, app.state.hub))
         # 应用资源监控·磁盘低频采集循环（Ticket 001，规格 docs/specs/2026-09-28-app-metrics.md）。
         # 先睡后采（同 _watchdog），故启动与测试期内都不触发；单拍异常在循环内吞掉，带不崩平台。
@@ -134,6 +138,7 @@ def create_app(database_url: str | None = None) -> FastAPI:
         attachment_cleanup.cancel()
         with suppress(asyncio.CancelledError):
             await attachment_cleanup
+        await app.state.apk_builder.close()
         # 优雅退出：停掉仍在跑的 dev 栈（prod 不受影响，FR3-04）；同样不得因 Docker 侧异常而卡住关闭
         try:
             from app.deploy import engine as deploy_engine

@@ -11,12 +11,14 @@ chat 闸门（FR4-09）的 409 detail 是**字典** `{code, message}`——前�
 """
 import logging
 import re
+from contextlib import suppress
 
 from fastapi import APIRouter, Request, HTTPException, File, UploadFile
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
-from app.deploy import engine, mobile, prod, records, sqlrun
+from app.deploy import apkbuild, engine, mobile, prod, records, shell, sqlrun
 from app.deploy import provision
 from app.deploy import tasks as deploy_tasks
 from app.deploy.errors import DeployError
@@ -111,10 +113,17 @@ async def detail(request: Request, app_id: int):
 
 @router.patch("/{app_id}")
 async def rename(request: Request, app_id: int, body: AppRenameIn):
-    """应用改名（只改显示名）：slug 不可改——它是工程目录名、库名与镜像名的共同锚点。"""
+    """应用改名（只改显示名）：slug 不可改——它是工程目录名、库名与镜像名的共同锚点。
+
+    名字进壳参数（APK launcher 标签与自动图标），移动栈改名后 prod 正在运行就立即重出包；
+    prod 未运行时只留下 params_stale，下一次发布会重建（ADR-0042）。
+    """
     try:
-        return await app_service.rename_app(request.app.state.session_factory, app_id, body.name,
-                                            owner_user_id=request.state.actor["id"])
+        app = await app_service.rename_app(request.app.state.session_factory, app_id, body.name,
+                                           owner_user_id=request.state.actor["id"])
+        with suppress(Exception):
+            await request.app.state.apk_builder.enqueue(app_id, app=app)
+        return app
     except DeployError as e:
         raise _http(e)
 
@@ -140,6 +149,9 @@ async def remove(request: Request, app_id: int):
         snap = await app_service.delete_app(sf, app_id)
     except DeployError as e:
         raise _http(e)
+    # 平台侧 APK 构建临时文件随记录清理；prod 卷里的产物归属应用环境，不在删除链里
+    with suppress(Exception):
+        apkbuild.cleanup_app(snap["slug"])
     return {"ok": True, "kept": {"root_path": snap["root_path"], "slug": snap["slug"],
                                  "databases": snap["databases"]}}
 
@@ -227,11 +239,11 @@ async def app_urls(request: Request, app_id: int):
         raise _http(e)
 
 
-# ---------- 移动端分发（规格 2026-11-03 US-15…US-19）：H5 地址 + APK 代管 ----------
+# ---------- 移动端分发（规格 2026-11-03 H5 + 规格 2026-11-05 APK 壳） ----------
 
 @router.get("/{app_id}/mobile")
 async def mobile_info(request: Request, app_id: int):
-    """移动端弹框数据源：dev/prod 两条 H5 地址 + APK 下载地址与已上传体积（只读）。"""
+    """移动端弹框数据源：dev/prod 两条 H5 地址 + APK 构建状态/壳版本/图标（只读）。"""
     sf = request.app.state.session_factory
     try:
         app = await app_service.get_app(sf, app_id, owner_user_id=request.state.actor["id"])
@@ -240,17 +252,78 @@ async def mobile_info(request: Request, app_id: int):
         raise _http(e)
 
 
-@router.post("/{app_id}/mobile/apk")
-async def mobile_upload_apk(request: Request, app_id: int, file: UploadFile = File(...)):
-    """上传 APK 到应用 prod 的 uploads 卷（同步串流，最多 APK_MAX_BYTES）。
+@router.post("/{app_id}/mobile/apk/rebuild", status_code=202)
+async def mobile_rebuild_apk(request: Request, app_id: int):
+    """手动重建 APK（ADR-0042）：无论参数是否变化都重出包并递增壳版本。
 
-    同步而非 202：写入耗时与上传带宽同量级，且没有可播报的后台进度；失败要当场告诉用户原因
-    （非 .apk / 未发布 / 超限 / 容器异常），挂成后台任务只会把错误变成静默。
+    同步闸门只查「移动栈 + prod 正在运行」——构建本身异步，进度由弹框轮询 GET /mobile。
     """
     sf = request.app.state.session_factory
     try:
         app = await app_service.get_app(sf, app_id, owner_user_id=request.state.actor["id"])
-        return await mobile.upload_apk(sf, app, file)
+        if not mobile.is_mobile(app):
+            raise DeployError("仅移动端应用支持 APK 构建", status=400)
+        if app.get("status_prod") != "running":
+            raise DeployError("正式环境未运行：请先发布并启动正式环境，再构建 APK", status=409)
+        result = await request.app.state.apk_builder.enqueue(app_id, force=True, app=app)
+        return {"ok": True, "status": "building", "deduped": result == "building"}
+    except DeployError as e:
+        raise _http(e)
+
+
+@router.get("/{app_id}/mobile/icon")
+async def mobile_icon(request: Request, app_id: int):
+    """图标预览：自定义优先，否则按应用名实时生成 SVG。cookie 鉴权随同源请求自动带上。"""
+    sf = request.app.state.session_factory
+    try:
+        app = await app_service.get_app(sf, app_id, owner_user_id=request.state.actor["id"])
+        if not mobile.is_mobile(app):
+            raise DeployError("仅移动端应用支持移动端分发", status=400)
+        path = apkbuild.custom_icon_path(app["slug"])
+        if path is not None:
+            media = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
+            return FileResponse(path, media_type=media, headers={"Cache-Control": "no-store"})
+        return Response(content=shell.auto_icon_svg(app.get("name") or "", app["slug"]),
+                        media_type="image/svg+xml", headers={"Cache-Control": "no-store"})
+    except DeployError as e:
+        raise _http(e)
+
+
+@router.put("/{app_id}/mobile/icon")
+async def mobile_upload_icon(request: Request, app_id: int, file: UploadFile = File(...)):
+    """上传图标覆盖自动图标：PNG/JPEG 魔数 + ≤2MB；成功即触发重建（prod 未运行则留到下次发布）。"""
+    sf = request.app.state.session_factory
+    try:
+        app = await app_service.get_app(sf, app_id, owner_user_id=request.state.actor["id"])
+        if not mobile.is_mobile(app):
+            raise DeployError("仅移动端应用支持移动端分发", status=400)
+        data = await file.read(shell.MOBILE_ICON_MAX_BYTES + 1)
+        if len(data) > shell.MOBILE_ICON_MAX_BYTES:
+            raise DeployError(f"图标不能超过 {shell.MOBILE_ICON_MAX_BYTES // (1024 * 1024)}MB",
+                              status=413)
+        if not data:
+            raise DeployError("图标文件为空", status=400)
+        ext = shell.detect_icon_ext(data)
+        if ext is None:
+            raise DeployError("只支持 PNG/JPEG 图标", status=400)
+        apkbuild.save_icon(app["slug"], data, ext)
+        result = await request.app.state.apk_builder.enqueue(app_id, app=app)
+        return {"ok": True, "build": result}
+    except DeployError as e:
+        raise _http(e)
+
+
+@router.delete("/{app_id}/mobile/icon")
+async def mobile_reset_icon(request: Request, app_id: int):
+    """恢复自动图标（删掉自定义覆盖），同样触发重建。"""
+    sf = request.app.state.session_factory
+    try:
+        app = await app_service.get_app(sf, app_id, owner_user_id=request.state.actor["id"])
+        if not mobile.is_mobile(app):
+            raise DeployError("仅移动端应用支持移动端分发", status=400)
+        removed = apkbuild.delete_icon(app["slug"])
+        result = await request.app.state.apk_builder.enqueue(app_id, app=app)
+        return {"ok": True, "removed": removed, "build": result}
     except DeployError as e:
         raise _http(e)
 
@@ -454,9 +527,11 @@ async def publish(request: Request, app_id: int, body: PublishIn):
                         "code": "chat_active",
                         "message": "当前 AI 正在修改代码，发布的可能是不完整版本，是否继续？"})
         await prod.preflight_docker()
+        builder = request.app.state.apk_builder
         _spawn(request, app_id, lambda: prod.publish(sf, app, notify=hub.publish,
                                                      force=body.force,
-                                                     confirm_destructive=body.confirmDestructive))
+                                                     confirm_destructive=body.confirmDestructive,
+                                                     on_success=lambda: builder.enqueue(app_id)))
     except DeployError as e:
         raise _http(e)
     return {"ok": True}

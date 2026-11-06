@@ -1,14 +1,14 @@
 <script setup>
-// 移动端弹框（规格 2026-11-03 US-15~US-19）：应用卡面 ☰ 与聊天页「更多」共用同一个组件。
-// 自持 <a-modal>（与 PublishModal 同一种所有权形态）：父级只传 app + open，关窗走 update:open。
-// 地址一律来自后端 GET /apps/{id}/mobile（ADR-0016）。唯一的加工是把 dev 地址里「打包默认的
-// localhost」换成浏览器当前 host——手机扫 localhost 必然失败（CONTEXT「真机预览码」）。
-import { computed, ref, watch } from 'vue'
+// 移动端弹框（规格 2026-11-03 US-15~US-19 + 规格 2026-11-05 / ADR-0042）：应用卡面 ☰ 与聊天页
+// 「更多」共用同一个组件。自持 <a-modal>（与 PublishModal 同一种所有权形态）：父级只传 app + open。
+// 地址一律来自后端 GET /apps/{id}/mobile（ADR-0016）。APK 由平台在发布成功后自动构建，
+// 这里只展示状态、触发手动重建、覆盖图标；构建中每 3 秒轮询一次，关闭弹框即停。
+import { computed, onUnmounted, ref, watch } from 'vue'
 import { message } from 'ant-design-vue'
 import {
-  CloudDownloadOutlined, CopyOutlined, ExportOutlined, UploadOutlined,
+  CloudDownloadOutlined, CopyOutlined, ExportOutlined, ReloadOutlined, UndoOutlined, UploadOutlined,
 } from '@ant-design/icons-vue'
-import { appMobile, uploadMobileApk } from '../api'
+import { appMobile, rebuildMobileApk, resetMobileIcon, uploadMobileIcon } from '../api'
 import { copyText } from '../utils/clipboard'
 import { qrMatrix } from '../utils/qr'
 
@@ -18,14 +18,18 @@ const props = defineProps({
 })
 const emit = defineEmits(['update:open'])
 
+const INFO_POLL_MS = 3000
+const ICON_MAX_BYTES = 2 * 1024 * 1024
+
 const info = ref(null)
 const loading = ref(false)
 const error = ref('')
 const env = ref('dev')
-const uploading = ref(false)
-const uploadPct = ref(0)
-const fileInput = ref(null)
+const rebuilding = ref(false)
+const iconUploading = ref(false)
+const iconInput = ref(null)
 let seq = 0
+let pollTimer = null
 
 const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]'])
 const QR_MARGIN = 2
@@ -59,27 +63,46 @@ function withLiveHost(url) {
   }
 }
 
-async function load() {
+function stopPoll() {
+  if (pollTimer) {
+    clearInterval(pollTimer)
+    pollTimer = null
+  }
+}
+
+function detailText(err, fallback) {
+  const detail = err?.response?.data?.detail
+  return typeof detail === 'string' && detail ? detail : fallback
+}
+
+async function load(quiet = false) {
   const my = ++seq
-  loading.value = true
-  error.value = ''
+  if (!quiet) {
+    loading.value = true
+    error.value = ''
+  }
   try {
     const res = (await appMobile(props.app.id)).data
     if (my === seq) info.value = res
   } catch (e) {
-    if (my !== seq) return
-    error.value = e?.response?.data?.detail || '移动端信息加载失败'
+    if (my !== seq || quiet) return   // 轮询失败不弹 toast：下一拍继续试，构建不受影响
+    error.value = detailText(e, '移动端信息加载失败')
     message.error(error.value)
   } finally {
-    if (my === seq) loading.value = false
+    if (my === seq && !quiet) loading.value = false
   }
 }
 
 watch(() => props.open, (v) => {
-  if (!v) return
+  if (!v) {
+    stopPoll()
+    return
+  }
   env.value = 'dev'
   error.value = ''
-  uploadPct.value = 0
+  rebuilding.value = false
+  iconUploading.value = false
+  stopPoll()
   load()
 }, { immediate: true })
 
@@ -112,13 +135,30 @@ const mainQr = computed(() => {
 
 const apkUrl = computed(() => info.value?.apk_url || '')
 const apkSize = computed(() => info.value?.apk_size ?? null)
-const apkMaxMb = computed(() => Math.floor((info.value?.apk_max_bytes || 0) / (1024 * 1024)))
-const canUpload = computed(() => prodRunning.value && !uploading.value && !loading.value)
-// 没上传过就不出码：US-08 的同一条理由，不给用户一张扫开是 404 的码。
+const apk = computed(() => info.value?.apk || {})
+const apkStatus = computed(() => apk.value.status || 'idle')
+const building = computed(() => apkStatus.value === 'building')
+const apkReady = computed(() => apkStatus.value === 'ready' && apkSize.value != null)
+const canRebuild = computed(() => prodRunning.value && !!apk.value.can_rebuild && !rebuilding.value)
+const STATUS_TEXT = {
+  idle: '尚未构建',
+  building: '构建中',
+  ready: '已就绪',
+  failed: '构建失败',
+}
+const apkStatusText = computed(() => STATUS_TEXT[apkStatus.value] || apkStatus.value)
+const apkBadgeClass = computed(() => ({
+  ok: apkStatus.value === 'ready',
+  busy: apkStatus.value === 'building',
+  bad: apkStatus.value === 'failed',
+}))
+const iconUrl = computed(() => info.value?.icon?.url || '')
+
 const apkQr = computed(() => {
   if (!prodRunning.value) return { reason: '正式环境未运行', matrix: null }
+  if (building.value) return { reason: '构建中，完成后可扫码', matrix: null }
+  if (!apkReady.value) return { reason: 'APK 就绪后可扫码下载', matrix: null }
   if (!apkUrl.value) return { reason: '下载地址尚未就绪', matrix: null }
-  if (apkSize.value == null) return { reason: '上传后可扫码下载', matrix: null }
   const matrix = qrMatrix(apkUrl.value)
   return matrix ? { reason: '', matrix } : { reason: '二维码生成失败', matrix: null }
 })
@@ -150,32 +190,73 @@ function openCurrent() {
   if (canOpen.value) openTab(currentUrl.value, `zerocode-mobile-${props.app.id}-${env.value}`)
 }
 
-function pickApk() {
-  if (canUpload.value) fileInput.value?.click()
-}
-
-async function onFile(e) {
-  const file = e.target.files?.[0]
-  e.target.value = '' // 允许重选同一个文件（上次失败后重试）
-  if (!file) return
-  if (!file.name.toLowerCase().endsWith('.apk')) return fail('只支持 .apk 文件')
-  if (info.value?.apk_max_bytes && file.size > info.value.apk_max_bytes) {
-    return fail(`APK 不能超过 ${apkMaxMb.value}MB`)
+// building 期间每 3 秒拉一次状态；状态离开 building（ready/failed）即自动停表。
+watch(apkStatus, (s) => {
+  if (s === 'building') {
+    if (!pollTimer) {
+      pollTimer = setInterval(async () => {
+        await load(true)
+        if (apkStatus.value !== 'building') stopPoll()
+      }, INFO_POLL_MS)
+    }
+  } else {
+    stopPoll()
   }
-  uploading.value = true
-  uploadPct.value = 0
+}, { immediate: true })
+onUnmounted(stopPoll)
+
+async function rebuild() {
+  if (!canRebuild.value) return
+  rebuilding.value = true
   error.value = ''
   try {
-    await uploadMobileApk(props.app.id, file, (evt) => {
-      if (evt.total) uploadPct.value = Math.min(99, Math.round((evt.loaded / evt.total) * 100))
-    })
-    message.success('APK 已上传')
-    await load()
+    await rebuildMobileApk(props.app.id)
+    message.success('已开始重新构建')
+    await load(true)
   } catch (err) {
-    const detail = err?.response?.data?.detail
-    fail(typeof detail === 'string' ? detail : 'APK 上传失败')
+    fail(detailText(err, '重新构建失败'))
   } finally {
-    uploading.value = false
+    rebuilding.value = false
+  }
+}
+
+function pickIcon() {
+  if (!iconUploading.value) iconInput.value?.click()
+}
+
+async function onIconFile(e) {
+  const file = e.target.files?.[0]
+  e.target.value = '' // 允许重选同一个文件
+  if (!file) return
+  if (!/\.(png|jpe?g)$/i.test(file.name) && !/^image\/(png|jpeg)$/.test(file.type || '')) {
+    return fail('只支持 PNG/JPEG 图标')
+  }
+  if (file.size > ICON_MAX_BYTES) return fail('图标不能超过 2MB')
+  iconUploading.value = true
+  try {
+    const res = await uploadMobileIcon(props.app.id, file)
+    const deferred = res?.data?.build === 'deferred'
+    message.success(deferred ? '图标已保存，下次发布成功后自动生效' : '图标已更新，正在重新构建')
+    await load(true)
+  } catch (err) {
+    fail(detailText(err, '图标上传失败'))
+  } finally {
+    iconUploading.value = false
+  }
+}
+
+async function resetIcon() {
+  if (iconUploading.value) return
+  iconUploading.value = true
+  try {
+    const res = await resetMobileIcon(props.app.id)
+    const deferred = res?.data?.build === 'deferred'
+    message.success(deferred ? '已恢复自动图标，下次发布成功后生效' : '已恢复自动图标，正在重新构建')
+    await load(true)
+  } catch (err) {
+    fail(detailText(err, '恢复自动图标失败'))
+  } finally {
+    iconUploading.value = false
   }
 }
 </script>
@@ -194,7 +275,7 @@ async function onFile(e) {
     <div v-else-if="info" class="zc-mobile">
       <div class="zc-mobile-bar">
         <span class="zc-mobile-hint">预览环境直改直跑；正式环境跑已发布版本。扫码给手机，复制给桌面。</span>
-        <a-button size="small" class="zc-mobile-refresh" @click="load">刷新</a-button>
+        <a-button size="small" class="zc-mobile-refresh" @click="load()">刷新</a-button>
       </div>
 
       <section class="zc-m-block">
@@ -250,23 +331,41 @@ async function onFile(e) {
 
       <section class="zc-m-block">
         <div class="zc-m-block-main">
+          <div class="zc-m-icon-row">
+            <img v-if="iconUrl" class="zc-m-icon" :src="iconUrl" alt="应用图标" />
+            <div class="zc-m-icon-actions">
+              <span class="zc-m-k">应用图标</span>
+              <span class="zc-apk-meta">{{ info.icon?.custom ? '自定义' : '自动生成' }}</span>
+              <input ref="iconInput" type="file" accept="image/png,image/jpeg" class="zc-icon-input"
+                     @change="onIconFile" />
+              <a-button size="small" class="zc-icon-pick" :loading="iconUploading" @click="pickIcon">
+                <upload-outlined /> 上传图标
+              </a-button>
+              <a-button v-if="info.icon?.custom" size="small" class="zc-icon-reset"
+                        :disabled="iconUploading" @click="resetIcon">
+                <undo-outlined /> 恢复自动
+              </a-button>
+            </div>
+          </div>
+
           <div class="zc-m-apk-head">
             <span class="zc-m-k">APK 安装包</span>
-            <span v-if="apkSize != null" class="zc-apk-badge ok">已上传 {{ fmtBytes(apkSize) }}</span>
-            <span v-else class="zc-apk-badge">尚未上传</span>
+            <span class="zc-apk-badge" :class="apkBadgeClass">{{ apkStatusText }}</span>
+            <span v-if="apkSize != null" class="zc-apk-meta">{{ fmtBytes(apkSize) }}</span>
+            <span v-if="apk.shell_version" class="zc-apk-meta">壳 v{{ apk.shell_version }}</span>
+            <span v-if="apk.package_name" class="zc-apk-meta mono">{{ apk.package_name }}</span>
           </div>
 
           <p v-if="!prodRunning" class="zc-m-tip warn">
-            正式环境未运行：请先发布并启动正式环境，再上传 APK（落点是 prod 的 uploads 卷）。
+            正式环境未运行：APK 在发布成功后自动构建；先发布并启动正式环境，或等下一次发布。
           </p>
           <template v-else>
             <div class="zc-m-actions">
-              <input ref="fileInput" type="file" accept=".apk" class="zc-apk-input" @change="onFile" />
-              <a-button size="small" class="zc-apk-pick" :loading="uploading" :disabled="!canUpload"
-                        @click="pickApk">
-                <upload-outlined /> {{ uploading ? `上传中 ${uploadPct}%` : '上传 APK' }}
+              <a-button size="small" class="zc-apk-rebuild" :loading="rebuilding" :disabled="!canRebuild"
+                        @click="rebuild">
+                <reload-outlined /> {{ building ? '构建中' : '重新构建' }}
               </a-button>
-              <template v-if="apkSize != null">
+              <template v-if="apkReady">
                 <a class="zc-apk-get" :href="apkUrl" target="_blank" rel="noopener">
                   <cloud-download-outlined /> 下载
                 </a>
@@ -275,15 +374,20 @@ async function onFile(e) {
                 </a-button>
               </template>
             </div>
-            <div v-if="uploading" class="zc-upload-track">
-              <span class="zc-upload-fill" :style="{ width: `${uploadPct}%` }" />
-            </div>
+            <p v-if="building" class="zc-m-tip">
+              平台正在后台打包，弹框每 3 秒自动刷新；关闭弹框不影响构建。
+            </p>
+            <p v-else-if="apkStatus === 'failed'" class="zc-m-tip warn zc-m-error">
+              构建失败：{{ apk.error || '请点「重新构建」重试' }}
+            </p>
+            <p v-else-if="apkStatus === 'ready' && apk.params_stale" class="zc-m-tip warn">
+              壳参数已变化（名称/图标/地址/包名），当前安装包是旧的；下次发布成功后会自动重建，也可现在重建。
+            </p>
           </template>
 
           <p class="zc-m-tip">
-            打包指引：APK 在平台外用 HBuilderX 云打包生成，接口地址必须填正式环境的绝对地址
-            （{{ prodBase || '见上方正式地址' }}）——APK 不在同源环境里，相对 /api 不生效。
-            SSL 关时该地址是 http://宿主:prod_port 形态，SSL 开时是 https://应用域名。
+            APK 是远程 URL 壳：安装后打开的是正式环境 H5（{{ prodBase || '见上方正式地址' }}），
+            不含离线副本与原生能力。包名绑定网关域名，换域名需卸载重装。
           </p>
         </div>
 
@@ -302,7 +406,7 @@ async function onFile(e) {
     </div>
     <div v-else class="zc-mobile-fail">
       <p>{{ error || '移动端信息不可用' }}</p>
-      <a-button size="small" @click="load">重试</a-button>
+      <a-button size="small" @click="load()">重试</a-button>
     </div>
   </a-modal>
 </template>
@@ -350,18 +454,26 @@ async function onFile(e) {
 .zc-m-qr.small .zc-qr-blocked { width: 96px; }
 .zc-qr-cap { font-size: 11px; color: var(--zc-text-sub); }
 
-.zc-m-apk-head { display: flex; align-items: center; gap: 10px; }
+.zc-m-icon-row { display: flex; align-items: center; gap: 12px; }
+.zc-m-icon { width: 48px; height: 48px; border-radius: 12px; border: 1px solid var(--zc-border);
+             object-fit: cover; background: var(--zc-bg); }
+.zc-m-icon-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.zc-icon-input { display: none; }
+
+.zc-m-apk-head { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
 .zc-apk-badge { font-size: 11px; color: var(--zc-text-sub); background: var(--zc-bg);
                 border: 1px solid var(--zc-border); border-radius: 10px; padding: 1px 8px; }
 .zc-apk-badge.ok { color: #5b8a72; border-color: rgba(91, 138, 114, 0.35);
                    background: rgba(91, 138, 114, 0.08); }
-.zc-apk-input { display: none; }
+.zc-apk-badge.busy { color: #9a7b3e; border-color: rgba(154, 123, 62, 0.35);
+                     background: rgba(154, 123, 62, 0.08); }
+.zc-apk-badge.bad { color: #b96a6a; border-color: rgba(185, 106, 106, 0.35);
+                    background: rgba(185, 106, 106, 0.08); }
+.zc-apk-meta { font-size: 11px; color: var(--zc-text-sub); }
+.zc-apk-meta.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 .zc-apk-get { display: inline-flex; align-items: center; gap: 4px; font-size: 12px;
               color: var(--zc-primary); text-decoration: none; }
 .zc-apk-get:hover { text-decoration: underline; }
-.zc-upload-track { height: 4px; border-radius: 2px; background: var(--zc-bg); overflow: hidden; }
-.zc-upload-fill { display: block; height: 100%; background: var(--zc-primary);
-                  transition: width 0.15s; }
 
 .zc-mobile-fail { display: flex; flex-direction: column; align-items: center; gap: 12px;
                   padding: 32px 0; color: var(--zc-text-sub); }
