@@ -220,23 +220,43 @@ def create_app(database_url: str | None = None) -> FastAPI:
     # ---- 前端静态托管（Task 15）：挂载 frontend/dist，SPA 回退 index.html ----
     import os
     from pathlib import Path
-    from fastapi.responses import FileResponse, JSONResponse
+    from fastapi.responses import JSONResponse
     from fastapi.staticfiles import StaticFiles
     from starlette.exceptions import HTTPException as StarletteHTTPException
     dist = Path(os.environ.get("ZEROCODE_FRONTEND_DIST",
                                Path(__file__).resolve().parents[1] / "frontend" / "dist"))
     if dist.is_dir():
-        app.mount("/", StaticFiles(directory=dist, html=True), name="spa")
+        index_file = dist / "index.html"
+
+        class SpaStaticFiles(StaticFiles):
+            """入口 HTML 每次向服务器校验，哈希分块照旧。
+
+            分块文件名带内容哈希，内容一变名字就变，长缓存安全；index.html 是链路里唯一
+            不带哈希的入口，只给 ETag 而不给 Cache-Control 时浏览器会按启发式有效期
+            （RFC 7234 §4.2.2，经验值约 (now - last-modified) * 10%）判定「还能直接用」，
+            连条件请求都不发——于是旧 index.html 连同它引用的那批旧哈希分块一起在本地复活，
+            前端重新部署后用户仍看旧界面（2026-11-06 演示机实测）。no-cache 不是「不缓存」，
+            而是「用前必须回源」，命中 ETag 就走 304，代价只是一次空响应。
+            """
+
+            def file_response(self, full_path, stat_result, scope, status_code=200):
+                response = super().file_response(full_path, stat_result, scope, status_code)
+                if str(full_path).endswith(".html"):
+                    response.headers["Cache-Control"] = "no-cache"
+                return response
+
+        spa = SpaStaticFiles(directory=dist, html=True)
+        app.mount("/", spa, name="spa")
 
         # SPA 回退：非 /api、/ws 的 GET 请求未命中静态文件时回退 index.html；
         # API/WS 路径保持 JSON 404，不吞掉后端自身的 404 语义。
-        index_file = dist / "index.html"
-
+        # 走 spa.get_response 而不是直接 FileResponse：那套 header 与 If-None-Match→304 的
+        # 判定都在 StaticFiles 里，自己 new 一个 FileResponse 会静默丢掉条件请求支持。
         @app.exception_handler(404)
         async def spa_fallback(request, exc: StarletteHTTPException):
             if (request.method in ("GET", "HEAD") and index_file.is_file()
                     and not request.url.path.startswith(("/api", "/ws"))):
-                return FileResponse(index_file)
+                return await spa.get_response("index.html", request.scope)
             return JSONResponse({"detail": exc.detail}, status_code=404)
     return app
 
