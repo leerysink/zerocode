@@ -1,5 +1,5 @@
 // @vitest-environment happy-dom
-// 提问导航条的纯几何/文案判定：文案回退、可导航提问的挑选、minimap 位置映射、视口内高亮。
+// 提问导航条的纯几何/文案判定：文案回退、可导航提问的挑选、固定居中盒定位、视口内高亮。
 // 数字进数字出，不碰 DOM——DOM 量测留在 useChatPromptRail。
 import { describe, it, expect } from 'vitest'
 import {
@@ -85,27 +85,51 @@ const MEASURED = {
 const GEOM = { scrollHeight: 4000, clientHeight: 800 }
 const run = (extra = {}) => buildPromptMarks({ prompts: PROMPTS, measured: MEASURED, ...GEOM, ...extra })
 
-describe('buildPromptMarks：minimap 位置映射', () => {
-  it('横杠纵向位置 = 提问在内容里的真实位置（百分比），按下标认人', () => {
-    expect(run({ scrollTop: 0 }).marks.map((m) => m.topPct)).toEqual([12.5, 45, 80])
+describe('buildPromptMarks：固定居中盒定位', () => {
+  it('横杠在盒内按像素等距摆放，整组垂直居中，按下标认人', () => {
+    // 盒高 200、横杠高 14、间距 12：组高 24，居中后三条中心在 88 / 100 / 112
+    expect(run({ scrollTop: 0 }).marks.map((m) => m.top)).toEqual([88, 100, 112])
   })
 
-  it('位置落在 [0,100] 内，越界被夹住', () => {
+  it('两条提问时成簇居中，间距 12px', () => {
     const { marks } = buildPromptMarks({
       prompts: [{ index: 0, label: 'a' }, { index: 1, label: 'b' }],
-      measured: { 0: { top: -20, height: 10 }, 1: { top: 130, height: 10 } },
-      scrollHeight: 100, clientHeight: 50, scrollTop: 0,
+      measured: { 0: { top: 10, height: 10 }, 1: { top: 900, height: 10 } },
+      ...GEOM, scrollTop: 0,
     })
-    expect(marks.map((m) => m.topPct)).toEqual([0, 100])
+    expect(marks.map((m) => m.top)).toEqual([94, 106])
   })
 
-  it('还没量到位置的提问不画横杠，其余照画不错位', () => {
+  it('还没量到位置的提问不画横杠，其余按实际条数居中', () => {
     const { marks } = buildPromptMarks({
       prompts: PROMPTS,
       measured: { 0: MEASURED[0], 7: MEASURED[7] },
       ...GEOM, scrollTop: 0,
     })
-    expect(marks.map((m) => [m.index, m.topPct])).toEqual([[0, 12.5], [7, 80]])
+    expect(marks.map((m) => [m.index, m.top])).toEqual([[0, 94], [7, 106]])
+  })
+
+  it('条数多时压缩间距塞进盒内，仍居中且不越界', () => {
+    const many = Array.from({ length: 20 }, (_, i) => ({ index: i, label: `问${i}` }))
+    const measured = Object.fromEntries(many.map((p, i) => [p.index, { top: i * 100, height: 40 }]))
+    const { marks } = buildPromptMarks({ prompts: many, measured, ...GEOM, scrollTop: 0 })
+    // 可用高 200-14=186，19 段均分 → 间距约 9.79，首尾贴盒内边
+    expect(marks[0].top).toBe(7)
+    expect(marks[19].top).toBe(193)
+    expect(marks[1].top - marks[0].top).toBeCloseTo(9.79, 2)
+    for (const m of marks) {
+      expect(m.top).toBeGreaterThanOrEqual(7)
+      expect(m.top).toBeLessThanOrEqual(193)
+    }
+  })
+
+  it('提问极多时间距继续压缩，横杠仍不越出盒外', () => {
+    const many = Array.from({ length: 50 }, (_, i) => ({ index: i, label: `问${i}` }))
+    const measured = Object.fromEntries(many.map((p, i) => [p.index, { top: i * 50, height: 20 }]))
+    const { marks } = buildPromptMarks({ prompts: many, measured, ...GEOM, scrollTop: 0 })
+    expect(marks[0].top).toBe(7)
+    expect(marks[49].top).toBe(193)
+    expect(marks[1].top - marks[0].top).toBeLessThan(6)
   })
 
   it('内容高度为 0 或完全没有量测时不画横杠（首屏还没量出位置）', () => {

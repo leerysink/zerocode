@@ -48,7 +48,7 @@ export function useChatPromptRail({ scrollRef, view }) {
   // 条数变了才重量位置：流式增量只长最后一条，它下面没有提问，重算是白付的回流代价
   watch(() => [view.value.length, prompts.value.length], () => nextTick(measure))
 
-  // 容器变高变矮（侧栏拖宽、窗口缩放）会让比例失配，跟着重量一次
+  // 容器变高变矮（侧栏拖宽、窗口缩放）会让量测位置过期，跟着重量一次
   // 位置只有挂载后才量得到，所以横杠比正文晚一帧出现：一帧内轨道为空是可接受的，不占位
   let ro = null
   onMounted(() => {

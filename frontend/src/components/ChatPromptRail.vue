@@ -1,7 +1,9 @@
 <script setup>
-// 提问导航条（prompt rail）：中栏对话区最右侧的一列横杠，每根对应一次用户提问，
-// 纵向位置按提问在滚动内容里的真实比例摆放（minimap 式），悬停出浮层看全文、点击滚过去。
+// 提问导航条（prompt rail）：中栏对话区最右侧的一列横杠，每根对应一次用户提问。
+// 横杠在固定高度的居中盒里等距成簇（不再按内容比例铺满整列），悬停出浮层看全文、点击滚过去。
 // 本组件纯展示：几何与高亮由 promptRailModel 算好喂进来，它只负责画与发事件。
+import { RAIL_BOX_HEIGHT } from '../stores/promptRailModel'
+
 defineProps({
   marks: { type: Array, default: () => [] },
 })
@@ -9,7 +11,7 @@ const emit = defineEmits(['select'])
 </script>
 
 <template>
-  <div class="zc-rail" role="navigation" aria-label="提问导航">
+  <div class="zc-rail" role="navigation" aria-label="提问导航" :style="{ height: RAIL_BOX_HEIGHT + 'px' }">
     <a-tooltip v-for="m in marks" :key="m.index" placement="left" :overlay-style="{ maxWidth: '440px' }">
       <template #title>
         <div class="zc-rail-tip">{{ m.label }}</div>
@@ -18,7 +20,7 @@ const emit = defineEmits(['select'])
         type="button"
         class="zc-rail-mark"
         :class="{ 'is-active': m.active }"
-        :style="{ top: m.topPct + '%' }"
+        :style="{ top: m.top + 'px' }"
         :data-prompt-mark="m.index"
         :aria-label="m.label"
         @click="emit('select', m.index)"
@@ -30,10 +32,12 @@ const emit = defineEmits(['select'])
 </template>
 
 <style scoped>
-/* 轨道是与滚动容器并排的一列，不覆盖在滚动区上——压上去会挡住原生滚动条 */
+/* 轨道是与滚动容器并排的一列，不覆盖在滚动区上——压上去会挡住原生滚动条。
+   固定高度 + align-self:center，让横杠簇停在右缘中间，而不是被拉满整个聊天列。 */
 .zc-rail {
   position: relative;
   flex: none;
+  align-self: center;
   width: 24px;
 }
 

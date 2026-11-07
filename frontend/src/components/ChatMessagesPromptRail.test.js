@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 // 提问导航条接进 ChatMessages 的接缝：锚点、渲染门、点击定位。
 // happy-dom 没有布局引擎，offsetTop/scrollHeight 恒为 0，所以这里给提问行桩出一套可预测的几何，
-// 量到的比例才是真的——位置映射本身由 promptRailModel.test.js 用纯数字覆盖，两边不重复。
+// 量到的几何才是真的——盒内定位本身由 promptRailModel.test.js 用纯数字覆盖，两边不重复。
 import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest'
 import { h, nextTick } from 'vue'
 import { mount } from '@vue/test-utils'
@@ -100,12 +100,12 @@ describe('锚点', () => {
 })
 
 describe('渲染门与位置', () => {
-  it('两条提问就画出两根横杠，纵向位置按提问在内容里的比例', async () => {
+  it('两条提问就画出两根横杠，按保留居中盒的像素位置成簇', async () => {
     const w = await mountChat(TWO_PROMPTS)
     const marks = w.findAll('.zc-rail-mark')
     expect(marks.length).toBe(2)
-    // top = 500 与 2500，内容高 4000 → 12.5% 与 62.5%
-    expect(marks.map((n) => n.attributes('style'))).toEqual(['top: 12.5%;', 'top: 62.5%;'])
+    // 盒高 200、间距 12：两条中心在 94 / 106，与提问在内容里的位置无关
+    expect(marks.map((n) => n.attributes('style'))).toEqual(['top: 94px;', 'top: 106px;'])
   })
 
   it('只有一条提问时整条轨道不渲染', async () => {
