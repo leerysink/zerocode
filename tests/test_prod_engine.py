@@ -692,7 +692,7 @@ async def _seed_publish_history(sf, aid, versions, step="record"):
         await records.finish(sf, rid, "success", step=step)
 
 
-async def test_publish_success_sequence(monkeypatch, sf, seed, pub_root):
+async def test_publish_success_sequence(monkeypatch, sf, seed, pub_root, gateway_routes_tmp):
     """七步全序 + 事件/落库互证（04 §4.1/§5）：进度、日志、版本推进、README、存量补件、keep-5。"""
     olds = [f"b2026091900000{i}" for i in range(1, 6)]        # 已发 5 版 → 第 6 版触发 keep-5 清理
     wid, aid = await seed(slug="zcpub", prod_port=8982, dev_port=8983,
@@ -754,6 +754,9 @@ async def test_publish_success_sequence(monkeypatch, sf, seed, pub_root):
     # ⑩ README 发布块刷新（T5 接缝的实际接线点）
     readme = (pub_root / "README.md").read_text(encoding="utf-8")
     assert res["url"] in readme and res["version"] in readme
+    # ⑪ 发布成功必须把 slug 投回网关路由表：publishing 阶段已把它摘掉，而收尾的裸
+    #    UPDATE 不经过 set_status——漏掉这次 refresh，域名对着刚发布的版本回 404。
+    assert json.loads(gateway_routes_tmp.read_text(encoding="utf-8")) == {"zcpub": 8982}
 
 
 async def test_publish_runs_on_success_hook_and_swallows_failure(monkeypatch, sf, seed, pub_root):
@@ -1217,7 +1220,8 @@ async def test_rollback_requires_prod_cred(monkeypatch, sf, seed, pub_root):
     assert seams.dones[-1]["ok"] is False
 
 
-async def test_rollback_switches_version_without_migrating(monkeypatch, sf, seed, pub_root):
+async def test_rollback_switches_version_without_migrating(monkeypatch, sf, seed, pub_root,
+                                                           gateway_routes_tmp):
     """回滚 = 只换程序（07/00 D8：数据库永不回滚）：按目标版本重渲染 + up，绝不重放迁移。"""
     NEW = "b20260921000000"
     wid, aid = await seed(slug="zcpub", prod_port=8982, dev_port=8983,
@@ -1240,6 +1244,8 @@ async def test_rollback_switches_version_without_migrating(monkeypatch, sf, seed
     assert (row[1], row[2]) == ("success", "health")
     assert row[4]["health"] == {"frontend": True, "api": True}   # M-b：回滚成功 detail 也带 health
     assert all(_PW not in s for s in seams.bare_events)
+    # publishing 摘掉的 slug 要在回滚成功后补回（与 publish 同一条裸 UPDATE 路径）
+    assert json.loads(gateway_routes_tmp.read_text(encoding="utf-8")) == {"zcpub": 8982}
 
 
 async def test_rollback_unexpected_error_also_emits_prod_status(monkeypatch, sf, seed, pub_root):

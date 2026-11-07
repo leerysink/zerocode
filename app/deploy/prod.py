@@ -575,6 +575,9 @@ async def publish(sf, app: dict, notify=None, *, force: bool = False,
                 "UPDATE app_project SET current_version=:v, status_prod='running', "
                 "updated_at=now() WHERE id=:i"), {"v": version, "i": app_id})
             await s.commit()
+        # 这条 UPDATE 绕过了 set_status（路由表刷新只挂在它后面）；不补这一步，
+        # 发布成功也进不了 routes.json —— 域名对着刚发布的版本回 404。
+        await gateway_routes.refresh(sf)
         # P2：发布成功即归档本版结构快照（releases/<version>/schema.sql），作为下次破坏性 diff 基线。
         # 文件存、不碰平台库；归档失败不改判发布成败（下次缺基线时闸门自动跳过）。
         try:
@@ -680,6 +683,7 @@ async def rollback(sf, app: dict, version: str, notify=None) -> dict:
                                  "updated_at=now() WHERE id=:i"),
                             {"v": version, "st": "running" if ok else "unhealthy", "i": app_id})
             await s.commit()
+        await gateway_routes.refresh(sf)      # 同 publish：裸 UPDATE 不经过 set_status
         await records.finish(sf, rid, "success" if ok else "failed", step="health",
                              error=None if ok else f"回滚后体检未通过 {checks}",
                              detail={"health": checks} if ok else None)
