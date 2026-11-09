@@ -274,3 +274,31 @@ async def test_add_message_rejects_unbindable_attachment(client, tmp_path, monke
         await add_message(sf, sid, "user", content="x", attachment_ids=[att_id])
     # 消息也回滚了：绑定失败不产生半条消息
     assert (await client.get(f"/api/sessions/{sid}/messages")).json() == []
+
+
+async def test_messages_gzip_for_large_payload(client):
+    """大会话首包压缩（规格 2026-11-09）：客户端声明 gzip 时，消息响应压缩传输，
+    解压后与未压缩响应逐字等价。950 KB 的原样首包是线上打开 3 秒的主因之一。"""
+    ws = await _mk_ws(client)
+    s = (await client.post("/api/sessions", json={"workspace_id": ws["id"]})).json()
+    sf = client.app.state.session_factory
+    for i in range(3):
+        await add_message(sf, s["id"], "user", content=f"{i}:" + "长消息" * 2000)
+    gz = await client.get(f"/api/sessions/{s['id']}/messages",
+                          headers={"Accept-Encoding": "gzip"})
+    assert gz.status_code == 200
+    assert gz.headers.get("content-encoding") == "gzip"
+    plain = await client.get(f"/api/sessions/{s['id']}/messages",
+                             headers={"Accept-Encoding": "identity"})
+    assert "content-encoding" not in plain.headers
+    # httpx 自动解压：两侧解析出的 JSON 必须等价（压缩不能改内容）
+    assert gz.json() == plain.json()
+
+
+async def test_small_response_not_gzipped(client):
+    """小于 minimum_size 的响应不压缩：会话详情这类小 JSON 保持明文，避免无谓开销。"""
+    ws = await _mk_ws(client)
+    s = (await client.post("/api/sessions", json={"workspace_id": ws["id"]})).json()
+    r = await client.get(f"/api/sessions/{s['id']}", headers={"Accept-Encoding": "gzip"})
+    assert r.status_code == 200
+    assert "content-encoding" not in r.headers

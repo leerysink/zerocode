@@ -26,6 +26,11 @@ import { findOpenToolCall, DECLINE_ANSWER, NOTICE_TEXT } from './messageModel'
 const BUSY_HINT = '会话正在执行中：点右侧「停止」结束当前执行后即可继续发言'
 const COMPACT_HINT = '上下文压缩中，请稍候'
 const OFFLINE_HINT = '连接未就绪，正在重连，请稍候再发'
+const LOAD_FAILED_HINT = '会话加载失败，请再次点击会话重试'
+
+// 会话消息快照只活在本页内存：切回同一会话先摆出来，再后台刷新替换。
+// 上限按条数不按字节——单会话首包 ~1 MB（950 KB 来自工具结果），5 个够覆盖来回切换。
+const SESSION_CACHE_LIMIT = 5
 
 // 聊天流里那枚未定稿的压缩标记（kind==='compacting'）在哪：从后往前找，同一时刻至多一枚。
 // 返回 -1 表示这轮的开始帧没收到（刷新/断线期间压缩跑完），定稿时就当没有标记处理。
@@ -273,6 +278,10 @@ export const useChatStore = defineStore('chat', {
     currentSessionId: null,
     currentWorkspaceId: null,
     messages: [],
+    loadingSession: false, // 未缓存会话的历史还没到：中栏显加载态，不留上一个会话的残余
+    sessionCache: {}, // 会话 id -> { messages, todoList, currentModelId, effectiveModel, visionSupported }
+    cacheOrder: [], // 会话 id 的最近使用序：淘汰从头砍，最后一项是最新
+    loadedSessionId: null, // 已成功装入过历史的会话：慢响应/失败时据此决定能不能写缓存
     streamingContent: '',
     wsStatus: 'disconnected',
     toolProgress: null, // 预览工具的临时进度 {name, line}：不落库、不进消息流，终态即清
@@ -297,23 +306,76 @@ export const useChatStore = defineStore('chat', {
       this.workspaces = (await listWorkspaces()).data
     },
     async openSession(id, workspaceId = null) {
+      // 离开旧会话：把当前内容留成快照，下次切回先摆出来（只在已成功装入过历史时留）
+      if (this.currentSessionId && this.currentSessionId !== id) {
+        this._rememberSession(this.currentSessionId)
+      }
+      // 旧连接必须在等历史之前就断：否则这段等待窗口里它的流事件会写进新会话的消息流，
+      // 用户的发言也会被发到上一个会话。新连接仍要等历史装入后才建（见下）。
+      this._detachSocket()
       this.currentSessionId = id
-      // 竞态守卫：快速切换会话时，先打开会话的慢响应后到，不得覆盖新会话的 messages
-      const { data } = await getMessages(id)
-      if (this.currentSessionId !== id) return
-      // 会话详情：todo/模型状态（交互增强）；detail 慢响应后到同样不得覆盖新会话。
+      if (workspaceId != null) this.currentWorkspaceId = workspaceId
+      this._resetOpenState()
+      // 缓存命中就立刻摆出来、不显加载态；未命中则清空残余，让「旧内容在等」不再发生
+      const cached = this.sessionCache[id]
+      this.messages = cached ? cached.messages : []
+      this.todoList = cached ? cached.todoList : []
+      this.currentModelId = cached ? cached.currentModelId : null
+      this.effectiveModel = cached ? cached.effectiveModel : null
+      this.visionSupported = cached ? cached.visionSupported : false
+      this.loadingSession = !cached
+      // 两个请求并行：详情只补 todo/模型，消息才是首屏；串行会让公网上的等待翻倍。
       // 详情拉取失败不阻断会话打开（T11 审查闭合）：todo/模型降级为空，照常渲染历史并连接
-      let detail = null
+      const detailP = getSessionDetail(id).then((r) => r?.data ?? null).catch(() => null)
+      // 竞态守卫：快速切换会话时，先打开会话的慢响应后到，不得覆盖新会话的 messages
+      let data = null
       try {
-        detail = (await getSessionDetail(id)).data
+        ({ data } = await getMessages(id))
       } catch {
-        // 降级：detail 缺失视同空 todo / 未配置模型
+        data = null // 失败走下面的可重试提示，不把异常抛给点击处理链
       }
       if (this.currentSessionId !== id) return
-      this.todoList = detail?.todo_state || []
-      this.currentModelId = detail?.model_config_id ?? null
-      this.effectiveModel = detail?.effective_model || null
-      this.visionSupported = !!detail?.effective_model?.supports_vision
+      if (data) {
+        this.messages = data
+        this.loadedSessionId = id
+        this.loadingSession = false
+        // 历史装入之后才连：hub 补发的待答卡若先到，会被随后装入的历史整体替换掉
+        this.connect(id)
+      } else {
+        this.loadingSession = false
+        this.hint = LOAD_FAILED_HINT
+        // 历史没装进来就不建新连接（旧连接已在入口断开），点同一会话即可重试
+      }
+      // 详情慢响应后到同样不得覆盖新会话；todo/模型只回填，不重排消息
+      const detail = await detailP
+      if (this.currentSessionId !== id) return
+      if (detail) {
+        this.todoList = detail.todo_state || []
+        this.currentModelId = detail.model_config_id ?? null
+        this.effectiveModel = detail.effective_model || null
+        this.visionSupported = !!detail.effective_model?.supports_vision
+        // 已排队但还没被注入的插话没落库（只在 hub.pending），刷新/切回来时由详情带回复原，
+        // 否则用户刚说出去的话会凭空消失。旧服务端可能只回字符串，两种形态都要认。
+        for (const c of detail.pending_steering || []) {
+          if (typeof c === 'string') {
+            this.messages.push({ role: 'user', content: c, queued: true })
+            continue
+          }
+          this.messages.push({
+            role: 'user', content: c.content || '', attachments: c.attachments || [],
+            client_msg_id: c.client_msg_id || undefined, queued: true,
+          })
+        }
+      }
+      this._rememberSession(id)
+    },
+    // 跨会话字段一律复位：它们都属于「刚才那个会话」，跟着新会话走会造出假执行态/假草稿
+    _resetOpenState() {
+      this.todoList = []
+      this.currentModelId = null
+      this.effectiveModel = null
+      this.visionSupported = false
+      this.streamingContent = ''
       this.streamingThinking = ''
       this.compacting = false
       this.hint = ''
@@ -322,38 +384,48 @@ export const useChatStore = defineStore('chat', {
       this.pendingEcho = ''
       this.pendingEchoId = ''
       this.pendingOutbox = {}
-      // 渲染门：右栏（Task 13/14）以 currentWorkspaceId 判定；由调用方传入工作区 id
-      if (workspaceId != null) this.currentWorkspaceId = workspaceId
-      this.messages = data
-      // 已排队但还没被注入的插话没落库（只在 hub.pending），刷新/切回来时由详情带回复原，
-      // 否则用户刚说出去的话会凭空消失。旧服务端可能只回字符串，两种形态都要认。
-      for (const c of detail?.pending_steering || []) {
-        if (typeof c === 'string') {
-          this.messages.push({ role: 'user', content: c, queued: true })
-          continue
-        }
-        this.messages.push({
-          role: 'user', content: c.content || '', attachments: c.attachments || [],
-          client_msg_id: c.client_msg_id || undefined, queued: true,
-        })
-      }
-      this.streamingContent = ''
       this.toolProgress = null // 临时进度不跨会话：切会话/重开时一并抹掉
       // 执行态一律以服务端为准，不在这里猜：DB 的 status='running' 在进程崩溃后会滞留
       // 最多 10 分钟（watchdog 周期），拿它立 running=true 会造出「假在跑、又停不掉」的新死结。
       // connect 之后后端若真在跑，会补发一帧 status(running) 把执行态与「停止」按钮立回来。
       this.running = false
-      this.connect(id)
+      this.loadedSessionId = null
     },
-    connect(sessionId, keepBackoff = false) {
+    // 没成功装入过历史的会话不写缓存：否则切回去会先闪一个「空会话」再去拉真历史
+    _rememberSession(id) {
+      if (!id || this.loadedSessionId !== id) return
+      this.sessionCache[id] = {
+        messages: this.messages.slice(), // 只拷数组：回来后实时事件还在往原数组 push
+        todoList: this.todoList,
+        currentModelId: this.currentModelId,
+        effectiveModel: this.effectiveModel,
+        visionSupported: this.visionSupported,
+      }
+      this.cacheOrder = this.cacheOrder.filter((x) => x !== id).concat(id)
+      while (this.cacheOrder.length > SESSION_CACHE_LIMIT) {
+        delete this.sessionCache[this.cacheOrder.shift()]
+      }
+    },
+    forgetSession(id) {
+      delete this.sessionCache[id]
+      this.cacheOrder = this.cacheOrder.filter((x) => x !== id)
+    },
+    // 断开当前连接：切会话/重连前必须先摘干净，否则旧会话的流事件会写进新会话的消息流
+    _detachSocket() {
       if (this._ws) {
-        this._ws.onclose = null // 切换会话/重连前断开旧连接，不触发其重连回调
+        this._ws.onmessage = null
+        this._ws.onclose = null // 主动断开不触发旧连接的重连回调
         this._ws.close()
+        this._ws = null
       }
       if (this._reconnectTimer) {
         clearTimeout(this._reconnectTimer)
         this._reconnectTimer = null
       }
+      this.wsStatus = 'disconnected'
+    },
+    connect(sessionId, keepBackoff = false) {
+      this._detachSocket()
       // 入口重置退避计数：用户发起的新连接（切换会话/手动重连）不沿用旧退避；
       // 定时器重连传 keepBackoff=true，以延续同一断线期的指数退避（1s→2s→4s→…上限 15s）
       if (!keepBackoff) this._retry = 0

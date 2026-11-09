@@ -121,6 +121,7 @@ onMounted(loadAll)
 async function removeSession(wsId, s) {
   try {
     await deleteSession(s.id)
+    store.forgetSession(s.id) // 删掉的会话不再留在切回缓存里
     store.sessionsByWs[wsId] = sessionsOf(wsId).filter((x) => x.id !== s.id)
     if (store.currentSessionId === s.id) store.currentSessionId = null
     message.success('会话已删除')

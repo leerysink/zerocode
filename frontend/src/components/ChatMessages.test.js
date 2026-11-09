@@ -47,18 +47,22 @@ const SpinStub = {
   },
 }
 
+const STUBS = {
+  'a-image': ImageStub, 'a-image-preview-group': GroupStub, 'a-button': ButtonStub,
+  'a-spin': SpinStub,
+  MarkdownView: true, ToolCallBlock: true, AskUserCard: true,
+  ThinkingBlock: true, TodoCard: true,
+}
+
 function mountMessages(messages) {
+  return mountMessagesWith({ messages, hasSession: true })
+}
+
+function mountMessagesWith(props) {
   setActivePinia(createPinia())
   return mount(ChatMessages, {
-    props: { messages, hasSession: true },
-    global: {
-      stubs: {
-        'a-image': ImageStub, 'a-image-preview-group': GroupStub, 'a-button': ButtonStub,
-        'a-spin': SpinStub,
-        MarkdownView: true, ToolCallBlock: true, AskUserCard: true,
-        ThinkingBlock: true, TodoCard: true,
-      },
-    },
+    props,
+    global: { stubs: STUBS },
   })
 }
 
@@ -724,4 +728,66 @@ it('工具调用块拿到当前会话 id（聊天流里的内联 diff 靠它跳�
   await nextTick()
 
   expect(w.findComponent(ToolCallBlock).props('sessionId')).toBe(12)
+})
+
+// 规格 2026-11-09：大会话首屏先铺最近 80 条，其余空闲补齐（无「加载更早」按钮）
+describe('大会话渐进渲染', () => {
+  const seq = (n) => Array.from({ length: n }, (_, i) => ({ role: 'user', content: `m${i}` }))
+
+  it('超过 80 条时首帧只渲染最近 80 条，顺序与结尾正确', () => {
+    const w = mountMessages(seq(200))
+    const rows = w.findAll('.zc-msg')
+    expect(rows.length).toBe(80)
+    expect(rows[0].text()).toBe('m120')
+    expect(rows.at(-1).text()).toBe('m199')
+  })
+
+  it('空闲帧分批补齐，最终全部出现且顺序不变', async () => {
+    const w = mountMessages(seq(200))
+    await vi.waitFor(() => expect(w.findAll('.zc-msg').length).toBe(200), { timeout: 3000 })
+    const rows = w.findAll('.zc-msg')
+    expect(rows[0].text()).toBe('m0')
+    expect(rows[199].text()).toBe('m199')
+  })
+
+  it('不超过 80 条时一次性渲染，行为与现状一致', async () => {
+    const w = mountMessages(seq(40))
+    await nextTick()
+    expect(w.findAll('.zc-msg').length).toBe(40)
+  })
+
+  it('前插补齐时 scrollTop 按新增高度补偿，视线不跳', async () => {
+    // happy-dom 没有布局：按已渲染行数折算高度，才量得到补偿这一步
+    const ROW = 100
+    Object.defineProperty(HTMLElement.prototype, 'scrollHeight', {
+      configurable: true,
+      get() { return (this.querySelectorAll ? this.querySelectorAll('.zc-msg').length : 0) * ROW },
+    })
+    try {
+      const w = mountMessages(seq(200))
+      const el = w.find('.zc-chat').element
+      await nextTick()
+      expect(el.scrollTop).toBe(80 * ROW) // 挂载即贴底
+      await vi.waitFor(() => expect(w.findAll('.zc-msg').length).toBe(200), { timeout: 3000 })
+      // 内容从 80 行长到 200 行，scrollTop 同步补回 120 行的高度：仍停在底部
+      expect(el.scrollTop).toBe(200 * ROW)
+    } finally {
+      delete HTMLElement.prototype.scrollHeight
+    }
+  })
+})
+
+it('加载态：未缓存会话历史未到时显示加载提示，不显示「开始你的第一句话吧」', () => {
+  const w = mountMessagesWith({ messages: [], hasSession: true, loading: true })
+  expect(w.find('.stub-spin').exists()).toBe(true)
+  expect(w.text()).toContain('正在加载会话')
+  expect(w.text()).not.toContain('开始你的第一句话吧')
+})
+
+it('缓存命中时不显示加载态（内容已在）', () => {
+  const w = mountMessagesWith({
+    messages: [{ role: 'user', content: '缓存内容' }], hasSession: true, loading: false,
+  })
+  expect(w.find('.stub-spin').exists()).toBe(false)
+  expect(w.text()).toContain('缓存内容')
 })

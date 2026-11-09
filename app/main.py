@@ -159,6 +159,10 @@ def create_app(database_url: str | None = None) -> FastAPI:
     from app.api import workspaces, sessions, files, models
     from app.api.ws import router as ws_router
     app = FastAPI(title="zerocode", lifespan=lifespan)
+    # 控制台由本进程直接托管（不起 nginx），消息接口的大会话首包可达 ~1 MB；没有这层压缩，
+    # 公网上就是原样传输。全仓无 SSE/StreamingResponse，压缩不存在缓冲流式响应的风险。
+    from fastapi.middleware.gzip import GZipMiddleware
+    app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=6)
     # 登录体系（Ticket 002 / ADR-0003）：/api/auth register/login/logout/me（guard 中间件在后续票接入）
     from app.api import auth as auth_api
     app.include_router(auth_api.router)

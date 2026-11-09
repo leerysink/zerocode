@@ -39,6 +39,7 @@ onMounted(() => store.loadWorkspaces())
         :streaming="store.streamingContent"
         :streaming-thinking="store.streamingThinking"
         :has-session="!!store.currentSessionId"
+        :loading="store.loadingSession"
       />
       <TodoBar v-if="store.todoList.length" :todos="store.todoList" />
       <!-- 发送决策在 chat store（被拦时保留输入框文本 + 给 hint），故不再冒泡 send -->

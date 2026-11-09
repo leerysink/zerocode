@@ -26,7 +26,7 @@ vi.mock('../api', () => ({
 vi.mock('ant-design-vue', () => ({ message: { success: vi.fn(), error: vi.fn(), warning: vi.fn() } }))
 
 import {
-  listApps, listSessions, listWorkspaces, createSession, renameApp, deleteApp,
+  listApps, listSessions, listWorkspaces, createSession, renameApp, deleteApp, deleteSession,
   getSessionLiveStatuses,
 } from '../api'
 import { message } from 'ant-design-vue'
@@ -41,6 +41,16 @@ const slotDiv = (name) => ({
     return h('div', { class: `stub-${name}` }, this.$slots.default ? this.$slots.default() : [])
   },
 })
+// 气泡确认：真实实现的确认态是浮层，桩直接给一个「确认」按钮，好让删除链路可驱动
+const PopconfirmStub = {
+  name: 'a-popconfirm',
+  render() {
+    return h('div', { class: 'stub-popconfirm' }, [
+      ...(this.$slots.default ? this.$slots.default() : []),
+      h('button', { class: 'stub-popconfirm-ok', onClick: () => this.$emit('confirm') }, 'confirm'),
+    ])
+  },
+}
 const ButtonStub = {
   name: 'a-button',
   render() {
@@ -99,7 +109,7 @@ const STUBS = {
   'a-button': ButtonStub,
   'a-spin': slotDiv('a-spin'),
   'a-empty': slotDiv('a-empty'),
-  'a-popconfirm': slotDiv('a-popconfirm'),
+  'a-popconfirm': PopconfirmStub,
   'a-dropdown': DropdownStub,
   'a-modal': ModalStub,
   'a-select': SelectStub,
@@ -518,5 +528,17 @@ describe('SideBar 会话状态角标', () => {
 
     const second = await mountSideBar({ liveRows: [row] })
     expect(second.wrapper.find('.zc-session-status').classes()).toContain('is-completed')
+  })
+})
+
+describe('SideBar 删除会话', () => {
+  it('删除会话后清掉它的切回缓存（下次打开不是删掉的内容）', async () => {
+    const { wrapper, store } = await mountSideBar()
+    const spy = vi.spyOn(store, 'forgetSession')
+    deleteSession.mockResolvedValue({ data: { ok: true } })
+    await wrapper.findAll('.stub-popconfirm-ok')[0].trigger('click')
+    await flushPromises()
+    expect(deleteSession).toHaveBeenCalledWith(100)
+    expect(spy).toHaveBeenCalledWith(100)
   })
 })

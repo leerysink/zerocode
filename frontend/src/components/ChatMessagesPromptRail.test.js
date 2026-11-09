@@ -147,6 +147,22 @@ describe('点击定位', () => {
   })
 })
 
+describe('渐进渲染补齐', () => {
+  it('首帧只画量得到的横杠，旧消息补齐后其余横杠出现', async () => {
+    const many = Array.from({ length: 200 }, (_, i) => (
+      i % 2 === 0 ? { role: 'user', content: `问${i}` } : { role: 'assistant', content: `答${i}` }
+    ))
+    const w = await mountChat(many)
+    // 只铺最近 80 条：下标 120 起的提问才在 DOM 里，轨道也只画量得到的这 40 条
+    expect(w.findAll('.zc-msg')).toHaveLength(80)
+    expect(w.findAll('.zc-rail-mark')).toHaveLength(40)
+    await vi.waitFor(() => {
+      expect(w.findAll('.zc-msg')).toHaveLength(200)
+      expect(w.findAll('.zc-rail-mark')).toHaveLength(100)
+    })
+  })
+})
+
 describe('滚动跟随', () => {
   it('滚动后高亮换到当前视口里的那条提问', async () => {
     const w = await mountChat(TWO_PROMPTS)

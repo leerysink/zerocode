@@ -6,7 +6,7 @@
 // 滚动策略：新消息/新卡片强制滚底；流式增量仅在用户已贴底时跟随，不打断上翻阅读。
 // 右缘提问导航条（prompt rail）：每根横杠对应一次用户提问，悬停看全文、点击滚过去；
 // 位置映射与高亮判定在 promptRailModel，DOM 量测在 useChatPromptRail，本组件只挂锚点与接线。
-import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useChatStore } from '../stores/chat'
 import { normalizeMessages } from '../stores/messageModel'
 import { useChatPromptRail } from '../composables/useChatPromptRail'
@@ -26,6 +26,7 @@ const props = defineProps({
   streaming: { type: String, default: '' },
   streamingThinking: { type: String, default: '' },
   hasSession: { type: Boolean, default: false },
+  loading: { type: Boolean, default: false },
 })
 
 const store = useChatStore()
@@ -129,7 +130,57 @@ watch(() => props.hasSession, scrollToBottom)
 onMounted(scrollToBottom)
 
 // 右缘导航条：量测以 scrollRef 为基准，锚点 data-prompt-index 挂在下面的 user 气泡行上
-const { marks: promptMarks, onScroll, scrollToPrompt } = useChatPromptRail({ scrollRef, view })
+const { marks: promptMarks, onScroll, scrollToPrompt, measure } = useChatPromptRail({ scrollRef, view })
+
+// 大会话首屏（规格 2026-11-09）：先铺最近 80 条，其余在空闲帧分批前插补齐。
+// 触发点只认「消息数组被整体替换」（切会话/缓存恢复）：实时增量是原地 push，数组身份不变，
+// 不会把读者正在翻的旧消息窗口重置掉。
+const RENDER_STEP = 80
+const renderFrom = ref(0)
+const renderItems = computed(() => {
+  const start = Math.min(renderFrom.value, view.value.length)
+  const out = []
+  for (let i = start; i < view.value.length; i++) out.push({ i, m: view.value[i] })
+  return out
+})
+
+let fillTimer = null
+function cancelFill() {
+  if (fillTimer == null) return
+  if (typeof cancelIdleCallback === 'function') cancelIdleCallback(fillTimer)
+  else clearTimeout(fillTimer)
+  fillTimer = null
+}
+function scheduleFill() {
+  cancelFill()
+  if (renderFrom.value <= 0) return
+  const run = () => {
+    fillTimer = null
+    if (renderFrom.value <= 0) return
+    const el = scrollRef.value
+    const beforeHeight = el ? el.scrollHeight : 0
+    const beforeTop = el ? el.scrollTop : 0
+    renderFrom.value = Math.max(0, renderFrom.value - RENDER_STEP)
+    nextTick(() => {
+      // 前插会抬高滚动内容：scrollTop 补回等量高度，读者的视线才不跳
+      if (el) el.scrollTop = beforeTop + (el.scrollHeight - beforeHeight)
+      measure() // 新渲染出的提问锚点才量得到，导航条随之补齐
+      scheduleFill()
+    })
+  }
+  fillTimer = typeof requestIdleCallback === 'function'
+    ? requestIdleCallback(run, { timeout: 200 })
+    : setTimeout(run, 16)
+}
+watch(
+  () => props.messages,
+  (list) => {
+    renderFrom.value = Math.max(0, (list?.length || 0) - RENDER_STEP)
+    scheduleFill()
+  },
+  { immediate: true }
+)
+onBeforeUnmount(cancelFill)
 </script>
 
 <template>
@@ -141,37 +192,42 @@ const { marks: promptMarks, onScroll, scrollToPrompt } = useChatPromptRail({ scr
         <p class="zc-empty-sub">从左侧选择一个会话继续，或新建会话开始探索</p>
       </div>
       <template v-else>
-        <div v-if="!view.length && !streaming" class="zc-empty zc-empty-lite">
+        <!-- 未缓存会话的历史还没到：显加载态，不把上一个会话的内容留在中栏 -->
+        <div v-if="loading && !view.length" class="zc-empty zc-empty-lite">
+          <a-spin size="small" />
+          <p class="zc-empty-sub">正在加载会话…</p>
+        </div>
+        <div v-else-if="!view.length && !streaming" class="zc-empty zc-empty-lite">
           <p class="zc-empty-sub">开始你的第一句话吧</p>
         </div>
 
-        <template v-for="(m, i) in view" :key="i">
+        <template v-for="item in renderItems" :key="item.i">
           <!-- user：右侧浅蓝气泡（图片网格在文字之前；queued = 执行中发出的插话，等下一个工具边界注入）。
-               data-prompt-index 是导航条的量测与定位锚点，值必须是这里的下标 i。 -->
-          <div v-if="m.role === 'user'" class="zc-msg is-user" :data-prompt-index="i">
+               data-prompt-index 是导航条的量测与定位锚点，值必须是这条在归一化 view 里的下标。 -->
+          <div v-if="item.m.role === 'user'" class="zc-msg is-user" :data-prompt-index="item.i">
             <div class="zc-bubble">
-              <div v-if="m.attachments && m.attachments.length" class="zc-bubble-images">
+              <div v-if="item.m.attachments && item.m.attachments.length" class="zc-bubble-images">
                 <a-image-preview-group>
-                  <a-image v-for="a in m.attachments" :key="a.id" :src="a.url" :alt="a.filename" :width="160" />
+                  <a-image v-for="a in item.m.attachments" :key="a.id" :src="a.url" :alt="a.filename" :width="160" />
                 </a-image-preview-group>
               </div>
-              <span v-if="m.content" class="zc-bubble-text">{{ m.content }}</span>
-              <span v-if="m.queued" class="zc-queued">排队中</span>
+              <span v-if="item.m.content" class="zc-bubble-text">{{ item.m.content }}</span>
+              <span v-if="item.m.queued" class="zc-queued">排队中</span>
             </div>
           </div>
           <!-- assistant：思考块（reasoning）+ Markdown 渲染（MarkdownView 按 content 缓存，
                空内容但有思考的历史消息也渲染；纯 tool_calls 空内容行仍不渲染） -->
-          <div v-else-if="m.role === 'assistant' && (m.content || m.reasoning)" class="zc-msg is-assistant">
+          <div v-else-if="item.m.role === 'assistant' && (item.m.content || item.m.reasoning)" class="zc-msg is-assistant">
             <div class="zc-assistant">
-              <ThinkingBlock v-if="m.reasoning" :thinking="m.reasoning" />
-              <MarkdownView v-if="m.content" class="zc-md" :content="m.content" />
+              <ThinkingBlock v-if="item.m.reasoning" :thinking="item.m.reasoning" />
+              <MarkdownView v-if="item.m.content" class="zc-md" :content="item.m.content" />
             </div>
           </div>
           <!-- notice：压缩进行中（转圈）与完成等系统提示（灰字），居中分隔 -->
-          <div v-else-if="m.role === 'notice'" class="zc-msg is-notice">
+          <div v-else-if="item.m.role === 'notice'" class="zc-msg is-notice">
             <span class="zc-notice-text">
-              <a-spin v-if="m.kind === 'compacting'" size="small" class="zc-notice-spin" />
-              {{ m.content }}
+              <a-spin v-if="item.m.kind === 'compacting'" size="small" class="zc-notice-spin" />
+              {{ item.m.content }}
             </span>
           </div>
           <!-- tool：ask_user 渲染提问卡；需确认的调用渲染确认卡（待答可交互／已答只读留痕）；
@@ -179,21 +235,21 @@ const { marks: promptMarks, onScroll, scrollToPrompt } = useChatPromptRail({ scr
                browser_open/step/close 渲染步骤流卡（三张卡都要过「有结果或仍是最后一条」那道闸）；
                其余落回通用折叠块。
                字段一律是归一化后的 name/args/result，实时与历史同形（见 messageModel.js）。 -->
-          <div v-else-if="m.role === 'tool'" class="zc-msg is-tool">
-            <AskUserCard v-if="isAskCard(m)" :questions="m.questions" :result="m.result" />
-            <ConfirmCard v-else-if="confirmCardState(m)" :msg="m" :state="confirmCardState(m)" :progress="liveProgress(m, i)" />
-            <TodoCard v-else-if="m.name === 'todo_write' && m.args && m.args.todos" :todos="m.args.todos" />
-            <PageInspectCard v-else-if="isPageCard(m, i)" :msg="m" :progress="liveProgress(m, i)" />
-            <BrowserFlowCard v-else-if="isBrowserCard(m, i)" :msg="m" :progress="liveProgress(m, i)" />
-            <PreviewCard v-else-if="isPreviewCard(m, i)" :msg="m" :progress="liveProgress(m, i)" />
+          <div v-else-if="item.m.role === 'tool'" class="zc-msg is-tool">
+            <AskUserCard v-if="isAskCard(item.m)" :questions="item.m.questions" :result="item.m.result" />
+            <ConfirmCard v-else-if="confirmCardState(item.m)" :msg="item.m" :state="confirmCardState(item.m)" :progress="liveProgress(item.m, item.i)" />
+            <TodoCard v-else-if="item.m.name === 'todo_write' && item.m.args && item.m.args.todos" :todos="item.m.args.todos" />
+            <PageInspectCard v-else-if="isPageCard(item.m, item.i)" :msg="item.m" :progress="liveProgress(item.m, item.i)" />
+            <BrowserFlowCard v-else-if="isBrowserCard(item.m, item.i)" :msg="item.m" :progress="liveProgress(item.m, item.i)" />
+            <PreviewCard v-else-if="isPreviewCard(item.m, item.i)" :msg="item.m" :progress="liveProgress(item.m, item.i)" />
             <!-- 会话 id 兜空串：null 会撞在 [Number,String] 的 props 校验上刷一屏警告，
                  而空串本来就是「跳不过去」的合法取值（DiffBlock 据此不渲染入口） -->
-            <ToolCallBlock v-else :msg="m" :session-id="store.currentSessionId ?? ''" />
+            <ToolCallBlock v-else :msg="item.m" :session-id="store.currentSessionId ?? ''" />
           </div>
           <!-- error：红色气泡 + 尾部重试（重发最后一条 user 消息） -->
-          <div v-else-if="m.role === 'error'" class="zc-msg is-error">
+          <div v-else-if="item.m.role === 'error'" class="zc-msg is-error">
             <div class="zc-error">
-              <div class="zc-error-text">{{ m.content }}</div>
+              <div class="zc-error-text">{{ item.m.content }}</div>
               <a-button type="link" danger size="small" @click="store.retry()">重试</a-button>
             </div>
           </div>

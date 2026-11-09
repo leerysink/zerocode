@@ -512,3 +512,173 @@ describe('压缩期间的发言拦截', () => {
     expect(s._ws.send).toHaveBeenCalledTimes(1)
   })
 })
+
+// 规格 2026-11-09：打开大会话要秒开——并行请求、消息先到先显、切走清空、切回读缓存。
+describe('openSession 装载顺序、切换瞬态与缓存', () => {
+  function deferred() {
+    let resolve
+    let reject
+    const p = new Promise((res, rej) => { resolve = res; reject = rej })
+    return { p, resolve, reject }
+  }
+
+  async function freshStore() {
+    setActivePinia(createPinia())
+    const s = useChatStore()
+    s.connect = vi.fn()
+    const { getMessages, getSessionDetail } = await import('../api')
+    return { s, getMessages, getSessionDetail }
+  }
+
+  beforeEach(async () => {
+    const { getMessages, getSessionDetail } = await import('../api')
+    getMessages.mockReset()
+    getSessionDetail.mockReset()
+    getSessionDetail.mockResolvedValue({ data: { todo_state: [], pending_steering: [] } })
+  })
+
+  it('两个请求并行发出，消息先到先渲染，详情后到只回填', async () => {
+    const { s, getMessages, getSessionDetail } = await freshStore()
+    const msg = deferred()
+    const det = deferred()
+    getMessages.mockReturnValue(msg.p)
+    getSessionDetail.mockReturnValue(det.p)
+    const done = s.openSession(5, 2)
+    // 详情不等消息返回就发出：串行是线上等待翻倍的主因
+    expect(getMessages).toHaveBeenCalledWith(5)
+    expect(getSessionDetail).toHaveBeenCalledWith(5)
+    expect(s.messages).toEqual([])
+    msg.resolve({ data: [{ role: 'user', content: '历史' }] })
+    await vi.waitFor(() => expect(s.messages).toHaveLength(1))
+    // WS 只在历史装入之后才连：hub 补发的待答卡不能先到、又被历史替换掉
+    expect(s.connect).toHaveBeenCalledWith(5)
+    expect(s.currentModelId).toBe(null) // 详情还没到，不阻塞渲染
+    det.resolve({
+      data: {
+        todo_state: [{ content: 'A' }],
+        model_config_id: 7,
+        effective_model: { model: 'm', supports_vision: true },
+        pending_steering: [],
+      },
+    })
+    await done
+    expect(s.todoList).toHaveLength(1)
+    expect(s.currentModelId).toBe(7)
+    expect(s.visionSupported).toBe(true)
+  })
+
+  it('未缓存会话：点下立即清空旧会话内容并标记加载中', async () => {
+    const { s, getMessages } = await freshStore()
+    s.currentSessionId = 1
+    s.messages = [{ role: 'user', content: '旧会话' }]
+    const pending = deferred()
+    getMessages.mockReturnValue(pending.p)
+    const done = s.openSession(2)
+    expect(s.messages).toEqual([])          // 不再显示上一个会话的内容
+    expect(s.loadingSession).toBe(true)
+    expect(s.currentSessionId).toBe(2)      // 侧栏高亮立即切换
+    pending.resolve({ data: [] })
+    await done
+    expect(s.loadingSession).toBe(false)
+  })
+
+  it('消息请求失败：不抛异常、给出可重试提示、不连接 WS', async () => {
+    const { s, getMessages } = await freshStore()
+    getMessages.mockRejectedValue(new Error('boom'))
+    await s.openSession(9)
+    expect(s.messages).toEqual([])
+    expect(s.loadingSession).toBe(false)
+    expect(s.hint).toMatch(/加载失败/)
+    expect(s.connect).not.toHaveBeenCalled()
+  })
+
+  it('切会话时先断旧连接再等历史：等待窗口里旧流事件写不进新会话', async () => {
+    const { s, getMessages } = await freshStore()
+    const close = vi.fn()
+    s.currentSessionId = 1
+    s.messages = [{ role: 'user', content: '旧会话' }]
+    s._ws = { readyState: 1, close, onmessage: () => {}, onclose: () => {} }
+    const pending = deferred()
+    getMessages.mockReturnValue(pending.p)
+    const done = s.openSession(2)
+    // 历史还在路上（公网这段就是几百毫秒）：旧连接此刻必须已经断开
+    expect(close).toHaveBeenCalled()
+    expect(s._ws).toBeNull()
+    pending.resolve({ data: [] })
+    await done
+  })
+
+  it('消息请求失败时断掉旧会话的连接：旧流事件不能写进这个空会话', async () => {
+    const { s, getMessages } = await freshStore()
+    const close = vi.fn()
+    s._ws = { readyState: 1, close, onmessage: () => {}, onclose: () => {} }
+    getMessages.mockRejectedValue(new Error('boom'))
+    await s.openSession(9)
+    expect(close).toHaveBeenCalled()
+    expect(s._ws).toBeNull()
+    expect(s.wsStatus).toBe('disconnected')
+  })
+
+  it('切走再切回同一会话：立即显示缓存，后台刷新后原地替换', async () => {
+    const { s, getMessages } = await freshStore()
+    getMessages.mockResolvedValueOnce({ data: [{ role: 'user', content: 'A' }] })
+    await s.openSession(1)
+    getMessages.mockResolvedValueOnce({ data: [{ role: 'user', content: 'B' }] })
+    await s.openSession(2)
+    const refresh = deferred()
+    getMessages.mockReturnValueOnce(refresh.p)
+    const back = s.openSession(1)
+    // 缓存命中：不等网络就把内容摆出来，也不再显示加载态
+    expect(s.messages.map((m) => m.content)).toEqual(['A'])
+    expect(s.loadingSession).toBe(false)
+    refresh.resolve({ data: [{ role: 'user', content: 'A2' }] })
+    await back
+    expect(s.messages.map((m) => m.content)).toEqual(['A2'])
+  })
+
+  it('消息失败但已有缓存时，保留缓存内容并提示刷新失败', async () => {
+    const { s, getMessages } = await freshStore()
+    getMessages.mockResolvedValueOnce({ data: [{ role: 'user', content: 'A' }] })
+    await s.openSession(1)
+    getMessages.mockResolvedValueOnce({ data: [] })
+    await s.openSession(2)
+    getMessages.mockRejectedValueOnce(new Error('boom'))
+    await s.openSession(1)
+    expect(s.messages.map((m) => m.content)).toEqual(['A'])
+    expect(s.hint).toMatch(/加载失败/)
+  })
+
+  it('缓存最多保留 5 个会话，超出淘汰最久未使用', async () => {
+    const { s, getMessages } = await freshStore()
+    getMessages.mockImplementation((id) => Promise.resolve({ data: [{ role: 'user', content: `s${id}` }] }))
+    for (let id = 1; id <= 6; id++) await s.openSession(id)
+    expect(Object.keys(s.sessionCache)).toHaveLength(5)
+    expect(s.sessionCache[1]).toBeUndefined()  // 最早的被淘汰
+    expect(s.cacheOrder).toEqual([2, 3, 4, 5, 6])
+  })
+
+  it('删除会话清掉其缓存', async () => {
+    const { s, getMessages } = await freshStore()
+    getMessages.mockResolvedValue({ data: [{ role: 'user', content: 'A' }] })
+    await s.openSession(3)
+    s.forgetSession(3)
+    expect(s.sessionCache[3]).toBeUndefined()
+    expect(s.cacheOrder).not.toContain(3)
+  })
+
+  it('慢响应后到时既不覆盖当前会话，也不写缓存', async () => {
+    const { s, getMessages } = await freshStore()
+    const slow = deferred()
+    const fast = deferred()
+    getMessages.mockReturnValueOnce(slow.p).mockReturnValueOnce(fast.p)
+    const pSlow = s.openSession(5)
+    const pFast = s.openSession(6)
+    fast.resolve({ data: [{ role: 'user', content: 'B' }] })
+    await pFast
+    slow.resolve({ data: [{ role: 'user', content: 'A' }] })
+    await pSlow
+    expect(s.currentSessionId).toBe(6)
+    expect(s.messages.map((m) => m.content)).toEqual(['B'])
+    expect(s.sessionCache[5]).toBeUndefined()
+  })
+})
