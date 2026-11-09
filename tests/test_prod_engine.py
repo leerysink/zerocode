@@ -12,7 +12,7 @@ import pytest
 from sqlalchemy import text as t
 
 from app.db import make_session_factory
-from app.deploy import compose, nics, prod, records, sqlrun
+from app.deploy import compose, engine, nics, prod, records, sqlrun
 from app.deploy.errors import DeployError
 from app.hub import ChatHub
 
@@ -415,6 +415,22 @@ async def test_wait_prod_health_static_api_always_true():
     ok, checks = await prod.wait_prod_health(Path("D:/__none__"), 59997, 1, "static")
     assert ok is False
     assert checks == {"frontend": False, "api": True}
+
+
+async def test_health_probes_ignore_system_proxy_env(monkeypatch):
+    """NO_PROXY 里的 `[::1]` 会让 httpx 拼出非法代理地址并在构造客户端时抛 InvalidURL。
+
+    探针目标是本机/宿主端口，不该走环境代理；否则发布会在容器都起来之后倒在这里。
+    """
+    monkeypatch.setenv("NO_PROXY", "localhost,[::1],::1")
+    ok, checks = await prod.wait_prod_health(Path("D:/__none__"), 59997, 1, "static")
+    assert ok is False
+    assert checks == {"frontend": False, "api": True}
+
+    ok, last = await engine._all_200(59997, ("/",), 1)
+    assert ok is False
+    assert "Invalid port" not in last
+
 
 
 async def test_prod_status_reads_db_and_compose_text(monkeypatch, sf, seed):

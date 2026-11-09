@@ -58,8 +58,10 @@ async def probe_tls(url: str, timeout: float = TLS_TIMEOUT) -> bool:
     只在后台任务（预检）里调用，不进请求路径。
     """
     try:
+        # trust_env=False：真机直连应用域名，平台侧环境代理既不代表真机路径，NO_PROXY 带
+        # `[::1]` 时还会让 httpx 构造客户端即抛 InvalidURL（假报「域名或证书不可用」）
         async with httpx.AsyncClient(timeout=timeout, transport=transport,
-                                     follow_redirects=False) as c:
+                                     follow_redirects=False, trust_env=False) as c:
             await c.get(url)
         return True
     except Exception:  # noqa: BLE001
@@ -79,7 +81,9 @@ async def egress_ip(*, force: bool = False, timeout: float = EGRESS_TIMEOUT) -> 
         return _cache["ip"]
     ip = ""
     try:
-        async with httpx.AsyncClient(timeout=timeout, transport=transport) as c:
+        # 上传由 builder 容器直连微信，白名单要的是宿主直连出口 IP，同样不取环境代理
+        async with httpx.AsyncClient(timeout=timeout, transport=transport,
+                                     trust_env=False) as c:
             r = await c.get(EGRESS_PROBE_URL)
         if r.status_code == 200:
             ip = r.text.strip()

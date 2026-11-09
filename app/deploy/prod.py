@@ -84,7 +84,9 @@ async def wait_prod_health(root: Path, port: int, timeout: int,
     （控制者裁定，不删）。"""
     target = host or preview_probe_host()
     checks = {"frontend": False, "api": stack == "static"}
-    async with httpx.AsyncClient(timeout=3.0) as c:
+    # trust_env=False：探针只连本机/宿主发布的端口，系统代理无意义；且 NO_PROXY 里带方括号的
+    # IPv6（如 `[::1]`）会让 httpx 在构造客户端时就抛 InvalidURL，发布会在容器起来后倒在这里
+    async with httpx.AsyncClient(timeout=3.0, trust_env=False) as c:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             try:

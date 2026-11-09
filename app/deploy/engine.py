@@ -234,7 +234,9 @@ async def _all_200(port: int, paths: tuple, timeout: int, host: str | None = Non
     target = host or preview_probe_host()
     headers = _probe_headers(port)
     last = "未探测"
-    async with httpx.AsyncClient(timeout=2.0) as c:
+    # 同 prod.wait_prod_health：本机/宿主端口不走环境代理，也避开 NO_PROXY 带 `[::1]` 时
+    # httpx 构造客户端即抛 InvalidURL 的问题
+    async with httpx.AsyncClient(timeout=2.0, trust_env=False) as c:
         deadline = time.monotonic() + max(int(timeout), 1)
         while True:
             try:
