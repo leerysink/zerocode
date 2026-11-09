@@ -11,6 +11,7 @@ import {
 import { appMobile, rebuildMobileApk, resetMobileIcon, uploadMobileIcon } from '../api'
 import { copyText } from '../utils/clipboard'
 import { qrMatrix } from '../utils/qr'
+import MiniprogramPanel from './MiniprogramPanel.vue'
 
 const props = defineProps({
   app: { type: Object, required: true },
@@ -190,13 +191,16 @@ function openCurrent() {
   if (canOpen.value) openTab(currentUrl.value, `zerocode-mobile-${props.app.id}-${env.value}`)
 }
 
-// building 期间每 3 秒拉一次状态；状态离开 building（ready/failed）即自动停表。
-watch(apkStatus, (s) => {
-  if (s === 'building') {
+// building 期间每 3 秒拉一次状态；APK 与小程序任一任务进行中都轮询，全部结束即停表。
+const mpStatus = computed(() => info.value?.miniprogram?.status || 'idle')
+const mpBusy = computed(() => mpStatus.value === 'building' || mpStatus.value === 'uploading')
+const busy = computed(() => apkStatus.value === 'building' || mpBusy.value)
+watch(busy, (on) => {
+  if (on) {
     if (!pollTimer) {
       pollTimer = setInterval(async () => {
         await load(true)
-        if (apkStatus.value !== 'building') stopPoll()
+        if (!busy.value) stopPoll()
       }, INFO_POLL_MS)
     }
   } else {
@@ -403,6 +407,8 @@ async function resetIcon() {
           <span class="zc-qr-cap">扫码下载</span>
         </div>
       </section>
+
+      <miniprogram-panel :app-id="app.id" :mp="info.miniprogram" @refresh="load(true)" />
     </div>
     <div v-else class="zc-mobile-fail">
       <p>{{ error || '移动端信息不可用' }}</p>

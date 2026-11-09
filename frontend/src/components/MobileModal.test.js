@@ -12,6 +12,12 @@ const mocks = vi.hoisted(() => ({
     rebuildMobileApk: vi.fn(),
     uploadMobileIcon: vi.fn(),
     resetMobileIcon: vi.fn(),
+    bindMiniprogram: vi.fn(),
+    unbindMiniprogram: vi.fn(),
+    reuploadMiniprogram: vi.fn(),
+    requestMiniprogramPreview: vi.fn(),
+    miniprogramPreviewUrl: (id, stamp) =>
+      `/api/apps/${id}/mobile/miniprogram/preview${stamp ? `?v=${encodeURIComponent(stamp)}` : ''}`,
   },
   antd: { message: { success: vi.fn(), error: vi.fn(), warning: vi.fn(), info: vi.fn() } },
 }))
@@ -69,6 +75,11 @@ const INFO = {
   apk_max_bytes: 200 * 1024 * 1024,
   apk: APK,
   icon: { custom: false, url: '/api/apps/12/mobile/icon?v=1', updated_at: null },
+  miniprogram: {
+    bound: false, appid_masked: '', key_uploaded_at: null, status: 'idle',
+    job_kind: null, error: null, version: null, uploaded_at: null, preview_at: null,
+    preview_available: false,
+  },
 }
 
 const mountOptions = {
@@ -380,5 +391,276 @@ describe('MobileModal 图标覆盖', () => {
     await pickIcon(w, { name: 'icon.png', size: 1024, type: 'image/png' })
     expect(w.find('.zc-m-error').text()).toContain('图标不是有效的 PNG/JPEG')
     expect(mocks.antd.message.error).toHaveBeenCalledWith('图标不是有效的 PNG/JPEG')
+  })
+})
+
+describe('MobileModal 小程序凭据（ADR-0045）', () => {
+  const BOUND = {
+    bound: true, appid_masked: 'wx12****cdef', key_uploaded_at: '2026-11-09T10:00:00Z',
+    status: 'idle', job_kind: null, error: null, version: null, uploaded_at: null, preview_at: null,
+  }
+
+  async function fillBind(w, { appid = 'wx1234567890abcdef', file = { name: 'private.key' } } = {}) {
+    await w.find('.zc-mp-appid-input').setValue(appid)
+    const input = w.find('.zc-mp-key-input')
+    Object.defineProperty(input.element, 'files', { value: [file], configurable: true })
+    await input.trigger('change')
+    await w.find('.zc-mp-bind').trigger('click')
+    await flushPromises()
+  }
+
+  it('未绑定时填 AppID 并选密钥文件即可绑定，成功后重新拉取信息', async () => {
+    mocks.api.bindMiniprogram.mockResolvedValue({ data: { ok: true } })
+    const w = await mountModal()
+    const base = mocks.api.appMobile.mock.calls.length
+
+    await fillBind(w)
+
+    expect(mocks.api.bindMiniprogram).toHaveBeenCalledTimes(1)
+    const [id, appid, file] = mocks.api.bindMiniprogram.mock.calls[0]
+    expect(id).toBe(12)
+    expect(appid).toBe('wx1234567890abcdef')
+    expect(file.name).toBe('private.key')
+    expect(mocks.antd.message.success).toHaveBeenCalledWith('已绑定小程序账号')
+    expect(mocks.api.appMobile.mock.calls.length).toBe(base + 1)
+  })
+
+  it('缺少 AppID 或密钥文件时本地拒绝，不发请求', async () => {
+    const w = await mountModal()
+    await w.find('.zc-mp-appid-input').setValue('')
+    const input = w.find('.zc-mp-key-input')
+    Object.defineProperty(input.element, 'files', { value: [{ name: 'private.key' }], configurable: true })
+    await input.trigger('change')
+    await w.find('.zc-mp-bind').trigger('click')
+    await flushPromises()
+    expect(mocks.api.bindMiniprogram).not.toHaveBeenCalled()
+    expect(w.find('.zc-mp-error').text()).toContain('请填写小程序 AppID')
+  })
+
+  it('已绑定只显示脱敏 AppID 与上传时间，解绑后重新拉取', async () => {
+    mocks.api.unbindMiniprogram.mockResolvedValue({ data: { ok: true } })
+    const w = await mountModal({ miniprogram: BOUND })
+
+    expect(w.find('.zc-mp-appid').text()).toBe('wx12****cdef')
+    expect(w.find('.zc-mp-key-input').exists()).toBe(false)
+    expect(w.text()).toContain('密钥上传于')
+
+    await w.find('.zc-mp-unbind').trigger('click')
+    await flushPromises()
+    expect(mocks.api.unbindMiniprogram).toHaveBeenCalledWith(12)
+    expect(mocks.antd.message.success).toHaveBeenCalledWith('已解绑小程序账号')
+  })
+
+  it('绑定被后端拒绝时透出 detail 原文', async () => {
+    mocks.api.bindMiniprogram.mockRejectedValue({
+      response: { data: { detail: '该 AppID 已绑定其他应用，请先解绑' } },
+    })
+    const w = await mountModal()
+    await fillBind(w)
+    expect(w.find('.zc-mp-error').text()).toContain('该 AppID 已绑定其他应用')
+    expect(mocks.antd.message.error).toHaveBeenCalledWith('该 AppID 已绑定其他应用，请先解绑')
+  })
+})
+
+describe('MobileModal 小程序任务状态（规格 2026-11-09）', () => {
+  const BOUND = {
+    bound: true, appid_masked: 'wx12****cdef', key_uploaded_at: '2026-11-09T10:00:00Z',
+    status: 'idle', job_kind: null, error: null, version: null, uploaded_at: null, preview_at: null,
+  }
+
+  it('预检进行中显示构建提示并轮询，结束后停表', async () => {
+    vi.useFakeTimers()
+    const building = { ...BOUND, status: 'building', job_kind: 'precheck' }
+    mocks.api.appMobile.mockResolvedValue({ data: { ...INFO, miniprogram: building } })
+    const w = mount(MobileModal, mountOptions)
+    mounted.push(w)
+    await flushPromises()
+
+    expect(w.find('.zc-mp-badge').text()).toBe('构建中')
+    expect(w.text()).toContain('编译并预检（不产生开发版）')
+    const base = mocks.api.appMobile.mock.calls.length
+
+    mocks.api.appMobile.mockResolvedValue({ data: { ...INFO, miniprogram: { ...BOUND, status: 'ready' } } })
+    await vi.advanceTimersByTimeAsync(3000)
+    await flushPromises()
+
+    expect(mocks.api.appMobile.mock.calls.length).toBe(base + 1)
+    expect(w.find('.zc-mp-badge').text()).toBe('已就绪')
+
+    await vi.advanceTimersByTimeAsync(6000)
+    expect(mocks.api.appMobile.mock.calls.length).toBe(base + 1)
+  })
+
+  it('失败时展示分类后的错误摘要', async () => {
+    const failed = { ...BOUND, status: 'failed', error: 'IP 白名单：invalid ip 1.2.3.4' }
+    const w = await mountModal({ miniprogram: failed })
+    expect(w.find('.zc-mp-badge').text()).toBe('失败')
+    expect(w.find('.zc-mp-error').text()).toContain('IP 白名单')
+  })
+
+  it('上传成功后展示开发版版本与上传时间', async () => {
+    const ready = {
+      ...BOUND, status: 'ready', job_kind: 'upload',
+      version: 'b20261109100000', uploaded_at: '2026-11-09T10:00:05Z',
+    }
+    const w = await mountModal({ miniprogram: ready })
+    expect(w.find('.zc-mp-badge').text()).toBe('已就绪')
+    expect(w.text()).toContain('版本 b20261109100000')
+    expect(w.text()).toContain('上传于')
+  })
+
+  it('点「重新上传」触发一次上传并入队后重新拉取', async () => {
+    mocks.api.reuploadMiniprogram.mockResolvedValue({ data: { ok: true, status: 'building' } })
+    const w = await mountModal({ miniprogram: BOUND })
+    const base = mocks.api.appMobile.mock.calls.length
+
+    await w.find('.zc-mp-upload').trigger('click')
+    await flushPromises()
+
+    expect(mocks.api.reuploadMiniprogram).toHaveBeenCalledWith(12)
+    expect(mocks.antd.message.success).toHaveBeenCalledWith('已开始上传开发版')
+    expect(mocks.api.appMobile.mock.calls.length).toBe(base + 1)
+  })
+
+  it('上传/构建进行中禁用「重新上传」；后端 409 原文可见', async () => {
+    const busy = { ...BOUND, status: 'uploading', job_kind: 'upload' }
+    const w = await mountModal({ miniprogram: busy })
+    expect(w.find('.zc-mp-upload').attributes('disabled')).toBeDefined()
+
+    mocks.api.reuploadMiniprogram.mockRejectedValue({
+      response: { data: { detail: '正式环境未运行：请先发布并启动正式环境，再上传小程序' } },
+    })
+    const idle = await mountModal({ miniprogram: BOUND })
+    await idle.find('.zc-mp-upload').trigger('click')
+    await flushPromises()
+    expect(idle.find('.zc-mp-error').text()).toContain('正式环境未运行')
+  })
+})
+
+describe('MobileModal 小程序前置条件与指引（规格 2026-11-09 US-22/US-25）', () => {
+  const BOUND = {
+    bound: true, appid_masked: 'wx12****cdef', key_uploaded_at: '2026-11-09T10:00:00Z',
+    status: 'idle', job_kind: null, error: null, version: null, uploaded_at: null,
+    preview_at: null, preview_available: false,
+  }
+  const READY = {
+    ok: true, reasons: [],
+    request_domain: 'https://bbb.example.test',
+    egress_ip: '203.0.113.9',
+  }
+  const GUIDANCE = {
+    request_domain: 'https://bbb.example.test',
+    egress_ip: '203.0.113.9',
+    console_url: 'https://mp.weixin.qq.com/',
+    steps: ['dev_version', 'trial_version', 'submit_review'],
+  }
+
+  it('前置条件不满足时禁用上传与预览并给出原因，绑定仍可保存', async () => {
+    const blocked = {
+      ...BOUND,
+      readiness: { ok: false, reasons: ['ssl_off'], request_domain: '', egress_ip: '' },
+    }
+    const w = await mountModal({ miniprogram: blocked })
+    expect(w.find('.zc-mp-blocker').text()).toContain('HTTPS')
+    expect(w.find('.zc-mp-upload').attributes('disabled')).toBeDefined()
+    expect(w.find('.zc-mp-preview-btn').attributes('disabled')).toBeDefined()
+
+    const unbound = await mountModal({
+      miniprogram: { ...INFO.miniprogram, readiness: blocked.readiness },
+    })
+    expect(unbound.find('.zc-mp-bind').attributes('disabled')).toBeUndefined()
+  })
+
+  it('条件满足时展示加白清单与三步指引，域名可一键复制', async () => {
+    const w = await mountModal({
+      miniprogram: { ...BOUND, readiness: READY, guidance: GUIDANCE },
+    })
+    expect(w.text()).toContain('https://bbb.example.test')
+    expect(w.text()).toContain('203.0.113.9')
+    expect(w.text()).toContain('不支持通配符')
+    expect(w.text()).toContain('平台不会提审')
+    expect(w.find('.zc-mp-console').attributes('href')).toBe('https://mp.weixin.qq.com/')
+
+    await w.find('.zc-mp-copy-domain').trigger('click')
+    await flushPromises()
+    expect(writeText).toHaveBeenCalledWith('https://bbb.example.test')
+    expect(mocks.antd.message.success).toHaveBeenCalledWith('域名已复制')
+  })
+
+  it('出网 IP 获取失败只提示手动确认，不阻断上传', async () => {
+    const noIp = {
+      ...BOUND,
+      readiness: { ...READY, egress_ip: '' },
+      guidance: { ...GUIDANCE, egress_ip: '' },
+    }
+    const w = await mountModal({ miniprogram: noIp })
+    expect(w.text()).toContain('获取失败，请手动确认')
+    expect(w.find('.zc-mp-copy-ip').attributes('disabled')).toBeDefined()
+    expect(w.find('.zc-mp-upload').attributes('disabled')).toBeUndefined()
+  })
+
+  it('非移动栈应用没有小程序区块', async () => {
+    vi.stubGlobal('location', { hostname: 'localhost' })
+    mocks.api.appMobile.mockRejectedValue({
+      response: { status: 400, data: { detail: '仅移动端应用支持移动端分发' } },
+    })
+    const w = mount(MobileModal, mountOptions)
+    mounted.push(w)
+    await flushPromises()
+    expect(w.find('.zc-mp').exists()).toBe(false)
+    expect(w.text()).toContain('仅移动端应用支持移动端分发')
+  })
+})
+
+describe('MobileModal 小程序预览码（规格 2026-11-09 US-16）', () => {
+  const BOUND = {
+    bound: true, appid_masked: 'wx12****cdef', key_uploaded_at: '2026-11-09T10:00:00Z',
+    status: 'idle', job_kind: null, error: null, version: null, uploaded_at: null, preview_at: null,
+    preview_available: false,
+  }
+
+  it('未生成过时只有按钮、无破图；点击后入队并重新拉取', async () => {
+    mocks.api.requestMiniprogramPreview.mockResolvedValue({ data: { ok: true, status: 'building' } })
+    const w = await mountModal({ miniprogram: BOUND })
+    const base = mocks.api.appMobile.mock.calls.length
+
+    expect(w.find('.zc-mp-qr-img').exists()).toBe(false)
+    expect(w.find('.zc-mp-preview-btn').text()).toContain('生成预览码')
+
+    await w.find('.zc-mp-preview-btn').trigger('click')
+    await flushPromises()
+
+    expect(mocks.api.requestMiniprogramPreview).toHaveBeenCalledWith(12)
+    expect(mocks.antd.message.success).toHaveBeenCalledWith('已开始生成预览码')
+    expect(mocks.api.appMobile.mock.calls.length).toBe(base + 1)
+  })
+
+  it('已有预览码时展示鉴权图片与「重新生成」，并提示短时有效', async () => {
+    const ready = {
+      ...BOUND, status: 'ready', job_kind: 'preview',
+      preview_at: '2026-11-09T10:02:00Z', preview_available: true,
+    }
+    const w = await mountModal({ miniprogram: ready })
+    const img = w.find('.zc-mp-qr-img')
+    expect(img.exists()).toBe(true)
+    expect(img.attributes('src')).toContain('/api/apps/12/mobile/miniprogram/preview?v=')
+    expect(w.find('.zc-mp-preview-btn').text()).toContain('重新生成')
+    expect(w.text()).toContain('短时有效')
+  })
+
+  it('任务进行中禁用生成按钮', async () => {
+    const busy = { ...BOUND, status: 'building', job_kind: 'preview' }
+    const w = await mountModal({ miniprogram: busy })
+    expect(w.find('.zc-mp-preview-btn').attributes('disabled')).toBeDefined()
+  })
+
+  it('重新生成失败时透出后端 detail', async () => {
+    mocks.api.requestMiniprogramPreview.mockRejectedValue({
+      response: { data: { detail: '尚未绑定小程序账号：请先绑定 AppID 与上传密钥' } },
+    })
+    const w = await mountModal({ miniprogram: BOUND })
+    await w.find('.zc-mp-preview-btn').trigger('click')
+    await flushPromises()
+    expect(w.find('.zc-mp-error').text()).toContain('尚未绑定小程序账号')
   })
 })

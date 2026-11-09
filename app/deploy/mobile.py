@@ -65,8 +65,10 @@ async def info(sf, app: dict) -> dict:
     if app.get("status_prod") == "running":
         root = await engine._app_root(sf, app)
         size = await _apk_size(root, app["slug"])
-    from app.deploy import apkbuild
+    from app.deploy import apkbuild, mpbuild, mpcreds, mpruntime
     state = await apkbuild.get_state(sf, app["id"])
+    mp = await mpcreds.get_binding(sf, app["id"])
+    mp_ready = await mpruntime.readiness(app, mp)
     params = apkbuild.current_params(app)
     digest = shell.params_hash(params)
     icon_file = apkbuild.custom_icon_path(app["slug"])
@@ -94,6 +96,20 @@ async def info(sf, app: dict) -> dict:
             "custom": icon_file is not None,
             "url": f"/api/apps/{app['id']}/mobile/icon?v={int(icon_ts) if icon_ts else digest[:12]}",
             "updated_at": _iso(datetime.fromtimestamp(icon_ts, tz=timezone.utc)) if icon_ts else None,
+        },
+        "miniprogram": {
+            "bound": mp["appid"] is not None,
+            "appid_masked": mpcreds.mask_appid(mp["appid"]),
+            "key_uploaded_at": _iso(mp["key_uploaded_at"]),
+            "status": mp["status"] or "idle",
+            "job_kind": mp["job_kind"],
+            "error": mp["error"],
+            "version": mp["version"],
+            "uploaded_at": _iso(mp["uploaded_at"]),
+            "preview_at": _iso(mp["preview_at"]),
+            "preview_available": mpbuild.preview_path(app["slug"]).is_file(),
+            "readiness": mp_ready,
+            "guidance": mpruntime.guidance(app, egress_ip=mp_ready["egress_ip"]),
         },
     }
 

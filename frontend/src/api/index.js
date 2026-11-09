@@ -116,6 +116,19 @@ export const uploadMobileIcon = (id, file) => {
   return http.put(`/apps/${id}/mobile/icon`, fd)
 }
 export const resetMobileIcon = (id) => http.delete(`/apps/${id}/mobile/icon`)
+// 小程序预览码（规格 2026-11-09 US-16）：POST 只入队，图片走鉴权 GET（同源 <img> 自带 cookie）。
+export const reuploadMiniprogram = (id) => http.post(`/apps/${id}/mobile/miniprogram/upload`)
+export const requestMiniprogramPreview = (id) => http.post(`/apps/${id}/mobile/miniprogram/preview`)
+export const miniprogramPreviewUrl = (id, stamp) =>
+  `/api/apps/${id}/mobile/miniprogram/preview${stamp ? `?v=${encodeURIComponent(stamp)}` : ''}`
+// 小程序凭据（规格 2026-11-09 / ADR-0045）：密钥只上行；任何读取接口都只回脱敏 AppID。
+export const bindMiniprogram = (id, appid, file) => {
+  const fd = new FormData()
+  fd.append('appid', appid)
+  fd.append('file', file)
+  return http.put(`/apps/${id}/mobile/miniprogram/credentials`, fd)
+}
+export const unbindMiniprogram = (id) => http.delete(`/apps/${id}/mobile/miniprogram/credentials`)
 // 应用资源监控（Ticket 001）：当前实时值（本期 workspace_size + prod_status）。
 export const appMetricsCurrent = (id) => http.get(`/apps/${id}/metrics/current`)
 // 历史曲线（Ticket 002）：window 取 1h/24h/7d/30d，返回各 kind 时序。

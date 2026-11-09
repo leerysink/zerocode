@@ -297,3 +297,33 @@ async def test_mobile_apk_migration_replayable(test_engine):
     async with test_engine.begin() as conn:
         for st in stmts:
             await conn.execute(text(st))
+
+
+# ---------- V20261109_01：微信小程序凭据与任务状态（ADR-0043~0045） ----------
+
+async def test_miniprogram_migration_schema(test_engine):
+    async with test_engine.connect() as conn:
+        t = (await conn.execute(text("SELECT to_regclass('app_mobile_miniprogram')"))).scalar()
+        cols = (await conn.execute(text(
+            "SELECT column_name, is_nullable, column_default FROM information_schema.columns "
+            "WHERE table_name='app_mobile_miniprogram'"))).all()
+        idx = (await conn.execute(text(
+            "SELECT indexname FROM pg_indexes WHERE tablename='app_mobile_miniprogram'"))).scalars().all()
+    assert t is not None
+    by_name = {c[0]: c for c in cols}
+    assert {"app_id", "status", "job_kind", "error", "appid", "key_sha256",
+            "key_uploaded_at", "version", "uploaded_at", "preview_at", "updated_at"} <= set(by_name)
+    assert by_name["status"][2] == "'idle'::character varying"
+    assert by_name["appid"][1] == "YES"           # 未绑定允许 NULL，绑定后靠唯一索引防重
+    assert any("appid" in name for name in idx)   # UNIQUE(appid)：一账号只能挂一个应用
+
+
+async def test_miniprogram_migration_replayable(test_engine):
+    from app.db import split_statements
+    from pathlib import Path
+    stmts = split_statements(
+        Path("changelog/V20261109_01_mobile_miniprogram.sql").read_text(encoding="utf-8"))
+    assert len(stmts) == 1
+    async with test_engine.begin() as conn:
+        for st in stmts:
+            await conn.execute(text(st))

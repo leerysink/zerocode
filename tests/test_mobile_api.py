@@ -12,7 +12,8 @@ import pytest
 from sqlalchemy import text
 
 from app.db import make_session_factory
-from app.deploy import apkbuild, engine as eng_mod, mobile, ports, provision, shell, sqlrun
+from app.deploy import (apkbuild, engine as eng_mod, mobile, mpbuild, mpcreds, mpruntime, ports,
+                        provision, shell, sqlrun)
 from app.services import app_service
 
 pytestmark = pytest.mark.asyncio
@@ -21,6 +22,9 @@ SLUG = "zcmob"
 ROOT = Path("D:/__zc_mobile_api__")
 MOBILE_STACK = "vue3-springboot-mobile"
 PNG = b"\x89PNG\r\n\x1a\n" + b"fake-png-body"
+MP_APPID = "wx1234567890abcdef"
+MP_KEY = b"-----BEGIN PRIVATE KEY-----\nMIIEvfake\n-----END PRIVATE KEY-----\n"
+
 
 
 @pytest.fixture(autouse=True)
@@ -41,6 +45,13 @@ def _isolate_data_dir(monkeypatch, tmp_path):
     monkeypatch.setenv("ZEROCODE_DATA_DIR", str(tmp_path / "data"))
 
 
+@pytest.fixture(autouse=True)
+def _readiness_env(monkeypatch):
+    """GET /mobile 会带出网 IP：固定 env，探测一次也不打真外网。"""
+    monkeypatch.setenv("ZEROCODE_EGRESS_IP", "203.0.113.9")
+    mpruntime._cache.update(ip="", at=None)
+
+
 @pytest.fixture
 async def make_app(client, test_engine):
     """工厂：在测试库造应用行（workspace + app_project），端口由当前登记状态推导。"""
@@ -49,21 +60,24 @@ async def make_app(client, test_engine):
     uid = (await client.get("/api/auth/me")).json()["id"]
     created: list[tuple[int, int]] = []
 
-    async def _make(*, stack: str = MOBILE_STACK, status_prod: str = "running") -> dict:
+    async def _make(*, stack: str = MOBILE_STACK, status_prod: str = "running",
+                    slug: str = SLUG) -> dict:
         async with sf() as s:
             prod_port, dev_port = await ports.allocate_pair(s)
+            root = ROOT if slug == SLUG else ROOT / slug
+            root.mkdir(parents=True, exist_ok=True)
             wid = (await s.execute(text(
                 "INSERT INTO workspace (name, root_path, owner_user_id) "
-                "VALUES ('mob', :r, :o) RETURNING id"), {"r": str(ROOT), "o": uid})).scalar()
+                "VALUES ('mob', :r, :o) RETURNING id"), {"r": str(root), "o": uid})).scalar()
             aid = (await s.execute(text(
                 "INSERT INTO app_project (workspace_id, name, slug, scale, stack, prod_port, dev_port, "
                 "status_prod, owner_user_id) "
                 "VALUES (:w, 'mob', :sl, 'large', :st, :pp, :dp, :sp, :o) RETURNING id"),
-                {"w": wid, "sl": SLUG, "st": stack, "pp": prod_port, "dp": dev_port,
+                {"w": wid, "sl": slug, "st": stack, "pp": prod_port, "dp": dev_port,
                  "sp": status_prod, "o": uid})).scalar()
             await s.commit()
         created.append((aid, wid))
-        return {"id": aid, "slug": SLUG, "prod_port": prod_port, "dev_port": dev_port}
+        return {"id": aid, "slug": slug, "prod_port": prod_port, "dev_port": dev_port}
 
     yield _make
     async with sf() as s:
@@ -93,6 +107,24 @@ def fake_builder(client, monkeypatch):
     """替换真实 worker 的 enqueue（保留实例，lifespan 关闭路径不受影响）。"""
     fb = _FakeBuilder()
     monkeypatch.setattr(client.app.state.apk_builder, "enqueue", fb.enqueue)
+    return fb
+
+
+class _FakeMpBuilder:
+    def __init__(self, result="queued"):
+        self.result = result
+        self.calls: list[dict] = []
+
+    async def enqueue(self, app_id, *, kind="upload", force=False, app=None):
+        self.calls.append({"app_id": app_id, "kind": kind, "force": force, "app": app})
+        return self.result
+
+
+@pytest.fixture(autouse=True)
+def mp_builder_fake(client, monkeypatch):
+    """绑定/改名会触发预检入队：本文件只验 REST，真正构建由 test_mp_build 覆盖。"""
+    fb = _FakeMpBuilder()
+    monkeypatch.setattr(client.app.state.mp_builder, "enqueue", fb.enqueue)
     return fb
 
 
@@ -417,3 +449,237 @@ def _fake_size(value):
     async def _f(root, slug):
         return value
     return _f
+
+
+# ---------- 小程序凭据（规格 2026-11-09 / ADR-0043~0045） ----------
+
+def _mp_base(app_id: int) -> str:
+    return f"/api/apps/{app_id}/mobile/miniprogram/credentials"
+
+
+async def _bind_mp(client, app_id: int, *, appid: str = MP_APPID, key: bytes = MP_KEY):
+    return await client.put(
+        _mp_base(app_id), data={"appid": appid},
+        files={"file": ("private.key", key, "application/octet-stream")})
+
+
+async def test_miniprogram_bind_masks_and_hides_key(client, make_app, mp_builder_fake):
+    """绑定后只暴露脱敏 AppID 与上传时间；私钥永不回显（ADR-0045）。"""
+    app = await make_app()
+    r = await _bind_mp(client, app["id"])
+    assert r.status_code == 200, r.text
+    assert r.json()["appid_masked"] == "wx12****cdef"
+    assert b"PRIVATE KEY" not in r.content
+    # 绑定即触发一次异步预检（编译 + preview，不产开发版）
+    assert [(c["app_id"], c["kind"]) for c in mp_builder_fake.calls] == [(app["id"], "precheck")]
+
+    got = await client.get(f"/api/apps/{app['id']}/mobile")
+    assert got.status_code == 200, got.text
+    mp = got.json()["miniprogram"]
+    assert mp["bound"] is True
+    assert mp["appid_masked"] == "wx12****cdef"
+    assert mp["key_uploaded_at"]
+    assert mp["status"] == "idle"
+    assert b"PRIVATE KEY" not in got.content
+    assert mpcreds.key_path(SLUG).is_file()
+
+
+async def test_miniprogram_unbind_clears_row_and_key(client, make_app):
+    app = await make_app()
+    assert (await _bind_mp(client, app["id"])).status_code == 200
+
+    r = await client.delete(_mp_base(app["id"]))
+    assert r.status_code == 200, r.text
+    assert not mpcreds.key_path(SLUG).exists()
+    mp = (await client.get(f"/api/apps/{app['id']}/mobile")).json()["miniprogram"]
+    assert mp["bound"] is False and mp["appid_masked"] == ""
+    assert mp["status"] == "idle"
+
+
+async def test_miniprogram_appid_is_globally_unique(client, make_app):
+    """一应用一账号（ADR-0045）：AppID 被别的应用占用时 409，且不破坏原绑定的密钥。"""
+    first = await make_app()
+    second = await make_app(slug="zcmob2")
+    assert (await _bind_mp(client, first["id"])).status_code == 200
+
+    r = await _bind_mp(client, second["id"])
+    assert r.status_code == 409 and "已绑定" in r.json()["detail"]
+    assert mpcreds.key_path("zcmob2").exists() is False
+    assert mpcreds.key_path(SLUG).is_file()
+    assert (await client.get(f"/api/apps/{first['id']}/mobile")).json()["miniprogram"]["bound"] is True
+
+
+async def test_miniprogram_bind_rejects_bad_input(client, make_app, monkeypatch):
+    app = await make_app()
+    base = _mp_base(app["id"])
+
+    r = await _bind_mp(client, app["id"], appid="wx123")
+    assert r.status_code == 400 and "AppID" in r.json()["detail"]
+
+    r = await _bind_mp(client, app["id"], key=b"not a key")
+    assert r.status_code == 400 and "密钥" in r.json()["detail"]
+
+    r = await client.put(base, data={"appid": MP_APPID},
+                         files={"file": ("private.key", b"", "application/octet-stream")})
+    assert r.status_code == 400 and "为空" in r.json()["detail"]
+
+    monkeypatch.setattr(mpcreds, "KEY_MAX_BYTES", 8)
+    r = await _bind_mp(client, app["id"])
+    assert r.status_code == 413
+    assert (await client.get(f"/api/apps/{app['id']}/mobile")).json()["miniprogram"]["bound"] is False
+
+
+async def test_miniprogram_endpoints_reject_non_mobile_stack(client, make_app):
+    app = await make_app(stack="vue3-springboot")
+    assert (await _bind_mp(client, app["id"])).status_code == 400
+    assert (await client.delete(_mp_base(app["id"]))).status_code == 400
+
+
+def _mp_preview(app_id: int) -> str:
+    return f"/api/apps/{app_id}/mobile/miniprogram/preview"
+
+
+def _mp_upload(app_id: int) -> str:
+    return f"/api/apps/{app_id}/mobile/miniprogram/upload"
+
+
+async def test_miniprogram_upload_forces_and_dedupes(client, make_app, mp_builder_fake):
+    """手动重传：force=True 覆盖开发版；进行中再点返回 deduped，不并行。"""
+    app = await make_app()
+    assert (await _bind_mp(client, app["id"])).status_code == 200
+    mp_builder_fake.calls.clear()
+
+    r = await client.post(_mp_upload(app["id"]))
+    assert r.status_code == 202, r.text
+    assert r.json() == {"ok": True, "status": "building", "deduped": False}
+    call = mp_builder_fake.calls[0]
+    assert (call["app_id"], call["kind"], call["force"]) == (app["id"], "upload", True)
+
+    mp_builder_fake.result = "building"
+    r = await client.post(_mp_upload(app["id"]))
+    assert r.status_code == 202 and r.json()["deduped"] is True
+
+
+async def test_miniprogram_upload_gates(client, make_app, mp_builder_fake):
+    """非移动栈 400；未绑定 409（先绑定）；prod 未运行 409（先发布）——都不产生任务。"""
+    plain = await make_app(stack="vue3-springboot")
+    assert (await client.post(_mp_upload(plain["id"]))).status_code == 400
+
+    unbound = await make_app(slug="zcmob2")
+    r = await client.post(_mp_upload(unbound["id"]))
+    assert r.status_code == 409 and "绑定" in r.json()["detail"]
+
+    stopped = await make_app(status_prod="stopped", slug="zcmob3")
+    assert (await _bind_mp(client, stopped["id"], appid="wxabcdef1234567890")).status_code == 200
+    mp_builder_fake.calls.clear()
+    r = await client.post(_mp_upload(stopped["id"]))
+    assert r.status_code == 409 and "正式环境未运行" in r.json()["detail"]
+    assert mp_builder_fake.calls == []
+
+
+async def test_miniprogram_preview_enqueues_and_dedupes(client, make_app, mp_builder_fake):
+    """按需生成预览码：202 入队；任务进行中再点仍 202，但 deduped=true（不并行）。"""
+    app = await make_app()
+    assert (await _bind_mp(client, app["id"])).status_code == 200
+    mp_builder_fake.calls.clear()
+
+    r = await client.post(_mp_preview(app["id"]))
+    assert r.status_code == 202, r.text
+    assert r.json() == {"ok": True, "status": "building", "deduped": False}
+    assert [(c["app_id"], c["kind"]) for c in mp_builder_fake.calls] == [(app["id"], "preview")]
+
+    mp_builder_fake.result = "building"
+    r = await client.post(_mp_preview(app["id"]))
+    assert r.status_code == 202
+    assert r.json()["deduped"] is True
+
+
+async def test_miniprogram_preview_requires_binding_and_mobile(client, make_app, mp_builder_fake):
+    plain = await make_app(stack="vue3-springboot")
+    assert (await client.post(_mp_preview(plain["id"]))).status_code == 400
+    assert (await client.get(_mp_preview(plain["id"]))).status_code == 400
+
+    app = await make_app(slug="zcmob2")
+    r = await client.post(_mp_preview(app["id"]))
+    assert r.status_code == 409 and "绑定" in r.json()["detail"]
+    assert mp_builder_fake.calls == []
+
+
+async def test_miniprogram_preview_image_needs_auth(client):
+    """同源 <img> 也走全局 guard：未登录不得读到预览码。
+
+    本文件 autouse 的 mp_builder_fake 依赖 client（会把与会话灌进同一个 anon_client），
+    故这里另建一个不带 cookie 的裸 client。"""
+    from httpx import ASGITransport, AsyncClient
+
+    async with AsyncClient(transport=ASGITransport(app=client.app), base_url="http://t") as anon:
+        r = await anon.get("/api/apps/1/mobile/miniprogram/preview")
+    assert r.status_code == 401
+
+
+async def test_miniprogram_preview_image_exists(client, make_app):
+    app = await make_app()
+    assert (await client.get(_mp_preview(app["id"]))).status_code == 404
+
+    path = mpbuild.preview_path(SLUG)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"\xff\xd8\xffpreview-jpeg")
+    assert "uploads" not in path.parts          # 码不进任何公开目录
+
+    r = await client.get(_mp_preview(app["id"]))
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "image/jpeg"
+    assert r.headers["cache-control"] == "no-store"
+    assert r.content == b"\xff\xd8\xffpreview-jpeg"
+
+    info = (await client.get(f"/api/apps/{app['id']}/mobile")).json()["miniprogram"]
+    assert info["preview_available"] is True
+
+
+async def test_miniprogram_preview_available_false_without_file(client, make_app):
+    app = await make_app()
+    info = (await client.get(f"/api/apps/{app['id']}/mobile")).json()["miniprogram"]
+    assert info["preview_available"] is False
+
+
+async def test_miniprogram_readiness_and_guidance_shape(client, make_app, monkeypatch):
+    """弹框「为什么还不能用」的数据源：readiness 原因 + 域名/出网 IP/三步指引键。"""
+    monkeypatch.delenv("ZEROCODE_SSL_ENABLE", raising=False)
+    app = await make_app()
+    assert (await _bind_mp(client, app["id"])).status_code == 200
+    mp = (await client.get(f"/api/apps/{app['id']}/mobile")).json()["miniprogram"]
+    domain = f"https://{SLUG}.zerocode.com"
+    assert mp["readiness"] == {"ok": True, "reasons": [], "request_domain": domain,
+                               "egress_ip": "203.0.113.9"}
+    assert mp["guidance"] == {
+        "request_domain": domain,
+        "egress_ip": "203.0.113.9",
+        "console_url": "https://mp.weixin.qq.com/",
+        "steps": ["dev_version", "trial_version", "submit_review"],
+    }
+
+    monkeypatch.setenv("ZEROCODE_SSL_ENABLE", "false")
+    mp = (await client.get(f"/api/apps/{app['id']}/mobile")).json()["miniprogram"]
+    assert mp["readiness"]["ok"] is False
+    assert mp["readiness"]["reasons"] == ["ssl_off"]
+    assert mp["guidance"]["request_domain"] == ""
+
+
+async def test_miniprogram_credentials_cleaned_on_app_delete(client, make_app, monkeypatch):
+    async def _noop(*args, **kwargs):
+        return []
+
+    monkeypatch.setattr(eng_mod, "down_app_stacks", _noop)
+    app = await make_app()
+    assert (await _bind_mp(client, app["id"])).status_code == 200
+    assert mpcreds.key_path(SLUG).is_file()
+    qr = mpbuild.preview_path(SLUG)
+    qr.parent.mkdir(parents=True, exist_ok=True)
+    qr.write_bytes(b"qr")
+    mpbuild.workspace(SLUG).mkdir(parents=True, exist_ok=True)
+
+    r = await client.delete(f"/api/apps/{app['id']}")
+    assert r.status_code == 200, r.text
+    assert not (mpcreds.keys_dir() / SLUG).exists()
+    assert not qr.exists() and not mpbuild.workspace(SLUG).exists()
+

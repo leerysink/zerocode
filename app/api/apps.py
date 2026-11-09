@@ -13,12 +13,12 @@ import logging
 import re
 from contextlib import suppress
 
-from fastapi import APIRouter, Request, HTTPException, File, UploadFile
+from fastapi import APIRouter, Request, HTTPException, File, Form, UploadFile
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
-from app.deploy import apkbuild, engine, mobile, prod, records, shell, sqlrun
+from app.deploy import apkbuild, engine, mobile, mpbuild, mpcreds, prod, records, shell, sqlrun
 from app.deploy import provision
 from app.deploy import tasks as deploy_tasks
 from app.deploy.errors import DeployError
@@ -123,6 +123,8 @@ async def rename(request: Request, app_id: int, body: AppRenameIn):
                                            owner_user_id=request.state.actor["id"])
         with suppress(Exception):
             await request.app.state.apk_builder.enqueue(app_id, app=app)
+        with suppress(Exception):
+            await request.app.state.mp_builder.enqueue(app_id, kind="precheck", app=app)
         return app
     except DeployError as e:
         raise _http(e)
@@ -152,6 +154,10 @@ async def remove(request: Request, app_id: int):
     # 平台侧 APK 构建临时文件随记录清理；prod 卷里的产物归属应用环境，不在删除链里
     with suppress(Exception):
         apkbuild.cleanup_app(snap["slug"])
+    with suppress(Exception):
+        mpcreds.cleanup_app(snap["slug"])
+    with suppress(Exception):
+        mpbuild.cleanup_app(snap["slug"])
     return {"ok": True, "kept": {"root_path": snap["root_path"], "slug": snap["slug"],
                                  "databases": snap["databases"]}}
 
@@ -328,6 +334,112 @@ async def mobile_reset_icon(request: Request, app_id: int):
         raise _http(e)
 
 
+# ---------- 小程序凭据（规格 2026-11-09 / ADR-0045）：密钥只进不出 ----------
+
+@router.put("/{app_id}/mobile/miniprogram/credentials")
+async def miniprogram_bind(request: Request, app_id: int, appid: str = Form(...),
+                           file: UploadFile = File(...)):
+    """绑定/换绑小程序账号：AppID + 代码上传密钥；绑定成功后由任务器跑一次预检。
+
+    密钥只写入平台数据区（0600），响应与任何 GET 都不回显原文；AppID 全局唯一，
+    一应用一账号（换绑先解绑）。
+    """
+    sf = request.app.state.session_factory
+    try:
+        app = await app_service.get_app(sf, app_id, owner_user_id=request.state.actor["id"])
+        if not mobile.is_mobile(app):
+            raise DeployError("仅移动端应用支持小程序分发", status=400)
+        data = await file.read(mpcreds.KEY_MAX_BYTES + 1)
+        if not data:
+            raise DeployError("上传密钥文件为空", status=400)
+        if len(data) > mpcreds.KEY_MAX_BYTES:
+            raise DeployError(f"上传密钥不能超过 {mpcreds.KEY_MAX_BYTES // 1024}KB", status=413)
+        result = await mpcreds.bind(sf, app, appid, data)
+        # 绑定后异步预检一次：编译 + preview，不产生开发版（ADR-0045）；入队失败不推翻绑定
+        try:
+            await request.app.state.mp_builder.enqueue(app_id, kind="precheck", app=app)
+        except Exception:  # noqa: BLE001
+            logger.warning("小程序预检入队失败 app_id=%s", app_id, exc_info=True)
+        return {"ok": True, **result}
+    except DeployError as e:
+        raise _http(e)
+
+
+@router.delete("/{app_id}/mobile/miniprogram/credentials")
+async def miniprogram_unbind(request: Request, app_id: int):
+    """解绑小程序账号：清 DB 行与密钥文件；正在跑的任务按当前轮失败收口。"""
+    sf = request.app.state.session_factory
+    try:
+        app = await app_service.get_app(sf, app_id, owner_user_id=request.state.actor["id"])
+        if not mobile.is_mobile(app):
+            raise DeployError("仅移动端应用支持小程序分发", status=400)
+        await mpcreds.unbind(sf, app)
+        return {"ok": True}
+    except DeployError as e:
+        raise _http(e)
+
+
+@router.post("/{app_id}/mobile/miniprogram/preview", status_code=202)
+async def miniprogram_preview(request: Request, app_id: int):
+    """按需生成预览码：只跑 preview，不产生开发版（ADR-0045）。
+
+    码经鉴权接口读取、短时有效；任务进行中再点不并行，返回 deduped。
+    """
+    sf = request.app.state.session_factory
+    try:
+        app = await app_service.get_app(sf, app_id, owner_user_id=request.state.actor["id"])
+        if not mobile.is_mobile(app):
+            raise DeployError("仅移动端应用支持小程序分发", status=400)
+        binding = await mpcreds.get_binding(sf, app_id)
+        if not binding.get("appid"):
+            raise DeployError("尚未绑定小程序账号：请先绑定 AppID 与上传密钥", status=409)
+        result = await request.app.state.mp_builder.enqueue(app_id, kind="preview", app=app)
+        return {"ok": True, "status": "building", "deduped": result == "building"}
+    except DeployError as e:
+        raise _http(e)
+
+
+@router.post("/{app_id}/mobile/miniprogram/upload", status_code=202)
+async def miniprogram_upload(request: Request, app_id: int):
+    """手动重传开发版：不改代码、不重发布也能覆盖一次（版本号仍取当前发布版本）。
+
+    与发布后的自动上传共用串行队列；`force=True` 跳过任何「上次已传过」的判断，
+    但进行中不并行——返回 `deduped`，本轮结束后补跑。
+    """
+    sf = request.app.state.session_factory
+    try:
+        app = await app_service.get_app(sf, app_id, owner_user_id=request.state.actor["id"])
+        if not mobile.is_mobile(app):
+            raise DeployError("仅移动端应用支持小程序分发", status=400)
+        binding = await mpcreds.get_binding(sf, app_id)
+        if not binding.get("appid"):
+            raise DeployError("尚未绑定小程序账号：请先绑定 AppID 与上传密钥", status=409)
+        if app.get("status_prod") != "running":
+            raise DeployError("正式环境未运行：请先发布并启动正式环境，再上传小程序", status=409)
+        result = await request.app.state.mp_builder.enqueue(
+            app_id, kind="upload", force=True, app=app)
+        return {"ok": True, "status": "building", "deduped": result == "building"}
+    except DeployError as e:
+        raise _http(e)
+
+
+@router.get("/{app_id}/mobile/miniprogram/preview")
+async def miniprogram_preview_image(request: Request, app_id: int):
+    """预览码图片：同源 <img> 自带会话 cookie；不落公开目录，未生成时 404。"""
+    sf = request.app.state.session_factory
+    try:
+        app = await app_service.get_app(sf, app_id, owner_user_id=request.state.actor["id"])
+        if not mobile.is_mobile(app):
+            raise DeployError("仅移动端应用支持小程序分发", status=400)
+        path = mpbuild.preview_path(app["slug"])
+        if not path.is_file():
+            raise DeployError("预览码尚未生成：请先点「生成预览码」", status=404)
+        return FileResponse(path, media_type="image/jpeg",
+                            headers={"Cache-Control": "no-store"})
+    except DeployError as e:
+        raise _http(e)
+
+
 # ---------- sqlchange（Task 12 / 规格 07）：应用侧迁移的执行、记账与待办清单 ----------
 
 # 应用库连接串口径收口到锚点服务（Task 5）：两处各自维护一份早晚漂移。
@@ -498,6 +610,22 @@ async def scaffold_backfill(request: Request, app_id: int):
 _VERSION_RE = re.compile(r"^b\d{14}$")
 
 
+async def _after_publish(request: Request, app_id: int) -> None:
+    """发布成功后的附加产物（ADR-0042/0045）：APK 构建与小程序上传各自入队、互不阻塞。
+
+    两个任务器都自己从库里重读应用并判闸门（非移动栈/未绑定 → skipped）；这里逐项兜错，
+    一家抛异常不得连累另一家，更不能反噬已成功的发布（引擎侧还有一层兜底）。
+    """
+    for name, enqueue in (
+        ("APK", lambda: request.app.state.apk_builder.enqueue(app_id)),
+        ("小程序", lambda: request.app.state.mp_builder.enqueue(app_id, kind="upload")),
+    ):
+        try:
+            await enqueue()
+        except Exception:  # noqa: BLE001
+            logger.exception("发布成功后的%s入队失败（不影响发布结果） app_id=%s", name, app_id)
+
+
 @router.post("/{app_id}/publish", status_code=202)
 async def publish(request: Request, app_id: int, body: PublishIn):
     """一键发布（04 §5 / FR4-09 chat 闸门 + publishing 并发双保险）。
@@ -527,11 +655,10 @@ async def publish(request: Request, app_id: int, body: PublishIn):
                         "code": "chat_active",
                         "message": "当前 AI 正在修改代码，发布的可能是不完整版本，是否继续？"})
         await prod.preflight_docker()
-        builder = request.app.state.apk_builder
         _spawn(request, app_id, lambda: prod.publish(sf, app, notify=hub.publish,
                                                      force=body.force,
                                                      confirm_destructive=body.confirmDestructive,
-                                                     on_success=lambda: builder.enqueue(app_id)))
+                                                     on_success=lambda: _after_publish(request, app_id)))
     except DeployError as e:
         raise _http(e)
     return {"ok": True}

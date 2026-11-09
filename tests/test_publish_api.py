@@ -149,6 +149,57 @@ async def test_publish_success_enqueues_apk_build(client, monkeypatch, no_prefli
     assert seen == [{"app_id": aid, "force": False}]     # 只给 app_id，worker 自己重新读库
 
 
+async def test_publish_success_also_enqueues_miniprogram_upload(client, monkeypatch, no_preflight):
+    """发布成功同一次回调里入队小程序上传（ADR-0045）：两者互不等待；未绑定由任务器 skipped。"""
+    aid = await _mk(client)
+    mp_seen: list[dict] = []
+
+    async def fake_publish(sf, app, notify=None, *, force=False, confirm_destructive=False, on_success=None):
+        await on_success()
+        return {"status": "running"}
+
+    async def fake_apk_enqueue(app_id, *, force=False, app=None):
+        return "queued"
+
+    async def fake_mp_enqueue(app_id, *, kind="upload", force=False, app=None):
+        mp_seen.append({"app_id": app_id, "kind": kind, "force": force})
+        return "skipped"
+
+    monkeypatch.setattr(prod_mod, "publish", fake_publish)
+    monkeypatch.setattr(client.app.state.apk_builder, "enqueue", fake_apk_enqueue)
+    monkeypatch.setattr(client.app.state.mp_builder, "enqueue", fake_mp_enqueue)
+    r = await client.post(f"/api/apps/{aid}/publish", json={"force": True})
+    assert r.status_code == 202, r.text
+    await client.app.state.dev_tasks[aid]
+    assert mp_seen == [{"app_id": aid, "kind": "upload", "force": False}]
+
+
+async def test_publish_apk_enqueue_failure_does_not_block_miniprogram(client, monkeypatch,
+                                                                      no_preflight):
+    """APK 入队抛错只记日志：小程序上传照常入队，发布结果不变。"""
+    aid = await _mk(client)
+    mp_seen: list[dict] = []
+
+    async def fake_publish(sf, app, notify=None, *, force=False, confirm_destructive=False, on_success=None):
+        await on_success()
+        return {"status": "running"}
+
+    async def boom_apk(app_id, *, force=False, app=None):
+        raise RuntimeError("apk worker 挂了")
+
+    async def fake_mp_enqueue(app_id, *, kind="upload", force=False, app=None):
+        mp_seen.append({"app_id": app_id, "kind": kind})
+        return "queued"
+
+    monkeypatch.setattr(prod_mod, "publish", fake_publish)
+    monkeypatch.setattr(client.app.state.apk_builder, "enqueue", boom_apk)
+    monkeypatch.setattr(client.app.state.mp_builder, "enqueue", fake_mp_enqueue)
+    r = await client.post(f"/api/apps/{aid}/publish", json={"force": True})
+    assert r.status_code == 202, r.text
+    await client.app.state.dev_tasks[aid]
+    assert mp_seen == [{"app_id": aid, "kind": "upload"}]
+
+
 async def test_publish_chat_gate_only_own_workspace(client, monkeypatch, no_preflight):
     """闸门只看**本应用工作区**的活跃会话：别的应用在改代码不该挡住这次发布。"""
     aid = await _mk(client)
