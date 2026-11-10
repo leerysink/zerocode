@@ -171,6 +171,35 @@ describe('MemoryPanel - 启用开关', () => {
   })
 })
 
+describe('MemoryPanel - 查看具体', () => {
+  const DATA = [{ id: '12', type: 'fact', content: '正文', title: '部署域名', enabled: true }]
+
+  it('每条把工作区与记忆 id 拼成整页地址，新标签打开', async () => {
+    const open = vi.fn(() => ({}))
+    vi.stubGlobal('open', open)
+    mocks.api.listMemories.mockResolvedValue({ data: DATA, headers: {} })
+
+    const wrapper = await mountPanel()
+    const btn = wrapper.findAll('button').find((b) => b.text() === '查看具体')
+    expect(btn).toBeTruthy()
+    await btn.trigger('click')
+
+    expect(open).toHaveBeenCalledWith('/workspaces/1/memory/12', 'zerocode-memory-12')
+    vi.unstubAllGlobals()
+  })
+
+  it('新标签被拦截时给可操作提示，不静默失败', async () => {
+    vi.stubGlobal('open', vi.fn(() => null))
+    mocks.api.listMemories.mockResolvedValue({ data: DATA, headers: {} })
+
+    const wrapper = await mountPanel()
+    await wrapper.findAll('button').find((b) => b.text() === '查看具体').trigger('click')
+
+    expect(message.error).toHaveBeenCalledWith('浏览器拦住了新标签，允许弹窗后再点一次')
+    vi.unstubAllGlobals()
+  })
+})
+
 describe('MemoryPanel - 删除', () => {
   it('删除弹确认框并调用 deleteMemory', async () => {
     const data = [{ id: '1', type: 'fact', content: '测试', title: '要删的', enabled: true }]

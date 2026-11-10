@@ -6,18 +6,12 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { message, Modal } from 'ant-design-vue'
 import { PlusOutlined, ReloadOutlined, SearchOutlined } from '@ant-design/icons-vue'
 import { createMemory, deleteMemory, listMemories, updateMemory } from '../api'
+import { TYPE_LABELS, groupMemories } from '../utils/memory'
+import { openMemoryDetailPage } from '../utils/openFolder'
 
 const props = defineProps({
   workspaceId: { type: [Number, String], required: true },
 })
-
-// type 中文标签（与后端 MEMORY_TYPES 一一对应）
-const TYPE_LABELS = {
-  preference: '偏好',
-  decision: '决策',
-  fact: '事实',
-  pitfall: '踩坑',
-}
 
 const memories = ref([])
 const loading = ref(false)
@@ -64,19 +58,8 @@ const filtered = computed(() => {
   )
 })
 
-// 按 type 分组（保持 MEMORY_TYPES 顺序：preference / decision / fact / pitfall）
-// 未知 type 兜底归末组，不丢行（后端扩展分类时面板不静默少给）
-const grouped = computed(() => {
-  const groups = []
-  const known = new Set(Object.keys(TYPE_LABELS))
-  for (const type of Object.keys(TYPE_LABELS)) {
-    const items = filtered.value.filter((m) => m.type === type)
-    if (items.length) groups.push({ type, label: TYPE_LABELS[type], items })
-  }
-  const extras = filtered.value.filter((m) => !known.has(m.type))
-  if (extras.length) groups.push({ type: '_other', label: '其他', items: extras })
-  return groups
-})
+// 分组规则与记忆详情左栏共用（utils/memory.js），面板只管过滤后交给它
+const grouped = computed(() => groupMemories(filtered.value))
 
 async function submit() {
   if (!formContent.value.trim()) {
@@ -100,6 +83,13 @@ async function submit() {
     message.error(e?.response?.data?.detail || '添加失败')
   } finally {
     submitting.value = false
+  }
+}
+
+// 「查看具体」：与变更记录同款出口——侧栏放不下全文，整页新标签里看
+function openDetail(m) {
+  if (!openMemoryDetailPage(props.workspaceId, m.id)) {
+    message.error('浏览器拦住了新标签，允许弹窗后再点一次')
   }
 }
 
@@ -280,6 +270,7 @@ onMounted(load)
             </div>
             <div class="zc-mem-content">{{ m.content }}</div>
             <div class="zc-mem-item-actions">
+              <a-button size="small" type="link" @click="openDetail(m)">查看具体</a-button>
               <a-button size="small" type="link" @click="startEdit(m)">编辑</a-button>
               <a-button size="small" type="link" danger @click="confirmDelete(m)">删除</a-button>
             </div>

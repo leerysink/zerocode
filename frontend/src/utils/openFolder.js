@@ -85,3 +85,18 @@ export function openFileChangePage(sessionId, changeId) {
   if (!url) return false
   return Boolean(globalThis.open?.(url, `zerocode-change-${normalizeId(changeId)}`))
 }
+
+// 记忆详情整页（/workspaces/{工作区}/memory/{记忆}）：同样只在这里拼地址，由 router/index.test.js 对拍。
+// 工作区 id 必须进地址：列表接口挂在它下面，单给记忆号只能另开一条鉴权路径。
+export function memoryDetailPath(workspaceId, memoryId) {
+  const ws = normalizeWorkspaceId(workspaceId)
+  const mid = normalizeId(memoryId)
+  return ws && mid ? `/workspaces/${ws}/memory/${mid}` : ''
+}
+
+// 窗口名按记忆固定：看哪条开哪个标签，与变更详情同策略（不按工作区收敛成一个）。
+export function openMemoryDetailPage(workspaceId, memoryId) {
+  const url = memoryDetailPath(workspaceId, memoryId)
+  if (!url) return false
+  return Boolean(globalThis.open?.(url, `zerocode-memory-${normalizeId(memoryId)}`))
+}

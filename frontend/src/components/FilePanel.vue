@@ -3,7 +3,7 @@
 // 收起/拖拽入口在面板左缘的手柄（SidePanelHandle），antd 自带 trigger 不再挂。
 // 「文件」tab：工作区文件树（GET /fs/tree → treeData）+ 顶部刷新按钮 + 打开文件夹按钮；
 //   点击文件 → 只读内容预览（pre）；后端对二进制/超 200KB 文件拒读（400），错误详情展示在预览区即「>200KB 提示」；
-//   编辑收口到工作台：这里只给「在编辑器中打开」，新标签带 ?name=&file= 跳到工作台并定位该文件。
+//   编辑收口到工作台：这里只给「查看具体」，新标签带 ?name=&file= 跳到工作台整页并定位该文件。
 // 「打开文件夹」按 fs.open_folder_mode 分流：默认直接新标签打开内置文件管理器整页（/workspaces/{id}/files）；
 //   显式选 auto 时同机访问才调后端本机文件管理器（POST /api/fs/open-folder），直开失败也降级到内置，见 utils/openFolder.js。
 // 「变更记录」tab：GET /api/sessions/{id}/file-changes（id 倒序），逐条 DiffBlock 显示 path+action+diff；
@@ -185,8 +185,9 @@ onMounted(loadTree)
               v-if="!previewError"
               size="small"
               class="zc-fp-open-editor"
+              title="在新标签打开该文件的整页查看"
               @click="openInEditor"
-            >在编辑器中打开</a-button>
+            >查看具体</a-button>
           </div>
           <a-spin v-if="loading" class="zc-fp-loading" />
           <template v-else>

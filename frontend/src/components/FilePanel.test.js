@@ -224,7 +224,7 @@ describe('FilePanel 受控宽度与收起', () => {
   })
 })
 
-describe('FilePanel 只读预览与在编辑器中打开', () => {
+describe('FilePanel 只读预览与查看具体', () => {
   const NODES = [
     { name: 'src', path: 'src', type: 'dir', children: [{ name: 'a.md', path: 'src/a.md', type: 'file' }] },
     { name: 'broken.bin', path: 'broken.bin', type: 'file' },
@@ -251,13 +251,14 @@ describe('FilePanel 只读预览与在编辑器中打开', () => {
     expect(readFile).toHaveBeenCalledWith(7, 'src/a.md')
   })
 
-  it('选中可读文件出现「在编辑器中打开」，新标签地址带 name 与 file 且都编码', async () => {
+  it('选中可读文件出现「查看具体」，新标签地址带 name 与 file 且都编码', async () => {
     const open = stubOpen()
     readFile.mockResolvedValue({ data: { content: 'x' } })
     const wrapper = await mountPanel('auto', NODES)
     useChatStore().workspaces = [{ id: 7, name: '订单 台账' }]
 
     await selectFile(wrapper, 'src/a.md')
+    expect(wrapper.find('.zc-fp-open-editor').text()).toBe('查看具体')
     await wrapper.find('.zc-fp-open-editor').trigger('click')
 
     expect(open).toHaveBeenCalledWith(
@@ -267,7 +268,7 @@ describe('FilePanel 只读预览与在编辑器中打开', () => {
     expect(message.warning).not.toHaveBeenCalled()
   })
 
-  it('「在编辑器中打开」的新标签被拦截时给可操作提示，不静默失败', async () => {
+  it('「查看具体」的新标签被拦截时给可操作提示，不静默失败', async () => {
     stubOpen(null)
     readFile.mockResolvedValue({ data: { content: 'x' } })
     const wrapper = await mountPanel('auto', NODES)
@@ -278,7 +279,7 @@ describe('FilePanel 只读预览与在编辑器中打开', () => {
     expect(message.warning).toHaveBeenCalled()
   })
 
-  it('读取失败（二进制/超限）照旧展示 detail，且不出现「在编辑器中打开」', async () => {
+  it('读取失败（二进制/超限）照旧展示 detail，且不出现「查看具体」', async () => {
     readFile.mockRejectedValue({ response: { data: { detail: '不支持读取的文件（二进制或超过200KB）' } } })
     const wrapper = await mountPanel('auto', NODES)
 
@@ -288,7 +289,7 @@ describe('FilePanel 只读预览与在编辑器中打开', () => {
     expect(wrapper.find('.zc-fp-open-editor').exists()).toBe(false)
   })
 
-  it('切工作区清空预览与「在编辑器中打开」', async () => {
+  it('切工作区清空预览与「查看具体」', async () => {
     readFile.mockResolvedValue({ data: { content: '# 标题' } })
     const wrapper = await mountPanel('auto', NODES)
     await selectFile(wrapper, 'src/a.md')

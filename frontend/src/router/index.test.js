@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 import { describe, expect, it, vi } from 'vitest'
 vi.mock('../stores/auth', () => ({ useAuthStore: () => ({ loaded: true, user: { id: 1 }, fetchMe: vi.fn() }) }))
-import { fileChangePath, workspaceFilesPath } from '../utils/openFolder'
+import { fileChangePath, memoryDetailPath, workspaceFilesPath } from '../utils/openFolder'
 import router from './index'
 
 describe('router', () => {
@@ -31,5 +31,16 @@ describe('router', () => {
   it('变更详情的入口地址与路由表对得上', () => {
     const hit = router.options.routes.find((r) => r.name === 'session-file-change')
     expect(hit.path.replace(':sessionId', '12').replace(':changeId', '345')).toBe(fileChangePath(12, 345))
+  })
+
+  it('注册了记忆详情整页路由', () => {
+    const hit = router.options.routes.find((r) => r.name === 'workspace-memory-detail')
+    expect(hit).toBeTruthy()
+    expect(hit.path).toBe('/workspaces/:id/memory/:memoryId')
+  })
+
+  it('记忆详情的入口地址与路由表对得上', () => {
+    const hit = router.options.routes.find((r) => r.name === 'workspace-memory-detail')
+    expect(hit.path.replace(':id', '933').replace(':memoryId', '12')).toBe(memoryDetailPath(933, 12))
   })
 })

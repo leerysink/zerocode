@@ -2,7 +2,7 @@
 // 纯函数化是为了把三种取值 × 各种访问地址的组合全部钉死，不用挂组件。
 // 内置那一路现在是个独立页面（新标签打开），地址拼接与被拦截的返回值也一起钉在这里。
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { fileChangePath, isLocalHostname, openFileChangePage, openWorkspaceFilesPage, resolveOpenFolderMode, workspaceFilesPath } from './openFolder'
+import { fileChangePath, isLocalHostname, memoryDetailPath, openFileChangePage, openMemoryDetailPage, openWorkspaceFilesPage, resolveOpenFolderMode, workspaceFilesPath } from './openFolder'
 
 describe('isLocalHostname', () => {
   it('回环形态判为本机（浏览器与后端同机，explorer 开在用户眼前）', () => {
@@ -152,6 +152,48 @@ describe('fileChangePath 变更详情整页地址', () => {
       expect(fileChangePath(bad, 345)).toBe('')
       expect(fileChangePath(12, bad)).toBe('')
     }
+  })
+})
+
+describe('memoryDetailPath 记忆详情整页地址', () => {
+  it('工作区与记忆两个 id 都按字符串直传，19 位大整数不经 Number 不丢精度', () => {
+    expect(memoryDetailPath(933, 12)).toBe('/workspaces/933/memory/12')
+    expect(memoryDetailPath('933', '12')).toBe('/workspaces/933/memory/12')
+    expect(memoryDetailPath('2026092201000900123', '2026092201000988888'))
+      .toBe('/workspaces/2026092201000900123/memory/2026092201000988888')
+  })
+
+  it('边界：任一段 id 不合法就不给地址', () => {
+    for (const bad of [undefined, null, '', ' ', 'abc', '1.5', '1e3', '-7', {}, []]) {
+      expect(memoryDetailPath(bad, 12)).toBe('')
+      expect(memoryDetailPath(933, bad)).toBe('')
+    }
+  })
+})
+
+describe('openMemoryDetailPage 新标签打开记忆详情', () => {
+  afterEach(() => vi.unstubAllGlobals())
+
+  it('按记忆命名窗口：同一条反复点复用那一个标签，看不同条各开一个', () => {
+    const open = vi.fn(() => ({}))
+    vi.stubGlobal('open', open)
+
+    expect(openMemoryDetailPage(933, 12)).toBe(true)
+    expect(open).toHaveBeenCalledWith('/workspaces/933/memory/12', 'zerocode-memory-12')
+  })
+
+  it('被浏览器拦截（open 返回 null）时如实报 false，让调用方去提示', () => {
+    vi.stubGlobal('open', vi.fn(() => null))
+    expect(openMemoryDetailPage(933, 12)).toBe(false)
+  })
+
+  it('边界：id 不合法时一个标签都不开，也不报错', () => {
+    const open = vi.fn(() => ({}))
+    vi.stubGlobal('open', open)
+
+    expect(openMemoryDetailPage(933, '')).toBe(false)
+    expect(openMemoryDetailPage('', 12)).toBe(false)
+    expect(open).not.toHaveBeenCalled()
   })
 })
 

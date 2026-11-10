@@ -47,6 +47,12 @@ const routes = [
     component: () => import('../views/FileChangeDetailView.vue'),
   },
   {
+    // 记忆详情整页；地址收在 utils/openFolder.js 的 memoryDetailPath，与路由表对拍
+    path: '/workspaces/:id/memory/:memoryId',
+    name: 'workspace-memory-detail',
+    component: () => import('../views/MemoryDetailView.vue'),
+  },
+  {
     path: '/store',
     name: 'store',
     component: () => import('../views/StoreView.vue'),
