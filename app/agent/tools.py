@@ -1,12 +1,20 @@
-import asyncio, dataclasses, difflib, json, os
+import asyncio, dataclasses, difflib, fnmatch, json, os
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 from sqlalchemy import text
 
 from app.agent import registry
 from app.agent.result_budget import apply_budget
+from app import workspace_ignore
 
 MAX_READ_BYTES = 200 * 1024
+# 目录分页上限：默认一页 200，模型显式要求也只给到 500（再多的目录该用 search 收窄，不该翻页硬啃）。
+DEFAULT_LIST_LIMIT = 200
+MAX_LIST_LIMIT = 500
+# 检索硬上限：命中 200 条 / 扫 5000 个文件后停止并明确告知——检索的价值在「快速定位」，不在「导出全库」。
+MAX_SEARCH_MATCHES = 200
+MAX_SEARCH_FILES = 5000
+MAX_SEARCH_LINE_CHARS = 200
 BINARY_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".pdf", ".zip", ".gz", ".exe", ".dll", ".so", ".bin", ".db", ".sqlite", ".mp3", ".mp4"}
 # 技能母本受控读面文本白名单（故事11）：references/assets 常见形态，非此列表一律拒
 SKILL_READ_EXTS = {".md", ".txt", ".json", ".csv", ".yaml", ".yml"}
@@ -147,6 +155,58 @@ async def execute_tool(ctx: ToolContext, name: str, args: dict, *, confirmed: bo
     return result
 
 
+def _int_arg(args: dict, key: str, default: int | None) -> int | None:
+    """可选整数参数：缺省/空串取默认，非法值明确报错。
+
+    不能把写错的 offset 静默当成 0——那会让模型以为在读第 300 行、实际拿回第一段，
+    并据此得出错误结论。
+    """
+    raw = args.get(key)
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        raise ToolError(f"{key} 必须是整数，收到 {raw!r}")
+
+
+def _slice_lines(text: str, offset: int, limit: int | None):
+    """按行切一段 → (content, total_lines, start_line, end_line, truncated_by_bytes, notice)。
+
+    字节上限只在**行边界**切：否则返回的最后半行没有对应 offset，下一段会悄悄跳过它。
+    单行自身就超过上限时才在行内硬切，并明说「剩余部分无法续读」。
+    """
+    lines = text.splitlines(keepends=True)
+    total = len(lines)
+    if offset < 1:
+        raise ToolError(f"offset 必须从 1 开始（收到 {offset}）")
+    if total == 0:
+        if offset > 1:
+            raise ToolError(f"offset {offset} 超出文件行数（文件为空）")
+        return "", 0, 1, 0, False, None
+    if offset > total:
+        raise ToolError(f"offset {offset} 超出文件行数（共 {total} 行）")
+    end = total if limit is None else min(total, offset + limit - 1)
+    chunk = "".join(lines[offset - 1:end])
+    if len(chunk.encode("utf-8")) > MAX_READ_BYTES:
+        cut = chunk.encode("utf-8")[:MAX_READ_BYTES].decode("utf-8", errors="ignore")
+        if "\n" in cut:
+            chunk = cut[:cut.rfind("\n") + 1]
+            end = offset + chunk.count("\n") - 1
+            notice = (f"内容超过单次读取上限，已返回第 {offset}-{end} 行，共 {total} 行；"
+                      f"继续请用 offset={end + 1}")
+        else:
+            # 单行超长：行内截断，没有可续读的下一行
+            chunk, end = cut, offset
+            notice = ("该行超过单次读取上限，已在行内截断；剩余部分无法用 offset 续读，"
+                      "请用 search 定位具体片段或改用 edit_file 精确修改")
+        return chunk, total, offset, end, True, notice
+    notice = None
+    if offset > 1 or end < total:
+        notice = f"已返回第 {offset}-{end} 行，共 {total} 行；继续请用 offset={end + 1}"
+    return chunk, total, offset, end, False, notice
+
+
 async def _handle_list_dir(ctx: ToolContext, args: dict, *, confirmed: bool = False) -> dict:
     d = resolve_in_workspace(ctx.root, args.get("path"))
     if not d.is_dir():
@@ -157,7 +217,100 @@ async def _handle_list_dir(ctx: ToolContext, args: dict, *, confirmed: bool = Fa
             continue
         entries.append({"name": child.name, "type": "dir" if child.is_dir() else "file",
                         "size": child.stat().st_size if child.is_file() else None})
-    return {"path": args.get("path") or ".", "entries": entries[:200]}
+    total = len(entries)
+    offset = _int_arg(args, "offset", 0)
+    limit = _int_arg(args, "limit", DEFAULT_LIST_LIMIT)
+    if offset < 0:
+        raise ToolError("offset 必须是非负整数")
+    if limit < 1:
+        raise ToolError("limit 必须是正整数")
+    limit = min(limit, MAX_LIST_LIMIT)
+    page = entries[offset:offset + limit]
+    nxt = offset + len(page)
+    return {"path": args.get("path") or ".", "entries": page, "total_entries": total,
+            "next_offset": nxt if nxt < total else None}
+
+
+def _iter_workspace_files(base: Path, root: Path, stats: dict):
+    """遍历 base 下的文件并剪掉忽略目录；stats 记跳过的目录数（由调用方展示给模型）。"""
+    for dirpath, dirnames, filenames in os.walk(base):
+        rel_dir = Path(dirpath).relative_to(root)
+        kept = []
+        for name in sorted(dirnames):
+            parts = (rel_dir / name).parts if rel_dir.parts else (name,)
+            if name.startswith(".") or name == "deploy" or workspace_ignore.is_ignored_dir(parts):
+                stats["skipped_dirs"] += 1
+                continue
+            kept.append(name)
+        dirnames[:] = kept
+        for name in sorted(filenames):
+            if name.startswith("."):
+                continue
+            fp = Path(dirpath) / name
+            yield fp, fp.relative_to(root).as_posix()
+
+
+async def _handle_search(ctx: ToolContext, args: dict, *, confirmed: bool = False) -> dict:
+    mode = str(args.get("mode") or "").strip()
+    pattern = str(args.get("pattern") or "").strip()
+    if mode not in ("content", "files"):
+        raise ToolError("mode 只接受 content（搜内容）或 files（找文件）")
+    if not pattern:
+        raise ToolError("pattern 不能为空")
+    base = resolve_in_workspace(ctx.root, args.get("path"))
+    if base.is_file():
+        raise ToolError("path 必须是目录；找单个文件请用 mode=files")
+    if not base.is_dir():
+        raise ToolError(f"目录不存在: {args.get('path')}")
+    root = Path(ctx.root).resolve()
+    base = base.resolve()
+    needle = pattern.lower()
+    matches: list = []
+    stats = {"skipped_dirs": 0, "skipped_files": 0}
+    notes: list[str] = []
+    truncated = False
+    scanned = 0
+    for fp, rel in _iter_workspace_files(base, root, stats):
+        if len(matches) >= MAX_SEARCH_MATCHES:
+            truncated = True
+            notes.append(f"命中超过 {MAX_SEARCH_MATCHES} 条已截断，请收窄 pattern 或 path")
+            break
+        if mode == "files":
+            if (fnmatch.fnmatch(rel.lower(), needle)
+                    or fnmatch.fnmatch(fp.name.lower(), needle)):
+                matches.append(rel)
+            continue
+        try:
+            size = fp.stat().st_size
+        except OSError:
+            stats["skipped_files"] += 1
+            continue
+        if fp.suffix.lower() in BINARY_EXTS or size > MAX_READ_BYTES:
+            stats["skipped_files"] += 1
+            continue
+        scanned += 1
+        if scanned > MAX_SEARCH_FILES:
+            truncated = True
+            notes.append(f"已扫描 {MAX_SEARCH_FILES} 个文件后停止，请用 path 收窄范围")
+            break
+        try:
+            text = fp.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            stats["skipped_files"] += 1
+            continue
+        for i, line in enumerate(text.splitlines(), 1):
+            if needle in line.lower():
+                matches.append({"path": rel, "line": i,
+                                "text": line.strip()[:MAX_SEARCH_LINE_CHARS]})
+                if len(matches) >= MAX_SEARCH_MATCHES:
+                    break
+    if stats["skipped_dirs"] or stats["skipped_files"]:
+        notes.append(f"已按平台规则跳过 {stats['skipped_dirs']} 个目录、"
+                     f"{stats['skipped_files']} 个文件（忽略表 / deploy/ / 二进制 / 超大文件）")
+    return {"mode": mode, "pattern": pattern, "matches": matches, "count": len(matches),
+            "truncated": truncated, "skipped_dirs": stats["skipped_dirs"],
+            "skipped_files": stats["skipped_files"], "note": "；".join(notes)}
+
 
 
 async def _handle_read_file(ctx: ToolContext, args: dict, *, confirmed: bool = False) -> dict:
@@ -190,10 +343,19 @@ async def _handle_read_file(ctx: ToolContext, args: dict, *, confirmed: bool = F
         raise ToolError(f"文件不存在: {args.get('path')}")
     if f.suffix.lower() in BINARY_EXTS:
         raise ToolError(f"不支持读取二进制文件: {args.get('path')}")
+    offset = _int_arg(args, "offset", 1)
+    limit = _int_arg(args, "limit", None)
+    if limit is not None and limit < 1:
+        raise ToolError("limit 必须是正整数")
     size = f.stat().st_size
-    if size > MAX_READ_BYTES:
-        raise ToolError(f"文件超过 200KB（{size} 字节），请用 edit_file 分段处理")
-    return {"path": args.get("path"), "content": f.read_text(encoding="utf-8", errors="replace"), "size": size}
+    content, total, start, end, truncated, notice = _slice_lines(
+        f.read_text(encoding="utf-8", errors="replace"), offset, limit)
+    out = {"path": args.get("path"), "content": content, "size": size,
+           "total_lines": total, "start_line": start, "end_line": end,
+           "remaining_lines": max(0, total - end), "truncated_by_bytes": truncated}
+    if notice:
+        out["notice"] = notice
+    return out
 
 
 async def _handle_write_file(ctx: ToolContext, args: dict, *, confirmed: bool = False) -> dict:

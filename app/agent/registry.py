@@ -30,6 +30,9 @@ CONFIRM_PREVIEW_RESTART = "preview_restart"  # 仅当预览正在运行时确认
 # read_file 的上限契约是 200KB **字节**（204800 UTF-8 字节，纯 ASCII 即 204800 字符）；
 # 预算上限必须高过它，否则「能读的文件」会被预算误判成需要截断。
 READ_FILE_POLICY = ResultPolicy(max_chars=230_000, max_items=200, max_str_chars=230_000)
+# list_dir 一页最多 500 条，预算的条目上限必须跟得上，否则「允许翻 500 条」会被预算再砍回 200。
+LIST_DIR_POLICY = ResultPolicy(max_chars=32_000, max_items=500, max_str_chars=2_000)
+SEARCH_POLICY = ResultPolicy(max_chars=32_000, max_items=200, max_str_chars=2_000)
 SMALL_POLICY = ResultPolicy(max_chars=8_000, max_items=100, max_str_chars=2_000)
 LOG_POLICY = ResultPolicy(max_chars=20_000, max_items=300, max_str_chars=2_000)
 DB_POLICY = ResultPolicy(max_chars=32_000, max_items=500, max_str_chars=8_000)
@@ -58,10 +61,19 @@ def _fn(name: str, description: str, properties: dict | None = None,
 
 
 # 基础文件工具：描述保持一句话（随每次请求发送，教程在 system prompt）
-_LIST_DIR = _fn("list_dir", "列出工作区内目录内容（单层，忽略隐藏文件）", {
-    "path": {"type": "string", "description": "相对工作区的目录路径，空为根目录"}})
-_READ_FILE = _fn("read_file", "读取工作区内文本文件内容（上限200KB）", {
-    "path": {"type": "string", "description": "相对路径"}}, ["path"])
+_LIST_DIR = _fn("list_dir", "列出工作区内目录内容（单层，忽略隐藏文件）；result.next_offset 非空表示还有下一页", {
+    "path": {"type": "string", "description": "相对工作区的目录路径，空为根目录"},
+    "offset": {"type": "integer", "description": "从第几个条目开始（0 基，缺省 0）"},
+    "limit": {"type": "integer", "description": "本页条目数（缺省 200，上限 500）"}})
+_READ_FILE = _fn("read_file", "读取工作区内文本文件；长文件用 offset/limit 按行分段，结果恒带 total_lines 与剩余行", {
+    "path": {"type": "string", "description": "相对路径"},
+    "offset": {"type": "integer", "description": "起始行号（1 基，缺省 1）"},
+    "limit": {"type": "integer", "description": "读取行数（缺省读到文件末；单次仍受 200KB 限制）"}}, ["path"])
+_SEARCH = _fn("search", "在工作区内检索：mode=content 搜内容（字面子串、不区分大小写），mode=files 按文件名/路径 glob（如 *.vue）", {
+    "mode": {"type": "string", "enum": ["content", "files"],
+             "description": "content=搜内容；files=找文件"},
+    "pattern": {"type": "string", "description": "content 为字面子串；files 为 glob 模式"},
+    "path": {"type": "string", "description": "可选的子目录起点，缺省整个工作区"}}, ["mode", "pattern"])
 _WRITE_FILE = _fn("write_file", "新建或整体覆盖工作区内文件（UTF-8）", {
     "path": {"type": "string", "description": "相对路径"},
     "content": {"type": "string", "description": "完整文件内容"}}, ["path", "content"])
@@ -192,9 +204,12 @@ _BROWSER_CLOSE = _fn("browser_close", "关闭当前浏览器会话，返回本�
 
 
 SPECS: tuple[ToolSpec, ...] = (
-    ToolSpec("list_dir", _LIST_DIR, "fs", handler_ref=("app.agent.tools", "_handle_list_dir")),
+    ToolSpec("list_dir", _LIST_DIR, "fs", handler_ref=("app.agent.tools", "_handle_list_dir"),
+             result_policy=LIST_DIR_POLICY),
     ToolSpec("read_file", _READ_FILE, "fs", handler_ref=("app.agent.tools", "_handle_read_file"),
              result_policy=READ_FILE_POLICY),
+    ToolSpec("search", _SEARCH, "fs", handler_ref=("app.agent.tools", "_handle_search"),
+             result_policy=SEARCH_POLICY),
     ToolSpec("write_file", _WRITE_FILE, "fs", confirm=CONFIRM_WRITE,
              handler_ref=("app.agent.tools", "_handle_write_file"), result_policy=SMALL_POLICY),
     ToolSpec("edit_file", _EDIT_FILE, "fs", confirm=CONFIRM_WRITE,
