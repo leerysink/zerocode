@@ -9,7 +9,8 @@ const CHANGES = [
   { id: '346', path: 'src/new.js', action: 'create' },
   { id: '345', path: 'src/App.vue', action: 'edit' },
   { id: '344', path: 'src/old.js', action: 'delete' },
-  { id: '343', path: 'src/x.js', action: 'rename' },
+  { id: '343', path: 'src/x.js', action: 'move' },
+  { id: '342', path: 'src/y.js', action: 'rename' },
 ]
 
 function mountList(props = {}) {
@@ -29,13 +30,14 @@ describe('ChangeFileList 渲染', () => {
     const wrapper = mountList()
     const items = wrapper.findAll('.zc-cfl-item')
 
-    expect(items).toHaveLength(4)
+    expect(items).toHaveLength(5)
     expect(items[0].text()).toContain('新建')
     expect(items[0].text()).toContain('src/new.js')
     expect(items[1].text()).toContain('修改')
     expect(items[2].text()).toContain('删除')
-    expect(items[3].text()).toContain('rename')
-    expect(wrapper.find('.zc-cfl-count').text()).toBe('4')
+    expect(items[3].text()).toContain('移动')
+    expect(items[4].text()).toContain('rename')
+    expect(wrapper.find('.zc-cfl-count').text()).toBe('5')
   })
 
   it('当前条高亮，数字与字符串 id 都能对上', () => {

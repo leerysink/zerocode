@@ -18,8 +18,8 @@ const props = defineProps({
   changeId: { type: [Number, String], default: '' },
 })
 
-// 与后端 tools.py 的 action 取值对应（create/edit/delete），未知值原样展示
-const ACTION_LABEL = { create: '新建', edit: '修改', delete: '删除' }
+// 与后端 tools.py 的 action 取值对应（create/edit/delete/move），未知值原样展示
+const ACTION_LABEL = { create: '新建', edit: '修改', delete: '删除', move: '移动' }
 
 // 能不能看详情，判据就是「地址拼不拼得出来」——不另立一套 id 合法性判定，
 // 免得两处规则漂移（openFolder 那边收紧成只认纯数字时，这里自动跟着收）

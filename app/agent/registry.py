@@ -83,6 +83,22 @@ _EDIT_FILE = _fn("edit_file", "对文件做精确唯一匹配替换；old_string
     "path": {"type": "string"},
     "old_string": {"type": "string"},
     "new_string": {"type": "string"}}, ["path", "old_string", "new_string"])
+_DELETE_FILE = _fn(
+    "delete_file",
+    ("删除工作区里的一个文件（真删盘；删除前留存原文，可用 revert_change 复原）。"
+     "只删文件、不递归删目录；app.json 与 deploy/ 不可删；二进制或超 200KB 的文件不留原文、不可回滚"),
+    {"path": {"type": "string", "description": "要删除的文件相对路径"}}, ["path"])
+_MOVE_FILE = _fn(
+    "move_file",
+    "重命名或移动文件（old_path → new_path）。目标已存在一律拒绝，不会覆盖；只移动文件、不移动目录",
+    {"old_path": {"type": "string", "description": "原相对路径"},
+     "new_path": {"type": "string", "description": "目标相对路径（不得已存在）"}},
+    ["old_path", "new_path"])
+_REVERT_CHANGE = _fn(
+    "revert_change",
+    ("回滚某路径在本会话内最近一次改动（把当时的原文写回）。"
+     "磁盘当前内容与该记录不符时拒绝，避免覆盖之后的改动；撤销新建会把文件删掉"),
+    {"path": {"type": "string", "description": "要回滚的文件相对路径"}}, ["path"])
 _ASK_USER = _fn(
     "ask_user",
     ("当需求不明确、有多种实现方案或信息缺失时，向用户提一个问题；"
@@ -233,6 +249,13 @@ SPECS: tuple[ToolSpec, ...] = (
              handler_ref=("app.agent.tools", "_handle_write_file"), result_policy=SMALL_POLICY),
     ToolSpec("edit_file", _EDIT_FILE, "fs", confirm=CONFIRM_WRITE,
              handler_ref=("app.agent.tools", "_handle_edit_file"), result_policy=SMALL_POLICY),
+    # Week 4 写面：与 write/edit 同走写入确认（文件写入可回滚，但仍要先让用户看见改什么）。
+    ToolSpec("delete_file", _DELETE_FILE, "fs", confirm=CONFIRM_WRITE,
+             handler_ref=("app.agent.tools", "_handle_delete_file"), result_policy=SMALL_POLICY),
+    ToolSpec("move_file", _MOVE_FILE, "fs", confirm=CONFIRM_WRITE,
+             handler_ref=("app.agent.tools", "_handle_move_file"), result_policy=SMALL_POLICY),
+    ToolSpec("revert_change", _REVERT_CHANGE, "fs", confirm=CONFIRM_WRITE,
+             handler_ref=("app.agent.tools", "_handle_revert_change"), result_policy=SMALL_POLICY),
     ToolSpec("ask_user", _ASK_USER, "chat"),
     ToolSpec("todo_write", _TODO_WRITE, "chat",
              handler_ref=("app.agent.tools", "_handle_todo_write"), result_policy=SMALL_POLICY),

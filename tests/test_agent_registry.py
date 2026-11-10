@@ -12,6 +12,7 @@ from app.agent import registry
 
 ROOT = Path(__file__).resolve().parents[1]
 BASE_NAMES = ["list_dir", "read_file", "search", "write_file", "edit_file",
+              "delete_file", "move_file", "revert_change",
               "ask_user", "todo_write", "memory_write"]
 APP_NAMES = ["preview_status", "preview_logs", "preview_restart",
              "db_query", "db_write", "preview_page",

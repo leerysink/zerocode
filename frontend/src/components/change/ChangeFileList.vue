@@ -13,8 +13,8 @@ const props = defineProps({
 
 const emit = defineEmits(['select', 'retry'])
 
-// 与后端 tools.py 的 action 取值对应（create/edit/delete），未知值原样展示
-const ACTION_LABEL = { create: '新建', edit: '修改', delete: '删除' }
+// 与后端 tools.py 的 action 取值对应（create/edit/delete/move），未知值原样展示
+const ACTION_LABEL = { create: '新建', edit: '修改', delete: '删除', move: '移动' }
 const labelOf = (a) => ACTION_LABEL[a] || a || '变更'
 
 const isActive = (c) => String(c.id) === String(props.activeId)
@@ -131,6 +131,10 @@ const countText = computed(() => String(props.changes.length))
 .zc-cfl-action.is-delete {
   background: rgba(245, 108, 108, 0.18);
   color: #e06c6c;
+}
+.zc-cfl-action.is-move {
+  background: rgba(103, 194, 58, 0.18);
+  color: #5fa832;
 }
 .zc-cfl-item.is-active .zc-cfl-action {
   background: rgba(255, 255, 255, 0.22);

@@ -1,4 +1,4 @@
-import asyncio, dataclasses, difflib, fnmatch, json, os
+import asyncio, dataclasses, difflib, fnmatch, json, os, shutil
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 from sqlalchemy import text
@@ -99,7 +99,8 @@ def _unified_diff(path: str, before: str, after: str) -> str:
         before.splitlines(keepends=True), after.splitlines(keepends=True),
         fromfile=f"a/{path}", tofile=f"b/{path}"))
 
-async def _record_change(ctx: ToolContext, path: str, action: str, before: str, after: str, msg_id: int | None = None):
+async def _record_change(ctx: ToolContext, path: str, action: str, before: str | None,
+                         after: str | None, msg_id: int | None = None, diff: str | None = None):
     # 会话侧凭据遮断（Ticket 010 第四出口）：before/after/diff 会整体落平台库 file_change
     # 并把 diff 推给 WebSocket——这是 tool_args 三出口之外、把用户写进工作区的口令复制进
     # 平台侧的第四个明文出口。用户真正要写的明文留在工作区文件里（那是用户自己的域、
@@ -107,9 +108,14 @@ async def _record_change(ctx: ToolContext, path: str, action: str, before: str, 
     # 复用同一张规则表（memory_service.redact_sensitive），不另抄正则；先遮 before/after
     # 再据此算 diff，保证三列互相对应、不会一列遮了一列没遮。
     from app.services.memory_service import redact_sensitive
-    before, _ = redact_sensitive(before)
-    after, _ = redact_sensitive(after)
-    diff = _unified_diff(path, before, after)
+    # before/after 为 None 表示「未存原文」（二进制/超限文件、不解析内容的 move）：
+    # 三列一起留空，回滚侧据此拒绝——用空串冒充原文会让回滚把文件写成空的。
+    if before is not None:
+        before, _ = redact_sensitive(before)
+    if after is not None:
+        after, _ = redact_sensitive(after)
+    if diff is None:
+        diff = _unified_diff(path, before or "", after or "") if (before or after) else ""
     change_id = None
     if ctx.session_factory is not None:
         async with ctx.session_factory() as s:
@@ -382,8 +388,9 @@ async def _handle_write_file(ctx: ToolContext, args: dict, *, confirmed: bool = 
     f.parent.mkdir(parents=True, exist_ok=True)
     # newline='' 字节保真，避免 Windows 行尾翻转污染目标文件
     f.write_text(content, encoding="utf-8", newline="")
-    await _record_change(ctx, str(f.relative_to(ctx.root)), "edit" if existed else "create", before, content)
-    return {"ok": True, "path": str(f.relative_to(ctx.root)), "bytes": len(content.encode("utf-8"))}
+    path_rel = _rel_of(ctx.root, f)
+    await _record_change(ctx, path_rel, "edit" if existed else "create", before, content)
+    return {"ok": True, "path": path_rel, "bytes": len(content.encode("utf-8"))}
 
 
 async def _handle_edit_file(ctx: ToolContext, args: dict, *, confirmed: bool = False) -> dict:
@@ -418,8 +425,114 @@ async def _handle_edit_file(ctx: ToolContext, args: dict, *, confirmed: bool = F
     # newline='' 字节保真，避免 Windows 行尾翻转污染目标文件
     with open(f, "w", encoding="utf-8", newline="") as fh:
         fh.write(after)
-    await _record_change(ctx, str(f.relative_to(ctx.root)), "edit", content, after)
-    return {"ok": True, "path": str(f.relative_to(ctx.root))}
+    path_rel = _rel_of(ctx.root, f)
+    await _record_change(ctx, path_rel, "edit", content, after)
+    return {"ok": True, "path": path_rel}
+
+
+def _rel_of(root: Path, f: Path) -> str:
+    """记录/回参统一的相对路径口径：正斜杠（与模型输入、search 产出一致，跨平台可回查）。"""
+    return f.relative_to(Path(root).resolve()).as_posix()
+
+
+def _read_text_keep_eol(f: Path, limit: int | None = None) -> str | None:
+    """按字节保真读文本（newline=''）；二进制/超限/非 UTF-8 一律 None = 未存原文。"""
+    try:
+        if limit is not None and f.stat().st_size > limit:
+            return None
+        with open(f, "r", encoding="utf-8", newline="") as fh:
+            return fh.read()
+    except (UnicodeDecodeError, OSError):
+        return None
+
+
+async def _handle_delete_file(ctx: ToolContext, args: dict, *, confirmed: bool = False) -> dict:
+    rel = args.get("path")
+    f = resolve_in_workspace(ctx.root, rel)
+    from app.deploy.guard import is_protected
+    if is_protected(Path(ctx.root), rel):
+        raise ToolError("app.json 与 deploy/ 由平台管理，AI 不可删除")
+    if f.is_dir():
+        # 递归删除的爆炸半径不允许由一次工具调用决定；空目录也不删（不替用户做清理决定）。
+        raise ToolError(f"只能删除文件，不递归删除目录: {rel}")
+    if not f.is_file():
+        raise ToolError(f"文件不存在: {rel}")
+    before = None
+    if f.suffix.lower() not in BINARY_EXTS:
+        before = _read_text_keep_eol(f, MAX_READ_BYTES)
+    f.unlink()
+    path_rel = _rel_of(ctx.root, f)
+    await _record_change(ctx, path_rel, "delete", before, "",
+                         diff=None if before is not None else f"已删除 {path_rel}（未存原文，不可回滚）")
+    out = {"ok": True, "path": path_rel, "revertible": before is not None}
+    if before is None:
+        out["notice"] = "二进制或超过 200KB 的文件未存原文，不可回滚"
+    return out
+
+
+async def _handle_move_file(ctx: ToolContext, args: dict, *, confirmed: bool = False) -> dict:
+    old_rel, new_rel = args.get("old_path"), args.get("new_path")
+    old = resolve_in_workspace(ctx.root, old_rel)
+    new = resolve_in_workspace(ctx.root, new_rel)
+    from app.deploy.guard import is_protected
+    for rel in (old_rel, new_rel):
+        if is_protected(Path(ctx.root), rel):
+            raise ToolError("app.json 与 deploy/ 由平台管理，AI 不可移动")
+    if old == Path(ctx.root).resolve() or old.is_dir():
+        raise ToolError(f"只能移动文件，不移动目录: {old_rel}")
+    if not old.is_file():
+        raise ToolError(f"文件不存在: {old_rel}")
+    if new.exists():
+        raise ToolError(f"目标已存在，拒绝覆盖: {new_rel}（请先删除或换一个名字）")
+    new.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(old), str(new))
+    old_rel, new_rel = _rel_of(ctx.root, old), _rel_of(ctx.root, new)
+    await _record_change(ctx, old_rel, "move", None, None,
+                         diff=f"移动: {old_rel} → {new_rel}")
+    return {"ok": True, "from": old_rel, "to": new_rel}
+
+
+async def _handle_revert_change(ctx: ToolContext, args: dict, *, confirmed: bool = False) -> dict:
+    rel = args.get("path")
+    f = resolve_in_workspace(ctx.root, rel)
+    from app.deploy.guard import is_protected
+    if is_protected(Path(ctx.root), rel):
+        raise ToolError("app.json 与 deploy/ 由平台管理，AI 不可回滚")
+    if ctx.session_factory is None:
+        raise ToolError("当前会话没有变更记录存储，无法回滚")
+    path_rel = _rel_of(ctx.root, f)
+    async with ctx.session_factory() as s:
+        row = (await s.execute(text(
+            "SELECT id, action, before_content, after_content FROM file_change "
+            "WHERE session_id=:sid AND path=:p AND before_content IS NOT NULL "
+            "ORDER BY id DESC LIMIT 1"),
+            {"sid": ctx.session_id, "p": path_rel})).mappings().first()
+    if row is None:
+        raise ToolError(f"没有可回滚的改动记录: {rel}"
+                        "（本会话没改过它，或那条记录未存原文→不可回滚）")
+    after = row["after_content"] or ""
+    current = _read_text_keep_eol(f) if f.is_file() else None
+    if current is None and f.is_file():
+        raise ToolError("文件不是 UTF-8 编码，无法比对，已拒绝回滚")
+    # 写前比对：磁盘必须仍停在该记录的 after_content 上（删除后「不存在」等价于空串）。
+    if (after == "" and current not in (None, "")) or (after != "" and current != after):
+        raise ToolError("文件当前内容与该记录不一致（本会话之后又被改过或移动），"
+                       "已拒绝回滚以免覆盖这些改动")
+    before = row["before_content"]
+    if before == "":
+        # 撤销「新建」：原文是「文件不存在」，写回空串会留一个空壳文件，故直接删掉。
+        if not f.exists():
+            raise ToolError(f"磁盘上已没有该文件，无需回滚: {rel}")
+        f.unlink()
+        await _record_change(ctx, path_rel, "delete", current or "", "",
+                             diff=f"回滚：撤销新建 {path_rel}")
+        return {"ok": True, "path": path_rel, "change_id": row["id"], "deleted": True}
+    existed = f.is_file()
+    f.parent.mkdir(parents=True, exist_ok=True)
+    with open(f, "w", encoding="utf-8", newline="") as fh:
+        fh.write(before)
+    await _record_change(ctx, path_rel, "edit" if existed else "create", current or "", before)
+    return {"ok": True, "path": path_rel, "change_id": row["id"], "deleted": False}
 
 
 async def _handle_todo_write(ctx: ToolContext, args: dict, *, confirmed: bool = False) -> dict:

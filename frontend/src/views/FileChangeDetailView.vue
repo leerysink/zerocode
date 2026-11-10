@@ -101,8 +101,8 @@ const model = computed(() => (row.value
   })
   : null))
 
-// 与后端 tools.py 的 action 取值对应（create/edit/delete），未知值原样展示
-const ACTION_LABEL = { create: '新建', edit: '修改', delete: '删除' }
+// 与后端 tools.py 的 action 取值对应（create/edit/delete/move），未知值原样展示
+const ACTION_LABEL = { create: '新建', edit: '修改', delete: '删除', move: '移动' }
 const actionLabel = computed(() => {
   const a = row.value?.action || ''
   return ACTION_LABEL[a] || a
