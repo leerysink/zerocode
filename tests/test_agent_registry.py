@@ -15,7 +15,8 @@ BASE_NAMES = ["list_dir", "read_file", "search", "write_file", "edit_file",
               "ask_user", "todo_write", "memory_write"]
 APP_NAMES = ["preview_status", "preview_logs", "preview_restart",
              "db_query", "db_write", "preview_page",
-             "browser_open", "browser_step", "browser_close"]
+             "browser_open", "browser_step", "browser_close",
+             "release_preflight", "db_schema", "sqlchange_status"]
 
 
 def _names(app=False, clarify=False):

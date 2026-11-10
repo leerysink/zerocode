@@ -576,9 +576,11 @@ async def test_preview_tools_mounted_only_for_app_workspace(test_engine, tmp_pat
     sid, aid, sf = await mk_app_session(test_engine, tmp_path)
     llm = ScriptedLLM([[delta("好"), *done("好了")]])
     await mk_runner(sf, llm, Recorder()).run(sid, "起个预览", asyncio.Event())
-    assert tool_names(llm)[-9:] == ["preview_status", "preview_logs", "preview_restart",
-                                    "db_query", "db_write", "preview_page",
-                                    "browser_open", "browser_step", "browser_close"]
+    assert tool_names(llm)[-12:] == ["preview_status", "preview_logs", "preview_restart",
+                                     "db_query", "db_write", "preview_page",
+                                     "browser_open", "browser_step", "browser_close",
+                                     "release_preflight", "db_schema", "sqlchange_status"]
+    assert "<app_diagnostics>" in llm.received[0][0]["content"]
     assert "<preview>" in llm.received[0][0]["content"]
     assert "<browser>" in llm.received[0][0]["content"]
     assert "<browser_session>" in llm.received[0][0]["content"]
@@ -596,7 +598,9 @@ async def test_no_preview_tools_without_app_row(test_engine, tmp_path):
     assert not any(n.startswith("preview_") for n in names)
     assert not any(n.startswith("db_") for n in names)
     assert not any(n.startswith("browser_") for n in names)   # 交互工具同闸（规格 §5.1）
+    assert "release_preflight" not in names and "sqlchange_status" not in names
     assert "<preview>" not in llm.received[0][0]["content"]
+    assert "<app_diagnostics>" not in llm.received[0][0]["content"]
     assert "<database>" not in llm.received[0][0]["content"]
     assert "<browser>" not in llm.received[0][0]["content"]
     assert "<browser_session>" not in llm.received[0][0]["content"]

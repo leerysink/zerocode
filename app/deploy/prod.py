@@ -276,7 +276,8 @@ async def _step_ev(app_id, notify, rid_step_cb, step: str, state: str) -> None:
         await rid_step_cb(step)
 
 
-async def _ensure_prod_proxy_conf(root: Path, stack: str = "vue3-fastapi") -> bool:
+async def _ensure_prod_proxy_conf(root: Path, stack: str = "vue3-fastapi", *,
+                                  dry_run: bool = False) -> bool:
     """存量应用补齐生产反代接线（T3b 之前创建的工程没有 nginx.conf，更没把它 COPY 进镜像）。
 
     终审 C-1：只补 conf 不够——M1 存量 frontend/Dockerfile 没有 `COPY nginx.conf` 那行，
@@ -286,6 +287,8 @@ async def _ensure_prod_proxy_conf(root: Path, stack: str = "vue3-fastapi") -> bo
     补齐源按栈取（C2）：给大型应用刷 fastapi 那份 = 把 `backend:8000` 的 upstream 塞进它镜像，
     必须跟着 app 自己的 stack 走；`stack` 默认 vue3-fastapi 保旧调用形状不变。
     叠加栈（移动栈）按层序**倒序**找：覆盖层先于基底，与 scaffold 渲染「后者胜」一致。
+
+    dry_run=True 只回答「会不会补」，绝不写盘（release_preflight 的只读体检用）。
     """
     from app.services.app_service import TEMPLATES, template_layers_of
     fe = root / "frontend"
@@ -297,9 +300,10 @@ async def _ensure_prod_proxy_conf(root: Path, stack: str = "vue3-fastapi") -> bo
                     if (TEMPLATES / layer / "frontend" / "nginx.conf").is_file()), None)
         if src is None:
             raise DeployError(f"生产反代模板缺失：{stack}/frontend/nginx.conf", status=500)
-        conf.write_text(src.read_text(encoding="utf-8"), encoding="utf-8", newline="")
+        if not dry_run:
+            conf.write_text(src.read_text(encoding="utf-8"), encoding="utf-8", newline="")
         patched = True
-    if fe.is_dir() and _wire_dockerfile_proxy(fe / "Dockerfile"):
+    if fe.is_dir() and _wire_dockerfile_proxy(fe / "Dockerfile", dry_run=dry_run):
         patched = True
     return patched
 
@@ -313,7 +317,7 @@ _MIRROR_WIRES = (
 
 
 def _wire_dockerfile_mirror(dockerfile: Path, from_prefix: str, install_hint: str,
-                            arg: str, default: str) -> bool:
+                            arg: str, default: str, *, dry_run: bool = False) -> bool:
     """存量应用的 Dockerfile 补 `ARG` + `ENV` 两行，让 prod 构建期的 build args 有消费方（幂等）。
 
     与 `_wire_dockerfile_proxy` 同一条保守纪律，只认平台模板形状：指定基座 + 真有那条安装指令。
@@ -331,12 +335,13 @@ def _wire_dockerfile_mirror(dockerfile: Path, from_prefix: str, install_hint: st
     for i, ln in enumerate(lines):
         if ln.strip().upper().startswith(from_prefix):
             lines[i + 1:i + 1] = [f"ARG {arg}={default}", f"ENV {arg}=${{{arg}}}"]
-            dockerfile.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="")
+            if not dry_run:
+                dockerfile.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="")
             return True
     return False
 
 
-def ensure_prod_build_mirror(root: Path) -> bool:
+def ensure_prod_build_mirror(root: Path, *, dry_run: bool = False) -> bool:
     """按形状给存量应用的 backend/frontend Dockerfile 补镜像源接线，任一发生即 True。
 
     与镜像源本身是否配置无关：模板里的 ARG 默认值就是官方源，所以没配镜像源的部署补了也零行为
@@ -345,7 +350,8 @@ def ensure_prod_build_mirror(root: Path) -> bool:
     patched = False
     for rel, prefix, hint, arg, default in _MIRROR_WIRES:
         # 不用 any(生成器表达式)：短路会把后半边的接线跳过，两个 stage 都得补
-        if _wire_dockerfile_mirror(root / rel / "Dockerfile", prefix, hint, arg, default):
+        if _wire_dockerfile_mirror(root / rel / "Dockerfile", prefix, hint, arg, default,
+                                   dry_run=dry_run):
             patched = True
     return patched
 
@@ -357,7 +363,7 @@ _LEGACY_TYPECHECK_BUILD = '"build": "vue-tsc -b && vite build"'
 _VITE_ONLY_BUILD = '"build": "vite build"'
 
 
-def ensure_prod_build_script(root: Path) -> bool:
+def ensure_prod_build_script(root: Path, *, dry_run: bool = False) -> bool:
     """存量应用 frontend/package.json 的 build 摘掉 vue-tsc 闸门（幂等）。
 
     只认逐字命中模板的那一行：应用自己改过的构建脚本（哪怕只是加了个 flag）原样放过，
@@ -370,12 +376,13 @@ def ensure_prod_build_script(root: Path) -> bool:
     text = pkg.read_text(encoding="utf-8")
     if _LEGACY_TYPECHECK_BUILD not in text:
         return False
-    pkg.write_text(text.replace(_LEGACY_TYPECHECK_BUILD, _VITE_ONLY_BUILD),
-                   encoding="utf-8", newline="")
+    if not dry_run:
+        pkg.write_text(text.replace(_LEGACY_TYPECHECK_BUILD, _VITE_ONLY_BUILD),
+                       encoding="utf-8", newline="")
     return True
 
 
-def _wire_dockerfile_proxy(dockerfile: Path) -> bool:
+def _wire_dockerfile_proxy(dockerfile: Path, *, dry_run: bool = False) -> bool:
     """M1 存量 frontend/Dockerfile 缺 `COPY nginx.conf`：在 nginx 基座 FROM 行后补一行（幂等）。
 
     只对**平台模板形状**出手（FROM nginx* 且无该 COPY 指令）；形状不认识就原样放过，
@@ -389,9 +396,78 @@ def _wire_dockerfile_proxy(dockerfile: Path) -> bool:
     for i, ln in enumerate(lines):
         if ln.strip().upper().startswith("FROM NGIN"):
             lines.insert(i + 1, "COPY nginx.conf /etc/nginx/conf.d/default.conf")
-            dockerfile.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="")
+            if not dry_run:
+                dockerfile.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="")
             return True
     return False
+
+
+async def preflight_checks(sf, root: Path, app: dict, prev_version: str | None, *,
+                           confirm_destructive: bool = False, read_only: bool = False):
+    """发布 preflight 的唯一判据源（publish 与 release_preflight 工具共用）。
+
+    按**真实执行顺序**逐项产出 dict：
+    - kind="block"：不修必失败；message 即发布侧异常文案，payload 原样传给 DeployError；
+    - kind="fix"：平台会幂等回填的工程接线；read_only=False 时就地回填，True 时只回答「补不补」；
+    - kind="note"：跳过 / 已放行 / 校验通过的播报。
+
+    两处各写一份判据必然分叉——「体检说没问题、发布却报错」会直接毁掉用户对体检的信任。
+    """
+    slug = app["slug"]
+    bad = scan_sqlchange(root)
+    if bad:
+        yield {"kind": "block", "code": "sqlchange_name",
+               "message": f"sqlchange 文件名不规范：{bad}（应为 V<日期>_<两位序号>_<说明>.sql）"}
+    if not (root / "app.json").is_file():
+        yield {"kind": "block", "code": "app_json", "message": "app.json 缺失，无法发布"}
+    if await _ensure_prod_proxy_conf(root, app.get("stack") or "vue3-fastapi",
+                                     dry_run=read_only):
+        yield {"kind": "fix", "code": "prod_proxy",
+               "message": "✓ 已为存量应用补齐 frontend 生产反代（nginx.conf / Dockerfile COPY 接线）",
+               "report": "frontend 生产反代接线缺失（nginx.conf / Dockerfile COPY），发布时平台会自动补齐"}
+    if ensure_prod_build_mirror(root, dry_run=read_only):
+        yield {"kind": "fix", "code": "build_mirror",
+               "message": "✓ 已为存量应用补齐 prod 构建期依赖镜像源接线（Dockerfile ARG/ENV）",
+               "report": "prod 构建期依赖镜像源接线缺失（Dockerfile ARG/ENV），发布时平台会自动补齐"}
+    if ensure_prod_build_script(root, dry_run=read_only):
+        yield {"kind": "fix", "code": "build_script",
+               "message": "✓ 已为存量应用摘掉 prod 构建的类型检查闸门（frontend build → vite build）",
+               "report": "frontend 构建脚本仍带 vue-tsc 闸门，发布时平台会摘成 vite build"}
+    cfg = await deploy_cfg(sf)
+    # 1.x dev/prod 结构等价校验（P1 止血；并入 preflight，不改步序）：
+    #     dev 实际结构必须等于 fold(sqlchange 文件)，否则视为漂移，硬阻断发布。
+    skip_verify = str(cfg.get("deploy.skip_schema_parity", "")).lower() in ("1", "true", "yes")
+    if skip_verify:
+        yield {"kind": "note", "code": "skip_parity",
+               "message": "⚠ 已跳过 dev/prod 结构等价校验（deploy.skip_schema_parity）"}
+    else:
+        vp = await verify_dev_matches_files(sf, root, slug)
+        block = parity_block_message(vp)
+        if block:
+            yield {"kind": "block", "code": "schema_parity", "message": block}
+        else:
+            yield {"kind": "note", "code": "parity_ok",
+                   "message": "✓ dev 结构与 sqlchange 文件等价校验通过"}
+    # 1.y 结构破坏性闸门（P2→P3 可确认）：上一版归档快照 vs 当前 schema.sql，
+    #     命中删/改名/收窄即阻断；confirm_destructive（一次性）或持久 skip 才放行。
+    skip_destr = str(cfg.get("deploy.skip_schema_destructive", "")).lower() in ("1", "true", "yes")
+    if skip_destr:
+        yield {"kind": "note", "code": "skip_destructive",
+               "message": "⚠ 已跳过结构破坏性闸门（deploy.skip_schema_destructive 持久兜底）"}
+    elif confirm_destructive:
+        yield {"kind": "note", "code": "destructive_confirmed",
+               "message": "⚠ 破坏性变更已由人工确认放行（本次一次性，不改持久配置）"}
+    else:
+        d = compute_schema_diff(root, prev_version)
+        if d is not None:
+            msg = destructive_message(d)
+            if msg:
+                yield {"kind": "block", "code": "schema_destructive", "message": msg,
+                       "payload": {"code": "schema_destructive",
+                                   "destructive": destructive_changes(d), "diff": d}}
+            else:
+                yield {"kind": "note", "code": "destructive_ok",
+                       "message": "✓ 结构破坏性校验通过（相对上一版无删/改名/收窄）"}
 
 
 async def publish(sf, app: dict, notify=None, *, force: bool = False,
@@ -440,45 +516,11 @@ async def publish(sf, app: dict, notify=None, *, force: bool = False,
         await _notify(notify, app_id, {"type": "prod_status", "status": "publishing"})
         # 1 preflight：命名规范 + 工程件齐备（旧栈原样在跑，此时失败=零影响）
         await _step_ev(app_id, notify, rst, "preflight", "running")
-        bad = scan_sqlchange(root)
-        if bad:
-            raise DeployError(f"sqlchange 文件名不规范：{bad}（应为 V<日期>_<两位序号>_<说明>.sql）")
-        if not (root / "app.json").is_file():
-            raise DeployError("app.json 缺失，无法发布")
-        if await _ensure_prod_proxy_conf(root, app.get("stack") or "vue3-fastapi"):
-            await _step(app_id, notify, "✓ 已为存量应用补齐 frontend 生产反代（nginx.conf / Dockerfile COPY 接线）")
-        if ensure_prod_build_mirror(root):
-            await _step(app_id, notify, "✓ 已为存量应用补齐 prod 构建期依赖镜像源接线（Dockerfile ARG/ENV）")
-        if ensure_prod_build_script(root):
-            await _step(app_id, notify, "✓ 已为存量应用摘掉 prod 构建的类型检查闸门（frontend build → vite build）")
-        # 1.x dev/prod 结构等价校验（P1 止血；并入 preflight，不改步序）：
-        #     dev 实际结构必须等于 fold(sqlchange 文件)，否则视为漂移，硬阻断发布。
-        _skip_verify = str((await deploy_cfg(sf)).get("deploy.skip_schema_parity", "")).lower() in ("1", "true", "yes")
-        if _skip_verify:
-            await _step(app_id, notify, "⚠ 已跳过 dev/prod 结构等价校验（deploy.skip_schema_parity）")
-        else:
-            _vp = await verify_dev_matches_files(sf, root, slug)
-            _block = parity_block_message(_vp)
-            if _block:
-                raise DeployError(_block)
-            await _step(app_id, notify, "✓ dev 结构与 sqlchange 文件等价校验通过")
-        # 1.y 结构破坏性闸门（P2→P3 可确认）：上一版归档快照 vs 当前 schema.sql，
-        #     命中删/改名/收窄即阻断；confirm_destructive（一次性）或持久 skip 才放行。
-        _skip_destr = str((await deploy_cfg(sf)).get("deploy.skip_schema_destructive", "")).lower() in ("1", "true", "yes")
-        if _skip_destr:
-            await _step(app_id, notify, "⚠ 已跳过结构破坏性闸门（deploy.skip_schema_destructive 持久兜底）")
-        elif confirm_destructive:
-            await _step(app_id, notify, "⚠ 破坏性变更已由人工确认放行（本次一次性，不改持久配置）")
-        else:
-            d = compute_schema_diff(root, prev_version)
-            if d is not None:
-                msg = destructive_message(d)
-                if msg:
-                    raise DeployError(msg, payload={
-                        "code": "schema_destructive",
-                        "destructive": destructive_changes(d),
-                        "diff": d})
-                await _step(app_id, notify, "✓ 结构破坏性校验通过（相对上一版无删/改名/收窄）")
+        async for item in preflight_checks(sf, root, app, prev_version,
+                                           confirm_destructive=confirm_destructive):
+            if item["kind"] == "block":
+                raise DeployError(item["message"], payload=item.get("payload"))
+            await _step(app_id, notify, item["message"])
         await _step_ev(app_id, notify, rst, "preflight", "ok")
         # 2 build（旧容器不动——04 §4.1；渲染先于 build：prod-compose.yml 的落盘条件已放宽为栈判定）
         await _step_ev(app_id, notify, rst, "build", "running")

@@ -85,6 +85,14 @@ async def _cred_or_409(request, slug: str, env: str) -> dict:
     return cred
 
 
+async def tables_of(conn) -> list[dict]:
+    """public schema 下的基表与视图（connection 级核心；REST 与 Agent 工具共用）。"""
+    rows = (await conn.execute(text(
+        "SELECT table_name AS name, table_type AS type FROM information_schema.tables "
+        "WHERE table_schema = 'public' ORDER BY table_name"))).mappings().all()
+    return [dict(r) for r in rows]
+
+
 async def list_tables(request, slug: str, env: str) -> list[dict]:
     """列 public schema 下基表与视图（information_schema 参数化，无注入面）。"""
     cred = await _cred_or_409(request, slug, env)
@@ -92,10 +100,7 @@ async def list_tables(request, slug: str, env: str) -> list[dict]:
     try:
         async with eng.connect() as conn:
             await conn.exec_driver_sql(f"SET statement_timeout = '{STATEMENT_TIMEOUT}'")
-            rows = (await conn.execute(text(
-                "SELECT table_name AS name, table_type AS type FROM information_schema.tables "
-                "WHERE table_schema = 'public' ORDER BY table_name"))).mappings().all()
-        return [dict(r) for r in rows]
+            return await tables_of(conn)
     finally:
         await eng.dispose()
 
@@ -127,6 +132,18 @@ async def _table_columns_pk(conn, table: str) -> dict | None:
     }
 
 
+async def schema_of(conn, table: str) -> dict:
+    """单表列/主键/索引（connection 级核心；REST 与 Agent 工具共用）。表不存在 → DeployError(404)。"""
+    base = await _table_columns_pk(conn, table)
+    if base is None:
+        raise DeployError(f"表不存在: {table}", status=404)
+    idx = (await conn.execute(text(
+        "SELECT indexname AS name, indexdef AS definition FROM pg_indexes "
+        "WHERE schemaname='public' AND tablename=:t ORDER BY indexname"),
+        {"t": table})).mappings().all()
+    return {**base, "indexes": [dict(i) for i in idx]}
+
+
 async def table_schema(request, slug: str, env: str, table: str) -> dict:
     """读列/主键/索引。table 作绑定参数查 information_schema；不存在 → DeployError(404)。"""
     cred = await _cred_or_409(request, slug, env)
@@ -134,14 +151,7 @@ async def table_schema(request, slug: str, env: str, table: str) -> dict:
     try:
         async with eng.connect() as conn:
             await conn.exec_driver_sql(f"SET statement_timeout = '{STATEMENT_TIMEOUT}'")
-            base = await _table_columns_pk(conn, table)
-            if base is None:
-                raise DeployError(f"表不存在: {table}", status=404)
-            idx = (await conn.execute(text(
-                "SELECT indexname AS name, indexdef AS definition FROM pg_indexes "
-                "WHERE schemaname='public' AND tablename=:t ORDER BY indexname"),
-                {"t": table})).mappings().all()
-        return {**base, "indexes": [dict(i) for i in idx]}
+            return await schema_of(conn, table)
     finally:
         await eng.dispose()
 

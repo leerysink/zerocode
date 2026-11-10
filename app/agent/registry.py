@@ -160,6 +160,16 @@ _DB_WRITE = _fn(
     {"statements": {"type": "array", "items": {"type": "string"},
                     "description": "按执行顺序的 SQL 语句（INSERT/UPDATE/DELETE/表级 DDL）"}},
     ["statements"])
+_DIAG_PREFLIGHT = _fn(
+    "release_preflight",
+    "发布前只读体检：列出阻断项与发布时会自动补齐的可自修项（不写盘、不构建、不起容器）")
+_DIAG_DB_SCHEMA = _fn(
+    "db_schema", "查看当前应用库结构（只读）：不带 table 回表清单，带 table 回该表列/主键/索引",
+    {"env": {"type": "string", "enum": ["dev", "prod"], "description": "看哪套库，默认 dev"},
+     "table": {"type": "string", "description": "可选；给出则回该表详情"}})
+_DIAG_SQLCHANGE = _fn(
+    "sqlchange_status",
+    "查看数据轨各环境已执行/未执行的迁移文件（只读，dev 与 prod 各自列出 pending 与 failed）")
 
 _PREVIEW_PAGE = _fn(
     "preview_page",
@@ -248,6 +258,16 @@ SPECS: tuple[ToolSpec, ...] = (
     ToolSpec("browser_close", _BROWSER_CLOSE, "browser_session", scope=SCOPE_APP,
              handler_ref=("app.agent.browser_session_tools", "run_browser_session_tool"),
              pass_name=True, result_policy=BROWSER_POLICY),
+    # 只读诊断（Week 2）：判据复用 prod.preflight_checks / db_admin_service / sqlrun，不另起一套。
+    ToolSpec("release_preflight", _DIAG_PREFLIGHT, "diag", scope=SCOPE_APP,
+             handler_ref=("app.agent.diag_tools", "run_diag_tool"),
+             pass_name=True, result_policy=SMALL_POLICY),
+    ToolSpec("db_schema", _DIAG_DB_SCHEMA, "diag", scope=SCOPE_APP,
+             handler_ref=("app.agent.diag_tools", "run_diag_tool"),
+             pass_name=True, result_policy=DB_POLICY),
+    ToolSpec("sqlchange_status", _DIAG_SQLCHANGE, "diag", scope=SCOPE_APP,
+             handler_ref=("app.agent.diag_tools", "run_diag_tool"),
+             pass_name=True, result_policy=DB_POLICY),
 )
 
 SPEC_BY_NAME: dict[str, ToolSpec] = {spec.name: spec for spec in SPECS}

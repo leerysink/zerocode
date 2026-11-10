@@ -17,7 +17,6 @@ from fastapi import APIRouter, Request, HTTPException, File, Form, UploadFile
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import create_async_engine
 from app.deploy import apkbuild, engine, mobile, mpbuild, mpcreds, prod, records, shell, sqlrun
 from app.deploy import provision
 from app.deploy import tasks as deploy_tasks
@@ -447,15 +446,8 @@ from app.store.anchor import app_db_url as _app_db_url
 
 
 async def _history_rows(url: str, sql: str) -> list[dict]:
-    """读应用库的 sqlchange_history；库没供给/历史表没建（应用刚创建还没迁移过）→ 空列表而非 500。"""
-    eng = create_async_engine(url)
-    try:
-        async with eng.connect() as c:
-            return [dict(r) for r in (await c.execute(text(sql))).mappings().all()]
-    except Exception:
-        return []
-    finally:
-        await eng.dispose()
+    """应用库记账读取：实现收口在 sqlrun.history_rows（REST 与 Agent 共用同一份读法）。"""
+    return await sqlrun.history_rows(url, sql)
 
 
 async def _run_sqlchange(sf, app: dict, hub) -> None:

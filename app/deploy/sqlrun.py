@@ -74,6 +74,25 @@ async def build_if_missing() -> None:
         raise RuntimeError(f"sqlrunner 镜像构建失败:\n{log}")
 
 
+async def history_rows(url: str, sql: str) -> list[dict]:
+    """读应用库的 sqlchange_history；库没供给/历史表没建（应用刚创建还没迁移过）→ 空列表而非 500。
+
+    收口在 sqlrun（迁移记账就住在这里）：REST 的 records/files 与 Agent 的 sqlchange_status 共用。
+    吞异常是刻意的——「历史读不到」与「一条都没执行」对调用方是同一个结论，
+    不该让一次状态查询把整页打成 500。
+    """
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import create_async_engine
+    eng = create_async_engine(url)
+    try:
+        async with eng.connect() as c:
+            return [dict(r) for r in (await c.execute(text(sql))).mappings().all()]
+    except Exception:
+        return []
+    finally:
+        await eng.dispose()
+
+
 def segment_files(sqlchange_dir: Path, env: str) -> list[str]:
     """某环境一次执行会看到的 .sql **相对 sqlchange/ 的路径**（公共段在前、本环境段在后）。
 
