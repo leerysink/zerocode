@@ -8,7 +8,7 @@
 message_done 是**轮次收口**，不是执行终态：每个工具轮在派发工具之前也会发一次（content 为空则不发），
 把本轮已流式输出的文字固化成一条消息，所以一次执行可以发多次。执行终态只由 status/error 判定。
 """
-import asyncio, datetime, inspect, itertools, json
+import asyncio, datetime, inspect, itertools, json, time
 import logging
 from pathlib import Path
 from app.agent.preview_tools import (build_preview_prompt, confirm_summary, fetch_app,
@@ -19,11 +19,13 @@ from app.agent.browser_session_tools import (build_browser_session_prompt, close
 from app.agent.db_tools import build_db_prompt, db_confirm_summary
 from app.agent.prompts import build_clarify_prompt, build_system_prompt
 from app.agent import clarify as _cl
+from app.agent import registry as _registry
 from app.agent.tools import ToolContext, ToolError, execute_tool
 from app.agent.mentions import expand_mentions
 from app.agent.redact import redact_tool_calls_args, redact_tool_result
 from app.services import compaction_service as _comp
 from app.services import memory_service as _mem
+from app.services import tool_metric_service as _tool_metric
 from app.services.message_service import add_message
 from app.services.session_title_service import ensure_session_title
 from sqlalchemy import text
@@ -453,13 +455,11 @@ class AgentRunner:
                               + build_browser_prompt() + build_browser_session_prompt())
         # 交互工具的挂载条件与 preview_page 完全一致（规格 §5.1）：只在解析出唯一应用时挂载，
         # 非应用工作区连「调了才发现不能用」的假工具都不给。
-        tools = (_TOOLS + PREVIEW_TOOLS + DB_TOOLS + BROWSER_TOOLS + BROWSER_SESSION_TOOLS
-                 if app else _TOOLS)
-        # 澄清工具与门禁同生同灭（规格 §4 故事 20）：关掉开关的账户既不该看见 clarify_done，
-        # 更不该被一道模型看不见的闸拦下写入——那只会让写文件变成莫名失败。
+        # 挂载由注册表按范围拼装（基础恒在 / 应用 / 澄清），不再在这里手拼几个名单：
+        # 非应用工作区连「调了才发现不能用」的假工具都不给；clarify_done 与澄清门禁同生同灭
+        # （关掉开关的账户既不该看见它，也不该被一道看不见的闸拦下写入）。
         clarify_on = _cl.enabled(cfg)
-        if clarify_on:
-            tools = tools + CLARIFY_TOOLS
+        tools = _registry.build_tools(app=bool(app), clarify=clarify_on)
         run_state = {}
         if (clarify_on and self.clarify_waived is not None
                 and self.clarify_waived.get(session_id)):
@@ -569,7 +569,11 @@ class AgentRunner:
                     except json.JSONDecodeError:
                         push_args = {}
                     await self.send({"type": "tool_call", "name": name, "args": push_args})
+                    started = time.perf_counter()
                     result = await self._dispatch(ctx, cfg, session_id, name, exec_args, cancel)
+                    await self._note_tool_metric(session_id, name, result,
+                                                 int((time.perf_counter() - started) * 1000),
+                                                 _round)
                     # 凭据遮断（Ticket 010 第五出口）：tool_result 落库 / WS 推送走净化版，
                     # 但**当轮回注模型仍用原文**——read_file 的真实内容必须进 messages，
                     # 否则模型看不到文件、edit_file 构造不出 old_string。平台侧库/事件不留
@@ -610,6 +614,25 @@ class AgentRunner:
             await add_message(self.sf, session_id, "tool", tool_call_id=exec_tc.get("id"),
                               tool_name=name, tool_result=cancelled)
             await self.send({"type": "tool_result", "name": name, "result": cancelled})
+
+    async def _note_tool_metric(self, session_id, name, result, duration_ms, round_no):
+        """一次工具调用一行度量（2026-11-10）：工具名/成败/耗时/结果体积/截断/拒绝/轮次。
+
+        记录的是 `_dispatch` 的返回值——也就是**模型实际看到的那份**（预算已施加、确认标记
+        已写入），所以轮次与体积能与真实上下文成本对上。写入本身是旁路，服务层吞异常。
+        `ask_user` 的耗时会包含用户思考/离开的时间，读聚合时按工具分开看，别拿总均值当性能。
+        """
+        payload = result if isinstance(result, dict) else {}
+        denied = payload.get("confirm") == "denied"
+        ok = payload.get("ok") is not False and not payload.get("cancelled") and not denied
+        try:
+            chars = len(json.dumps(result, ensure_ascii=False, default=str))
+        except (TypeError, ValueError):
+            chars = 0
+        truncated = bool((payload.get("_budget") or {}).get("truncated"))
+        await _tool_metric.record(
+            self.sf, session_id=session_id, tool_name=name, ok=ok, duration_ms=duration_ms,
+            result_chars=chars, truncated=truncated, denied=denied, round_no=round_no)
 
     @staticmethod
     def _denied(cancel, message):
@@ -663,8 +686,11 @@ class AgentRunner:
             if isinstance(assumptions, list) and assumptions:
                 result["assumptions"] = [str(a) for a in assumptions][:20]
             return result
+        # 确认策略读注册表：加一个需要确认的工具不必再回来改这里的 if 链。
+        spec = _registry.spec_of(name)
+        confirm_policy = spec.confirm if spec is not None else _registry.CONFIRM_NONE
         confirmed = False
-        if name in ("write_file", "edit_file"):
+        if confirm_policy == _registry.CONFIRM_WRITE:
             # 门禁挡在写入确认**之前**：不能让用户先吃一张确认卡、再告之后端其实没写。
             if _cl.enabled(cfg):
                 blocked = _cl.gate_block(ctx.run_state)
@@ -684,7 +710,7 @@ class AgentRunner:
                 # 批准也要置位：confirmed 是结果里 confirm 标记的唯一来源，漏了它前端就认不出
                 # 「这次写入是用户点头放行的」——已答态确认卡与刷新后的留痕都会退化成普通折叠块。
                 confirmed = True
-        elif name == "preview_restart":
+        elif confirm_policy == _registry.CONFIRM_PREVIEW_RESTART:
             # 中断运行中的预览要用户点头（§5.6）。AgentRunner 仍是 confirm_request 的唯一发出方；
             # 事件多带一个 summary，前端据此把「写入确认」换成「重启预览」的人话文案。
             # 判据读的是**此刻**的库状态：确认期间状态可能已经变了，handler 侧还有一道兜底。
@@ -704,9 +730,9 @@ class AgentRunner:
                 if not approved:
                     return self._denied(cancel, "用户拒绝重启预览")
                 confirmed = True
-        elif name == "db_write":
-            # 写库恒确认，不受 agent.write_confirm 开关影响（ADR-0027）：文件写入可 git 回滚，
-            # 数据库写入不可回滚。摘要逐条列 op 与危险标记，用户在确认卡里看到将发生什么。
+        elif confirm_policy == _registry.CONFIRM_ALWAYS:
+            # 恒确认，不受 agent.write_confirm 开关影响（ADR-0027）：文件写入可 git 回滚，
+            # 数据库写入不可回滚。今天只有 db_write 走这条；摘要逐条列 op 与危险标记。
             summary = db_confirm_summary(args.get("statements") or [])
             await self.send({"type": "confirm_request", "tool": name, "args": args,
                              "summary": summary})
@@ -729,6 +755,3 @@ class AgentRunner:
 
 class _Cancelled(Exception):
     pass
-
-from app.agent.llm import (PREVIEW_TOOLS, DB_TOOLS, BROWSER_TOOLS, BROWSER_SESSION_TOOLS,
-                           CLARIFY_TOOLS, TOOLS as _TOOLS)
