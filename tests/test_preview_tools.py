@@ -1148,13 +1148,24 @@ async def test_preview_context_fields_default_safely_and_are_not_shared(tmp_path
 
 
 async def test_no_command_execution_tool_exists(tmp_path):
-    """红线：动作面只有三个预览工具，没有任何 shell/命令入口（规格 §12）。"""
+    """红线（ADR-0046 改写后）：工具面无通用命令执行能力，只允许平台写死的 preset。
+
+    原先按「名字黑名单」钉，现在语义升级为「preset 白名单」：任何 schema 都不得出现
+    command/cmd/argv/shell/script 参数，唯一的执行类工具 run_check 只能选写死的 preset。
+    """
+    from app.agent import registry
     from app.agent.llm import PREVIEW_TOOL_NAMES, TOOLS
     from app.agent.tools import ToolContext, ToolError, execute_tool
     names = {t["function"]["name"] for t in TOOLS} | set(PREVIEW_TOOL_NAMES)
     assert names == {"list_dir", "read_file", "search", "write_file", "edit_file", "ask_user",
                      "todo_write", "memory_write",
                      "preview_status", "preview_logs", "preview_restart"}
+    for spec in registry.SPECS:
+        props = spec.schema["function"]["parameters"].get("properties", {})
+        assert not (set(props) & {"command", "cmd", "argv", "shell", "script"}), spec.name
+    check = registry.spec_of("run_check").schema["function"]["parameters"]
+    assert set(check["properties"]) == {"preset"}
+    assert check["properties"]["preset"]["enum"] == ["frontend_typecheck", "backend_compile"]
     ctx = ToolContext(root=tmp_path, session_id=1, session_factory=None, send=None)
     for forbidden in ("run_shell", "exec", "terminal", "run_command", "preview_stop"):
         with pytest.raises(ToolError):

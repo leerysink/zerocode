@@ -17,6 +17,7 @@ from app.agent.browser_tools import build_browser_prompt
 from app.agent.browser_session_tools import (build_browser_session_prompt, close_browser_session,
                                             redact_sensitive_step_args)
 from app.agent.db_tools import build_db_prompt, db_confirm_summary
+from app.agent.check_tools import build_check_prompt
 from app.agent.diag_tools import build_diag_prompt
 from app.agent.prompts import build_clarify_prompt, build_system_prompt
 from app.agent import clarify as _cl
@@ -450,9 +451,10 @@ class AgentRunner:
         preview_prompt = preview_note or (build_preview_prompt(app["stack"]) if app else None)
         if app:
             # 数据库指引与工具同生同灭（多应用 fail closed 时两者都不注入）。块顺序固定：
-            # <app_diagnostics> → <database> → <preview> → <browser> → <browser_session>；
+            # <app_diagnostics> → <app_checks> → <database> → <preview> → <browser> → <browser_session>；
             # system 尾部锚定 </browser_session>（见 test_agent_loop 的提示词顺序断言）。
-            preview_prompt = (build_diag_prompt() + build_db_prompt() + (preview_prompt or "")
+            preview_prompt = (build_diag_prompt() + build_check_prompt() + build_db_prompt()
+                              + (preview_prompt or "")
                               + build_browser_prompt() + build_browser_session_prompt())
         # 交互工具的挂载条件与 preview_page 完全一致（规格 §5.1）：只在解析出唯一应用时挂载，
         # 非应用工作区连「调了才发现不能用」的假工具都不给。

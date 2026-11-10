@@ -37,6 +37,8 @@ SMALL_POLICY = ResultPolicy(max_chars=8_000, max_items=100, max_str_chars=2_000)
 LOG_POLICY = ResultPolicy(max_chars=20_000, max_items=300, max_str_chars=2_000)
 DB_POLICY = ResultPolicy(max_chars=32_000, max_items=500, max_str_chars=8_000)
 BROWSER_POLICY = ResultPolicy(max_chars=32_000, max_items=300, max_str_chars=8_000)
+# 自检输出只留尾部几 KB 的报错，够模型定位 file:line，不把整段构建日志塞回上下文。
+CHECK_POLICY = ResultPolicy(max_chars=16_000, max_items=200, max_str_chars=16_000)
 
 
 @dataclass(frozen=True)
@@ -170,6 +172,13 @@ _DIAG_DB_SCHEMA = _fn(
 _DIAG_SQLCHANGE = _fn(
     "sqlchange_status",
     "查看数据轨各环境已执行/未执行的迁移文件（只读，dev 与 prod 各自列出 pending 与 failed）")
+_RUN_CHECK = _fn(
+    "run_check",
+    "在一次性容器里跑平台写死的自检项（只报告，不阻断发布）："
+    "frontend_typecheck 前端类型/编译检查；backend_compile 后端编译。不能传命令或参数",
+    {"preset": {"type": "string", "enum": ["frontend_typecheck", "backend_compile"],
+                "description": "检查项（平台写死的白名单，见 ADR-0046）"}},
+    ["preset"])
 
 _PREVIEW_PAGE = _fn(
     "preview_page",
@@ -268,6 +277,10 @@ SPECS: tuple[ToolSpec, ...] = (
     ToolSpec("sqlchange_status", _DIAG_SQLCHANGE, "diag", scope=SCOPE_APP,
              handler_ref=("app.agent.diag_tools", "run_diag_tool"),
              pass_name=True, result_policy=DB_POLICY),
+    # 预设自检（Week 3，ADR-0046）：工具面无通用命令执行能力，只允许平台写死的 preset。
+    ToolSpec("run_check", _RUN_CHECK, "check", scope=SCOPE_APP,
+             handler_ref=("app.agent.check_tools", "run_check_tool"),
+             pass_name=True, result_policy=CHECK_POLICY),
 )
 
 SPEC_BY_NAME: dict[str, ToolSpec] = {spec.name: spec for spec in SPECS}
