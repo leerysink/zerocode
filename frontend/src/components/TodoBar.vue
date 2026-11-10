@@ -4,7 +4,7 @@ import { computed, ref } from 'vue'
 import { DownOutlined, RightOutlined } from '@ant-design/icons-vue'
 
 const props = defineProps({ todos: { type: Array, default: () => [] } })
-const open = ref(true)
+const open = ref(false)
 const doneCount = computed(() => props.todos.filter((t) => t.status === 'completed').length)
 const STATUS_TEXT = { pending: '待办', in_progress: '进行中', completed: '已完成' }
 </script>

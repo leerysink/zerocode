@@ -1,17 +1,26 @@
 // @vitest-environment happy-dom
 // 变更记录详情整页的地址层 + 装配层：地址 → 拉一条变更 → 交给双栏面板。
-// 行模型与展开行为在 ChangeDiffPane.test.js 钉；这里只钉本页独有的四件事：
-// 地址解析与「非法 id 一个请求都不发」、接口失败要说得清、顶栏与状态栏的口径、主题与「在编辑器中打开」。
+// 行模型与展开行为在 ChangeDiffPane.test.js 钉，左栏渲染在 ChangeFileList.test.js 钉；
+// 这里只钉本页独有的五件事：地址解析与「非法 id 一个请求都不发」、接口失败要说得清、
+// 顶栏与状态栏的口径、左栏切换与地址同步、主题与「在编辑器中打开」。
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { mount } from '@vue/test-utils'
 
 const mocks = vi.hoisted(() => ({
   route: { params: {}, query: {} },
+  replace: vi.fn(),
   getFileChange: vi.fn(),
+  getFileChanges: vi.fn(),
 }))
 
-vi.mock('vue-router', () => ({ useRoute: () => mocks.route }))
-vi.mock('../api', () => ({ getFileChange: mocks.getFileChange }))
+vi.mock('vue-router', () => ({
+  useRoute: () => mocks.route,
+  useRouter: () => ({ replace: mocks.replace }),
+}))
+vi.mock('../api', () => ({
+  getFileChange: mocks.getFileChange,
+  getFileChanges: mocks.getFileChanges,
+}))
 vi.mock('ant-design-vue', () => ({
   message: { success: vi.fn(), error: vi.fn(), info: vi.fn(), warning: vi.fn() },
 }))
@@ -31,6 +40,23 @@ const CHANGE = {
   workspace_name: '订单台账',
 }
 
+// 同一会话里的其他变更：列表接口按 id 倒序返回，当前这条（345）不在最前
+const LIST = [
+  { id: '346', path: 'src/new.js', action: 'create', diff: '', created_at: '2026-11-02T11:00:00+00:00' },
+  { id: '345', path: 'src/App.vue', action: 'edit', diff: '', created_at: '2026-11-02T10:00:00+00:00' },
+  { id: '344', path: 'src/old.js', action: 'delete', diff: '', created_at: '2026-11-02T09:00:00+00:00' },
+]
+
+const CHANGE2 = {
+  ...CHANGE,
+  id: '346',
+  path: 'src/new.js',
+  action: 'create',
+  diff: '--- /dev/null\n+++ b/src/new.js\n@@ -0,0 +1 @@\n+x\n',
+  before_content: '',
+  after_content: 'x\n',
+}
+
 async function mountView({ sessionId = '12', changeId = '345' } = {}) {
   mocks.route.params = { sessionId, changeId }
   const wrapper = mount(FileChangeDetailView)
@@ -38,13 +64,15 @@ async function mountView({ sessionId = '12', changeId = '345' } = {}) {
   return wrapper
 }
 
-// 详情是一次 await 之后才落到 DOM 的，等微任务队列跑干净再继续断言
+// 详情与列表各是一次 await，等微任务队列跑干净再继续断言
 async function flush() {
-  for (let i = 0; i < 4; i += 1) await Promise.resolve()
+  for (let i = 0; i < 8; i += 1) await Promise.resolve()
 }
 
 beforeEach(() => {
   mocks.getFileChange.mockReset().mockResolvedValue({ data: { ...CHANGE } })
+  mocks.getFileChanges.mockReset().mockResolvedValue({ data: LIST.map((c) => ({ ...c })) })
+  mocks.replace.mockReset()
   localStorage.clear()
 })
 
@@ -70,12 +98,14 @@ describe('FileChangeDetailView 地址与取数', () => {
       expect(mocks.getFileChange).not.toHaveBeenCalled()
       expect(wrapper.find('.zc-fcd-bad').exists()).toBe(true)
     }
+    expect(mocks.getFileChanges).not.toHaveBeenCalled()
   })
 
   it('边界：会话 id 不合法同样挡住（详情接口挂在会话下，归属校验靠它）', async () => {
     const wrapper = await mountView({ sessionId: 'abc' })
 
     expect(mocks.getFileChange).not.toHaveBeenCalled()
+    expect(mocks.getFileChanges).not.toHaveBeenCalled()
     expect(wrapper.find('.zc-fcd-bad').exists()).toBe(true)
   })
 
@@ -87,6 +117,8 @@ describe('FileChangeDetailView 地址与取数', () => {
     expect(wrapper.find('.zc-fcd-error').exists()).toBe(true)
     expect(wrapper.find('.zc-fcd-error').text()).toContain('看不到这条变更')
     expect(wrapper.findComponent(ChangeDiffPane).exists()).toBe(false)
+    // 左栏仍在：这条看不到，还能切去同会话的其他记录
+    expect(wrapper.find('.zc-cfl').exists()).toBe(true)
   })
 })
 
@@ -125,6 +157,68 @@ describe('FileChangeDetailView 顶栏与状态栏', () => {
     mocks.getFileChange.mockResolvedValue({ data: { ...CHANGE, action: 'delete' } })
     const deleted = await mountView()
     expect(deleted.find('.zc-fcd-head').text()).toContain('删除')
+  })
+})
+
+describe('FileChangeDetailView 左侧文件索引', () => {
+  it('列出会话里的全部变更，当前条高亮', async () => {
+    const wrapper = await mountView()
+
+    expect(mocks.getFileChanges).toHaveBeenCalledWith('12')
+    const items = wrapper.findAll('.zc-cfl-item')
+    expect(items).toHaveLength(3)
+    expect(items[0].text()).toContain('新建')
+    expect(items[0].text()).toContain('src/new.js')
+    expect(items[1].text()).toContain('src/App.vue')
+    expect(items[1].classes()).toContain('is-active')
+    expect(items[0].classes()).not.toContain('is-active')
+  })
+
+  it('点另一条：同标签换 diff，并把地址同步成新记录', async () => {
+    mocks.getFileChange.mockImplementation((sid, cid) => Promise.resolve({
+      data: cid === '346' ? { ...CHANGE2 } : { ...CHANGE },
+    }))
+
+    const wrapper = await mountView()
+    await wrapper.findAll('.zc-cfl-item')[0].trigger('click')
+    await flush()
+
+    expect(mocks.getFileChange).toHaveBeenLastCalledWith('12', '346')
+    expect(mocks.replace).toHaveBeenCalledWith({
+      name: 'session-file-change',
+      params: { sessionId: '12', changeId: '346' },
+    })
+    expect(wrapper.findComponent(ChangeDiffPane).props('after')).toBe('x\n')
+    expect(wrapper.findAll('.zc-cfl-item')[0].classes()).toContain('is-active')
+    expect(wrapper.find('.zc-fcd-head').text()).toContain('新建')
+    expect(wrapper.find('.zc-fcd-head').text()).toContain('src/new.js')
+  })
+
+  it('点当前这条不重复请求，也不多写一条地址', async () => {
+    const wrapper = await mountView()
+    expect(mocks.getFileChange).toHaveBeenCalledTimes(1)
+
+    await wrapper.findAll('.zc-cfl-item')[1].trigger('click')
+    await flush()
+
+    expect(mocks.getFileChange).toHaveBeenCalledTimes(1)
+    expect(mocks.replace).not.toHaveBeenCalled()
+  })
+
+  it('列表失败不挡右侧 diff，重试后补出列表', async () => {
+    mocks.getFileChanges.mockRejectedValueOnce(new Error('500'))
+
+    const wrapper = await mountView()
+    expect(wrapper.find('.zc-cfl-error').exists()).toBe(true)
+    expect(wrapper.findComponent(ChangeDiffPane).exists()).toBe(true)
+    expect(wrapper.findComponent(ChangeDiffPane).props('after')).toBe('a\nB\nc\n')
+
+    mocks.getFileChanges.mockResolvedValueOnce({ data: LIST.map((c) => ({ ...c })) })
+    await wrapper.find('.zc-cfl-retry').trigger('click')
+    await flush()
+
+    expect(wrapper.find('.zc-cfl-error').exists()).toBe(false)
+    expect(wrapper.findAll('.zc-cfl-item')).toHaveLength(3)
   })
 })
 
