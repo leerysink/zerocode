@@ -158,6 +158,65 @@ async def test_token_env_adds_authorization(client, monkeypatch):
     assert gh and all(q.headers.get("authorization") == "Bearer tok-abc" for q in gh)
 
 
+async def test_github_mirror_prefix_applies_to_raw_downloads(client, monkeypatch):
+    """被墙网络走加速前缀：只改 raw 文件下载，API 仍直连，落库保留原始 GitHub 链接。"""
+    import httpx
+
+    monkeypatch.setenv("ZEROCODE_GITHUB_MIRROR", "https://mirror.example/")
+    seen = []
+
+    async def handler(request):
+        host, p = request.url.host, request.url.path
+        seen.append((host, p))
+        if host == "api.github.com":
+            if p == "/repos/owner/repo":
+                return httpx.Response(200, json={"default_branch": "main"})
+            if p.startswith("/repos/owner/repo/git/trees/"):
+                return httpx.Response(200, json={"tree": [_blob("skills/a/SKILL.md")]})
+            return httpx.Response(404)
+        if host == "mirror.example" and p.endswith("/skills/a/SKILL.md"):
+            return httpx.Response(200, content=SKILL_A)
+        return httpx.Response(404)
+
+    client.app.state.skills_http_transport = httpx.MockTransport(handler)
+    r = await client.post("/api/skills/install",
+                          json={"url": "https://github.com/owner/repo/tree/main/skills/a"})
+    assert r.status_code == 201, r.text
+    assert seen and all(h != "raw.githubusercontent.com" for h, _ in seen)
+    assert any(h == "mirror.example" for h, _ in seen)
+    assert r.json()["source_url"] == "https://github.com/owner/repo/tree/main/skills/a"
+
+
+async def test_raw_unreachable_falls_back_to_blob_api(client):
+    """raw 被墙（连接失败/超时）时退回 api.github.com 的 git/blobs 取同一内容。"""
+    import httpx
+
+    sha = "a" * 40
+
+    async def handler(request):
+        host, p = request.url.host, request.url.path
+        if host == "api.github.com":
+            if p == "/repos/owner/repo":
+                return httpx.Response(200, json={"default_branch": "main"})
+            if p.startswith("/repos/owner/repo/git/trees/"):
+                return httpx.Response(200, json={"tree": [
+                    {"path": "skills/a/SKILL.md", "type": "blob",
+                     "size": len(SKILL_A), "sha": sha}]})
+            if p == f"/repos/owner/repo/git/blobs/{sha}":
+                assert request.headers.get("accept") == "application/vnd.github.raw"
+                return httpx.Response(200, content=SKILL_A)
+            return httpx.Response(404)
+        if host == "raw.githubusercontent.com":
+            raise httpx.ConnectError("blocked", request=request)
+        return httpx.Response(404)
+
+    client.app.state.skills_http_transport = httpx.MockTransport(handler)
+    r = await client.post("/api/skills/install",
+                          json={"url": "https://github.com/owner/repo/tree/main/skills/a"})
+    assert r.status_code == 201, r.text
+    assert (Path(r.json()["skill_dir"]) / "SKILL.md").read_bytes() == SKILL_A
+
+
 async def test_tree_url_ref_used_for_fetch(client):
     reqs = []
     client.app.state.skills_http_transport = _gh_transport(

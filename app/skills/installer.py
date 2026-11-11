@@ -19,7 +19,7 @@ from urllib.parse import quote, urljoin, urlparse
 
 import httpx
 
-from app.config import github_token
+from app.config import github_mirror, github_token
 from app.skills.library import (TOTAL_MAX_BYTES, FILE_COUNT_MAX, MAX_FILE_BYTES, NAME_MAX,
                                 SkillError, check_size_budget, parse_skill_md)
 
@@ -104,6 +104,18 @@ def _rawize_github_blob(url: str) -> str:
     return url
 
 
+def _mirror_raw(url: str) -> str:
+    """raw.githubusercontent.com 下载按需加加速前缀；其它主机原样返回。
+
+    前缀形如 https://gh-proxy.com/（原样转发完整 raw URL），只解决文件下载被墙，
+    API 仍直连 api.github.com；未配置时行为与原来完全一致。
+    """
+    prefix = github_mirror()
+    if prefix and urlparse(url).hostname == "raw.githubusercontent.com":
+        return f"{prefix}/{url}"
+    return url
+
+
 def _oversize_error(msg: str) -> SkillError:
     """体积/条数守卫专用：打 oversize 标记，供 _fetch_tree 按标记而非「无 status_code」
     反推超预算（复审 M-1：SSRF/协议类拒绝不被误改文案成「仓库过大」）。"""
@@ -184,17 +196,18 @@ async def fetch_skill_from_url(url: str, *, transport=None) -> dict:
     if not is_skill_md_url(url):
         raise SkillError("直链必须指向 SKILL.md 文件")
     url = _rawize_github_blob(url)
+    fetch_url = _mirror_raw(url)
     client = httpx.AsyncClient(transport=transport, timeout=15.0)
     try:
         try:
-            raw = await _get_limited(client, url, "SKILL.md", required=True)
+            raw = await _get_limited(client, fetch_url, "SKILL.md", required=True)
             content = raw.decode("utf-8", "replace")
             name, desc = parse_skill_md(content)
             if len(name) > _NAME_MAX:
                 raise SkillError(f"技能 name 超过 {_NAME_MAX} 字符上限")
             files: dict[str, bytes] = {"SKILL.md": raw}
             running = len(raw)
-            base = url[: url.rfind("/") + 1]
+            base = fetch_url[: fetch_url.rfind("/") + 1]
             refs = _relative_refs(content)
             if len(refs) > _REF_ATTEMPTS_MAX:
                 raise _oversize_error(f"技能引用数超过上限: > {_REF_ATTEMPTS_MAX}")
@@ -314,8 +327,9 @@ async def fetch_skill_from_github(url: str, *, subpath: str | None = None,
                 raise SkillError("仓库文件树元数据异常：size 非数值") from None
             if declared_total > TOTAL_MAX_BYTES:
                 raise SkillError(f"技能总大小超过上限: {declared_total} > {TOTAL_MAX_BYTES} 字节")
-            raw_base = (f"https://raw.githubusercontent.com/{quote(spec['owner'])}/"
-                        f"{quote(spec['repo'])}/{quote(ref, safe='/')}/")
+            raw_base = _mirror_raw(
+                f"https://raw.githubusercontent.com/{quote(spec['owner'])}/"
+                f"{quote(spec['repo'])}/{quote(ref, safe='/')}/")
             files: dict[str, bytes] = {}
             running = 0
             for e in blobs:
@@ -323,7 +337,7 @@ async def fetch_skill_from_github(url: str, *, subpath: str | None = None,
                 if not path:
                     continue
                 rel = path[len(base_pre):]
-                data = await _get_limited(client, raw_base + quote(path), rel, required=True)
+                data = await _fetch_blob(client, e, raw_base, api)
                 running += len(data)  # 元数据可能缺失，下载中按实际字节边接边拒（审查 I-2）
                 if running > TOTAL_MAX_BYTES:
                     raise SkillError(f"技能总大小超过上限: > {TOTAL_MAX_BYTES} 字节")
@@ -342,6 +356,26 @@ async def fetch_skill_from_github(url: str, *, subpath: str | None = None,
                 "source_url": url, "subpath": base_dir or None, "source_type": "github"}
     finally:
         await client.aclose()
+
+
+async def _fetch_blob(client: httpx.AsyncClient, entry: dict, raw_base: str, api: str) -> bytes:
+    """先走 raw 下载；网络不可达（被墙/超时）时退回 git/blobs API 取同一内容。
+
+    国内网络常打死 raw.githubusercontent.com 而 api.github.com 仍可用；树条目自带 sha，
+    退回成本是每文件一次 API 调用（受 rate limit 约束，可配 token 缓解）。raw 返回
+    非 200 说明文件本身有问题，原样上报，不拿 API 结果掩盖。
+    """
+    path = str(entry.get("path") or "")
+    try:
+        return await _get_limited(client, raw_base + quote(path), path, required=True)
+    except httpx.HTTPError:
+        # 只对网络异常回退；HTTP 状态与 SSRF/协议类领域错误原样上报
+        sha = str(entry.get("sha") or "")
+        if not sha:
+            raise
+        return await _get_limited(
+            client, f"{api}/git/blobs/{sha}", path, required=True,
+            _hdrs={"Accept": "application/vnd.github.raw"})
 
 
 async def _fetch_tree(client: httpx.AsyncClient, api: str, ref: str) -> dict | None:

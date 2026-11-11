@@ -1,4 +1,18 @@
+import os
+
 import pytest
+
+
+def test_no_proxy_ipv6_brackets_normalized(monkeypatch):
+    """NO_PROXY 带 `[::1]` 会让 httpx 构造客户端即抛 InvalidURL（技能安装 500 的根因）。"""
+    import httpx
+
+    from app.config import normalize_no_proxy
+
+    monkeypatch.setenv("NO_PROXY", " localhost, [::1] ,::1 ")
+    normalize_no_proxy()
+    assert os.environ["NO_PROXY"] == "localhost,::1,::1"
+    httpx.Client().close()  # 归一化后构造不再抛错
 
 @pytest.mark.asyncio
 async def test_get_config_masked(client):
