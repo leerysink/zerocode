@@ -154,6 +154,13 @@ describe('askQuestionsOf 提问载荷整形', () => {
     expect(askQuestionsOf({ question: '选哪个', options: '不是 JSON' }))
       .toEqual([{ question: '选哪个' }])
   })
+  it('选项漏了 label 时用 description 顶上，空标/非对象选项直接丢掉', () => {
+    // 实跑撞到：模型把选项正文写进 description、label 整个没给。label 又是单选 radio 的
+    // value，全是 undefined 时与「未选」的组值相等，AntD 会把每个选项都画成已选且点不动。
+    const opts = [{ description: ' 就按三层做 ' }, { label: '只做两层' }, { label: '  ' }, 42]
+    expect(askQuestionsOf({ question: '选哪个', options: opts }))
+      .toEqual([{ question: '选哪个', options: [{ label: '就按三层做' }, { label: '只做两层' }] }])
+  })
   it('questions 被模型二次编码成 JSON 字符串时解回来（与后端 _normalize_questions 同口径）', () => {
     const raw = JSON.stringify([{ question: '选哪个', options: ['A', 'B'] }])
     expect(askQuestionsOf({ questions: raw }))

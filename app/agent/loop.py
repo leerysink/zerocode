@@ -47,8 +47,37 @@ def _options_of(raw) -> list:
         except json.JSONDecodeError:
             return []
     if isinstance(raw, list):
-        return [{"label": o} if isinstance(o, str) else o for o in raw]
+        return [opt for opt in (_option_of(o) for o in raw) if opt]
     return []
+
+
+def _option_of(o) -> dict | None:
+    """单个选项规整：label 必须是非空字符串，缺了就拿 description 顶上。
+
+    label 同时是**单选题 radio 的 value**：模型漏 label 时全是 undefined，与「未选」的组值
+    相等，AntD 会把每个选项都画成已选、点谁都不变，整张提问卡点不动（实跑撞到）。description
+    本来就是模型写给人看的选项正文，顶上后用户选中的文本原样回给模型。两个都没有的选项丢了
+    ——画出来也没有任何可读内容。前端 messageModel.optionOf 是同一口径，改一处必须改另一处。
+    """
+    if isinstance(o, str):
+        text = o.strip()
+        return {"label": text} if text else None
+    if not isinstance(o, dict):
+        return None
+    label = o.get("label")
+    label = label.strip() if isinstance(label, str) else ""
+    desc = o.get("description")
+    desc = desc.strip() if isinstance(desc, str) else ""
+    if not label:
+        if not desc:
+            return None
+        label, desc = desc, ""
+    out = {"label": label}
+    if desc:
+        out["description"] = desc
+    if "recommended" in o:
+        out["recommended"] = bool(o["recommended"])
+    return out
 
 
 def _normalize_question(q: dict) -> dict:

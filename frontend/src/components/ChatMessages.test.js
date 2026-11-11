@@ -580,6 +580,17 @@ describe('提问卡在消息流里', () => {
       .toEqual([{ question: '选哪个', options: [{ label: 'A' }, { label: 'B' }] }])
   })
 
+  it('选项漏 label 的历史行也用 description 顶上，卡片不会全员已选', () => {
+    const w = mountMessages([
+      {
+        role: 'tool', name: 'ask_user',
+        args: { questions: [{ question: '选哪个', options: [{ description: '按三层做' }] }] },
+      },
+    ])
+    expect(w.findComponent(AskUserCard).props('questions'))
+      .toEqual([{ question: '选哪个', options: [{ label: '按三层做' }] }])
+  })
+
   it('questions 被二次编码成 JSON 字符串时仍画出提问卡', () => {
     const w = mountMessages([
       { role: 'tool', name: 'ask_user', args: { questions: '[{"question":"选哪个","options":["A"]}]' } },

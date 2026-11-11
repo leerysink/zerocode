@@ -148,7 +148,30 @@ function optionsOf(raw) {
     try { v = JSON.parse(v) } catch { return [] }
   }
   if (!Array.isArray(v)) return []
-  return v.map((o) => (typeof o === 'string' ? { label: o } : o))
+  return v.map(optionOf).filter(Boolean)
+}
+
+// 与后端 _option_of 同口径：label 必须是非空字符串，缺了就拿 description 顶上（那本就是
+// 模型写给人看的选项正文）；两个都没有的选项直接丢。label 同时是单选 radio 的 value——
+// 实测模型漏 label 时全是 undefined，与「未选」的组值相等，AntD 会把每个选项都画成已选，
+// 且点谁发出的还是 undefined，整张提问卡点不动。
+function optionOf(o) {
+  if (typeof o === 'string') {
+    const text = o.trim()
+    return text ? { label: text } : null
+  }
+  if (!o || typeof o !== 'object') return null
+  let label = typeof o.label === 'string' ? o.label.trim() : ''
+  let desc = typeof o.description === 'string' ? o.description.trim() : ''
+  if (!label) {
+    if (!desc) return null
+    label = desc
+    desc = ''
+  }
+  const out = { label }
+  if (desc) out.description = desc
+  if ('recommended' in o) out.recommended = !!o.recommended
+  return out
 }
 
 // 「不再提问，自行决定」的固定答复**即协议**：模型在工具结果里读到它就停止追问、按默认继续。

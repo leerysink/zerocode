@@ -2107,6 +2107,27 @@ async def test_ask_user_options_survive_double_encoding(test_engine, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_ask_user_option_without_label_falls_back_to_description(test_engine, tmp_path):
+    """模型把选项正文写进 description、漏了 label 时，label 必须从 description 顶上。
+
+    提问卡拿 label 当单选 radio 的 value：全是 undefined 时与「未选」的组值相等，
+    AntD 会把每个选项都画成已选、点谁都不变，整张卡点不动（实跑撞到）。description
+    本来就是模型写给人看的选项正文，顶上后用户选中的文本原样回给模型。
+    """
+    captured = {}
+
+    async def spy_ask(session_id, questions, timeout):
+        captured["questions"] = questions
+        return {"answers": [{"answer": "就按三层做"}]}
+
+    opts = [{"description": " 就按三层做 "}, {"label": "只做两层"}, {"label": "  "}, 42]
+    turns = [done(None, [tool_call("c1", "ask_user", question="选哪个", options=opts)]), done("好了")]
+    sid, status, evs, sf = await run_once(test_engine, tmp_path, turns, ask=spy_ask)
+    assert status == "idle"
+    assert captured["questions"][0]["options"] == [{"label": "就按三层做"}, {"label": "只做两层"}]
+
+
+@pytest.mark.asyncio
 async def test_ask_user_questions_array_survive_double_encoding(test_engine, tmp_path):
     """模型把整个 questions 数组塞成 JSON 字符串时也认（实跑形状），否则它会白烧一轮才重发。"""
     captured = {}
