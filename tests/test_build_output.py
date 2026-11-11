@@ -695,6 +695,20 @@ def test_audit_does_not_mistake_updated_at_column_for_bare_update():
     assert bo.audit_replay_safety(sql, "x") == []
 
 
+def test_audit_does_not_mistake_truncated_column_for_truncate():
+    """边界：列名 `truncated` 含 `TRUNCATE` 子串，按子串匹配会把建表语句误杀。
+
+    agent_tool_metric 就有这一列；拦包关键字必须按整词判，标识符里的截断不算洗数据。
+    """
+    sql = ("CREATE TABLE IF NOT EXISTS agent_tool_metric (\n"
+           "    id BIGSERIAL PRIMARY KEY,\n"
+           "    truncated BOOLEAN NOT NULL DEFAULT FALSE\n);\n")
+    assert bo.audit_replay_safety(sql, "x") == []
+    # 反向：整词出现时仍须拦下（包括跨空格/换行书写的 DROP TABLE）
+    assert bo.audit_replay_safety("TRUNCATE TABLE agent_tool_metric;", "x")
+    assert bo.audit_replay_safety("DROP\nTABLE agent_tool_metric;", "x")
+
+
 def test_bare_update_only_in_comment_is_fine():
     """边界：注释里引用 UPDATE 是给人看的说明，不得被当成可执行语句拦下。"""
     sql = ("-- 旧的写法是 UPDATE app_config SET value = '60' WHERE key = 'x';\n"

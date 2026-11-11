@@ -410,8 +410,12 @@ def split_statements(sql: str) -> list[str]:
 # DROP COLUMN 单列出来：它不像 DROP INDEX 那样只是「重放会报错」，而是真会删掉服务器上的
 # 列与列里的数据。真实 changelog 目前只在注释里提到它（V20260917_02 的收尾建议），故一律拒包、
 # 由人工确认——需要删列时应当改写成 DO 块并显式登记，而不是让它随全量重放静默执行。
-_DESTRUCTIVE = ("DELETE FROM", "TRUNCATE", "DROP TABLE", "DROP DATABASE", "DROP SCHEMA",
-                "DROP COLUMN")
+# 按整词匹配，不用子串：列名 `truncated` 自带 `TRUNCATE`，子串匹配会把建表语句误杀
+# （agent_tool_metric 就有一个 truncated 列）。词边界同时排除了 `truncated`、`truncate_flag`
+# 这类标识符，而 `TRUNCATE;` / `TRUNCATE TABLE t` 仍然命中。
+_DESTRUCTIVE_RE = re.compile(
+    r"\b(?:DELETE\s+FROM|TRUNCATE|DROP\s+(?:TABLE|DATABASE|SCHEMA|COLUMN))\b",
+    re.IGNORECASE)
 
 # `ON CONFLICT ... DO UPDATE` 无法靠剔仲裁目标变成重放安全（DO UPDATE 必须有目标），
 # 且它的语义就是「覆盖」，与 ADR-0014 的只补不覆盖相左。
@@ -445,9 +449,9 @@ def audit_replay_safety(sql: str, origin: str) -> list[str]:
         # 都带这一列，用子串匹配会把它们全部误杀。
         if upper.startswith("UPDATE") and _update_disposition(st) is None:
             problems.append(f"{origin}: 裸 UPDATE，重放会把服务器既有值拍回本次打包时的值 → {st[:60]}…")
-        for word in _DESTRUCTIVE:
-            if word in upper:
-                problems.append(f"{origin}: 含 {word}，重放会洗掉服务器既有数据 → {st[:60]}…")
+        for m in _DESTRUCTIVE_RE.finditer(st):
+            word = _WS_RE.sub(" ", m.group(0)).upper()
+            problems.append(f"{origin}: 含 {word}，重放会洗掉服务器既有数据 → {st[:60]}…")
     return problems
 
 
