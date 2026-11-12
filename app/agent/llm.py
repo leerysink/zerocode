@@ -42,10 +42,16 @@ class OpenAICompatLLM:
         tool_calls: dict[int, dict] = {}
         stream = await self.client.chat.completions.create(
             model=self.model, messages=messages, tools=tools, stream=True)
+        finish_reason = None
         async for chunk in stream:
             if not chunk.choices:
                 continue
-            delta = chunk.choices[0].delta
+            choice = chunk.choices[0]
+            # 结束原因只出现在流末尾的 chunk 上，且该 chunk 可能没有 delta：
+            # loop 要靠它区分「模型答完了」与「被长度/内容审查截断」，不能丢
+            if getattr(choice, "finish_reason", None):
+                finish_reason = choice.finish_reason
+            delta = choice.delta
             rc = _reasoning_of(delta)
             if rc:
                 reasoning_parts.append(rc)
@@ -63,7 +69,7 @@ class OpenAICompatLLM:
                         slot["function"]["name"] = tc.function.name
                     if tc.function and tc.function.arguments:
                         slot["function"]["arguments"] += tc.function.arguments
-        yield {"type": "done", "message": {
+        yield {"type": "done", "finish_reason": finish_reason, "message": {
             "role": "assistant",
             "content": "".join(content_parts) or None,
             "reasoning": "".join(reasoning_parts) or None,

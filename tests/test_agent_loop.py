@@ -11,6 +11,11 @@ def delta(t):
 def done(content, tool_calls=None):
     return [{"type": "done", "message": {"role": "assistant", "content": content, "tool_calls": tool_calls}}]
 
+def done_fr(content, tool_calls=None, finish_reason="stop"):
+    """带结束原因的 done：复现上游「长度耗尽/内容审查」时空正文 + 特定 finish_reason 的形状。"""
+    return [{"type": "done", "finish_reason": finish_reason,
+             "message": {"role": "assistant", "content": content, "tool_calls": tool_calls}}]
+
 def tool_call(id_, name, **args):
     return {"id": id_, "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}}
 
@@ -69,6 +74,58 @@ async def test_plain_reply(test_engine, tmp_path):
             "SELECT content FROM message WHERE session_id=:i AND role='assistant' ORDER BY seq"),
             {"i": sid})).scalars().all()
     assert "你好" in row
+
+@pytest.mark.asyncio
+async def test_empty_reply_is_retried_instead_of_silently_finishing(test_engine, tmp_path):
+    """模型空回复（无正文、无工具调用）不能当「答完」：先补催一轮，正常续上。
+
+    实撞：Agent 连做 8 个工具后上游回了一轮空内容，loop 落了一条 content=NULL 的
+    assistant 行就返回 idle——界面只剩任务清单停在 5/11，没有任何报错。
+    """
+    turns = [done(None), done("补上了")]
+    sid, status, evs, sf = await run_once(test_engine, tmp_path, turns)
+    assert status == "idle"
+    assert any(e["type"] == "message_done" and e["content"] == "补上了" for e in evs)
+    async with sf() as s:
+        rows = (await s.execute(sql(
+            "SELECT content FROM message WHERE session_id=:i AND role='assistant' ORDER BY seq"),
+            {"i": sid})).scalars().all()
+    assert rows == ["补上了"]  # 空回复不得落库成一条空 assistant 行
+
+
+@pytest.mark.asyncio
+async def test_consecutive_empty_replies_surface_an_error(test_engine, tmp_path):
+    # 连续空回复超出补催上限：必须显性报错（终态 error），不能再静默收工
+    turns = [done_fr(None, finish_reason="length") for _ in range(3)]
+    sid, status, evs, sf = await run_once(test_engine, tmp_path, turns)
+    assert status == "error"
+    err = next(e for e in evs if e["type"] == "error")
+    assert "空回复" in err["message"] and "length" in err["message"]
+    async with sf() as s:
+        n = (await s.execute(sql(
+            "SELECT count(*) FROM message WHERE session_id=:i AND role='assistant'"),
+            {"i": sid})).scalar()
+    assert n == 0
+
+
+@pytest.mark.asyncio
+async def test_legacy_empty_assistant_row_is_not_replayed(test_engine, tmp_path):
+    # 旧版空回复静默收工会留下 content=NULL 的 assistant 行；回注给上游可能直接 400，
+    # 表现为「这个会话再发什么都报错」。空行没有信息量，历史回放时跳过。
+    sid = await mk_session(test_engine, tmp_path)
+    sf = make_session_factory(test_engine)
+    await add_message(sf, sid, "user", content="开始")
+    await add_message(sf, sid, "assistant", content=None)
+    llm = ScriptedLLM([[delta("好"), *done("继续做完了")]])
+    rec = Recorder()
+    runner = AgentRunner(sf, llm, cfg_provider(), rec,
+                         lambda *a, **k: asyncio.sleep(0, None), lambda *a, **k: True)
+    status = await runner.run(sid, "继续", asyncio.Event())
+    assert status == "idle"
+    sent = llm.received[0]
+    assert not [m for m in sent if m["role"] == "assistant"
+                and not (m.get("content") or "").strip() and not m.get("tool_calls")]
+
 
 @pytest.mark.asyncio
 async def test_write_file_flow(test_engine, tmp_path):

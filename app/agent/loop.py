@@ -34,6 +34,16 @@ from sqlalchemy import text
 
 logger = logging.getLogger(__name__)
 
+# 模型这一轮既没调工具也没给正文（空回复/只回了思考/被长度上限截断）时，不能当「答完」收工：
+# 那会让 UI 表现为任务静默停止（清单停在 N/M，无任何报错）。先补一句让模型自己接着做，
+# 连续这么多次仍为空就显式报错，把原因交给用户。
+_EMPTY_REPLY_RETRIES = 2
+_EMPTY_REPLY_NUDGE = (
+    "（平台提示）你上一条回复为空：既没有正文，也没有调用任何工具。"
+    "若当前任务尚未完成，请直接从断点继续执行，不要重复已完成的步骤；"
+    "若已经完成，请简要说明结果。"
+)
+
 def _options_of(raw) -> list:
     """把 options 规整成列表，容忍模型把它**双重编码成 JSON 字符串**。
 
@@ -292,9 +302,15 @@ class AgentRunner:
                     r["content"], meta.get(r["id"], []), r["id"] in inline,
                     files.get(r["id"], []))})
             elif r["role"] == "assistant":
+                calls = (r["tool_args"] or {}).get("tool_calls")
+                # 旧版把「空回复」当正常收工，落过 content=NULL 且无 tool_calls 的 assistant 行。
+                # 这种行回注给上游会被 OpenAI 兼容端点判非法（assistant 消息必须有 content
+                # 或 tool_calls），用户在本会话里再发一句话就 400。空行没有信息量，直接跳过。
+                if not (r["content"] or "").strip() and not calls:
+                    continue
                 m = {"role": "assistant", "content": r["content"]}
-                if r["tool_args"] and "tool_calls" in r["tool_args"]:
-                    m["tool_calls"] = r["tool_args"]["tool_calls"]
+                if calls:
+                    m["tool_calls"] = calls
                 msgs.append(m)
             elif r["role"] == "tool":
                 msgs.append({"role": "tool", "tool_call_id": r["tool_call_id"],
@@ -521,6 +537,7 @@ class AgentRunner:
         max_rounds = int(cfg.get("agent.max_tool_rounds", 30))
         # <=0 = 不限工具轮数（与超时参数 <=0 不限制的约定一致），不再 range(0) 零轮即错
         rounds = itertools.count() if max_rounds <= 0 else range(max_rounds)
+        empty_retries = 0
         for _round in rounds:
             if cancel.is_set():
                 raise _Cancelled()
@@ -528,6 +545,7 @@ class AgentRunner:
             await self._drain_steering(session_id, root, messages)
             llm = await self._llm_for(cfg)
             final = None
+            finish_reason = None
             async for ev in llm.chat_stream(messages, tools):
                 if cancel.is_set():
                     raise _Cancelled()
@@ -537,7 +555,12 @@ class AgentRunner:
                     await self.send({"type": "token", "delta": ev["content"]})
                 elif ev["type"] == "done":
                     final = ev["message"]
+                    finish_reason = ev.get("finish_reason")
+            if final is None:
+                # 流正常结束但没有 done 事件：不拿 AttributeError 当结论，给一句能定位的错
+                raise RuntimeError("模型流结束时没有返回完整消息（缺少 done 事件）")
             if final.get("tool_calls"):
+                empty_retries = 0
                 # 凭据遮断（Ticket 010）：三个持久/展示出口（落库、回注、事件推送）共用
                 # 同一份净化后的 tool_calls；工具执行 _dispatch 仍收原始 args——会话历史防
                 # 泄露 ≠ 破坏工具本意，fs_write 之类得能把用户真正要写的凭据落盘。
@@ -616,6 +639,20 @@ class AgentRunner:
                     await self.send({"type": "tool_result", "name": name, "result": sanitized_result})
                     messages.append({"role": "tool", "tool_call_id": exec_tc.get("id"),
                                      "content": json.dumps(result, ensure_ascii=False)})
+                continue
+            if not (final.get("content") or "").strip():
+                # 空回复不能当「正常答完」：这一分支原本会落一条 content=NULL 的 assistant 行、
+                # 发一条 message_done(null) 后返回 idle，前端什么都画不出来——用户看到的就是
+                # 「任务跑到一半停了，没有任何报错」。补一句让模型自己续上，连续为空才报错。
+                empty_retries += 1
+                logger.warning("会话 %s 第 %s 轮：模型返回空回复（finish_reason=%s），补催 %s/%s",
+                               session_id, _round + 1, finish_reason,
+                               empty_retries, _EMPTY_REPLY_RETRIES)
+                if empty_retries > _EMPTY_REPLY_RETRIES:
+                    raise RuntimeError(
+                        f"模型连续返回空回复（finish_reason={finish_reason or '未知'}），本轮未完成。"
+                        "常见原因是输出长度上限耗尽或上游流被提前关闭；可重新发送「继续」重试。")
+                messages.append({"role": "user", "content": _EMPTY_REPLY_NUDGE})
                 continue
             await add_message(self.sf, session_id, "assistant", content=final.get("content"),
                               reasoning=final.get("reasoning"))
