@@ -149,6 +149,8 @@ def test_render_ships_rbac_seed_and_no_demo_notes_seed(tmp_path):
     assert sorted(p.name for p in (out / "sqlchange").glob("*.sql")) == ["D20260101_01_rbac_seed.sql"]
     seed = (out / "sqlchange" / "D20260101_01_rbac_seed.sql").read_text(encoding="utf-8")
     assert "INSERT INTO sys_menu" in seed and "setval(" in seed and "demo_notes" not in seed
+    # 个人中心只从右上角头像进入：种子不得再生成侧栏菜单行，否则菜单树会多出一项
+    assert "'/profile'" not in seed
     snap = (out / "schema" / "schema.sql").read_text(encoding="utf-8")
     assert "CREATE TABLE IF NOT EXISTS sys_user" in snap
     assert "schema_history" not in snap and "INSERT" not in snap.upper()

@@ -25,9 +25,9 @@ ON CONFLICT (id) DO NOTHING;
 INSERT INTO sys_user_role (user_id, role_id) VALUES (1, 1) ON CONFLICT DO NOTHING;
 
 -- 菜单：目录与菜单（侧边栏只渲染 parent_id=0 且 menu_type in ('M','C') 的记录）
+-- 个人中心不进菜单树：/profile 是静态路由且列在 router 的 PUBLIC_PATHS 里，只从右上角头像下拉进入。
 INSERT INTO sys_menu (id, parent_id, menu_name, menu_type, path, component, permission, icon, sort, visible) VALUES
 (1,   0,   '首页',     'C', '/dashboard', 'dashboard/index',       NULL,                  'HomeOutlined',      0, 1),
-(2,   0,   '个人中心', 'C', '/profile',   'profile/index',         NULL,                  'UserOutlined',      9, 1),
 (100, 0,   '系统管理', 'M', 'system',     NULL,                    NULL,                  'SettingOutlined', 100, 1),
 (101, 100, '用户管理', 'C', 'user',       'system/user/index',     'system:user:list',    'UserOutlined',      1, 1),
 (102, 100, '角色管理', 'C', 'role',       'system/role/index',     'system:role:list',    'TeamOutlined',      2, 1),
@@ -62,12 +62,12 @@ INSERT INTO sys_menu (id, parent_id, menu_name, menu_type, path, component, perm
 (1072, 107, '登录日志清空', 'F', NULL, NULL, 'system:loginLog:clean',  NULL, 2, 1)
 ON CONFLICT (id) DO NOTHING;
 
--- 角色-菜单：admin 全量，common 仅首页/个人中心/系统管理/部门/字典
+-- 角色-菜单：admin 全量，common 仅首页/系统管理/部门/字典
 INSERT INTO sys_role_menu (role_id, menu_id)
 SELECT 1, id FROM sys_menu
 ON CONFLICT DO NOTHING;
 INSERT INTO sys_role_menu (role_id, menu_id) VALUES
-(2, 1), (2, 2), (2, 100), (2, 104), (2, 1041), (2, 1042), (2, 1043), (2, 105), (2, 1051), (2, 1052), (2, 1053)
+(2, 1), (2, 100), (2, 104), (2, 1041), (2, 1042), (2, 1043), (2, 105), (2, 1051), (2, 1052), (2, 1053)
 ON CONFLICT DO NOTHING;
 
 -- 样例字典（证明字典管理开箱可用；业务字典由本应用自行追加或替换）
