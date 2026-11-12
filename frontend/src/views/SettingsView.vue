@@ -281,11 +281,20 @@ async function save() {
             >
               <a-switch v-model:checked="store.form.clarifyEnabled" />
             </a-form-item>
+            <a-form-item
+              label="提问提醒题数"
+              extra="本轮问满 N 题时提醒模型停止追问（软提醒，不禁止提问）；0=不提醒"
+            >
+              <a-input-number v-model:value="store.form.askRemindAt" :min="0" style="width: 180px" />
+            </a-form-item>
             <a-form-item label="提问等待超时（秒）" extra="0=不限制">
               <a-input-number v-model:value="store.form.askTimeoutSeconds" :min="0" style="width: 180px" />
             </a-form-item>
             <a-form-item label="最大工具轮数" extra="0=不限制">
               <a-input-number v-model:value="store.form.maxToolRounds" :min="0" style="width: 180px" />
+            </a-form-item>
+            <a-form-item label="预览重启次数上限" extra="单次任务内启动/重启预览的次数上限；0=不限制">
+              <a-input-number v-model:value="store.form.previewMaxRestarts" :min="0" style="width: 180px" />
             </a-form-item>
             <a-form-item label="历史窗口（条数）">
               <a-input-number v-model:value="store.form.historyWindow" :min="0" style="width: 180px" />

@@ -11,11 +11,13 @@ const FIELD_TO_KEY = {
   writeConfirm: 'agent.write_confirm',
   askTimeoutSeconds: 'agent.ask_timeout_seconds',
   maxToolRounds: 'agent.max_tool_rounds',
+  previewMaxRestarts: 'agent.preview_max_restarts', // <=0 不限，见 app/agent/preview_tools.py::_max_restarts
   historyWindow: 'agent.history_window',
   openFolderMode: 'fs.open_folder_mode', // auto | system | web，见 utils/openFolder.js
   // clarify.* 是账户级键（ADR-0032）：门禁拷问的是「这个人」，关掉只影响自己。
   // 默认值与后端 app/agent/clarify.py 的 DEFAULT_ENABLED 同口径——库里没这个键时算开。
   clarifyEnabled: 'clarify.enabled',
+  askRemindAt: 'clarify.ask_remind_at', // 第 N 题的止损提醒，<=0 关闭；默认值与 clarify.py::DEFAULT_REMIND_AT 同口径
 }
 
 export const useConfigStore = defineStore('config', {
@@ -28,9 +30,11 @@ export const useConfigStore = defineStore('config', {
       writeConfirm: false,
       askTimeoutSeconds: 0, // 0 = 不限制
       maxToolRounds: 30,
+      previewMaxRestarts: 3, // 与 preview_tools.py 的 DEFAULT_MAX_RESTARTS 同值；库里没这行时表单的落点
       historyWindow: 40,
       openFolderMode: 'web', // 没配过这个键时的默认：一律弹内置文件管理器，本机直开属于显式选择（ADR-0009）
       clarifyEnabled: true, // 需求澄清模式默认开（ADR-0032）：库里没这行时后端也按开处理
+      askRemindAt: 6, // 与 clarify.py 的 DEFAULT_REMIND_AT 同值；0=不提醒
     },
     saving: false,
     loaded: false, // 是否已从后端拉到过配置（ensureLoaded 的去重依据）

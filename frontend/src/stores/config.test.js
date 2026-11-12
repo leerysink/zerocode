@@ -57,3 +57,26 @@ describe('config store 视觉能力', () => {
       expect.objectContaining({ 'llm.supports_vision': true }))
   })
 })
+
+describe('config store 预览重启次数与提问提醒', () => {
+  it('默认值与后端代码默认同口径：单次任务 3 次重启、第 6 题提醒', () => {
+    const { form } = useConfigStore()
+    expect(form.previewMaxRestarts).toBe(3)
+    expect(form.askRemindAt).toBe(6)
+  })
+
+  it('loadConfig / save 读写两个键，0 表示不限制/不提醒', async () => {
+    getConfig.mockResolvedValue({ data: {
+      'agent.preview_max_restarts': 5, 'clarify.ask_remind_at': 4 } })
+    const store = useConfigStore()
+    await store.loadConfig()
+    expect(store.form.previewMaxRestarts).toBe(5)
+    expect(store.form.askRemindAt).toBe(4)
+
+    store.form.previewMaxRestarts = 0
+    store.form.askRemindAt = 0
+    await store.save()
+    expect(putConfig).toHaveBeenCalledWith(expect.objectContaining({
+      'agent.preview_max_restarts': 0, 'clarify.ask_remind_at': 0 }))
+  })
+})
