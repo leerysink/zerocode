@@ -6,6 +6,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { message } from 'ant-design-vue'
 import { appMetricsCurrent, appMetricsHistory } from '../api'
+import { fmtBytes, fmtPct } from '../utils/metricsFormat'
 
 const props = defineProps({ app: { type: Object, required: true } })
 
@@ -16,20 +17,6 @@ const hist = ref({})            // 历史：{ cpu:[{ts,value}], ... }
 const window_ = ref('24h')      // 当前窗口（window 是保留名，加下划线避免与全局冲突）
 const switching = ref(false)    // 切窗独立 pending：不共用 loading（它会整块掉工具条导致点不动）
 let histSeq = 0                 // history 请求序号：只接受最新一次响应，防快速切窗乱序覆盖
-
-// 字节 → 人类可读（二进制步进）。
-function fmtBytes(n) {
-  if (n == null) return null
-  const units = ['B', 'KB', 'MB', 'GB', 'TB']
-  let v = Number(n)
-  let i = 0
-  while (v >= 1024 && i < units.length - 1) { v /= 1024; i += 1 }
-  return `${i === 0 ? v : v.toFixed(1)} ${units[i]}`
-}
-function fmtPct(n) {
-  return n == null ? null : `${Number(n).toFixed(1)} %`
-}
-const FMT = { pct: fmtPct, bytes: fmtBytes }
 
 // prod 运行态白名单（与后端 LIVE_PROD_STATUSES 对齐）：停炉时 cpu/memory 无实时值。
 const LIVE = ['running', 'unhealthy']
@@ -43,7 +30,7 @@ const METRICS = [
   { key: 'workspace_size', label: '工作区磁盘', fmt: 'bytes', color: '#8a7ba6', group: 'storage' },
 ]
 // cpu 按百分比、其余按字节；fmt==='pct' 之外一律走字节格式化。
-const fmtOf = (m) => (m.fmt === 'pct' ? FMT.pct : FMT.bytes)
+const fmtOf = (m) => (m.fmt === 'pct' ? fmtPct : fmtBytes)
 
 const GROUP_TITLES = { runtime: '运行时', storage: '存储' }
 

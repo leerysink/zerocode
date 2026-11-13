@@ -133,6 +133,8 @@ export const unbindMiniprogram = (id) => http.delete(`/apps/${id}/mobile/minipro
 export const appMetricsCurrent = (id) => http.get(`/apps/${id}/metrics/current`)
 // 历史曲线（Ticket 002）：window 取 1h/24h/7d/30d，返回各 kind 时序。
 export const appMetricsHistory = (id, window) => http.get(`/apps/${id}/metrics/history`, { params: { window } })
+// 应用页仪表卡批量取数：一次回当前账号所有可见应用的最近点 + 近 window 曲线（整页一个请求）。
+export const appMetricsSummary = () => http.get('/apps/metrics/summary')
 export const systemNics = () => http.get('/system/nics')
 
 // ---- 应用商店 M3-a（上架 / 申请审批）----

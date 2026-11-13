@@ -393,6 +393,113 @@ async def test_prune_expired_deletes_old_keeps_recent(sf, tmp_path):
     assert [float(v) for v in vals] == [2]
 
 
+# ---------- 批量 summary（应用页仪表卡：整页一次取数） ----------
+
+async def test_summary_returns_latest_point_per_app(client, tmp_path):
+    """summary 一次回当前账号每个应用的四类最近点 + prod 状态——仪表卡静息态的唯一数据源。
+
+    列表页 N 张卡若沿用按应用单取的 current，一轮轮询就是 N 个请求；本端点把它压成 1 个。"""
+    sf = client.app.state.session_factory
+    uid = (await client.get("/api/auth/me")).json()["id"]
+    aid = await _make_app(sf, "sumA", tmp_path, owner=uid, prod_port=8360, dev_port=8361,
+                          status_prod="running")
+    await _insert_metric(sf, aid, "cpu", 42.0)
+    await _insert_metric(sf, aid, "memory", 1234567)
+    await _insert_metric(sf, aid, "db_size", 777)
+    await _insert_metric(sf, aid, "workspace_size", 1024)
+    r = await client.get("/api/apps/metrics/summary")
+    assert r.status_code == 200, r.text
+    items = r.json()["items"]
+    assert [it["app_id"] for it in items] == [aid]
+    it = items[0]
+    assert it["prod_status"] == "running"
+    assert it["cpu"]["value"] == 42.0
+    assert it["memory"]["value"] == 1234567
+    assert it["db_size"]["value"] == 777
+    assert it["workspace_size"]["value"] == 1024
+
+
+async def test_summary_series_window_and_order(client, tmp_path):
+    """曲线只收 1h 窗口内的点、按时间升序（窗外 80min 前的旧点不进），sparkline 才不会画出一条假回落。"""
+    sf = client.app.state.session_factory
+    uid = (await client.get("/api/auth/me")).json()["id"]
+    aid = await _make_app(sf, "sumB", tmp_path, owner=uid, prod_port=8362, dev_port=8363,
+                          status_prod="running")
+    await _insert_metric(sf, aid, "cpu", 99, age_minutes=80)      # 窗外，必须不进曲线
+    for age, value in ((45, 11), (35, 12), (25, 13), (15, 14), (5, 15)):
+        await _insert_metric(sf, aid, "cpu", value, age_minutes=age)
+    r = await client.get("/api/apps/metrics/summary")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["window"] == "1h"      # 曲线口径由后端说一次，前端标题不再自己写死一个窗口
+    pts = body["items"][0]["series"]["cpu"]
+    assert [p["value"] for p in pts] == [11, 12, 13, 14, 15]      # 旧点在前
+    assert all(p["ts"] for p in pts)
+
+
+async def test_summary_excludes_other_owners_app(two_auth_clients, tmp_path):
+    """IDOR 护栏：批量端点没有「那一个应用」可 404，别人的应用直接不出现在 items 里。
+
+    最易回归掉的就是这条 owner 过滤（current/history 各锁过一次），本用例锁死 summary 的第三处。"""
+    alice, bob = two_auth_clients
+    sf = alice.app.state.session_factory
+    alice_uid = (await alice.get("/api/auth/me")).json()["id"]
+    bob_uid = (await bob.get("/api/auth/me")).json()["id"]
+    aid_alice = await _make_app(sf, "sumOwn1", tmp_path / "a1", owner=alice_uid,
+                                prod_port=8364, dev_port=8365)
+    aid_bob = await _make_app(sf, "sumOwn2", tmp_path / "a2", owner=bob_uid,
+                              prod_port=8366, dev_port=8367)
+    # bob 是非创始人：alice 的应用整条缺席，既不 404 也不列出——存在性本身就是要藏的信息
+    ids_bob = [it["app_id"] for it in (await bob.get("/api/apps/metrics/summary")).json()["items"]]
+    assert ids_bob == [aid_bob]
+    # alice 是创始人，本用例不测她的可见集（下一条专测），只确认她那条也在
+    ids_alice = [it["app_id"] for it in (await alice.get("/api/apps/metrics/summary")).json()["items"]]
+    assert aid_alice in ids_alice
+
+
+async def test_summary_founder_sees_all(two_auth_clients, tmp_path):
+    """创始人（首注册者）走 list_apps 的全局语义：items 含他人应用，不另写第二套权限判据。"""
+    alice, bob = two_auth_clients
+    assert (await alice.get("/api/auth/me")).json()["is_founder"] is True
+    sf = alice.app.state.session_factory
+    bob_uid = (await bob.get("/api/auth/me")).json()["id"]
+    aid_bob = await _make_app(sf, "sumFnd", tmp_path, owner=bob_uid,
+                              prod_port=8368, dev_port=8369)
+    ids = [it["app_id"] for it in (await alice.get("/api/apps/metrics/summary")).json()["items"]]
+    assert aid_bob in ids
+
+
+async def test_summary_nulls_runtime_points_and_series(client, tmp_path):
+    """停炉：cpu/memory 连最近点带曲线一起归空（残留读数画成趋势就是假回落）；存储类照回。"""
+    sf = client.app.state.session_factory
+    uid = (await client.get("/api/auth/me")).json()["id"]
+    aid = await _make_app(sf, "sumStop", tmp_path, owner=uid, prod_port=8370, dev_port=8371,
+                          status_prod="stopped")
+    await _insert_metric(sf, aid, "cpu", 30.0, age_minutes=5)
+    await _insert_metric(sf, aid, "memory", 111, age_minutes=5)
+    await _insert_metric(sf, aid, "workspace_size", 222, age_minutes=5)
+    it = (await client.get("/api/apps/metrics/summary")).json()["items"][0]
+    assert it["app_id"] == aid
+    assert it["cpu"] is None and it["memory"] is None
+    assert it["series"] == {"cpu": [], "memory": []}
+    assert it["workspace_size"]["value"] == 222
+
+
+async def test_summary_series_buckets_capped(client, tmp_path):
+    """1h 窗内 30 个原始点（2 分钟一个）压到 ≤25 个桶：点数上界不随采集频率增长，列表页才敢带曲线。"""
+    sf = client.app.state.session_factory
+    uid = (await client.get("/api/auth/me")).json()["id"]
+    aid = await _make_app(sf, "sumCap", tmp_path, owner=uid, prod_port=8372, dev_port=8373,
+                          status_prod="running")
+    for k in range(30):
+        await _insert_metric(sf, aid, "cpu", k, age_minutes=k * 2)
+    it = (await client.get("/api/apps/metrics/summary")).json()["items"][0]
+    pts = it["series"]["cpu"]
+    assert len(pts) <= 25              # 桶栅格可能在窗口头部多切出半个桶
+    assert len(pts) >= 20              # 仍然够画出一条可读 sparkline
+    assert [p["ts"] for p in pts] == sorted(p["ts"] for p in pts)
+
+
 def test_retention_days_falls_back_on_invalid(monkeypatch):
     monkeypatch.delenv("ZEROCODE_METRICS_RETENTION_DAYS", raising=False)
     assert metrics._retention_days() == metrics.DEFAULT_RETENTION_DAYS

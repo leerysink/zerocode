@@ -5,16 +5,16 @@
 import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { message, Modal } from 'ant-design-vue'
 import {
-  AppstoreOutlined, CloudServerOutlined, CloudUploadOutlined, CopyOutlined, DashboardOutlined,
+  AppstoreOutlined, CloudUploadOutlined, CopyOutlined, DashboardOutlined,
   DatabaseOutlined, DeleteOutlined, EditOutlined,
-  ExperimentOutlined,
   EyeOutlined, FolderOpenOutlined, HistoryOutlined, MenuOutlined, MobileOutlined, PlayCircleOutlined,
   PoweroffOutlined, ProfileOutlined, RedoOutlined, ReloadOutlined, RocketOutlined, ShopOutlined,
 } from '@ant-design/icons-vue'
 import {
-  appUrls, createApp, deleteApp, devReset, devRestart, devStart, devStatus, devStop, listApps,
-  openFolder, prodStart, prodStop, releaseToStore, renameApp, validateAppSlug,
+  appUrls, appMetricsSummary, createApp, deleteApp, devReset, devRestart, devStart, devStatus, devStop,
+  listApps, openFolder, prodStart, prodStop, releaseToStore, renameApp, validateAppSlug,
 } from '../api'
+import { fmtBytes, fmtPct } from '../utils/metricsFormat'
 import PublishHistory from '../components/PublishHistory.vue'
 import MetricsModal from '../components/MetricsModal.vue'
 import MobileModal from '../components/MobileModal.vue'
@@ -46,8 +46,17 @@ const rename = reactive({ open: false, app: null, name: '' })
 const del = reactive({ open: false, app: null })
 const openingFolder = ref(false)
 const cfg = useConfigStore()
+// 仪表带数据：整页一次批量取（appMetricsSummary），按 app_id 贴回卡片。
+// window 只认后端回的那个值——曲线口径有两处写法时，前端这处迟早过期。
+const msum = reactive({ window: '1h', items: [] })
+// 与后端 LIVE_PROD_STATUSES 对齐：停炉后 cpu/memory 没有实时值，画成 0 就是撒谎。
+const LIVE_PROD = ['running', 'unhealthy']
+const RING_C = 97.39            // r=15.5 的周长（环只画 0-100，超出的部分留给下面的真实数字）
+const NO_SAMPLE = '未采集'
+const NOT_LIVE = '停炉未采集'
 const form = reactive({ name: '', slug: '', slugTouched: false, scale: 'small', stack: 'vue3-fastapi' })
 let timer = null
+let metricsTimer = null
 
 const scaleCards = [
   { value: 'small', title: '小型', desc: '表单/台账/查询类，选一种轻量后端' },
@@ -67,8 +76,83 @@ async function load(silent = false) {
     if (!silent) loading.value = false
   }
 }
-onMounted(() => { load(); timer = setInterval(() => load(true), 5000) })
-onUnmounted(() => clearInterval(timer))
+// 仪表带的曲线桶宽 150 秒（后端 SUMMARY_WINDOW/SUMMARY_MAX_POINTS 决定），30 秒一轮已经追得上
+// 真实变化；状态那一路保持 5 秒静默轮询不变。两条定时分开是刻意的：绑在一起要么曲线白拉，
+// 要么状态变钝。
+onMounted(() => {
+  load()
+  loadSummary()
+  timer = setInterval(() => load(true), 5000)
+  metricsTimer = setInterval(loadSummary, 30000)
+})
+onUnmounted(() => { clearInterval(timer); clearInterval(metricsTimer) })
+
+async function loadSummary() {
+  try {
+    const { data } = await appMetricsSummary()
+    msum.window = data?.window || '1h'
+    msum.items = data?.items || []
+  } catch { /* 静默：仪表带退成「未采集」就行，卡片上的动作一个都不该因此失灵 */ }
+}
+
+// 每张卡的仪表读数：一次算好贴到卡片上（模板里反复取值会每张卡重算六次）。
+const bands = computed(() => Object.fromEntries(apps.value.map((a) => [a.id, readout(a)])))
+const band = (a) => bands.value[a.id] || readout(a)
+
+function readout(a) {
+  const it = msum.items.find((x) => x.app_id === a.id)
+  const live = !!it && LIVE_PROD.includes(it.prod_status)
+  const cpu = it?.cpu ? Number(it.cpu.value) : null
+  const none = live ? NO_SAMPLE : NOT_LIVE
+  return {
+    live,
+    cpu,
+    cpuText: it?.cpu ? fmtPct(it.cpu.value) : none,
+    memText: it?.memory ? fmtBytes(it.memory.value) : none,
+    dbText: it?.db_size ? fmtBytes(it.db_size.value) : NO_SAMPLE,
+    wsText: it?.workspace_size ? fmtBytes(it.workspace_size.value) : NO_SAMPLE,
+    cpuSpark: sparkPath(it?.series?.cpu),
+    memSpark: sparkPath(it?.series?.memory),
+    ringOffset: RING_C * (1 - Math.min(Math.max(cpu || 0, 0), 100) / 100),
+  }
+}
+
+// sparkline 路径：桶点归一到 100×26 视口。少于两点就不画——一条贴底的直线会被读成
+// 「一直在这么闲」，比留白更容易骗人。
+function sparkPath(points, w = 100, h = 26) {
+  const vals = (points || []).map((p) => Number(p?.value)).filter(Number.isFinite)
+  if (vals.length < 2) return ''
+  const min = Math.min(...vals)
+  const span = Math.max(...vals) - min || 1
+  const step = w / (vals.length - 1)
+  return vals.map((v, i) =>
+    `${i ? 'L' : 'M'}${(i * step).toFixed(1)} ${(h - 2 - ((v - min) / span) * (h - 4)).toFixed(1)}`).join(' ')
+}
+
+// 页头统计：prod 状态四桶必须严丝合缝盖全（running / starting+publishing / stopped / unhealthy+error），
+// 漏一桶就会出现「四个数加起来不等于总数」——列表示意里最容易骗人的正是这种漏。
+// 平均 CPU 只计采到值的活应用：一个都没采到写 —，写 0.0 % 会被读成「很闲」。
+const STAT_CELLS = [
+  { key: 'total', label: '应用' },
+  { key: 'running', label: '运行中', color: '#5b8a72' },
+  { key: 'busy', label: '进行中', color: 'var(--zc-primary)' },
+  { key: 'stopped', label: '已停止', color: '#9aa0a6' },
+  { key: 'bad', label: '异常', color: '#b96a6a' },
+  { key: 'cpuText', label: '平均 CPU' },
+]
+const stats = computed(() => {
+  const n = { total: apps.value.length, running: 0, busy: 0, stopped: 0, bad: 0 }
+  for (const a of apps.value) {
+    const s = a.status_prod || 'stopped'
+    if (s === 'unhealthy' || s === 'error') n.bad += 1
+    else if (s === 'starting' || s === 'publishing') n.busy += 1
+    else if (s === 'running') n.running += 1
+    else n.stopped += 1
+  }
+  const cpus = msum.items.map((it) => (it.cpu ? Number(it.cpu.value) : null)).filter(Number.isFinite)
+  n.cpuText = cpus.length ? fmtPct(cpus.reduce((x, y) => x + y, 0) / cpus.length) : '—'
+  return n
+})
 
 function onName() {
   if (!form.slugTouched) form.slug = slugFromName(form.name)
@@ -120,6 +204,9 @@ const statusText = (s) => ({
   running: '运行中', stopped: '已停止', starting: '启动中…',
   publishing: '发布中…', error: '出错了', unhealthy: '体检未通过',
 }[s || 'stopped'])
+// 环境胶囊里只画图标，动词全称只有一份来源：aria-label 与悬停气泡共用它，免得两处各写各的。
+const devToggleLabel = (a) => (a.status_dev === 'running' ? '停止预览' : '启动预览')
+const prodToggleLabel = (a) => (a.status_prod === 'running' ? '停止正式' : '启动正式')
 
 async function openPreview(a) {
   preview.open = true
@@ -354,22 +441,33 @@ async function doRelease() {
 
 <template>
   <div class="zc-apps">
-    <div class="zc-head">
-      <div class="zc-head-left">
-        <back-button />
-        <h2><appstore-outlined /> 我的应用</h2>
+    <div class="zc-hero">
+      <div class="zc-head">
+        <div class="zc-head-left">
+          <back-button />
+          <h2><appstore-outlined /> 我的应用</h2>
+          <span class="zc-hero-count">{{ stats.total }}</span>
+        </div>
+        <a-space>
+          <a-button @click="load()"><reload-outlined /> 刷新</a-button>
+          <a-button type="primary" @click="showWizard = true"><rocket-outlined /> 新建应用</a-button>
+        </a-space>
       </div>
-      <a-space>
-        <a-button @click="load()"><reload-outlined /> 刷新</a-button>
-        <a-button type="primary" @click="showWizard = true"><rocket-outlined /> 新建应用</a-button>
-      </a-space>
+      <div class="zc-stats">
+        <span v-for="c in STAT_CELLS" :key="c.key" class="zc-stat"
+              :style="c.color ? { color: c.color } : null">
+          <b class="zc-stat-value">{{ stats[c.key] }}</b>
+          <span class="zc-stat-label">{{ c.label }}</span>
+        </span>
+      </div>
     </div>
 
     <a-spin v-if="loading" class="zc-spin" />
     <a-empty v-else-if="!apps.length" description="还没有应用——点「新建应用」，用一句话描述你要的软件"
              style="margin-top: 80px" />
     <div v-else class="zc-grid">
-      <a-card v-for="a in apps" :key="a.id" class="zc-card">
+      <a-card v-for="a in apps" :key="a.id" class="zc-card zc-metric-card"
+              :style="{ '--zc-rail': statusColor(a.status_prod) }">
         <template #title>
           <span class="zc-dot" :style="{ background: statusColor(a.status_dev) }" />
           <span class="zc-card-name">{{ a.name }}</span>
@@ -378,22 +476,12 @@ async function doRelease() {
         </template>
         <template #extra>
           <a-dropdown :trigger="['click']" placement="bottomRight">
-            <menu-outlined class="zc-card-menu-btn" title="更多操作" @click.stop />
+            <menu-outlined class="zc-card-menu-btn" title="破坏性操作" @click.stop />
             <template #overlay>
               <div class="zc-app-menu">
-                <div class="zc-app-menu-item zc-menu-preview" @click.stop="openPreview(a)"><eye-outlined /> 预览</div>
+                <!-- ☰ 只剩这两个会删数据/删应用的动作。平铺进工具条等于把误点的代价摊到每次点击上，
+                     而它们本来各自带一次确认框，收在这里是对的。 -->
                 <div class="zc-app-menu-item zc-menu-reset" @click.stop="resetDev(a)"><redo-outlined /> 重建 dev</div>
-                <div class="zc-app-menu-item zc-menu-history" @click.stop="openHistory(a)"><history-outlined /> 发布历史</div>
-                <div class="zc-app-menu-item zc-menu-metrics" @click.stop="openMetrics(a)"><dashboard-outlined /> 资源监控</div>
-                <div v-if="isMobileApp(a)" class="zc-app-menu-item zc-menu-mobile" @click.stop="openMobile(a)"><mobile-outlined /> 移动端</div>
-                <div v-if="canReleaseToStore(a)" class="zc-app-menu-item zc-menu-release" @click.stop="openRelease(a)"><shop-outlined /> 发布到商店</div>
-                <div class="zc-app-menu-item zc-menu-rename" @click.stop="openRename(a)"><edit-outlined /> 重命名</div>
-                <div class="zc-app-menu-item zc-menu-folder" @click.stop="openAppFolder(a)"><folder-open-outlined /> 打开工程目录</div>
-                <div class="zc-app-menu-item zc-menu-copy" @click.stop="copyUrl(a.preview_url, `card:${a.id}`)"><copy-outlined /> 复制预览地址</div>
-                <div class="zc-app-menu-item zc-menu-logs" @click.stop="openLogs(a)"><profile-outlined /> 查看日志</div>
-                <a class="zc-app-menu-item zc-menu-db" :href="`/apps/${a.id}/db`" target="_blank" @click.stop>
-                  <database-outlined /> DB 操作
-                </a>
                 <div class="zc-app-menu-item zc-app-menu-danger zc-menu-del" @click.stop="openDelete(a)">
                   <delete-outlined /> 删除应用
                 </div>
@@ -415,42 +503,99 @@ async function doRelease() {
         </p>
         <!-- 复制失败才出现的兜底行：user-select: all 让单击即整段选中，键盘 Ctrl+C 就能拿走 -->
         <p v-if="copyFail.key === `card:${a.id}`" class="zc-line zc-copy-manual">{{ copyFail.url }}</p>
+        <!-- 仪表带：CPU 环 + 近窗曲线 + 三个字节读数。全是后端采集值；停炉没有实时值就照实空着，
+             不拿 0.0 % 冒充「很闲」。 -->
+        <div class="zc-band">
+          <div class="zc-gauge" :class="{ off: !band(a).live }"
+               title="CPU 占用：prod 栈所有常驻容器汇总，多核可超 100%（环只画到 100，数字照实）">
+            <svg class="zc-ring" viewBox="0 0 36 36" aria-hidden="true">
+              <circle class="zc-ring-track" cx="18" cy="18" r="15.5" />
+              <circle class="zc-ring-fill" cx="18" cy="18" r="15.5" :stroke-dasharray="RING_C"
+                      :stroke-dashoffset="band(a).ringOffset" transform="rotate(-90 18 18)" />
+            </svg>
+            <div class="zc-gauge-body">
+              <span class="zc-gauge-value">{{ band(a).cpuText }}</span>
+              <span class="zc-gauge-label">CPU</span>
+            </div>
+          </div>
+          <div class="zc-sparks">
+            <div class="zc-spark zc-spark-cpu">
+              <span class="zc-spark-label">CPU 近 {{ msum.window }}</span>
+              <svg v-if="band(a).cpuSpark" class="zc-spark-svg" viewBox="0 0 100 26"
+                   preserveAspectRatio="none" aria-hidden="true"><path :d="band(a).cpuSpark" /></svg>
+              <span v-else class="zc-spark-none">无采样</span>
+            </div>
+            <div class="zc-spark zc-spark-mem">
+              <span class="zc-spark-label">内存 近 {{ msum.window }}</span>
+              <svg v-if="band(a).memSpark" class="zc-spark-svg" viewBox="0 0 100 26"
+                   preserveAspectRatio="none" aria-hidden="true"><path :d="band(a).memSpark" /></svg>
+              <span v-else class="zc-spark-none">无采样</span>
+            </div>
+          </div>
+          <div class="zc-stores">
+            <span>内存 <b class="zc-metric-mem">{{ band(a).memText }}</b></span>
+            <span>数据库 <b class="zc-metric-db">{{ band(a).dbText }}</b></span>
+            <span>工作区 <b class="zc-metric-ws">{{ band(a).wsText }}</b></span>
+          </div>
+        </div>
         <!-- 操作仍在一行，但按环境切成两段：测试环境（dev，直改直跑的预览实例）| 生产环境（prod，已发布版本）。
              中间一条竖线 + 各段环境标签，避免同名动作被误读成跨环境操作。 -->
+        <!-- 环境动作行：两段各成一颗胶囊（状态点 + dev/prod + 两个图标动作），一行排完不折行。
+             分组交给胶囊外壳，中文全称退回 title 与按钮气泡——行宽只有 440px，撑不起四个全称按钮。 -->
         <div class="zc-acts">
-          <div class="zc-env-group zc-env-dev">
-            <span class="zc-env-label"
-                  title="测试环境（dev）：直接跑工程目录里的代码，独立 dev 端口与 _dev 库">
-              <experiment-outlined /> 测试环境
-            </span>
-            <a-space :size="6">
-              <a-button size="small" @click="toggleDev(a)">
-                <poweroff-outlined v-if="a.status_dev === 'running'" />
-                <play-circle-outlined v-else />
-                {{ a.status_dev === 'running' ? '停止预览' : '启动预览' }}
-              </a-button>
-              <a-button size="small" @click="restartDev(a)">重启</a-button>
-            </a-space>
+          <div class="zc-env-group zc-env-dev"
+               title="测试环境（dev）：直接跑工程目录里的代码，独立 dev 端口与 _dev 库">
+            <i class="zc-env-dot" :style="{ background: statusColor(a.status_dev) }" />
+            <span class="zc-env-name">dev</span>
+            <button type="button" class="zc-env-btn" :aria-label="devToggleLabel(a)" @click="toggleDev(a)">
+              <poweroff-outlined v-if="a.status_dev === 'running'" />
+              <play-circle-outlined v-else /><span class="zc-tb-label">{{ devToggleLabel(a) }}</span>
+            </button>
+            <button type="button" class="zc-env-btn" aria-label="重启预览" @click="restartDev(a)">
+              <reload-outlined /><span class="zc-tb-label">重启</span>
+            </button>
           </div>
-          <span class="zc-env-split" />
-          <div class="zc-env-group zc-env-prod">
-            <span class="zc-env-label"
-                  title="生产环境（prod）：跑已发布的版本，独立 prod 端口与 _prod 库">
-              <cloud-server-outlined /> 生产环境
-            </span>
-            <a-space :size="6">
-              <a-button type="primary" ghost size="small" :disabled="!canPublish(a)"
-                        :title="canPublish(a) ? '' : '该栈暂不支持发布'"
-                        :loading="a.status_prod === 'publishing'" @click="openPublish(a)">
-                <cloud-upload-outlined /> 发布
-              </a-button>
-              <a-button size="small" @click="toggleProd(a)">
-                <poweroff-outlined v-if="a.status_prod === 'running'" />
-                <play-circle-outlined v-else />
-                {{ a.status_prod === 'running' ? '停止正式' : '启动正式' }}
-              </a-button>
-            </a-space>
+          <div class="zc-env-group zc-env-prod"
+               title="生产环境（prod）：跑已发布的版本，独立 prod 端口与 _prod 库">
+            <i class="zc-env-dot" :style="{ background: statusColor(a.status_prod) }" />
+            <span class="zc-env-name">prod</span>
+            <button type="button" class="zc-env-btn zc-env-btn-prim zc-act-publish" :disabled="!canPublish(a)"
+                    aria-label="发布新版本"
+                    :title="canPublish(a) ? '发布新版本' : '该栈暂不支持发布'"
+                    :aria-busy="a.status_prod === 'publishing' ? 'true' : 'false'"
+                    :class="{ 'is-busy': a.status_prod === 'publishing' }" @click="openPublish(a)">
+              <reload-outlined v-if="a.status_prod === 'publishing'" spin />
+              <cloud-upload-outlined v-else /><span class="zc-tb-label">发布</span>
+            </button>
+            <button type="button" class="zc-env-btn" :aria-label="prodToggleLabel(a)" @click="toggleProd(a)">
+              <poweroff-outlined v-if="a.status_prod === 'running'" />
+              <play-circle-outlined v-else /><span class="zc-tb-label">{{ prodToggleLabel(a) }}</span>
+            </button>
           </div>
+        </div>
+        <!-- 工具条常驻显示（不靠 hover、不靠点开）：动作节点一直在 DOM 里，文字标签做成悬停气泡——
+             它同时是 accessible name。触屏与键盘都不必先「发现这里有东西」。 -->
+        <div class="zc-toolbar" role="group" aria-label="更多操作">
+          <button type="button" class="zc-tb-item zc-menu-preview" @click.stop="openPreview(a)">
+            <eye-outlined /><span class="zc-tb-label">预览</span></button>
+          <button type="button" class="zc-tb-item zc-menu-copy" @click.stop="copyUrl(a.preview_url, `card:${a.id}`)">
+            <copy-outlined /><span class="zc-tb-label">复制预览地址</span></button>
+          <button type="button" class="zc-tb-item zc-menu-metrics" @click.stop="openMetrics(a)">
+            <dashboard-outlined /><span class="zc-tb-label">资源监控</span></button>
+          <button type="button" class="zc-tb-item zc-menu-history" @click.stop="openHistory(a)">
+            <history-outlined /><span class="zc-tb-label">发布历史</span></button>
+          <button type="button" class="zc-tb-item zc-menu-folder" @click.stop="openAppFolder(a)">
+            <folder-open-outlined /><span class="zc-tb-label">打开工程目录</span></button>
+          <a class="zc-tb-item zc-menu-db" :href="`/apps/${a.id}/db`" target="_blank" @click.stop>
+            <database-outlined /><span class="zc-tb-label">DB 操作</span></a>
+          <button type="button" class="zc-tb-item zc-menu-logs" @click.stop="openLogs(a)">
+            <profile-outlined /><span class="zc-tb-label">查看日志</span></button>
+          <button type="button" class="zc-tb-item zc-menu-rename" @click.stop="openRename(a)">
+            <edit-outlined /><span class="zc-tb-label">重命名</span></button>
+          <button v-if="isMobileApp(a)" type="button" class="zc-tb-item zc-menu-mobile" @click.stop="openMobile(a)">
+            <mobile-outlined /><span class="zc-tb-label">移动端</span></button>
+          <button v-if="canReleaseToStore(a)" type="button" class="zc-tb-item zc-menu-release" @click.stop="openRelease(a)">
+            <shop-outlined /><span class="zc-tb-label">发布到商店</span></button>
         </div>
       </a-card>
     </div>
@@ -569,10 +714,26 @@ async function doRelease() {
 
 <style scoped>
 .zc-apps { padding: 20px 24px; height: 100%; overflow-y: auto; box-sizing: border-box; }
-.zc-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
-.zc-head-left { display: flex; align-items: center; gap: 10px; }
-.zc-head h2 { font-size: 18px; font-weight: 600; color: var(--zc-text); margin: 0; }
-.zc-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(520px, 1fr)); gap: 14px; }
+/* 页头总控区：一条淡主色渐变把「标题 + 计数 + 状态分布」兜成整块，与下面的卡片彻底分层
+   （ADR-0048 D）。渐变收在 .13→.02，再浓就要盖过卡片里的仪表带了。 */
+.zc-hero { margin-bottom: 16px; padding: 14px 16px 12px; border: 1px solid var(--zc-border); border-radius: 10px;
+           background: linear-gradient(105deg, rgba(91, 122, 157, 0.13), rgba(91, 122, 157, 0.02) 58%,
+                                         rgba(196, 154, 68, 0.05)); }
+.zc-head { display: flex; justify-content: space-between; align-items: center; }
+.zc-head-left { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.zc-head h2 { margin: 0; font-size: 22px; font-weight: 600; color: var(--zc-text); white-space: nowrap; }
+.zc-hero-count { flex-shrink: 0; padding: 2px 9px; border-radius: 10px; font-size: 12px; font-weight: 500;
+                 line-height: 1.5; color: var(--zc-primary); background: rgba(91, 122, 157, 0.12);
+                 font-variant-numeric: tabular-nums; }
+/* 返回做成描边 chip：住在渐变里时，裸文字链接的存在感比不过 22px 标题 */
+.zc-hero .zc-back { padding: 2px 10px 2px 7px; border: 1px solid var(--zc-border); border-radius: 14px;
+                    background: #fff; }
+.zc-stats { display: flex; flex-wrap: wrap; gap: 8px 22px; margin-top: 12px; }
+.zc-stat { display: flex; flex-direction: column; gap: 2px; min-width: 52px; }
+.zc-stat-value { font-size: 18px; font-weight: 600; line-height: 1.1; color: inherit;
+                 font-variant-numeric: tabular-nums; }
+.zc-stat-label { font-size: 11px; color: var(--zc-text-sub); }
+.zc-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(480px, 1fr)); gap: 14px; }
 .zc-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 8px; flex-shrink: 0; }
 /* 标题行拉成 flex：状态点固定、应用名可省略号、规格标签贴着名字（antd 的 .ant-card-head-title 里） */
 .zc-card :deep(.ant-card-head-title) { display: flex; align-items: center; overflow: hidden; }
@@ -583,15 +744,28 @@ async function doRelease() {
 /* 复制失败后的兜底地址：单击即整段选中（user-select: all），等宽 + 折行保证长域名可读 */
 .zc-copy-manual { user-select: all; cursor: text; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
                   word-break: break-all; background: rgba(91, 122, 157, 0.08); border-radius: 4px; padding: 2px 6px; }
-/* 一行内的环境分段：两段各自 flex 贴标签 + 按钮，中间竖线分隔；窄屏折行兜底。
-   按钮走 small（与其他卡片区一致）以保证两组 + 两个标签能舒坦地平在一行。 */
+/* 环境动作行：两段各一颗胶囊——状态点 + 字母名 + 两个图标动作，整条约 250px，稳稳落在一行。
+   分组靠胶囊外壳，不再靠中间竖线；中文全称退到 title 与按钮气泡。 */
 .zc-acts { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
-.zc-env-group { display: flex; align-items: center; gap: 6px; }
-.zc-env-label { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; line-height: 1;
-                white-space: nowrap; padding: 3px 6px; border-radius: 4px; }
-.zc-env-split { width: 1px; height: 18px; background: var(--zc-border); }
-.zc-env-dev .zc-env-label { color: var(--zc-primary); background: rgba(91, 122, 157, 0.10); }
-.zc-env-prod .zc-env-label { color: #9a7b3f; background: rgba(196, 154, 68, 0.12); }
+.zc-env-group { display: inline-flex; align-items: center; gap: 4px; height: 30px; padding: 0 5px 0 10px;
+                border: 1px solid var(--zc-border); border-radius: 15px; background: #fff;
+                transition: border-color 0.15s, box-shadow 0.15s; }
+.zc-env-group:hover { box-shadow: 0 1px 5px rgba(47, 58, 71, 0.08); }
+.zc-env-dev { border-color: rgba(91, 122, 157, 0.30); }
+.zc-env-prod { border-color: rgba(196, 154, 68, 0.34); }
+.zc-env-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+.zc-env-name { margin-inline-end: 2px; font-size: 11px; font-weight: 600; line-height: 1; letter-spacing: 0.04em; }
+.zc-env-dev .zc-env-name { color: var(--zc-primary); }
+.zc-env-prod .zc-env-name { color: #9a7b3f; }
+.zc-env-btn { position: relative; display: inline-flex; align-items: center; justify-content: center;
+              width: 27px; height: 26px; padding: 0; border: 1px solid transparent; border-radius: 7px;
+              background: none; color: var(--zc-text-sub); font-size: 14px; line-height: 1; cursor: pointer;
+              transition: color 0.15s, background 0.15s, border-color 0.15s; }
+.zc-env-btn:hover { color: var(--zc-primary); background: rgba(91, 122, 157, 0.10); }
+.zc-env-btn:focus-visible { outline: 2px solid var(--zc-primary); outline-offset: 1px; }
+.zc-env-btn:disabled { color: var(--zc-text-sub); cursor: not-allowed; opacity: 0.45; }
+/* 发布是这段里唯一有后果的动作，常驻主色（置灰时由 :disabled 接管） */
+.zc-env-btn-prim { color: var(--zc-primary); }
 .zc-spin { display: block; margin: 60px auto; }
 .zc-pick { border: 1px solid var(--zc-border); border-radius: 6px; padding: 10px 14px; margin-bottom: 10px;
            cursor: pointer; display: flex; flex-direction: column; gap: 4px; }
@@ -619,4 +793,81 @@ async function doRelease() {
 /* 资源监控弹框标题：应用名 + 右侧一枚按状态着色的小徽标 */
 .zc-metrics-title { display: inline-flex; align-items: center; gap: 8px; }
 .zc-metrics-badge { margin: 0; }
+
+/* ===== 仪表卡：状态轨 / 仪表带（CPU 环 + 近窗曲线 + 字节读数）/ 悬停滑出工具条 ===== */
+/* 卡根刻意不设 overflow:hidden——工具条的文字气泡要探出内容框，一刀切的裁剪会把「打开工程目录」
+   这种长标签削掉。左侧状态轨自带圆角，不需要靠裁剪对齐。 */
+.zc-metric-card { transition: box-shadow 0.2s ease, transform 0.2s ease, border-color 0.2s ease; }
+.zc-metric-card::before { content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
+                          background: var(--zc-rail, var(--zc-border)); border-radius: 8px 0 0 8px;
+                          transition: background 0.25s ease; }
+.zc-metric-card:hover { transform: translateY(-2px); border-color: rgba(91, 122, 157, 0.45);
+                        box-shadow: 0 8px 24px rgba(47, 58, 71, 0.10); }
+.zc-metric-card :deep(.ant-card-body) { padding: 14px 18px 12px; }
+
+/* 仪表带三段：环定宽、曲线吃掉剩余、读数靠右且不被压缩 */
+.zc-band { display: grid; grid-template-columns: 72px minmax(0, 1fr) auto; gap: 14px; align-items: center;
+           margin: 4px 0 12px; padding: 10px 12px; border: 1px solid var(--zc-border); border-radius: 8px;
+           background: linear-gradient(180deg, rgba(91, 122, 157, 0.055), rgba(91, 122, 157, 0.015)); }
+.zc-gauge { position: relative; width: 72px; height: 72px; }
+.zc-ring { display: block; width: 100%; height: 100%; }
+.zc-ring-track { fill: none; stroke: var(--zc-border); stroke-width: 3; }
+.zc-ring-fill { fill: none; stroke: var(--zc-primary); stroke-width: 3; stroke-linecap: round;
+                transition: stroke-dashoffset 0.5s ease; }
+.zc-gauge-body { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center;
+                 justify-content: center; gap: 2px; }
+.zc-gauge-value { font-size: 12px; font-weight: 600; line-height: 1; color: var(--zc-text);
+                  font-variant-numeric: tabular-nums; white-space: nowrap; }
+.zc-gauge-label { font-size: 10px; line-height: 1; letter-spacing: 0.06em; color: var(--zc-text-sub); }
+/* 停炉：环退成灰轨，读数只说明「没有采集」，不用 0.0 % 冒充空闲 */
+.zc-gauge.off .zc-ring-fill { stroke: var(--zc-border); }
+.zc-gauge.off .zc-gauge-value { font-size: 10px; font-weight: 500; color: var(--zc-text-sub); }
+
+.zc-sparks { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.zc-spark { display: grid; grid-template-columns: 76px minmax(0, 1fr); gap: 8px; align-items: center; }
+.zc-spark-label { font-size: 11px; line-height: 1; color: var(--zc-text-sub); white-space: nowrap; }
+.zc-spark-svg { display: block; width: 100%; height: 26px; }
+.zc-spark-svg path { fill: none; stroke-width: 1.6; stroke-linejoin: round; stroke-linecap: round;
+                     /* preserveAspectRatio=none 会把横向拉扁，非缩放描边才不会让 CPU 线比内存线粗 */
+                     vector-effect: non-scaling-stroke; }
+.zc-spark-cpu .zc-spark-svg path { stroke: #5b7a9d; }
+.zc-spark-mem .zc-spark-svg path { stroke: #5b8a72; }
+.zc-spark-none { font-size: 11px; color: var(--zc-text-sub); opacity: 0.7; }
+
+.zc-stores { display: flex; flex-direction: column; gap: 5px; font-size: 11px; line-height: 1.2;
+             color: var(--zc-text-sub); white-space: nowrap; }
+.zc-stores span { display: flex; justify-content: space-between; gap: 10px; }
+.zc-stores b { font-weight: 600; color: var(--zc-text); font-variant-numeric: tabular-nums; }
+.zc-metric-mem { color: #4a7263; }
+.zc-metric-db { color: #9a7333; }
+.zc-metric-ws { color: #6f6290; }
+
+/* 工具条常驻：一排图标动作直接摊在卡底。「悬停才出现」已经废掉——看不见就等于不存在。
+   overflow 一律 visible，否则文字气泡被裁一半。 */
+.zc-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+              margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--zc-border); }
+.zc-tb-item { position: relative; display: inline-flex; align-items: center; justify-content: center;
+              width: 30px; height: 28px; padding: 0; border: 1px solid var(--zc-border); border-radius: 6px;
+              background: #fff; color: var(--zc-text-sub); font-size: 14px; line-height: 1; cursor: pointer;
+              transition: color 0.15s, border-color 0.15s, background 0.15s, transform 0.15s; }
+.zc-tb-item:hover { color: var(--zc-primary); border-color: var(--zc-primary);
+                    background: rgba(91, 122, 157, 0.08); transform: translateY(-1px); }
+.zc-tb-item:focus-visible { outline: 2px solid var(--zc-primary); outline-offset: 1px; }
+/* 标签：只靠 opacity 隐藏，不进 a11y 树的是「看不见」而非「不存在」——
+   它同时是按钮的 accessible name 和悬停气泡的正文，砍掉就等于只剩一堆无名图标。 */
+.zc-tb-label { position: absolute; bottom: calc(100% + 6px); left: 50%; z-index: 3;
+               padding: 5px 8px; border-radius: 4px; background: rgba(47, 58, 71, 0.92); color: #fff;
+               font-size: 12px; line-height: 1; white-space: nowrap; opacity: 0; pointer-events: none;
+               transform: translateX(-50%) translateY(2px);
+               transition: opacity 0.14s ease, transform 0.14s ease; }
+.zc-tb-item:hover .zc-tb-label, .zc-tb-item:focus-visible .zc-tb-label,
+.zc-env-btn:hover .zc-tb-label, .zc-env-btn:focus-visible .zc-tb-label {
+  opacity: 1; transform: translateX(-50%) translateY(0); }
+
+@media (prefers-reduced-motion: reduce) {
+  .zc-metric-card, .zc-metric-card::before, .zc-tb-item, .zc-tb-label,
+  .zc-ring-fill, .zc-env-group, .zc-env-btn { transition: none; }
+  .zc-metric-card:hover, .zc-tb-item:hover { transform: none; }
+  .zc-tb-label { transform: translateX(-50%); }
+}
 </style>

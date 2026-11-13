@@ -27,6 +27,12 @@ KNOWN_KINDS = ("cpu", "memory", "db_size", "workspace_size")
 # 历史读取侧时间桶收敛上限：把任意窗口都折到 ≤ 这多个点（与 sparkline 视口对齐），
 # 避免 30d × 30s 粒度直返十几万行打爆内存/响应/前端渲染（存储侧不动，只读侧聚合）。
 MAX_HISTORY_POINTS = 300
+# 列表页仪表卡曲线口径：近 1h 折成 24 桶（≈150 秒一点）——30 秒轮询下曲线真在动，
+# 又不必把 24h/300 点的全量历史压进每张卡。只带 runtime 两类，存储是慢变量，不进 sparkline。
+SUMMARY_WINDOW = timedelta(hours=1)
+SUMMARY_WINDOW_LABEL = "1h"
+SUMMARY_MAX_POINTS = 24
+SUMMARY_SERIES_KINDS = ("cpu", "memory")
 
 
 async def _load_app(request: Request, app_id: int) -> dict:
@@ -53,6 +59,80 @@ async def _latest(session_factory, app_id: int, kind: str):
     if not row:
         return None
     return {"value": float(row["value"]), "ts": row["ts"].isoformat()}
+
+
+async def _latest_batch(session_factory, app_ids: list[int]) -> dict[int, dict]:
+    """一批应用的「每 kind 最近点」→ {app_id: {kind: {value, ts}}}。
+
+    DISTINCT ON 一次取全，绝不在循环里打 N 次查询——列表页几十个应用共用这一条。"""
+    async with session_factory() as s:
+        rows = (await s.execute(text(
+            "SELECT DISTINCT ON (app_id, kind) app_id, kind, value, ts FROM app_metrics "
+            "WHERE app_id = ANY(:ids) ORDER BY app_id, kind, ts DESC"),
+            {"ids": app_ids})).mappings().all()
+    out: dict[int, dict] = {}
+    for r in rows:
+        out.setdefault(int(r["app_id"]), {})[r["kind"]] = {
+            "value": float(r["value"]), "ts": r["ts"].isoformat()}
+    return out
+
+
+async def _series_batch(session_factory, app_ids: list[int], kinds: tuple[str, ...],
+                        interval: timedelta, max_points: int) -> dict[int, dict]:
+    """一批应用的时间窗曲线：按桶均值聚合 → {app_id: {kind: [{ts, value}]}}（桶升序）。
+
+    桶宽在 Python 算好（interval 来自硬编码常量，不接外部字符串），与 metrics_history 同一套
+    聚合口径；点数收敛到 ≤max_points，避免把 300 点全量历史压进列表页。"""
+    step = max(interval.total_seconds() / max_points, 1.0)
+    async with session_factory() as s:
+        rows = (await s.execute(text(
+            "SELECT app_id, kind, floor(extract(epoch FROM ts) / :step)::bigint AS bucket, "
+            "avg(value) AS value FROM app_metrics "
+            "WHERE app_id = ANY(:ids) AND kind = ANY(:kinds) "
+            "AND ts >= now() - CAST(:iv AS INTERVAL) "
+            "GROUP BY app_id, kind, bucket ORDER BY app_id, kind, bucket"),
+            {"ids": app_ids, "kinds": list(kinds), "step": step, "iv": interval})).mappings().all()
+    out: dict[int, dict] = {}
+    for r in rows:
+        ts = datetime.fromtimestamp(r["bucket"] * step, tz=timezone.utc).isoformat()
+        out.setdefault(int(r["app_id"]), {}).setdefault(r["kind"], []).append(
+            {"ts": ts, "value": float(r["value"])})
+    return out
+
+
+@router.get("/metrics/summary")
+async def metrics_summary(request: Request):
+    """应用页仪表卡的批量取数：当前账号可见的每个应用一条，含最近点 + 近 1h 曲线。
+
+    权限只有一条判据——沿用 app_service.list_apps 的 owner 过滤（创始人看全部），不在这里再写
+    一遍 SQL 权限，免得长出第二套「谁能看谁」。别人的应用不是 404 而是**不出现在 items 里**：
+    批量端点没有「那一个应用」可供 404，缺席本身就是不暴露存在性的口径。
+    停炉语义与 current 一致：cpu/memory 连点带曲线一起归空，不把残留读数画成趋势。"""
+    actor = request.state.actor
+    owner = None if actor.get("is_founder") else actor["id"]
+    apps = await app_service.list_apps(request.app.state.session_factory, owner_user_id=owner)
+    if not apps:
+        return {"window": SUMMARY_WINDOW_LABEL, "items": []}
+    sf = request.app.state.session_factory
+    ids = [int(a["id"]) for a in apps]
+    latest = await _latest_batch(sf, ids)
+    series = await _series_batch(sf, ids, SUMMARY_SERIES_KINDS, SUMMARY_WINDOW, SUMMARY_MAX_POINTS)
+    items = []
+    for a in apps:
+        aid = int(a["id"])
+        live = a.get("status_prod") in LIVE_PROD_STATUSES
+        point = latest.get(aid, {})
+        app_series = series.get(aid, {}) if live else {}
+        items.append({
+            "app_id": aid,
+            "prod_status": a.get("status_prod"),
+            "cpu": point.get("cpu") if live else None,
+            "memory": point.get("memory") if live else None,
+            "db_size": point.get("db_size"),
+            "workspace_size": point.get("workspace_size"),
+            "series": {k: app_series.get(k, []) for k in SUMMARY_SERIES_KINDS},
+        })
+    return {"window": SUMMARY_WINDOW_LABEL, "items": items}
 
 
 @router.get("/{app_id}/metrics/current")

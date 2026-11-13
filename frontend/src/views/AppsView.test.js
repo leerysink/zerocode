@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 // Task 10：AppsView 发布接线（最小挂载断言）——M2 占位文案撤掉、发布/历史入口上卡、
-// 栈闸门（可发布栈放行、static 置灰带说明；白名单与后端同源，漂移由
+// 栈闸门（可发布栈放行、名单外的栈置灰带说明；白名单与后端同源，漂移由
 // tests/test_deploy_basics.py 钉住）。弹层内部行为在 PublishModal.test 覆盖。
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
 import { h } from 'vue'
@@ -15,6 +15,7 @@ const mocks = vi.hoisted(() => ({
     appRecords: vi.fn(), deleteRecord: vi.fn(), systemNics: vi.fn(), putConfig: vi.fn(),
     releaseToStore: vi.fn(), renameApp: vi.fn(), deleteApp: vi.fn(), openFolder: vi.fn(),
     appMetricsCurrent: vi.fn(), appMobile: vi.fn(), uploadMobileApk: vi.fn(),
+    appMetricsSummary: vi.fn(),
     wsUrl: vi.fn(() => 'ws://test'),
   },
   antd: { message: { success: vi.fn(), error: vi.fn(), info: vi.fn(), warning: vi.fn() },
@@ -42,6 +43,12 @@ const APPS = [
     prod_port: 8403, status_dev: 'running', status_prod: 'stopped', current_version: null,
     preview_url: 'http://10.0.1.25:8303',
     workspace_id: 13 },
+  // 闸门要验「置灰带说明」这条路径，样本必须是名单外、平台真没有的栈：static 与 vue3-node
+  // 本期已进名单，再拿它们当「不支持发布」的样本，测的就不再是闸门而是过期名单。
+  { id: 4, name: '丁', slug: 'ddd', stack: 'vue3-deno', scale: 'small', dev_port: 8304,
+    prod_port: 8404, status_dev: 'stopped', status_prod: 'stopped', current_version: null,
+    preview_url: 'http://10.0.1.25:8304',
+    workspace_id: 14 },
 ]
 
 const slot = (name) => ({
@@ -84,8 +91,12 @@ const STUBS = {
     render() { return h('div', { class: 'stub-mobile-modal' }, String(this.app?.id ?? '')) } },
 }
 
-async function mountView() {
+// 仪表卡批量取数的默认桩：空 items（数据带走进「未采集」路径），单条用例传 summaryOf 覆盖。
+const summaryOf = (items, win = '1h') => ({ data: { window: win, items } })
+
+async function mountView(summary) {
   mocks.api.listApps.mockResolvedValue({ data: APPS })
+  mocks.api.appMetricsSummary.mockResolvedValue(summary || summaryOf([]))
   const wrapper = mount(AppsView, { global: { stubs: STUBS } })
   await flushPromises()
   return wrapper
@@ -133,7 +144,7 @@ describe('AppsView 发布接线', () => {
     expect(wrapper.findAll('.stub-card')[1].text()).toContain('启动正式')
   })
 
-  it('单行内的环境分段：测试环境组放预览启停/重启，竖线后生产环境组放发布/正式启停', async () => {
+  it('环境动作行压成一行：两段胶囊各带状态点，图标动作靠 aria-label 命名，竖线撤掉', async () => {
     const wrapper = await mountView()
     const card = wrapper.findAll('.stub-card')[0]
     const acts = card.find('.zc-acts')
@@ -142,36 +153,67 @@ describe('AppsView 发布接线', () => {
     const prod = acts.find('.zc-env-prod')
     expect(dev.exists()).toBe(true)
     expect(prod.exists()).toBe(true)
-    // 两段在同一行容器里，中间有竖线分隔
+    // 两段就是两个胶囊：分组靠胶囊外壳，不再靠中间那条竖线
     expect(acts.findAll('.zc-env-group').length).toBe(2)
-    expect(acts.find('.zc-env-split').exists()).toBe(true)
-    expect(dev.text()).toContain('测试环境')
+    expect(acts.find('.zc-env-split').exists()).toBe(false)
+    expect(dev.find('.zc-env-dot').exists()).toBe(true)
+    expect(prod.find('.zc-env-dot').exists()).toBe(true)
+    // 点不是装饰：颜色就是该环境的实时状态（夹具 dev 停 / prod 跑）
+    expect(dev.find('.zc-env-dot').attributes('style')).toContain('background: #9aa0a6')
+    expect(prod.find('.zc-env-dot').attributes('style')).toContain('background: #5b8a72')
+    // 胶囊里只写 dev / prod，中文全称退回 title（悬停说明），行宽才压得下来
+    expect(dev.text()).toContain('dev')
+    expect(dev.attributes('title')).toContain('测试环境')
+    expect(prod.text()).toContain('prod')
+    expect(prod.attributes('title')).toContain('生产环境')
+    // 四个动作的文字仍在 DOM 上（视觉隐藏的气泡），但按钮本体是图标
     expect(dev.text()).toContain('启动预览')   // status_dev=stopped
     expect(dev.text()).toContain('重启')
     expect(dev.text()).not.toContain('发布')
-    expect(prod.text()).toContain('生产环境')
     expect(prod.text()).toContain('发布')
     expect(prod.text()).toContain('停止正式')   // status_prod=running
     expect(prod.text()).not.toContain('预览')
+    // 图标必须真渲染 + 每个图标按钮都得有可读名字（只有气泡文字时 accessible name 仍要显式给）
+    for (const g of [dev, prod]) {
+      const btns = g.findAll('.zc-env-btn')
+      expect(btns.length).toBe(2)
+      for (const b of btns) {
+        expect(b.find('[role="img"]').exists()).toBe(true)
+        expect(b.attributes('aria-label')).toBeTruthy()
+      }
+    }
   })
 
-  it('栈闸门：可发布栈（fastapi/springboot）放行，不可发布栈（static）置灰带说明', async () => {
+  it('胶囊里的图标按钮真接线：dev 启停走 devStart、重启走 devRestart、prod 启停走 prodStop', async () => {
     const wrapper = await mountView()
-    const pubBtn = (i) => wrapper.findAll('.stub-card')[i].findAll('.stub-a-button')
-      .find((b) => b.text() === '发布')
+    const card = wrapper.findAll('.stub-card')[0]
+    const [devToggle, devRestart] = card.findAll('.zc-env-dev .zc-env-btn')
+    const prodToggle = card.findAll('.zc-env-prod .zc-env-btn')[1]
+    await devToggle.trigger('click')       // 夹具 status_dev=stopped → 该启动
+    await devRestart.trigger('click')
+    await prodToggle.trigger('click')      // 夹具 status_prod=running → 该停止
+    await flushPromises()
+    expect(mocks.api.devStart).toHaveBeenCalledWith(1)
+    expect(mocks.api.devRestart).toHaveBeenCalledWith(1)
+    expect(mocks.api.prodStop).toHaveBeenCalledWith(1)
+  })
+
+  it('栈闸门：名单内栈（fastapi/static/springboot）放行，名单外栈置灰带说明', async () => {
+    const wrapper = await mountView()
+    const pubBtn = (i) => wrapper.findAll('.stub-card')[i].find('.zc-act-publish')
     // 大型栈（vue3-springboot）后端早已可发布，闸门曾因只认 fastapi 把这张按钮钉死一个迭代
     expect(pubBtn(2).attributes('disabled')).toBeUndefined()
     expect(pubBtn(0).attributes('disabled')).toBeUndefined()
-    const staticBtn = pubBtn(1)
-    expect(staticBtn.attributes('disabled')).toBeDefined()
-    expect(staticBtn.attributes('title')).toContain('暂不支持')
+    expect(pubBtn(1).attributes('disabled')).toBeUndefined()   // static 本期进名单
+    const offListBtn = pubBtn(3)
+    expect(offListBtn.attributes('disabled')).toBeDefined()
+    expect(offListBtn.attributes('title')).toContain('暂不支持')
   })
 
   it('点发布打开进度弹层（PublishModal 挂载并收到 app）', async () => {
     const wrapper = await mountView()
     expect(wrapper.find('.stub-pub-modal').exists()).toBe(false)
-    const btn = wrapper.findAll('.stub-card')[0].findAll('.stub-a-button')
-      .find((b) => b.text() === '发布')
+    const btn = wrapper.findAll('.stub-card')[0].find('.zc-act-publish')
     await btn.trigger('click')
     expect(wrapper.find('.stub-pub-modal').exists()).toBe(true)
   })
@@ -328,18 +370,23 @@ describe('AppsView 商店接线', () => {
   })
 })
 
-// ---------- 卡片右上 ☰ 折叠菜单：重命名/打开工程目录/复制预览地址/查看日志/删除 ----------
+// ---------- 卡片动作分层（2026-11-13 改版）：工具条常驻平铺，☰ 只留破坏性动作 ----------
 describe('AppsView 卡片折叠菜单', () => {
-  it('卡片右上 ☰ 菜单收纳预览/重建/历史 + 五项工具操作', async () => {
+  it('☰ 只收纳两个破坏性动作，其余动作不点开也在卡片上', async () => {
     const wrapper = await mountView()
-    const menu = wrapper.findAll('.stub-card')[0].find('.stub-dropdown')
+    const card = wrapper.findAll('.stub-card')[0]
+    const menu = card.find('.stub-dropdown')
     expect(menu.exists()).toBe(true)
-    const text = menu.text()
-    for (const label of ['预览', '重建 dev', '发布历史', '重命名', '打开工程目录', '复制预览地址', '查看日志', '删除应用'])
-      expect(text).toContain(label)
+    expect(menu.text()).toContain('重建 dev')
+    expect(menu.text()).toContain('删除应用')
+    // 曾经这些都在下拉里，点开才看得见——改版后它们常驻，菜单里不该再有
+    expect(menu.text()).not.toContain('发布历史')
+    expect(menu.text()).not.toContain('查看日志')
+    for (const label of ['预览', '发布历史', '重命名', '打开工程目录', '复制预览地址', '查看日志', '资源监控'])
+      expect(card.text()).toContain(label)
   })
 
-  it('☰ 菜单含 DB 操作入口且 href 指向 /apps/:id/db（新标签打开）', async () => {
+  it('工具条含 DB 操作入口且 href 指向 /apps/:id/db（新标签打开）', async () => {
     const wrapper = await mountView()
     const dbLink = wrapper.findAll('.stub-card')[0].find('.zc-menu-db')
     expect(dbLink.exists()).toBe(true)
@@ -614,6 +661,7 @@ const MOBILE_APPS = [
 
 async function mountMobileView() {
   mocks.api.listApps.mockResolvedValue({ data: MOBILE_APPS })
+  mocks.api.appMetricsSummary.mockResolvedValue(summaryOf([]))
   const wrapper = mount(AppsView, { global: { stubs: STUBS } })
   await flushPromises()
   return wrapper
@@ -635,5 +683,160 @@ describe('AppsView 移动端入口', () => {
     const modal = wrapper.find('.stub-mobile-modal')
     expect(modal.exists()).toBe(true)
     expect(modal.text()).toBe('4')
+  })
+})
+
+// ---------- 仪表卡：一次批量取数 + 真实读数 + hover 工具条（2026-11-13 改版） ----------
+// 选批量接口而不是每卡各取一次的唯一动机就是下面第一条；读数一律走共享格式化，
+// 「未采集」必须画成文案而不是 0——后端刻意不为停炉栈写 0 假点，前端也不能把它画成零。
+const item = (over = {}) => ({
+  app_id: 1, prod_status: 'running',
+  cpu: { value: 12.5, ts: 't' }, memory: { value: 1234567, ts: 't' },
+  db_size: { value: 2048, ts: 't' }, workspace_size: { value: 5 * 1024 ** 3, ts: 't' },
+  series: { cpu: [{ ts: 'a', value: 1 }, { ts: 'b', value: 2 }, { ts: 'c', value: 3 }],
+            memory: [{ ts: 'a', value: 4 }, { ts: 'b', value: 5 }, { ts: 'c', value: 6 }] },
+  ...over,
+})
+
+describe('AppsView 仪表卡', () => {
+  it('整页只发一次批量 summary 请求，而不是每张卡各取一次', async () => {
+    await mountView()
+    expect(mocks.api.appMetricsSummary).toHaveBeenCalledTimes(1)
+  })
+
+  it('读数走共享格式化：CPU 百分比、内存/DB/工作区字节', async () => {
+    const wrapper = await mountView(summaryOf([item()]))
+    const card = wrapper.findAll('.stub-card')[0]
+    expect(card.find('.zc-gauge-value').text()).toBe('12.5 %')
+    expect(card.find('.zc-metric-mem').text()).toBe('1.2 MB')
+    expect(card.find('.zc-metric-db').text()).toBe('2.0 KB')
+    expect(card.find('.zc-metric-ws').text()).toBe('5.0 GB')
+  })
+
+  it('停炉与未采样画文案不画零（0.0 % 会被读成「真的很闲」）', async () => {
+    const wrapper = await mountView(summaryOf([item({
+      prod_status: 'stopped', cpu: null, memory: null, workspace_size: null,
+      series: { cpu: [], memory: [] },
+    })]))
+    const card = wrapper.findAll('.stub-card')[0]
+    expect(card.find('.zc-gauge-value').text()).toBe('停炉未采集')
+    expect(card.text()).not.toContain('0.0 %')
+    expect(card.find('.zc-metric-mem').text()).toBe('停炉未采集')
+    // 存储类与运行态无关：后端照回真实占用，前端照显
+    expect(card.find('.zc-metric-db').text()).toBe('2.0 KB')
+    expect(card.find('.zc-metric-ws').text()).toBe('未采集')
+  })
+
+  it('曲线按采样点画折线；一个点都没有时不画 path（贴底假直线比空白更坏）', async () => {
+    const wrapper = await mountView(summaryOf([item()]))
+    const card = wrapper.findAll('.stub-card')[0]
+    const paths = card.findAll('.zc-spark-cpu path')
+    expect(paths).toHaveLength(1)
+    expect(paths[0].attributes('d')).toContain('L')
+
+    const none = await mountView(summaryOf([item({ series: { cpu: [], memory: [] } })]))
+    expect(none.findAll('.stub-card')[0].find('.zc-spark-cpu path').exists()).toBe(false)
+    expect(none.findAll('.stub-card')[0].find('.zc-spark-cpu').text()).toContain('无采样')
+  })
+
+  it('窗口标签用后端回的 window，前端不自己写死一个口径', async () => {
+    const wrapper = await mountView(summaryOf([item()], '24h'))
+    expect(wrapper.findAll('.stub-card')[0].text()).toContain('近 24h')
+  })
+
+  it('工具条默认常驻：没有图钉开关，也没有 is-pinned 这类状态类', async () => {
+    const wrapper = await mountView()
+    const card = wrapper.findAll('.stub-card')[0]
+    expect(card.find('.zc-tb-pin').exists()).toBe(false)
+    expect(card.find('.zc-toolbar').classes()).not.toContain('is-pinned')
+  })
+
+  it('八个低频动作常驻卡片 DOM（不点开也在），☰ 只剩两个破坏性动作', async () => {
+    const wrapper = await mountView()
+    const card = wrapper.findAll('.stub-card')[0]
+    for (const k of ['preview', 'history', 'metrics', 'copy', 'folder', 'logs', 'rename', 'db']) {
+      expect(card.find(`.zc-tb-item.zc-menu-${k}`).exists()).toBe(true)
+    }
+    // 每个动作都得带图标——纯文字隐藏标签 + 无图标 = 一排空白方块
+    const items = card.findAll('.zc-tb-item')
+    expect(items.length).toBeGreaterThanOrEqual(8)
+    for (const it of items) expect(it.find('[role="img"]').exists()).toBe(true)
+    const menu = card.findAll('.zc-app-menu-item')
+    expect(menu).toHaveLength(2)
+    expect(card.find('.zc-menu-reset').exists()).toBe(true)
+    expect(card.find('.zc-menu-del').exists()).toBe(true)
+  })
+})
+
+// ---------- 页头总控区（ADR-0048 D 方案）：渐变条幅 + 应用数徽标 + prod 状态分桶 + 平均 CPU ----------
+describe('AppsView 页头总控区', () => {
+  const statOf = (hero) => Object.fromEntries(hero.findAll('.zc-stat')
+    .map((c) => [c.find('.zc-stat-label').text(), c.find('.zc-stat-value').text()]))
+  const sum = (s, keys) => keys.reduce((n, k) => n + Number(s[k]), 0)
+
+  it('标题旁挂应用总数，统计按 prod 状态分桶且四桶之和等于总数', async () => {
+    const wrapper = await mountView()   // 夹具 4 个：prod running×1 / stopped×3
+    const hero = wrapper.find('.zc-hero')
+    expect(hero.exists()).toBe(true)
+    expect(hero.find('.zc-hero-count').text()).toBe('4')
+    const s = statOf(hero)
+    expect(s['应用']).toBe('4')
+    expect(s['运行中']).toBe('1')
+    expect(s['已停止']).toBe('3')
+    expect(s['进行中']).toBe('0')
+    expect(s['异常']).toBe('0')
+    expect(sum(s, ['运行中', '已停止', '进行中', '异常'])).toBe(Number(s['应用']))
+  })
+
+  it('进行中把 starting/publishing 也算进去，别让一个正在发布的状态掉出分桶', async () => {
+    mocks.api.listApps.mockResolvedValue({
+      data: [APPS[0], { ...APPS[1], status_prod: 'publishing' }, { ...APPS[2], status_prod: 'starting' }],
+    })
+    mocks.api.appMetricsSummary.mockResolvedValue(summaryOf([]))
+    const wrapper = mount(AppsView, { global: { stubs: STUBS } })
+    await flushPromises()
+    const s = statOf(wrapper.find('.zc-hero'))
+    expect(s['进行中']).toBe('2')
+    expect(s['已停止']).toBe('0')
+    expect(sum(s, ['运行中', '已停止', '进行中', '异常'])).toBe(Number(s['应用']))
+  })
+
+  it('异常桶同时收 unhealthy 与 error，体检未通过的应用不能从四桶里漏掉', async () => {
+    mocks.api.listApps.mockResolvedValue({
+      data: [APPS[0], { ...APPS[1], status_prod: 'unhealthy' }, { ...APPS[2], status_prod: 'error' }],
+    })
+    mocks.api.appMetricsSummary.mockResolvedValue(summaryOf([]))
+    const wrapper = mount(AppsView, { global: { stubs: STUBS } })
+    await flushPromises()
+    const s = statOf(wrapper.find('.zc-hero'))
+    expect(s['异常']).toBe('2')
+    expect(s['已停止']).toBe('0')
+    expect(sum(s, ['运行中', '已停止', '进行中', '异常'])).toBe(Number(s['应用']))
+  })
+
+  it('平均 CPU 只把采到值的活应用计入平均', async () => {
+    const wrapper = await mountView(summaryOf([item(), item({ app_id: 2, cpu: { value: 32.5, ts: 't' } })]))
+    expect(statOf(wrapper.find('.zc-hero'))['平均 CPU']).toBe('22.5 %')
+  })
+
+  it('一个 CPU 读数都没采到时报 —，不报 0.0 %（0 会被读成「很闲」）', async () => {
+    const wrapper = await mountView(summaryOf([
+      item({ cpu: null, prod_status: 'stopped' }),
+      item({ app_id: 2, cpu: null, prod_status: 'stopped' }),
+    ]))
+    expect(statOf(wrapper.find('.zc-hero'))['平均 CPU']).toBe('—')
+  })
+
+  it('空列表页头不撒谎：总数 0、各桶 0、CPU 为 —', async () => {
+    mocks.api.listApps.mockResolvedValue({ data: [] })
+    mocks.api.appMetricsSummary.mockResolvedValue(summaryOf([]))
+    const wrapper = mount(AppsView, { global: { stubs: STUBS } })
+    await flushPromises()
+    const hero = wrapper.find('.zc-hero')
+    expect(hero.find('.zc-hero-count').text()).toBe('0')
+    const s = statOf(hero)
+    expect(s['应用']).toBe('0')
+    expect(s['运行中']).toBe('0')
+    expect(s['平均 CPU']).toBe('—')
   })
 })
