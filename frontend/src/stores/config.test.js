@@ -80,3 +80,41 @@ describe('config store 预览重启次数与提问提醒', () => {
       'agent.preview_max_restarts': 0, 'clarify.ask_remind_at': 0 }))
   })
 })
+
+describe('config store 运行参数与记忆召回', () => {
+  it('默认值逐项对齐后端代码默认：抄错等于用一次保存改掉默认值', () => {
+    expect(useConfigStore().form).toMatchObject({
+      autoCompactChars: 50000, compactMinNew: 6, compactKeepRecent: 8, steeringQueueMax: 20,
+      previewWaitSeconds: 240, previewLogLines: 80, previewConfirmRunning: true,
+      browserMaxPerRun: 6, browserMaxStepsPerRun: 12, browserTimeoutSeconds: 45,
+      browserExpectTimeoutMs: 3000, browserSettleMs: 1200, browserInteractiveMax: 40,
+      dbRowsLimit: 200, dbRowsAssertMax: 200,
+      memoryEnabled: true, memoryTopK: 5, memoryMinSimilarity: -1, memoryMaxTokens: 600,
+    })
+  })
+
+  it('新增映射键都必须在表单里有默认值，否则 save 会把 undefined 写进库', async () => {
+    putConfig.mockResolvedValue({ data: { ok: true } })
+    await useConfigStore().save()
+    const payload = putConfig.mock.calls[0][0]
+    expect(Object.keys(payload).length).toBeGreaterThan(20)
+    expect(Object.entries(payload).filter(([, v]) => v === undefined || v === null)).toEqual([])
+  })
+
+  it('loadConfig / save 原样读写 0 与小数值（0=关闭自动压缩、-1=不滤相似度）', async () => {
+    getConfig.mockResolvedValue({ data: {
+      'agent.auto_compact_chars': 0, 'agent.compact_keep_recent': 12,
+      'memory.top_k': 20, 'memory.min_similarity': 0.4 } })
+    const store = useConfigStore()
+    await store.loadConfig()
+    expect(store.form.autoCompactChars).toBe(0)
+    expect(store.form.compactKeepRecent).toBe(12)
+    expect(store.form.memoryTopK).toBe(20)
+    expect(store.form.memoryMinSimilarity).toBe(0.4)
+
+    await store.save()
+    expect(putConfig).toHaveBeenCalledWith(expect.objectContaining({
+      'agent.auto_compact_chars': 0, 'agent.compact_keep_recent': 12,
+      'memory.top_k': 20, 'memory.min_similarity': 0.4 }))
+  })
+})

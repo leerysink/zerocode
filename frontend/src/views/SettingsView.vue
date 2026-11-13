@@ -1,7 +1,10 @@
 <script setup>
 // 设置页（Task 14 充实，Task 16 分页签）：页签「模型库」= 多模型配置 CRUD（列表/新增/编辑/删除确认/设默认），
 // 页签「基础配置」= 原分组表单——模型接入（base_url / model / api_key(password) + 测试连接）、
-// 执行参数（write_confirm / ask_timeout_seconds / max_tool_rounds / history_window / fs.open_folder_mode）、环境状态（PG 版本）。
+// 执行参数（write_confirm / clarify.enabled / clarify.ask_remind_at / ask_timeout_seconds /
+// max_tool_rounds / agent.preview_max_restarts / history_window / fs.open_folder_mode）、环境状态（PG 版本）。
+// 页签「运行参数」= 其余 agent.*/memory.* 可调项：上下文压缩、执行与预览、浏览器检查、应用数据库工具、
+// 记忆召回。除记忆（账户级）外全是平台级键，页首用 alert 明说这件事。
 // 基础配置字段映射与保存走 config store（loadConfig / save），api_key 掩码哨兵 sk-*** 由后端 PUT 过滤、不会覆盖真实密钥。
 // 模型库 api_key 契约（后端 app/api/models.py）：编辑留空 = 不改（提交时填哨兵 sk-***），新建必填；GET 永远掩码回显。
 import { createVNode, onMounted, ref, watch } from 'vue'
@@ -320,6 +323,100 @@ async function save() {
           <a-button type="primary" :loading="store.saving" @click="save">保存</a-button>
         </div>
       </a-tab-pane>
+
+      <a-tab-pane key="agent" tab="运行参数">
+        <a-alert
+          class="zc-agent-note"
+          type="info"
+          show-icon
+          message="除「记忆召回」按账户生效外，本页其余项都是平台级配置：保存后对所有账号的会话生效。数值框的上下限与后端夹取区间一致，超出的值后端会回落。"
+        />
+        <a-card title="上下文压缩" class="zc-card">
+          <a-form layout="vertical">
+            <a-form-item label="自动压缩阈值（字符）" extra="水位之后的消息估算超过这个字符数就自动摘要，0=关闭自动压缩">
+              <a-input-number v-model:value="store.form.autoCompactChars" :min="0" :step="1000" style="width: 180px" />
+            </a-form-item>
+            <a-form-item label="压缩最少新增消息数" extra="距上次压缩至少新增这么多条才允许再压，0=不设下限">
+              <a-input-number v-model:value="store.form.compactMinNew" :min="0" style="width: 180px" />
+            </a-form-item>
+            <a-form-item label="压缩保留原文条数" extra="最近 N 条消息不进摘要，保持原文">
+              <a-input-number v-model:value="store.form.compactKeepRecent" :min="1" style="width: 180px" />
+            </a-form-item>
+          </a-form>
+        </a-card>
+
+        <a-card title="执行与预览" class="zc-card">
+          <a-form layout="vertical">
+            <a-form-item label="插话队列上限（条）" extra="执行中最多排几条插话，0=禁用插话">
+              <a-input-number v-model:value="store.form.steeringQueueMax" :min="0" style="width: 180px" />
+            </a-form-item>
+            <a-form-item label="预览启动等待（秒）" extra="preview_restart 单次最长等待，0..900">
+              <a-input-number v-model:value="store.form.previewWaitSeconds" :min="0" :max="900" style="width: 180px" />
+            </a-form-item>
+            <a-form-item label="预览日志行数" extra="返回给模型的最近日志行数，10..300">
+              <a-input-number v-model:value="store.form.previewLogLines" :min="10" :max="300" style="width: 180px" />
+            </a-form-item>
+            <a-form-item label="中断运行中的预览需确认" extra="关掉后模型可以不打招呼直接重启用户正在用的预览">
+              <a-switch v-model:checked="store.form.previewConfirmRunning" />
+            </a-form-item>
+          </a-form>
+        </a-card>
+
+        <a-card title="浏览器检查" class="zc-card">
+          <a-form layout="vertical">
+            <a-form-item label="只读检查次数上限（次/任务）" extra="0=不限，最大 100">
+              <a-input-number v-model:value="store.form.browserMaxPerRun" :min="0" :max="100" style="width: 180px" />
+            </a-form-item>
+            <a-form-item label="交互步数上限（步/任务）" extra="0=不限，最大 200">
+              <a-input-number v-model:value="store.form.browserMaxStepsPerRun" :min="0" :max="200" style="width: 180px" />
+            </a-form-item>
+            <a-form-item label="单步超时（秒）" extra="打开页面与检查的 HTTP 超时，10..120">
+              <a-input-number v-model:value="store.form.browserTimeoutSeconds" :min="10" :max="120" style="width: 180px" />
+            </a-form-item>
+            <a-form-item label="断言等待超时（毫秒）" extra="expect 轮询上限，500..8000">
+              <a-input-number v-model:value="store.form.browserExpectTimeoutMs" :min="500" :max="8000" :step="100" style="width: 180px" />
+            </a-form-item>
+            <a-form-item label="页面静置等待（毫秒）" extra="导航后留给动画的时间，0..5000">
+              <a-input-number v-model:value="store.form.browserSettleMs" :min="0" :max="5000" :step="100" style="width: 180px" />
+            </a-form-item>
+            <a-form-item label="交互元素清单条数" extra="喂给模型的可点元素清单长度，1..200，调大即调高每轮 token">
+              <a-input-number v-model:value="store.form.browserInteractiveMax" :min="1" :max="200" style="width: 180px" />
+            </a-form-item>
+          </a-form>
+        </a-card>
+
+        <a-card title="应用数据库工具" class="zc-card">
+          <a-form layout="vertical">
+            <a-form-item label="查询结果行数上限" extra="返回给模型的行数，10..1000">
+              <a-input-number v-model:value="store.form.dbRowsLimit" :min="10" :max="1000" style="width: 180px" />
+            </a-form-item>
+            <a-form-item label="断言比对行数上限" extra="rows 断言两侧各比对的行数，1..1000">
+              <a-input-number v-model:value="store.form.dbRowsAssertMax" :min="1" :max="1000" style="width: 180px" />
+            </a-form-item>
+          </a-form>
+        </a-card>
+
+        <a-card title="记忆召回" class="zc-card">
+          <a-form layout="vertical">
+            <a-form-item label="注入召回记忆" extra="关掉只是不再往提示词里塞记忆，AI 仍可写入记忆">
+              <a-switch v-model:checked="store.form.memoryEnabled" />
+            </a-form-item>
+            <a-form-item label="召回条数" extra="每次最多带几条记忆，1..100">
+              <a-input-number v-model:value="store.form.memoryTopK" :min="1" :max="100" style="width: 180px" />
+            </a-form-item>
+            <a-form-item label="相似度阈值" extra="-1..1；-1 表示一条都不因阈值被滤掉">
+              <a-input-number v-model:value="store.form.memoryMinSimilarity" :min="-1" :max="1" :step="0.05" style="width: 180px" />
+            </a-form-item>
+            <a-form-item label="记忆注入预算（token）" extra="1..20000；召回按分数排序逐条累计，触顶的整条丢弃">
+              <a-input-number v-model:value="store.form.memoryMaxTokens" :min="1" :max="20000" :step="100" style="width: 180px" />
+            </a-form-item>
+          </a-form>
+        </a-card>
+
+        <div class="zc-save-bar">
+          <a-button type="primary" :loading="store.saving" @click="save">保存</a-button>
+        </div>
+      </a-tab-pane>
     </a-tabs>
   </div>
 </template>
@@ -338,6 +435,9 @@ async function save() {
   align-items: center;
   gap: 8px;
   margin: 0 0 16px;
+}
+.zc-agent-note {
+  margin-bottom: 16px;
 }
 .zc-back {
   padding-inline: 6px;
