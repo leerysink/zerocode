@@ -165,3 +165,69 @@ def test_mobile_stack_key_agrees_with_the_registry():
     from app.deploy import compose, contract
     from app.services import app_service
     assert contract.MOBILE_STACK == compose.MOBILE_STACK == app_service.MOBILE_STACK
+
+
+# ==== 本期新栈：vue3-node 与 static 的契约事实（规格 2026-11-13 US-17/US-18/US-20）====
+
+META_NODE = {**VALID_META, "stack": "vue3-node"}
+META_STATIC = {**VALID_META, "stack": "static",
+               "health": {"frontend": "/", "backend": ""}}
+
+
+def test_contract_node_stack_states_its_runtime_facts(tmp_path):
+    """US-17：Agent 接手 Node 工程时得知道它是 Express 5 + TypeScript + pg-promise 的 ESM 工程。
+
+    `+asyncpg` 这条是本期最贵的一次纠错：pg-promise 只认纯 postgresql://，而契约原来只写
+    「DATABASE_URL（pg 连接串）」，模型照着 fastapi 的记忆写 `createPool('postgresql+asyncpg://…')`
+    会连不上库——dev 预览照样起得来（vite 只探前端），表征是首页一直「后端未就绪」。
+    """
+    c = _contract(tmp_path, META_NODE)
+    assert c and "Express 5" in c and "TypeScript" in c and "pg-promise" in c
+    assert "纯" in c and "+asyncpg" in c                # ENV_HINT 明说方言与反例
+    assert "8000" in c                                  # 容器内端口是契约事实，不是猜的
+    # ESM + NodeNext 的头号坑：相对 import 漏 .js 后缀，dev 侥幸、build 必红
+    assert ".js" in c and "ESM" in c
+    assert "\n8)" in c and "\n9)" in c and "\n10)" in c
+
+
+def test_contract_node_red_lines_are_sql_and_wildcard(tmp_path):
+    """US-18：两条栈专属红线——参数化禁拼接、Express 5 通配写 /{*path}。"""
+    c = _contract(tmp_path, META_NODE)
+    assert "$1" in c and "拼接" in c
+    assert "/{*path}" in c and "'*'" in c               # 旧写法要写出来，否则模型不知道禁的是什么
+    assert "TypeError" in c                             # 说清后果在启动期，不是运行时才 404
+
+
+def test_contract_node_does_not_leak_large_stack_paragraphs(tmp_path):
+    """Node 是小栈：大栈基座段（三件套/sys_*/Security）一条都不许漏进来（与 fastapi 同待遇）。"""
+    c = _contract(tmp_path, META_NODE)
+    for anchor in ("三件套", "sys_role_menu", "SPRING_DATASOURCE_URL", "@PreAuthorize"):
+        assert anchor not in c, anchor
+
+
+def test_contract_static_stack_drops_backend_and_data_track(tmp_path):
+    """US-20：static 没有后端与数据轨，契约不许再教它写 SQL、建 schema/、等 /api/health。
+
+    平台**确实**给 static 建了库（D-5：provision 保持栈无关），但纯前端够不着它——
+    所以库事实也不注入：写了就是邀请模型去设计一套「假装能连库」的前端。
+    """
+    c = _contract(tmp_path, META_STATIC)
+    assert c
+    # 义务没了（不是字没了：契约可以明说「本栈没有 sqlchange/」，但不能叫它去写 sqlchange/Dxxx 文件）
+    for gone in ("数据库变更走双轨", "sqlchange/D", "schema.sql", "本应用数据库",
+                 "/api/health", "后端从环境变量读取", "ON CONFLICT DO NOTHING"):
+        assert gone not in c, gone
+    for anchor in ("localStorage", "Blob", "跨设备同步"):
+        assert anchor in c, anchor
+    assert "纯前端静态页" in c
+    assert c.rstrip().endswith("正式使用请点「发布」。")   # 尾部不多出任何栈专属段
+
+
+def test_contract_fastapi_text_is_not_touched_by_the_new_stacks(tmp_path):
+    """新栈的分支只认各自 stack：fastapi 正文一个字节都不许变（它是存量应用的提示词）。"""
+    before = _contract(tmp_path, VALID_META)
+    for stack in ("vue3-node", "static"):
+        _contract(tmp_path, {**VALID_META, "stack": stack})
+    assert _contract(tmp_path, VALID_META) == before
+    for anchor in ("纯", "pg-promise", "localStorage", "{*path}"):
+        assert anchor not in before, anchor

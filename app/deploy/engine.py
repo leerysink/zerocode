@@ -21,6 +21,8 @@ from app.deploy.provision import provision_env, read_cred
 from app.deploy.settings import deploy_cfg, health_timeout, preview_probe_host, preview_url
 # 迁移入口按模块级名字引入（D-1）：引擎内以 bare name 调用，测试 monkeypatch engine.run_sqlchange 生效
 from app.deploy.sqlrun import run_sqlchange
+# 数据轨判据同样按模块级名字引入（D-1）：static 一类不铺轨的栈要跳过迁移闸门
+from app.deploy.scaffold import has_data_track
 
 logger = logging.getLogger(__name__)
 
@@ -332,11 +334,18 @@ async def start_dev(sf, app: dict, notify=None) -> dict:
         if notify:
             async def on_log(line):
                 await _notify(notify, app_id, {"type": "dev_log", "line": line})
-        await _step(app_id, notify, f"→ 执行 sqlchange 迁移（dev 库 {cred.get('db', '?')}）")
-        mig = await run_sqlchange(root, "dev", cred, on_log=on_log)
+        track = has_data_track(app.get("stack"))
+        await _step(app_id, notify,
+                   f"→ 执行 sqlchange 迁移（dev 库 {cred.get('db', '?')}）" if track
+                   else "· 该栈不铺数据轨，跳过迁移")
+        # 不铺数据轨的栈没有 sqlchange/，run_sqlchange 的 fail-closed 闸门会判 ok=False——那不是
+        # 「迁移出错」而是「本栈没有迁移」。短路成成功，是为了让下面的 migrate_result 事件与
+        # 「闸门不过应用不起」这条既有纪律都按同一形状走完（不发事件，前端迁移面板会悬在「迁移中」）。
+        mig = (await run_sqlchange(root, "dev", cred, on_log=on_log) if track
+               else {"ok": True, "code": 0, "log": "该栈不铺数据轨，无迁移可执行"})
         if not mig["ok"]:
             await _step(app_id, notify, "✗ 迁移失败，dev 栈不启动", since=t0, level=logging.WARNING)
-        else:
+        elif track:
             await _step(app_id, notify, "✓ 迁移完成", since=t0)
         await _notify(notify, app_id, {"type": "migrate_result",
                                        "env": "dev", "ok": mig["ok"], "log": mig["log"]})

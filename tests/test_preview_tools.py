@@ -1112,8 +1112,22 @@ async def test_preview_prompt_stack_specific_lines():
     spring = pt.build_preview_prompt("vue3-springboot")
     assert "必须 preview_restart" in spring and "uvicorn" not in spring
     assert "刷新即可" in pt.build_preview_prompt("static")
-    assert "刷新即可" in pt.build_preview_prompt("vue3-node")
     assert "</preview>" in pt.build_preview_prompt("unknown-stack")   # 未知栈仍有基线指引
+    # vue3-node 原来也断言「刷新即可」——那是「本栈无后端」错账的一部分，翻案见下一个用例
+    assert "无后端" not in pt.build_preview_prompt("vue3-springboot")
+
+
+async def test_preview_prompt_node_stack_is_not_told_it_has_no_backend():
+    """vue3-node 是有后端的栈：提示词曾写着「无后端，前端刷新即可」，模型于是从不看 /api/health。
+
+    交付本栈时这条错账必须一起翻：热更新语义说清楚是 tsx watch **重启进程**（不是模块级 HMR），
+    依赖清单改动仍旧要 preview_restart。
+    """
+    from app.agent import preview_tools as pt
+    p = pt.build_preview_prompt("vue3-node")
+    assert "无后端" not in p
+    assert "tsx watch" in p
+    assert "preview_restart" in p
 
 # ---------- execute_tool 分派与 ToolContext 契约 ----------
 

@@ -17,7 +17,7 @@ from fastapi import APIRouter, Request, HTTPException, File, Form, UploadFile
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 from sqlalchemy import text
-from app.deploy import apkbuild, engine, mobile, mpbuild, mpcreds, prod, records, shell, sqlrun
+from app.deploy import apkbuild, compose, engine, mobile, mpbuild, mpcreds, prod, records, shell, sqlrun
 from app.deploy import provision
 from app.deploy import tasks as deploy_tasks
 from app.deploy.errors import DeployError
@@ -736,7 +736,7 @@ async def delete_record(request: Request, app_id: int, rid: int):
         raise HTTPException(404, "发布记录不存在")
     version = row[0]
     if version:
-        for role in ("frontend", "backend"):
+        for role in compose.prod_roles(app.get("stack")):
             tag = f"zc-{app['slug']}-{role}:prod-{version}"
             try:
                 code, log = await prod._docker("image", "rm", tag, timeout=120)

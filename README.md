@@ -129,7 +129,7 @@ ZeroCode 是一台跑在**你自己机器上**的 AI 应用工厂。
 
 | 层次 | 选型 |
 | --- | --- |
-| 生成的应用 · 小型 | Vue 3 + FastAPI + PostgreSQL |
+| 生成的应用 · 小型 | 三档任选：Vue 3 + FastAPI + PostgreSQL（主推）、Vue 3 + Express 5 + TypeScript + pg-promise、纯前端静态页（Vue 3，无后端无库） |
 | 生成的应用 · 大型 | Vue 3 + Spring Boot 3（含 RBAC 权限体系、JWT 认证、Redis 登录态） |
 | 平台后端 | Python 3.11+、FastAPI、SQLAlchemy、asyncpg、Pydantic 2 |
 | 平台前端 | Vue 3.5、Ant Design Vue、Pinia、Vue Router、Vite |

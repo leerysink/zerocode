@@ -66,6 +66,9 @@ def _frontend(root, scripts=None, dev_deps=None):
 def _backend(root, kind="py"):
     if kind == "py":
         (root / "backend" / "app").mkdir(parents=True, exist_ok=True)
+    elif kind == "node":
+        (root / "backend" / "src").mkdir(parents=True, exist_ok=True)
+        (root / "backend" / "tsconfig.json").write_text('{"compilerOptions": {}}', encoding="utf-8")
     else:
         (root / "backend").mkdir(exist_ok=True)
         (root / "backend" / "pom.xml").write_text("<project/>", encoding="utf-8")
@@ -127,6 +130,58 @@ async def test_backend_compile_springboot_uses_mvn_compile(wired, monkeypatch):
     joined = " ".join(_run_args(spy)[0])
     assert "mvn" in joined and "compile" in joined and "-DskipTests" in joined
     assert r["passed"] is False and "cannot find symbol" in r["output"]
+
+
+@pytest.mark.asyncio
+async def test_backend_compile_node_uses_tsc_not_python(wired, monkeypatch):
+    """Node 小栈的后端是 TypeScript：自检 = 装依赖 + `npx tsc --noEmit`，与工程自己的 typecheck 脚本同口径。
+
+    这是一家三口的错账（ADR-0046 落地时 vue3-node 还没交付，却被归进 Python 分支）：容器基座是
+    node:20-alpine，里面既没有 python、也没有 backend/app，模型每跑一次自检都收到「backend/app
+    不存在」，白烧一轮对话。所以这里同时钉反向半边：命令串里不许再出现 python/compileall。
+    """
+    async def node_app(ctx):
+        return {**APP, "stack": "vue3-node"}
+
+    monkeypatch.setattr("app.agent.preview_tools.fetch_app", node_app)
+    _backend(wired, "node")
+    spy = DockerSpy(2, "src/index.ts:7:18 - error TS2304: Cannot find name 'foo'")
+    monkeypatch.setattr(engine, "docker", spy)
+    r = await execute_tool(make_ctx(wired), "run_check", {"preset": "backend_compile"})
+    args, _ = _run_args(spy)
+    joined = " ".join(args)
+    assert "backend" in args                                    # 跑在 backend 服务自己的基座里
+    assert "tsc --noEmit" in joined and "npm install" in joined
+    assert "python" not in joined and "compileall" not in joined
+    assert r["ok"] is True and r["passed"] is False and "TS2304" in r["output"]
+
+
+@pytest.mark.asyncio
+async def test_backend_compile_node_without_tsconfig_is_not_runnable(wired, monkeypatch):
+    """没有 tsconfig.json 就无从检查：报「无法执行」（ok=False），不起容器、不假装通过。
+
+    判据用 tsconfig 而不是 src/index.ts：应用可以把源码放进子目录、改 rootDir，但 `npx tsc --noEmit`
+    没有配置就是全盘扫描 + 默认 compilerOptions，结果必然与工程真实构建口径不一致。
+    """
+    async def node_app(ctx):
+        return {**APP, "stack": "vue3-node"}
+
+    monkeypatch.setattr("app.agent.preview_tools.fetch_app", node_app)
+    _backend(wired, "node")
+    (wired / "backend" / "tsconfig.json").unlink()
+    spy = DockerSpy()
+    monkeypatch.setattr(engine, "docker", spy)
+    r = await execute_tool(make_ctx(wired), "run_check", {"preset": "backend_compile"})
+    assert r["ok"] is False and "tsconfig" in r["error"]
+    assert spy.calls == []
+
+
+def test_check_prompt_names_every_backend_runtime():
+    """提示词里的后端运行时清单与 _backend_check 的分支同源：漏写一个，模型就以为这项检查不存在。"""
+    from app.agent import check_tools
+    text = check_tools.build_check_prompt()
+    for kw in ("compileall", "tsc --noEmit", "mvn compile"):
+        assert kw in text, kw
 
 
 @pytest.mark.asyncio

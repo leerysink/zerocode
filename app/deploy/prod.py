@@ -14,8 +14,9 @@ import httpx
 from sqlalchemy import text
 from app.deploy import engine, records
 from app.deploy import gateway_routes
-from app.deploy.compose import ensure_deploy_files
+from app.deploy.compose import ensure_deploy_files, prod_roles
 from app.deploy.errors import DeployError
+from app.deploy.scaffold import has_data_track
 from app.deploy.engine import (preflight_docker, _app_root, _compose_meta, _notify,
                                LOG_PREFIX)
 from app.deploy.ports import explain_start_failure
@@ -436,10 +437,14 @@ async def preflight_checks(sf, root: Path, app: dict, prev_version: str | None, 
     cfg = await deploy_cfg(sf)
     # 1.x dev/prod 结构等价校验（P1 止血；并入 preflight，不改步序）：
     #     dev 实际结构必须等于 fold(sqlchange 文件)，否则视为漂移，硬阻断发布。
+    # 不铺数据轨的栈没有可比的东西（scratch fold 会撞 run_sqlchange 的 fail-closed 闸门），整条跳过。
     skip_verify = str(cfg.get("deploy.skip_schema_parity", "")).lower() in ("1", "true", "yes")
     if skip_verify:
         yield {"kind": "note", "code": "skip_parity",
                "message": "⚠ 已跳过 dev/prod 结构等价校验（deploy.skip_schema_parity）"}
+    elif not has_data_track(app.get("stack")):
+        yield {"kind": "note", "code": "parity_skip",
+               "message": "· 该栈不铺数据轨，跳过结构等价校验"}
     else:
         vp = await verify_dev_matches_files(sf, root, slug)
         block = parity_block_message(vp)
@@ -512,6 +517,7 @@ async def publish(sf, app: dict, notify=None, *, force: bool = False,
         return out
 
     try:
+        sql_applied: list[str] = []      # 不铺数据轨的栈不进迁移步，记账仍要有这个键
         await set_status(sf, app_id, "publishing")
         await _notify(notify, app_id, {"type": "prod_status", "status": "publishing"})
         # 1 preflight：命名规范 + 工程件齐备（旧栈原样在跑，此时失败=零影响）
@@ -549,12 +555,17 @@ async def publish(sf, app: dict, notify=None, *, force: bool = False,
         ensure_deploy_files(root, app, {"dev": cred_dev, "prod": cred}, version=version)
         await _step_ev(app_id, notify, rst, "provision", "ok")
         # 4 migrate（prod 库自有 sqlchange_history，增量语义同 dev；不过应用不起）
-        await _step_ev(app_id, notify, rst, "migrate", "running")
-        mig = await run_sqlchange(root, "prod", cred, on_log=blog)
-        if not mig["ok"]:
-            raise DeployError(f"prod 迁移失败（退出码 {mig['code']}），旧版本继续服务")
-        sql_applied = [ln.split()[1] for ln in mig["log"].splitlines()
-                       if ln.startswith("OK ") and len(ln.split()) > 1]
+        # 不铺数据轨的栈（static）压根没有 sqlchange/：run_sqlchange 的 fail-closed 闸门见不到目录
+        # 就 ok=False，挂着它 = 发布必红在迁移步。这一步对它是「不适用」，仍记 ok 让七步进度条走完。
+        if has_data_track(app.get("stack")):
+            await _step_ev(app_id, notify, rst, "migrate", "running")
+            mig = await run_sqlchange(root, "prod", cred, on_log=blog)
+            if not mig["ok"]:
+                raise DeployError(f"prod 迁移失败（退出码 {mig['code']}），旧版本继续服务")
+            sql_applied = [ln.split()[1] for ln in mig["log"].splitlines()
+                           if ln.startswith("OK ") and len(ln.split()) > 1]
+        else:
+            await _step(app_id, notify, "· 该栈不铺数据轨，跳过 prod 迁移")
         await _step_ev(app_id, notify, rst, "migrate", "ok")
         # 5 deploy：同 tag 已在 build 产出，up -d 只做切换（migrate 闸门已在 compose 内）
         await _step_ev(app_id, notify, rst, "deploy", "running")
@@ -650,11 +661,12 @@ async def publish(sf, app: dict, notify=None, *, force: bool = False,
             await _step(app_id, notify, f"✗ README 发布块刷新失败（不影响发布结果）：{re_}",
                         level=logging.WARNING)
         await records.finish(sf, rid, "success", step="record", detail={
-            "images": [f"zc-{slug}-frontend:prod-{version}", f"zc-{slug}-backend:prod-{version}"],
+            "images": [f"zc-{slug}-{r}:prod-{version}" for r in prod_roles(app.get("stack"))],
             "sqlApplied": sql_applied, "durationMs": int((time.monotonic() - t0) * 1000),
             "health": checks, "url": url})
         try:
-            await cleanup_images(sf, app_id, slug, notify=notify)   # keep-N：发布收尾顺手清旧镜像
+            await cleanup_images(sf, app_id, slug, notify=notify,
+                                 stack=app.get("stack"))   # keep-N：发布收尾顺手清旧镜像
         except Exception as ce:  # noqa: BLE001  清理本就有下次发布兜底，抛上来不把成功改判
             await _step(app_id, notify, f"✗ 旧镜像清理异常（下次发布兜底重试）：{ce}",
                         level=logging.WARNING)
@@ -704,7 +716,7 @@ async def rollback(sf, app: dict, version: str, notify=None) -> dict:
                                        "url": "", "error": message})
         raise DeployError(message, status=status)
 
-    for role in ("frontend", "backend"):
+    for role in prod_roles(app.get("stack")):
         if not await image_exists(f"zc-{slug}-{role}:prod-{version}"):
             await _reject(f"该版本镜像已清理（{role}），无法回滚", 400)
     root = await _app_root(sf, app)
@@ -760,12 +772,16 @@ async def rollback(sf, app: dict, version: str, notify=None) -> dict:
         raise DeployError(f"回滚失败: {e}") from e
 
 
-async def cleanup_images(sf, app_id: int, slug: str, notify=None) -> list[str]:
-    """keep-N 镜像清理（FR4-05）：rmi 尽力而为，返回**实删** tag（删失败不算数）。"""
+async def cleanup_images(sf, app_id: int, slug: str, notify=None, stack: str | None = None) -> list[str]:
+    """keep-N 镜像清理（FR4-05）：rmi 尽力而为，返回**实删** tag（删失败不算数）。
+
+    role 集合按栈取：static 只有一个前端镜像，写死两个就在不存在的 tag 上白跑一轮 rmi
+    （删失败本就静默忽略，于是「清理了 0 个」看起来像磁盘很干净）。stack 缺省保持旧调用形状。
+    """
     keep = int((await deploy_cfg(sf)).get("deploy.keep_versions", 5))
     removed: list[str] = []
     for v in await records.versions_for_cleanup(sf, app_id, keep):
-        for role in ("frontend", "backend"):
+        for role in prod_roles(stack):
             tag = f"zc-{slug}-{role}:prod-{v}"
             code, _ = await _docker("image", "rm", tag, timeout=120)
             if code == 0:

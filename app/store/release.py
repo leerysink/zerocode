@@ -10,6 +10,7 @@ from sqlalchemy import text
 from app.deploy import prod, records
 from app.deploy.errors import DeployError
 from app.deploy.provision import read_cred
+from app.deploy.scaffold import has_data_track
 from app.deploy.settings import REPO_ROOT, deploy_cfg
 from app.services import app_service
 from app.store import anchor as anchor_mod
@@ -46,6 +47,12 @@ async def create_release(sf, *, app_id: int, title: str, summary: str,
     version = app.get("current_version")
     rid = await records.begin(sf, app_id, "release", version)
     try:
+        # 闸门 0（规格 2026-11-13 §6）：不铺数据轨的栈不进商店。下面闸门 2/3 对它是**必然**落空
+        # （没有 backend 镜像、prod 库没有迁移历史），但那两句都在教用户「重新发布一次」——照做还是
+        # 上不了架。一句诚实拒绝比两条误导省一轮客服；商店拓扑本期不动。
+        if not has_data_track(app.get("stack")):
+            raise DeployError("纯前端静态页应用暂不支持上架商店"
+                              "（商店版本包要求后端镜像与 prod 迁移历史作为升级基线）")
         # 闸门 1：必须是「真实在服的 prod 版本」——没发布过就没有可信的库状态与镜像
         if not version:
             raise DeployError("该应用还没有正式发布过，请先点「发布」再上架商店")

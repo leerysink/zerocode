@@ -493,9 +493,9 @@ _PW = "pw-never-log"               # 口令哨兵：任何事件/日志出现它
 PUB_STEPS = ("preflight", "build", "provision", "migrate", "deploy", "health", "record")
 
 
-def _pub_app(aid, slug="zcpub", prod_port=8982, dev_port=8983):
+def _pub_app(aid, slug="zcpub", prod_port=8982, dev_port=8983, stack="vue3-fastapi"):
     """publish/rollback 入参形态（app_service.get_app 的扁平列 + ports 双形态一起给）。"""
-    return {"id": aid, "slug": slug, "stack": "vue3-fastapi", "scale": "small",
+    return {"id": aid, "slug": slug, "stack": stack, "scale": "small",
             "ports": {"prod": prod_port, "dev": dev_port},
             "prod_port": prod_port, "dev_port": dev_port}
 
@@ -867,6 +867,80 @@ async def test_ensure_prod_proxy_conf_default_stack_untouched(tmp_path):
     assert (fe / "nginx.conf").read_text(encoding="utf-8") == (
         app_service.TEMPLATES / "vue3-fastapi" / "frontend" / "nginx.conf"
     ).read_text(encoding="utf-8")
+
+
+async def test_ensure_prod_proxy_conf_static_stack_gets_backendless_conf(tmp_path):
+    """US-14：给 static 存量应用补反代时**不得**补出 backend upstream。
+
+    这不是风格问题：nginx 在启动期解析 proxy_pass 的主机名，指到一个不存在的容器是整台容器直接
+    退出（不是 404），发布体检只报「前端未就绪」——拿 fastapi 那份模板刷静态站点等于亲手 brick 它。
+    """
+    from app.services import app_service
+    fe = tmp_path / "frontend"
+    fe.mkdir()
+    assert await prod._ensure_prod_proxy_conf(fe.parent, "static") is True
+    conf = (fe / "nginx.conf").read_text(encoding="utf-8")
+    assert conf == (app_service.TEMPLATES / "static" / "frontend" / "nginx.conf"
+                    ).read_text(encoding="utf-8")
+    assert "backend" not in conf and "proxy_pass" not in conf
+    assert "try_files" in conf                          # SPA 回落仍在：静态站点自己的那半边接线
+
+
+async def test_publish_static_stack_skips_migrate_and_ships_one_image(
+        monkeypatch, sf, seed, tmp_path, gateway_routes_tmp):
+    """US-12：static 发布走完七步，但不碰迁移、不碰结构校验、只记一个镜像 tag。
+
+    两个「不碰」各有死法：挂着 run_sqlchange 会在迁移步红（fail-closed 闸门见不到 sqlchange/ 就
+    ok=False）；挂着结构等价校验同样红在 scratch fold。而进度步**仍要齐**——前端七步进度条按
+    PUB_STEPS 渲染，少发一个 ok 就永远停在「迁移中」。
+    """
+    wid, aid = await seed(slug="zcpub", prod_port=8982, dev_port=8983)
+    root = tmp_path / "app"
+    (root / "frontend").mkdir(parents=True)           # 故意没有 sqlchange/ 与 schema/：静态站点的产物形状
+    (root / "app.json").write_text(
+        json.dumps({"schema": "zc-app/1", "slug": "zcpub", "stack": "static"}), encoding="utf-8")
+    (root / "README.md").write_text("# zcpub\n", encoding="utf-8")
+    seams = PubSeams(monkeypatch, root)
+
+    res = await prod.publish(sf, _pub_app(aid, stack="static"), notify=seams.notify, force=True)
+
+    assert res["status"] == "running"
+    assert seams.steps_ok == list(PUB_STEPS)
+    assert not any(c[0] == "migrate" for c in seams.calls), seams.calls
+    assert not any(c[0] == "verify" for c in seams.calls)
+    prod_yml = (root / "deploy" / "prod-compose.yml").read_text(encoding="utf-8")
+    assert "backend" not in prod_yml and "migrate" not in prod_yml
+    assert not (root / "sqlchange").exists()          # 发布不得替静态站点造出数据轨目录
+    row = await _record(sf, aid, "publish", res["version"])
+    assert row[1] == "success"
+    assert row[4]["images"] == [f"zc-zcpub-frontend:prod-{res['version']}"]
+    assert row[4]["sqlApplied"] == []
+
+
+async def test_rollback_static_stack_checks_frontend_image_only(
+        monkeypatch, sf, seed, tmp_path, gateway_routes_tmp):
+    """回滚体检按 prod_roles 走：static 只有一个 tag，写死两个就永远报「backend 镜像已清理」。
+
+    这条是「role 集合只在 compose.prod_roles 一处」的接线钉子——把 prod.py 改回写死二元组，
+    本用例必红（镜像其实还在，用户却被告知回滚不了）。
+    """
+    wid, aid = await seed(slug="zcpub", prod_port=8982, dev_port=8983,
+                          status_prod="running", current_version=PREV_VER)
+    root = tmp_path / "app"
+    (root / "frontend").mkdir(parents=True)
+    (root / "app.json").write_text(
+        json.dumps({"schema": "zc-app/1", "slug": "zcpub", "stack": "static"}), encoding="utf-8")
+    seams = PubSeams(monkeypatch, root)
+    asked: list[str] = []
+
+    async def image_exists(tag):
+        asked.append(tag)
+        return "-frontend:" in tag          # 只有前端镜像还在——正是「写死两个 role」会误判的那个现场
+
+    monkeypatch.setattr(prod, "image_exists", image_exists)
+    out = await prod.rollback(sf, _pub_app(aid, stack="static"), PREV_VER, notify=seams.notify)
+    assert out["status"] == "running"
+    assert asked == [f"zc-zcpub-frontend:prod-{PREV_VER}"]
 
 
 async def test_publish_blocks_on_bad_sqlchange_name(monkeypatch, sf, seed, pub_root):

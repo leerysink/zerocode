@@ -80,13 +80,73 @@ async def test_create_app_rejects_bad_scale_stack():
     with pytest.raises(DeployError):
         await app_service.create_app_project(
             sf, name="x", slug=SLUG, scale="large", stack="vue3-fastapi", root=str(ROOT))  # large 锁定 springboot
-    # 裁定 R-C：模板未交付的栈以 400 友好拒绝（vue3-springboot 已交付，vue3-node/static 未交付），
-    # 且不得留下半成品目录
+    # 小型档三个栈今天全部已交付，档位反方向仍要守：small + 大型栈一律拒
+    with pytest.raises(DeployError):
+        await app_service.create_app_project(
+            sf, name="x", slug=SLUG, scale="small", stack="vue3-springboot", root=str(ROOT))
+    assert not ROOT.exists()
+
+
+async def test_delivery_gate_still_blocks_undelivered_stack(monkeypatch, tmp_path):
+    """栈交付闸门（裁定 R-C）判据本体：模板层目录不存在 → 400「尚未开放」，且不留半成品目录。
+
+    小栈补齐后没有一个真栈会被它拦下，所以判据只能靠「把模板根指到一个空目录」来钉：
+    变异检查——注释掉 app_service 里的存在性判定，本用例必须红（否则向导里又能出现必挂的选项）。
+    """
+    monkeypatch.setattr(app_service, "TEMPLATES", tmp_path / "no-such-templates")
+    sf = make_session_factory(make_engine())
     with pytest.raises(DeployError) as ei:
         await app_service.create_app_project(
-            sf, name="x", slug=SLUG, scale="small", stack="vue3-node", root=str(ROOT))
+            sf, name="x", slug=SLUG, scale="small", stack="vue3-fastapi", root=str(ROOT))
     assert ei.value.status == 400 and "尚未开放" in str(ei.value)
     assert not ROOT.exists()
+
+
+async def test_create_app_node_stack_lays_typescript_backend():
+    """US-01：选 Node 栈创建成功，铺底是 TypeScript 工程（不是 Python 那套），双轨目录照旧在位。"""
+    sf = make_session_factory(make_engine())
+    await app_service.create_app_project(
+        sf, name="Node 应用", slug=SLUG, scale="small", stack="vue3-node", root=str(ROOT))
+    assert (ROOT / "backend" / "src" / "index.ts").is_file()
+    assert (ROOT / "backend" / "tsconfig.json").is_file()
+    assert not (ROOT / "backend" / "requirements.txt").exists()
+    assert not (ROOT / "backend" / "app").exists()
+    pkg = json.loads((ROOT / "backend" / "package.json").read_text(encoding="utf-8"))
+    assert "5." in pkg["dependencies"]["express"] and "pg-promise" in pkg["dependencies"]
+    # 铺底零修改可预览的四件事实：健康路径、app.json 栈、数据轨种子、无占位符残留
+    meta = json.loads((ROOT / "app.json").read_text(encoding="utf-8"))
+    assert meta["stack"] == "vue3-node" and meta["health"]["backend"] == "/api/health"
+    assert list((ROOT / "sqlchange").glob("D*.sql"))
+    assert (ROOT / "deploy" / "dev-compose.yml").is_file()
+    for p in ROOT.rglob("*"):
+        if p.is_file():
+            assert "{{" not in p.read_text(encoding="utf-8", errors="replace"), p
+
+async def test_create_app_static_stack_lays_no_backend_or_sql():
+    """US-02 + US-05：static 创建成功、产物零 SQL 零后端，但库与凭据照旧供给。
+
+    两个半边都得钉：只钉「没有 sqlchange」会放行「顺手给 static 跳过 provision」那种"优化"——
+    D-5 的取舍是**宁可浪费一对没人用的库，也不让创建链路出现栈分支**；而只钉 provision 那半边，
+    「脚手架又给纯前端补了句 INSERT INTO demo_notes」就会溜过去（首预览红在 run.sh）。
+    """
+    sf = make_session_factory(make_engine())
+    await app_service.create_app_project(
+        sf, name="静态页应用", slug=SLUG, scale="small", stack="static", root=str(ROOT))
+    for gone in ("backend", "schema", "sqlchange"):
+        assert not (ROOT / gone).exists(), gone
+    assert not list(ROOT.rglob("*.sql"))
+    assert (ROOT / "frontend" / "nginx.conf").is_file()
+    meta = json.loads((ROOT / "app.json").read_text(encoding="utf-8"))
+    assert meta["stack"] == "static" and meta["health"]["backend"] == ""
+    dev = (ROOT / "deploy" / "dev-compose.yml").read_text(encoding="utf-8")
+    assert "migrate" not in dev and "backend:" not in dev   # 闸门与后端服务都不在，只剩一个 vite
+    cred = await provision.read_cred(sf, SLUG, "dev")
+    assert cred and cred["db"] == f"{SLUG}_dev"             # provision 栈无关
+    assert f"DEV_DB={SLUG}_dev" in (ROOT / "deploy" / ".env").read_text(encoding="utf-8")
+    for p in ROOT.rglob("*"):
+        if p.is_file():
+            assert "{{" not in p.read_text(encoding="utf-8", errors="replace"), p
+
 
 async def test_create_app_rejects_name_over_100():
     """M-2（终审 F-02）：150 字名此前穿透 VARCHAR(100) 抛 DBAPIError、被兜底包装成「创建应用失败: <SQLAlchemy 原文>」；

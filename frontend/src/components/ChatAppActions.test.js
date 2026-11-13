@@ -536,9 +536,11 @@ it('vue3-springboot 应用同样可发布（闸门与列表页同源，不各自
   await w.find('.zc-menu-publish').trigger('click')
   expect(w.find('.stub-publish').exists()).toBe(true)
 })
-// 闸门读共享名单（utils/publishableStacks.js），不在聊天页另立第二套判断
+// 闸门读共享名单（utils/publishableStacks.js），不在聊天页另立第二套判断。
+// 例子用平台真没有的栈：static 与 vue3-node 本期已进名单（后端 PUBLISHABLE_STACKS 为准），
+// 再拿它们当「不支持发布」的样本，测的就不再是闸门而是过期名单。
 it('栈不支持发布时「发布新版本」不可点，且点了不挂弹层', async () => {
-  listApps.mockResolvedValue({ data: [{ ...APPS[0], stack: 'static' }] })
+  listApps.mockResolvedValue({ data: [{ ...APPS[0], stack: 'vue3-deno' }] })
   useChatStore().currentWorkspaceId = 101
   const w = mountActions()
   await flushPromises()

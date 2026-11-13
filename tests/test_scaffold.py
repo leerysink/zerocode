@@ -121,23 +121,26 @@ def test_template_nginx_prod_proxy(tmp_path):
 
 # prod 构建期的 build args 要有消费方：模板 Dockerfile 必须声明同名 ARG，且默认值是官方源
 # （没配镜像源的部署构建行为不变，见 ADR-0025）
+# 四元组里的 install 是「真正装依赖的那条 RUN」的判据：不能按 part 名推，Node 小栈的后端也装 npm 包。
 _MIRROR_ARGS = {
-    "vue3-fastapi": (("backend", "PIP_INDEX_URL", "https://pypi.org/simple"),
-                     ("frontend", "NPM_CONFIG_REGISTRY", "https://registry.npmjs.org")),
+    "vue3-fastapi": (("backend", "PIP_INDEX_URL", "https://pypi.org/simple", "pip install"),
+                     ("frontend", "NPM_CONFIG_REGISTRY", "https://registry.npmjs.org", "npm ")),
+    # Node 小栈两侧都是 npm 消费方；后端镜像是两段式，装包只发生在构建段（见该 Dockerfile）
+    "vue3-node": (("backend", "NPM_CONFIG_REGISTRY", "https://registry.npmjs.org", "npm install"),
+                  ("frontend", "NPM_CONFIG_REGISTRY", "https://registry.npmjs.org", "npm ")),
     # 大型栈后端是 maven，仓库镜像不在这两个参数范围内 → 只有前端有 npm 消费方
-    "vue3-springboot": (("frontend", "NPM_CONFIG_REGISTRY", "https://registry.npmjs.org"),),
+    "vue3-springboot": (("frontend", "NPM_CONFIG_REGISTRY", "https://registry.npmjs.org", "npm "),),
 }
 
 
 @pytest.mark.parametrize("stack,wires", sorted(_MIRROR_ARGS.items()))
 def test_template_dockerfiles_declare_mirror_args_with_official_defaults(stack, wires):
     root = Path(__file__).resolve().parents[1] / "app" / "templates" / stack
-    for part, arg, official in wires:
+    for part, arg, official, install in wires:
         dk = (root / part / "Dockerfile").read_text(encoding="utf-8")
         assert f"ARG {arg}={official}" in dk, f"{stack}/{part} 缺 ARG {arg}"
         assert f"ENV {arg}=${{{arg}}}" in dk, f"{stack}/{part} 缺 ENV {arg}"
         # ARG/ENV 必须早于真正装依赖的那条 RUN（比对注释里的 "npm" 字样没有意义，只认 RUN 行）
-        install = "pip install" if part == "backend" else "npm "
         runs = [i for i, ln in enumerate(dk.splitlines())
                 if ln.strip().upper().startswith("RUN") and install in ln]
         assert runs, f"{stack}/{part} 没有 {install} 那条 RUN"
@@ -449,3 +452,55 @@ def test_springboot_template_ships_both_db_tracks(tmp_path):
             assert "SCHEMA_HISTORY" not in text.upper(), p     # 平台只认 sqlchange_history，不双记账
         for leak in ("源项目", "init-all", r"base-pro\b"):       # 参考工程的私有假设 / 文件名
             assert re.search(leak, text) is None, (p, leak)
+
+
+# ==== static 栈：不铺数据轨（规格 2026-11-13 D-5 / 术语「铺数据轨」）====
+
+STATIC_TEMPLATE = TEMPLATE.parent / "static"
+
+
+def test_has_data_track_is_the_stack_level_predicate():
+    """判据是栈级显式名单，不是「产物里有没有 V*/D*.sql」那条既有分支。
+
+    既有分支的存在理由是「有结构轨的栈一定得有首轮种子」；static 铺完底必然落进它，
+    多出来的 `INSERT INTO demo_notes` 打到一张永不存在的表上——首预览红在 run.sh，
+    而且 AI 会看到一份它没法执行的迁移文件（sqlchange 是 append-only，删不掉）。
+    """
+    assert scaffold.has_data_track("vue3-fastapi") and scaffold.has_data_track("vue3-node")
+    assert scaffold.has_data_track("vue3-springboot")
+    assert not scaffold.has_data_track("static")
+
+
+def test_render_static_lays_no_sql_at_all(tmp_path):
+    """static 产物里一个 .sql 都没有：没有结构真相，也没有数据轨目录。"""
+    scaffold.render(STATIC_TEMPLATE, tmp_path, MAP, data_track=False)
+    assert not (tmp_path / "sqlchange").exists()
+    assert not (tmp_path / "schema").exists()
+    assert not (tmp_path / "backend").exists()
+    assert not list(tmp_path.rglob("*.sql"))
+    assert (tmp_path / "frontend" / "package.json").is_file()
+    assert (tmp_path / "frontend" / "nginx.conf").is_file()
+    assert (tmp_path / "README.md").is_file()
+    for p in tmp_path.rglob("*"):
+        if p.is_file():
+            assert "{{" not in p.read_text(encoding="utf-8", errors="replace"), p
+
+
+def test_render_default_still_lays_data_track(tmp_path):
+    """默认值不改既有行为：不传 data_track 的旧调用（含 materialize 桩）照旧补种子。
+
+    这条是 data_track 参数的变异钉子——把它写成 `data_track=False` 默认，上面那条既有
+    fastapi 用例立刻红。
+    """
+    scaffold.render(TEMPLATE, tmp_path, MAP)
+    assert len(list((tmp_path / "sqlchange").glob("D*.sql"))) == 1
+
+
+def test_render_layers_passes_data_track_to_every_layer(tmp_path):
+    """叠加层也得收到同一个判定：逐层循环里漏传，每一层各补一份种子（同路径覆盖侥幸看不出来）。"""
+    base, overlay, out = _two_layers(tmp_path)
+    scaffold.render_layers([base, overlay], out, MAP, data_track=False)
+    assert not (out / "sqlchange").exists()
+    base2, overlay2, out2 = _two_layers(tmp_path / "default_side")
+    scaffold.render_layers([base2, overlay2], out2, MAP)
+    assert len(list(out2.glob("sqlchange/D*.sql"))) == 1   # 默认半边逐层只补一次

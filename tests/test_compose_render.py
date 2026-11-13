@@ -51,6 +51,38 @@ def test_render_dev_compose_static():
     assert list(doc["services"]) == ["frontend"]   # static 栈仅 frontend（规格 03 §4.1）
     assert doc["services"]["frontend"]["ports"] == ["8211:5173"]
 
+def test_render_dev_compose_node():
+    """Node 小栈 dev：与 fastapi 同形（migrate 闸门 + 后端 8000 + 只前端对外），差别只在运行时与语言。
+
+    `DATABASE_URL` 必须是纯 `postgresql://` —— pg-promise 不认 SQLAlchemy 的 `+asyncpg` 方言前缀。
+    注入错形态的表征不在创建期：预览照样起来，首页显示后端未就绪，日志里一句连接串非法。
+    """
+    m = copy.deepcopy(META); m["stack"] = "vue3-node"
+    y = compose.render_dev_compose(m)
+    doc = yaml.safe_load(y)
+    assert list(doc["services"]) == ["migrate", "backend", "frontend"]
+    env = doc["services"]["backend"]["environment"]
+    assert env["DATABASE_URL"].startswith("postgresql://${DEV_USER}:")
+    assert "+asyncpg" not in env["DATABASE_URL"]
+    assert env["APP_PORT"] == "8000"
+    # 后端起的是工程自己的 dev 脚本（脚本内容属模板事实，由模板体检测试钉住 tsx watch）
+    assert doc["services"]["backend"]["command"] == 'sh -c "npm install && npm run dev"'
+    # 后端有**自己**的 node_modules 卷：与前端共用一个卷会把两套依赖树盖在一起
+    assert compose.BE_NODE_VOLUME in doc["services"]["backend"]["volumes"]
+    assert doc["volumes"] == {compose.VOLUME_NAME: {}, compose.BE_NODE_VOLUME_NAME: {}}
+    assert _named_volume_refs(doc) == set(doc["volumes"])   # 引用↔声明一致
+    assert [n for n, s in doc["services"].items() if s.get("ports")] == ["frontend"]
+    # 不串味：Node 栈里没有 pip / Maven / Spring 的痕迹
+    assert "pip" not in y.lower() and ".m2" not in y and "SPRING_" not in y
+
+
+def test_render_dev_compose_node_matches_golden():
+    """Node dev 产物钉在 golden 上：改这份文本必须显式重生基线（与旧栈 golden 同待遇）。"""
+    golden = Path(__file__).parent / "golden" / "dev-compose.node.yml"
+    m = copy.deepcopy(META); m["stack"] = "vue3-node"
+    assert compose.render_dev_compose(m) == golden.read_text(encoding="utf-8")
+
+
 @pytest.mark.parametrize("stack", ["vue3-fastapi", "vue3-springboot", "vue3-springboot-mobile"])
 def test_only_frontend_publishes_ports(stack):
     """仅前端端口对外（规格 05 FR5-06 / D5，P0）：backend/migrate 不得出现 ports（审查 I-2 / V9-M1）。
@@ -303,14 +335,17 @@ def test_render_prod_compose_single_service_blocks():
         assert "__" not in y                                     # 标记残留自检与 dev 同口径
         assert "external: true" in y
 
-def test_render_prod_compose_static_and_unknown_stack_raise():
-    """未开放发布的栈（static / 尚未交付的 vue3-node）：与 dev 同口径显式报错（brief Interfaces）。"""
-    for stack in ("static", "vue3-node"):
-        m = copy.deepcopy(META); m["stack"] = stack
-        with pytest.raises(DeployError) as ei:
-            compose.render_prod_compose(m)
-        assert stack in str(ei.value)
-        assert ei.value.status == 400
+def test_render_prod_compose_unpublished_stack_raises():
+    """闸门不许松成兜底：还没交付的栈继续 400 显式报错（brief Interfaces）。
+
+    vue3-node 与 static 本期都已交付（见各自的 prod 形状用例），例子换成平台真没有的栈——
+    判据本体不许跟着名单一起消失。
+    """
+    m = copy.deepcopy(META); m["stack"] = "vue3-deno"
+    with pytest.raises(DeployError) as ei:
+        compose.render_prod_compose(m)
+    assert "vue3-deno" in str(ei.value)
+    assert ei.value.status == 400
 
 def test_ensure_deploy_files_prod_compose_gated_on_stack_only(tmp_path):
     """T4 波裁定（欠账）：prod-compose.yml 的落盘条件放宽为 **stack=vue3-fastapi 即渲染**。
@@ -329,11 +364,15 @@ def test_ensure_deploy_files_prod_compose_gated_on_stack_only(tmp_path):
     assert "PROD_VERSION" not in env and "PROD_PASSWORD=\n" in env      # 留空/不写版本照旧
 
 
-def test_ensure_deploy_files_static_stack_writes_no_prod_compose(tmp_path):
-    """static 栈不发布（M3）：不落 prod-compose.yml——放宽后闸门只剩栈判定，须钉住另一半。"""
-    m = copy.deepcopy(META)
-    m["stack"] = "static"
-    compose.ensure_deploy_files(tmp_path, m, {"dev": CRED["dev"]})
+def test_ensure_deploy_files_skips_prod_compose_for_unpublished_stack(tmp_path, monkeypatch):
+    """闸门不吃凭据、只吃栈：名单外的栈即便 dev 能渲染、凭据齐全，也不落 prod-compose.yml。
+
+    static 本期已放行发布（见 test_static_stack_passes_publish_gate），今天没有天然的名单外例子，
+    所以把名单临时收窄——「未放行 = 不落文件」这半边判据不许跟着名单一起消失（落错文件的代价是
+    发布时 build 到一半去构建一个模板里根本没有的镜像）。
+    """
+    monkeypatch.setattr(compose, "PUBLISHABLE_STACKS", ("vue3-fastapi",))
+    compose.ensure_deploy_files(tmp_path, META_NODE, CRED)
     assert (tmp_path / "deploy" / "dev-compose.yml").is_file()
     assert not (tmp_path / "deploy" / "prod-compose.yml").exists()
 
@@ -494,11 +533,15 @@ def test_render_env_generates_secrets_once(tmp_path):
 
 
 def test_render_dev_compose_unknown_stack_still_raises():
-    """栈闸门不许松成兜底：未交付的栈继续 500 显式报错。"""
-    m = {**META, "stack": "vue3-node"}
+    """栈闸门不许松成兜底：未交付的栈继续 500 显式报错。
+
+    原来用 vue3-node 当例子（那时它确实没交付），本期它交付了，换一个平台真没有的栈——
+    判据本体不许跟着名单一起消失。
+    """
+    m = {**META, "stack": "vue3-deno"}
     with pytest.raises(DeployError) as ei:
         compose.render_dev_compose(m)
-    assert "vue3-node" in str(ei.value) and ei.value.status == 500
+    assert "vue3-deno" in str(ei.value) and ei.value.status == 500
 
 
 # ==== Task C1：prod compose 的 springboot 分支（镜像即产物） ====
@@ -586,6 +629,120 @@ def test_render_prod_compose_fastapi_matches_golden():
     assert compose.render_prod_compose(META) == golden.read_text(encoding="utf-8")
 
 
+META_NODE = {**META, "stack": "vue3-node"}
+
+
+def test_render_prod_compose_node_shape():
+    """Node 栈 prod 与 fastapi 同形（migrate 闸门 / 只前端对外 / 镜像即产物），差别只在连接串方言。
+
+    pg-promise 只认纯 `postgresql://`，SQLAlchemy 的 `+asyncpg` 前缀对它非法。注错不在创建期报错：
+    prod 栈照样起，表征是 /api/health 里 db 一直 false——所以这条断言只能落在渲染产物上。
+    """
+    y = compose.render_prod_compose(META_NODE)
+    doc = yaml.safe_load(y)
+    assert list(doc["services"]) == ["migrate", "backend", "frontend"]
+    b = doc["services"]["backend"]
+    env = b["environment"]
+    assert env["DATABASE_URL"].startswith("postgresql://${PROD_USER}:")
+    assert "+asyncpg" not in y
+    assert env["APP_PORT"] == "8000"
+    assert b["image"] == "zc-lailiao-backend:prod-${PROD_VERSION}"
+    assert b["build"] == "../backend"
+    assert "volumes" not in b                                         # 镜像即产物：不挂工程目录
+    assert "command" not in b
+    assert b["networks"] == ["default", "zcnet"]                      # 上 zcnet 只为访 zerocode-pg16
+    assert "ports" not in b
+    assert b["depends_on"]["migrate"]["condition"] == "service_completed_successfully"
+    f = doc["services"]["frontend"]
+    assert f["image"] == "zc-lailiao-frontend:prod-${PROD_VERSION}"
+    assert f["ports"] == ["8210:80"]                                  # 对外端口 -> 容器 80，经 nginx 反代
+    assert [n for n, s in doc["services"].items() if s.get("ports")] == ["frontend"]
+    assert "volumes" not in doc                                      # 小栈 prod 没有命名卷
+    assert "pip" not in y.lower() and ".m2" not in y and "SPRING_" not in y
+    assert "__" not in y
+
+
+def test_render_prod_compose_node_matches_golden():
+    """Node prod 产物钉在 golden 上：动这份文本必须显式重生基线（与 fastapi prod 同待遇）。"""
+    golden = Path(__file__).parent / "golden" / "prod-compose.node.yml"
+    assert compose.render_prod_compose(META_NODE) == golden.read_text(encoding="utf-8")
+
+
+def test_node_stack_passes_publish_gate_and_writes_prod_compose(tmp_path):
+    """发布名单登记半边：PUBLISHABLE_STACKS 含 vue3-node，创建即落一份能 build 的 prod 件。
+
+    漏了名单的表征不是报错——prod-compose.yml 压根不落盘，发布到 build 那步才找不到文件。
+    """
+    assert "vue3-node" in compose.PUBLISHABLE_STACKS
+    compose.ensure_deploy_files(tmp_path, META_NODE, {"dev": CRED["dev"]})
+    prod = (tmp_path / "deploy" / "prod-compose.yml").read_text(encoding="utf-8")
+    assert prod == compose.render_prod_compose(META_NODE)
+    assert "zc-lailiao-backend:prod-${PROD_VERSION}" in prod
+    env = (tmp_path / "deploy" / ".env").read_text(encoding="utf-8")
+    assert "JWT_SECRET" not in env and "REDIS_PASSWORD" not in env    # 小栈没有栈私有密钥
+
+
+META_STATIC = {**META, "stack": "static", "health": {"frontend": "/", "backend": ""}}
+
+
+def test_render_prod_compose_static_is_frontend_only(tmp_path):
+    """static 的 prod 只有一个纯 nginx 服务：没有 backend、没有 migrate，也就没有 zcnet 依赖。
+
+    多挂一个 migrate 的代价不是空跑——run_sqlchange 的 fail-closed 闸门见不到 sqlchange/ 就返回
+    ok=False，发布必红在 migrate 步；而 compose 里的 migrate 段本身引用的就是那套双轨目录。
+    不上 zcnet 同理：静态站点没有任何要访 zerocode-pg16 的进程，声明了反而把「网络存在」变成前置条件。
+    """
+    y = compose.render_prod_compose(META_STATIC)
+    doc = yaml.safe_load(y)
+    assert list(doc["services"]) == ["frontend"]
+    assert doc["name"] == "zc-lailiao-prod"
+    f = doc["services"]["frontend"]
+    assert f["image"] == "zc-lailiao-frontend:prod-${PROD_VERSION}"
+    assert f["build"] == "../frontend"
+    assert f["ports"] == ["8210:80"]
+    assert f["restart"] == "unless-stopped"
+    for gone in ("backend", "migrate", "DATABASE_URL", "sqlrunner", "zcnet"):
+        assert gone not in y, gone
+    assert "volumes" not in doc
+    assert "__" not in y
+    assert "environment" not in f                                   # 静态站点连 env 段都不该长出来
+    assert (tmp_path / "deploy").mkdir() is None
+    compose.ensure_deploy_files(tmp_path, META_STATIC, {"dev": CRED["dev"]})
+    assert (tmp_path / "deploy" / "prod-compose.yml").read_text(encoding="utf-8") == y
+
+
+def test_render_prod_compose_static_matches_golden():
+    golden = Path(__file__).parent / "golden" / "prod-compose.static.yml"
+    assert compose.render_prod_compose(META_STATIC) == golden.read_text(encoding="utf-8")
+
+
+def test_static_stack_passes_publish_gate(tmp_path):
+    assert "static" in compose.PUBLISHABLE_STACKS
+    compose.ensure_deploy_files(tmp_path, META_STATIC, {"dev": CRED["dev"]})
+    assert "zc-lailiao-frontend:prod-${PROD_VERSION}" in \
+        (tmp_path / "deploy" / "prod-compose.yml").read_text(encoding="utf-8")
+
+
+def test_prod_image_roles_are_the_services_that_produce_app_images():
+    """一个 role = 一个应用镜像：static 只有一个前端，回滚体检与 keep-N 清理都得按这个集合走。
+
+    照旧写死 ("frontend", "backend") 的表征不在发布期（compose build 只看文件里的服务），在**之后**：
+    回滚永远报「backend 镜像已清理」、记账里的 images 清单多一个不存在的 tag。
+    """
+    assert compose.prod_roles("static") == ("frontend",)
+    for stack in ("vue3-fastapi", "vue3-node", "vue3-springboot", "vue3-springboot-mobile"):
+        assert compose.prod_roles(stack) == ("frontend", "backend"), stack
+
+
+def test_prod_compose_static_injects_npm_build_arg(monkeypatch):
+    monkeypatch.setenv(NPM_ENV, "https://registry.npmmirror.com")
+    doc = yaml.safe_load(compose.render_prod_compose(META_STATIC))
+    assert doc["services"]["frontend"]["build"] == {
+        "context": "../frontend", "args": {"NPM_CONFIG_REGISTRY": "https://registry.npmmirror.com"}}
+    y = compose.render_prod_compose(META_STATIC)
+    assert "PIP_INDEX_URL" not in y
+
+
 # ---- 应用 dev 栈的依赖镜像源注入
 #
 # 变量由打包时烘进平台容器（build_output.py 写的 `${ZEROCODE_PYPI_MIRROR:-打包值}`），渲染器在
@@ -658,9 +815,9 @@ def test_dev_compose_pypi_only_keeps_frontend_environmentless(monkeypatch):
     assert "environment" not in doc["services"]["frontend"]
 
 
-@pytest.mark.parametrize("stack", ["static", "vue3-springboot"])
+@pytest.mark.parametrize("stack", ["static", "vue3-springboot", "vue3-node"])
 def test_dev_compose_non_fastapi_stacks_inject_npm_only(monkeypatch, stack):
-    """static 与 vue3-springboot 栈里没有 pip 消费方：即使两个变量都设，也只注入 npm。
+    """这些栈里没有 pip 消费方：即使两个变量都设，也只注入 npm。
 
     SB 的后端是 maven（mvn spring-boot:run），maven 仓库镜像不在本次参数范围内，所以它的
     backend 段保持原样——这条断言同时把这个缺口钉住：想顺手给 SB 后端加 PIP_INDEX_URL 会红。
@@ -676,6 +833,22 @@ def test_dev_compose_non_fastapi_stacks_inject_npm_only(monkeypatch, stack):
     assert "PIP_INDEX_URL" not in y
     assert "__" not in y
     assert _named_volume_refs(doc) == set(doc["volumes"])
+
+
+def test_dev_compose_node_backend_also_consumes_npm(monkeypatch):
+    """Node 栈的后端也装 npm 包：换源必须同时进 backend 与 frontend，且**不开第二个 environment 段**。
+
+    `_npm_env_block()` 自带 `environment:` 头，给已有该键的 backend 用它就是一个服务两段 env、
+    yaml 后者覆盖前者，dev 后端会静默丢掉 DATABASE_URL。所以这里走行形态。
+    """
+    monkeypatch.setenv(NPM_ENV, "https://registry.npmmirror.com")
+    y = compose.render_dev_compose({**META, "stack": "vue3-node"})
+    doc = yaml.safe_load(y)
+    be = doc["services"]["backend"]["environment"]
+    assert be["NPM_CONFIG_REGISTRY"] == "https://registry.npmmirror.com"
+    assert set(be) == {"DATABASE_URL", "APP_PORT", "NPM_CONFIG_REGISTRY"}   # DATABASE_URL 没被盖掉
+    assert y.count("environment:") == 3                                     # migrate/backend/frontend 各一段
+    assert "PIP_INDEX_URL" not in y
 
 
 def test_prod_compose_injects_build_args_from_env(monkeypatch):
@@ -711,6 +884,35 @@ def test_prod_compose_springboot_backend_has_no_pip_arg(monkeypatch):
     assert doc["services"]["backend"]["build"] == "../backend"
     assert doc["services"]["frontend"]["build"]["args"] == {
         "NPM_CONFIG_REGISTRY": "https://registry.npmmirror.com"}
+
+
+def test_prod_compose_node_backend_build_arg_is_npm_not_pip(monkeypatch):
+    """prod 后端构建参数按栈分叉：Node 后端在构建容器里跑的是 npm，给它 pip 源等于没注。
+
+    两个变量同时设是打包机的常态，所以这条必须让 pip 与 npm 都上值——只设 npm 时「backend 无条件
+    吃 PIP_INDEX_URL」的老写法不会露馅（它注进去一个没人读的参数，npm 源照样丢）。
+    """
+    monkeypatch.setenv(PYPI_ENV, "https://mirrors.aliyun.com/pypi/simple")
+    monkeypatch.setenv(NPM_ENV, "https://registry.npmmirror.com")
+    doc = yaml.safe_load(compose.render_prod_compose(META_NODE))
+    assert doc["services"]["backend"]["build"] == {
+        "context": "../backend", "args": {"NPM_CONFIG_REGISTRY": "https://registry.npmmirror.com"}}
+    assert doc["services"]["frontend"]["build"]["args"] == {
+        "NPM_CONFIG_REGISTRY": "https://registry.npmmirror.com"}
+    y = compose.render_prod_compose(META_NODE)
+    assert "PIP_INDEX_URL" not in y
+    # 反向半边：fastapi 后端照旧只吃 pip，改映射把它也换成 npm 会红
+    fa = yaml.safe_load(compose.render_prod_compose(META))
+    assert fa["services"]["backend"]["build"]["args"] == {
+        "PIP_INDEX_URL": "https://mirrors.aliyun.com/pypi/simple"}
+
+
+def test_prod_compose_node_without_mirror_env_keeps_golden_bytes():
+    """零注入半边（Node）：没设变量时 backend/frontend 的 build 都回标量形态、与 golden 逐字节一致。"""
+    golden = Path(__file__).parent / "golden" / "prod-compose.node.yml"
+    y = compose.render_prod_compose(META_NODE)
+    assert y == golden.read_text(encoding="utf-8")
+    assert "args:" not in y
 
 
 def test_prod_compose_npm_only_leaves_backend_build_scalar(monkeypatch):

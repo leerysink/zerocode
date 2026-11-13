@@ -8,7 +8,8 @@ STACK_LABEL = {"vue3-fastapi": "Vue3 + FastAPI", "vue3-node": "Vue3 + Express",
                "static": "纯前端静态页", "vue3-springboot": "Vue3 + Spring Boot 3",
                "vue3-springboot-mobile": "Vue3 + Spring Boot 3 + uni-app 移动端"}
 ENV_HINT = {"vue3-fastapi": "DATABASE_URL（SQLAlchemy asyncpg 连接串）与 APP_PORT",
-            "vue3-node": "DATABASE_URL（pg 连接串）与 APP_PORT",
+            "vue3-node": "DATABASE_URL（**纯** postgresql:// 连接串——pg-promise 不认 SQLAlchemy 的 "
+                         "`+asyncpg` 方言前缀）与 APP_PORT（容器内固定 8000）",
             "vue3-springboot": "SPRING_DATASOURCE_URL / SPRING_DATASOURCE_USERNAME / SPRING_DATASOURCE_PASSWORD / SERVER_PORT"
                                "（Redis 与 JWT_SECRET、UPLOAD_DIR 已由平台注入，代码不得自行拼接或硬编码）",
             "vue3-springboot-mobile": "SPRING_DATASOURCE_URL / SPRING_DATASOURCE_USERNAME / SPRING_DATASOURCE_PASSWORD / SERVER_PORT"
@@ -53,10 +54,49 @@ _MOBILE_EXTRA = (
         "不要给这个角色授权后台菜单；C 端账号只走 `POST /auth/register` 建，不要直接往 `sys_user` 插"
         "（后台用户列表默认就按这个角色过滤）。\n")
 
+# Node 小栈的栈专属红线（ADR-0047）：只写「本栈形状独有、且踩中就贵」的三条。
+# 版本号与依赖清单不在这里复述——2) 已经统一规定「只能追加、不得替换或降级」。
+_NODE_EXTRA = (
+        "\n8) 后端是 Express 5 + TypeScript + pg-promise 的 **ESM** 工程（`\"type\": \"module\"` + "
+        "`module: NodeNext`）：相对 import 必须带 `.js` 后缀（`import { db } from './db.js'`）。"
+        "dev 的 tsx 漏写后缀可能侥幸能跑，`npm run build` 出的 dist 一定 module not found——"
+        "所以发布前跑 `npm run typecheck`（就是 `tsc --noEmit`），不要只看预览。不要引入 ORM："
+        "本栈的数据访问层只有 pg-promise 一种写法，加了 ORM 就等于给市场应用换了一套启动依赖。\n"
+        "9) SQL 一律走 pg-promise 参数化占位（`$1`、`$2`…，或 `QueryFile`）："
+        "**不得把入参拼进 SQL 字符串**，表名/列名要动态也走 `pgp.helpers` 或白名单。"
+        "拼接的后果不在本地演示，在包出去的市场应用里——那已经是别人在生产环境跑的代码。\n"
+        "10) Express 5 的路由写法与 4.x 不兼容：通配用 `/{*path}`（旧 `'*'` 在 5.x 启动期直接抛 "
+        "TypeError，整个后端容器起不来）；错误中间件必须是四参数 `(err, req, res, next)` 且"
+        "`app.use` 注册在所有路由之后。异步处理函数不用 try/catch 包——5.x 会转发 rejected promise "
+        "给错误中间件。")
+
 STACK_EXTRA = {
     "vue3-springboot": _SPRINGBOOT_EXTRA,
     MOBILE_STACK: _SPRINGBOOT_EXTRA + _MOBILE_EXTRA,
+    "vue3-node": _NODE_EXTRA,
 }
+
+# 纯前端栈没有后端与数据轨：3)/4) 两段换成栈事实（契约在这里的角色是「别教它写跑不了的东西」，
+# 双轨与 health 义务对 static 是无中生有——模型会去建 schema/ 并等一个永不存在的后端）。
+_NO_DB_STACKS = ("static",)
+
+_STATIC_DATA_TEXT = (
+    "3) 本栈**没有后端也没有数据库**：不写 SQL、不建 `schema/` 与 `sqlchange/`、不写服务端代码。"
+    "平台仍会给本应用建库建角色，但纯前端够不着它，所以这里连库名都不提——需要落服务端的数据、"
+    "权限或跨设备同步时，先跟用户确认换栈，不要在前端造一套「假装是服务端」的存储逻辑。"
+    "数据留在浏览器 `localStorage`（键名带上应用前缀，同域多个应用不许互相盖）；"
+    "导出文件用前端 Blob 现造现下（xlsx/csv 都行），不要依赖任何下载接口。\n")
+
+_STATIC_ENV_TEXT = (
+    "4) 本栈没有后端环境变量，也没有 `/api` 前缀与 health 接口的义务；"
+    "dev 与 prod 都只有一层静态站点（prod 是纯 nginx 容器，没有反代 upstream）。\n")
+
+# 1) 的目录清单跟着栈走：写出来的目录就是模型会去摸的目录，多列一个 schema/ 它就多建一个。
+_STATIC_DIR_TEXT = (
+    "1) 目录：frontend/（Vue3+ant-design-vue 单工程）、deploy/、"
+    "docs/（应用过程文档：adr/ 存需求决策、specs/ 存计划，不进市场包）；"
+    "**本栈没有 backend/、schema/、sqlchange/**。\n")
+
 
 def _db_facts(db) -> str:
     """meta["database"] → dev/prod 库名与用户各一行事实；缺失或形态异常则降级为空（不抛）。
@@ -104,15 +144,19 @@ def build_app_contract(root: Path) -> str | None:
             ports = {}
         if not isinstance(health, dict):
             health = {}
+        no_db = stack in _NO_DB_STACKS
         return (
             f"\n\n【应用契约】当前工作区是 zerocode 应用工程「{meta.get('name')}」（{meta.get('slug')}，"
             f"{STACK_LABEL.get(stack, stack)}，dev 预览端口 {ports.get('dev')}）。\n"
-            + _db_facts(meta.get("database")) +
-            "1) 目录：frontend/（Vue3+ant-design-vue）、backend/（后端工程，static 栈无）、"
-            "schema/（结构真相）、sqlchange/（数据轨：顶层公共段 + dev/ 与 prod/ 两个环境段）、deploy/、"
-            "docs/（应用过程文档：adr/ 存需求决策、specs/ 存计划，不进市场包）。\n"
+            # 库事实对 static 不注入：纯前端够不着 PG，列出库名只会邀请模型去设计「假装能连库」的前端
+            + ("" if no_db else _db_facts(meta.get("database"))) +
+            (_STATIC_DIR_TEXT if no_db else
+             "1) 目录：frontend/（Vue3+ant-design-vue）、backend/（后端工程，static 栈无）、"
+             "schema/（结构真相）、sqlchange/（数据轨：顶层公共段 + dev/ 与 prod/ 两个环境段）、deploy/、"
+             "docs/（应用过程文档：adr/ 存需求决策、specs/ 存计划，不进市场包）。\n") +
             "2) 技术栈与版本以现有脚手架为准，只能追加依赖，不得替换或降级已锁定版本。\n"
-            "3) 数据库变更走双轨："
+            + (_STATIC_DATA_TEXT if no_db else
+               "3) 数据库变更走双轨："
             "**改表结构 → 编辑 `schema/schema.sql` 的目标态**（只写幂等可重放 DDL："
             "CREATE TABLE IF NOT EXISTS、逐列 ALTER TABLE ADD COLUMN IF NOT EXISTS、"
             "CREATE INDEX IF NOT EXISTS；不写数据、不写 DROP、不改列类型）；"
@@ -143,10 +187,11 @@ def build_app_contract(root: Path) -> str | None:
             "若本应用已上架商店，你的改动会决定别人能不能升级，宁可分两步；"
             "代码里不得出现建表/改表语句，不得硬编码数据库连接；"
             "数据轨 sqlchange 文件在单事务内执行，schema.sql 建索引写普通 CREATE INDEX IF NOT EXISTS，"
-            "不得使用 CREATE INDEX CONCURRENTLY。\n"
-            f"4) 后端从环境变量读取 {ENV_HINT.get(stack, '平台注入的环境变量')}；必须保持 /api 前缀与 health 接口"
-            f"（{health.get('backend', '')}）可用。\n"
-            "5) 前端页面用 ant-design-vue，中文界面，表格用 columns+bodyCell 模式，弹窗表单 label 宽 120px 右对齐。\n"
+            "不得使用 CREATE INDEX CONCURRENTLY。\n")
+            + (_STATIC_ENV_TEXT if no_db else
+               f"4) 后端从环境变量读取 {ENV_HINT.get(stack, '平台注入的环境变量')}；必须保持 /api 前缀与 health 接口"
+               f"（{health.get('backend', '')}）可用。\n")
+            + "5) 前端页面用 ant-design-vue，中文界面，表格用 columns+bodyCell 模式，弹窗表单 label 宽 120px 右对齐。\n"
             "6) deploy/ 与 app.json 由平台管理，禁止读写。\n"
             "7) 完成功能后告知用户：可点「预览」查看效果，正式使用请点「发布」。"
             + STACK_EXTRA.get(stack, ""))

@@ -82,7 +82,7 @@ def _check_scale_stack(scale: str, stack: str) -> None:
     if stack not in STACKS:
         raise DeployError(f"技术栈非法: {stack}")
     # 裁定 R-C：模板未交付的栈在此提前 400（不放行则 scaffold.render 会冒「栈模板不存在 500」）。
-    # vue3-springboot 已由 base-pro 移植交付（A3）；vue3-node / static 仍未开放。
+    # 判据本身保留：五个栈目录现在都在位，但「向导里有 = 必须过闸门」是规范，不是临时兜底。
     # 叠加层的存在性一并在这里判——漏判会把「覆盖层没交付」推迟到渲染中途，留下半套目录。
     if any(not (TEMPLATES / layer).is_dir() for layer in template_layers_of(stack)):
         raise DeployError(f"该技术栈尚未开放: {stack}（即将上线）", status=400)
@@ -174,7 +174,8 @@ async def create_app_project(session_factory, *, name: str, slug: str, scale: st
     try:
         render = materialize or (
             lambda rp, mp: scaffold.render_layers(
-                [TEMPLATES / layer for layer in template_layers_of(stack)], rp, mp))
+                [TEMPLATES / layer for layer in template_layers_of(stack)], rp, mp,
+                scaffold.has_data_track(stack)))
         render(root_path, mapping)   # R-C 已保证模板目录存在
         app = await _insert_rows(session_factory, name=name_stripped, slug=slug, scale=scale,
                                  stack=stack, root=root_path, prod_port=prod_port,

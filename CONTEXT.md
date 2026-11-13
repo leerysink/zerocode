@@ -651,6 +651,45 @@ sidecar 给可交互元素打的**一次性令牌**（DOM 属性 `data-zc-ref`�
   但本项目**明确不引入**——它会把接口和数据搬到平台管不到的第三方，与「一应用一库、
   凭据由平台供给」的模型冲突。文档与代码里不得出现「uniCloud 作为可选后端」的说法。
 
+## 小栈（small stack，小型档技术栈）
+
+小型档可选的三个 stack key：`vue3-fastapi`、`vue3-node`、`static`。它们共享同一套**小栈同形**约定：
+一个 compose 项目、一对端口（dev 奇 / prod 偶）、一套库、`/api` 前缀 + `/api/health`，
+以及**后端容器内监听 8000**——`frontend/vite.config.js` 的 proxy 与 `frontend/nginx.conf` 的 upstream
+都写 `backend:8000`，两个带后端的栈在这一层逐字节同形。
+它不是「简版大栈」：大型档锁定 Spring Boot 底座，小栈不背登录与 RBAC，也进不了联合健康探针。
+
+## vue3-node 栈（Node 小栈）
+
+`vue3-node` 的形态是 **Vue3 + Express 5 + TypeScript + pg-promise**：后端源码住 `backend/src/`，
+dev 经 `tsx watch` 起，prod 镜像先 `tsc` 再跑 `node dist/`；数据访问只写 SQL，由 pg-promise 做参数化。
+术语上叫「Node 小栈」，不叫「JS 栈」「全栈 JS」——后端是 TS，前端仍是与 `vue3-fastapi` 同形的 JS。
+两个反直觉选择都记在 ADR-0047：**不用 ORM**（迁移工具会绕过 `sqlchange/` 双轨直接改库）、
+**监听 8000 而不是 Node 惯例的 3000**（为了让反代与 compose 保持小栈同形）。
+
+## static 栈（纯前端静态页）
+
+`static` 是**既没有后端、也不使用数据库**的小栈形态：模板只有 `frontend/`（Vite + ant-design-vue）与 README，
+数据落 localStorage 与导出文件。它与另两个小栈一样是**已交付栈**（可创建、可发布）：dev 只起 vite，
+prod 只有 nginx 一个服务。平台侧仍按通用流程给它建库建角色、注入凭据——一次性的浪费，
+换的是 `provision` 链路保持栈无关；它的「无库」只体现在**不铺数据轨**上。
+
+## 铺数据轨 / 不铺数据轨（data track seeding）
+
+指脚手架产物里要不要带 `schema/schema.sql` 与 `sqlchange/`，从而被平台迁移闸门（`zerocode-sqlrunner`）接管。
+唯一事实源是 `scaffold.has_data_track(stack)`（栈级显式名单，只列「不铺」的一侧，新栈默认铺轨）；
+它管的是**补不补首轮种子**，与 `scaffold.render` 里那条既有判据（产物 `sqlchange/` 已有 `V*`/`D*.sql`
+就不追加）串在一起用：后者防的是栈自带数据轨（springboot 的 RBAC 基线）时重复补 `demo_notes`。
+**不铺数据轨**的栈（`static` 属于此类）模板不带那两个目录，铺底跳过补种子，发布与预览也一并跳过
+迁移闸门与结构等价校验——否则「无库的栈」产物里会出现一张永远不会被建的表，首个预览迁移直接报红。
+
+## 栈交付闸门（stack delivery gate，裁定 R-C）
+
+创建应用时的第三道校验：stack 合法、档位匹配之后，还要它的**每一层模板目录都真实存在**，
+否则以 400「该技术栈尚未开放」拒绝，而不是放行到 `scaffold.render` 冒「栈模板不存在 500」。
+它是**平台的交付状态**，不是用户可申请的开关：一个 stack key 出现在向导里，就必须已经过闸门——
+「界面能点、创建必挂」本身就是坏产物。本期把 `vue3-node` 与 `static` 补齐后，小型档三项全部过闸门。
+
 ## 移动栈（mobile stack）
 
 新建应用时可选的一种技术栈形态：**同一个应用内容三件套**——应用后端服务（backend，

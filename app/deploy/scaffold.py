@@ -16,6 +16,19 @@ INSERT INTO demo_notes (title) VALUES ('欢迎使用 {APP_NAME}') ON CONFLICT DO
 """
 # 结构真相在 schema/schema.sql（模板自带、声明式快照）；脚手架只补数据轨种子。
 
+# 「铺数据轨」= 产物带 schema/ + sqlchange/ 双轨目录，因而有首轮 D 种子可补、有迁移可跑。
+# 判据写成栈级显式名单，而不是复用下面「产物里有没有 V*/D*.sql」那条既有分支：static 铺完底
+# 必然落进那条分支（它的模板压根没有 sqlchange/），于是多出一句 `INSERT INTO demo_notes` 打到
+# 一张永不存在的表上——首预览红在 run.sh，而 sqlchange 是 append-only，AI 删不掉自己没写的文件。
+# 名单只列「不铺」的一侧：新栈默认铺轨，与既有行为同向（漏登记只会多空跑一次迁移，不会静默少建表）。
+NO_DATA_TRACK_STACKS = ("static",)
+
+
+def has_data_track(stack: str | None) -> bool:
+    """该栈是否铺数据轨（术语见 CONTEXT.md）。false 的栈：无结构真相、无迁移、无迁移闸门。"""
+    return stack not in NO_DATA_TRACK_STACKS
+
+
 def _render_file(src: Path, target: Path, mapping: dict) -> None:
     """渲染单个文件：解得出 UTF-8 才做占位替换，解不出即按字节原样 copy。
 
@@ -32,10 +45,11 @@ def _render_file(src: Path, target: Path, mapping: dict) -> None:
                       encoding="utf-8", newline="")
 
 
-def render(template: Path, dst: Path, mapping: dict) -> None:
+def render(template: Path, dst: Path, mapping: dict, data_track: bool = True) -> None:
     """把 template 目录渲染到 dst：占位符替换 + 生成初始迁移 + 残留自检。
 
     dst 已存在时覆盖合并（调用方需自行保证为空目录）。
+    data_track=False（不铺数据轨的栈）时跳过补种子——见 has_data_track。
     """
     if not template.is_dir():
         raise DeployError(f"栈模板不存在: {template}", status=500)
@@ -55,7 +69,7 @@ def render(template: Path, dst: Path, mapping: dict) -> None:
     # 栈自带数据轨（springboot 的 RBAC 基线）时不追加 demo 种子：demo_notes 是 vue3-fastapi
     # 专有条目，落到别的栈就是首预览迁移必红。
     shipped = sorted((dst / "sqlchange").glob("[VD]*.sql")) if (dst / "sqlchange").is_dir() else []
-    if not shipped:
+    if data_track and not shipped:
         init = dst / "sqlchange" / f"D{today}_01_seed.sql"
         init.parent.mkdir(parents=True, exist_ok=True)
         # M-2②（终审 F-03）：APP_NAME 进 SQL 字面量前做 PG 标准转义 `'`→`''`（对照探针：含引号名称
@@ -73,12 +87,15 @@ def render(template: Path, dst: Path, mapping: dict) -> None:
             raise DeployError(f"占位符渲染残留: {p.relative_to(dst)} 处有 {hit.group(0)}")
 
 
-def render_layers(templates, dst: Path, mapping: dict) -> None:
+def render_layers(templates, dst: Path, mapping: dict, data_track: bool = True) -> None:
     """按序叠加多层模板（规格 2026-11-03 US-03 / ADR-0039）：后层覆盖同路径，基底独有文件保留。
 
     正当实现就是「逐层调 render」，不是合并也不是替换：第二层只有它自己那几个文件，
     抹掉第一层等于把 springboot 后端代码从产物里删了。逐层各跑一次残留自检还有额外好处——
     基底坏了在覆盖层落地前就报，错误信息指向真正的肇事模板。
+
+    data_track 是整棵树的事实、不是单层的事实，所以逐层传同一个值：漏传就是每层各补一份种子
+    （同路径覆盖侥幸看不出来，序号却会撞车）。
     """
     for template in templates:
-        render(template, dst, mapping)
+        render(template, dst, mapping, data_track)

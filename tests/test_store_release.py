@@ -28,11 +28,12 @@ def _materialize(sql_files: dict[str, str]):
     return mz
 
 
-async def _make_app(sf, *, sql_files, publish_ok=True, version="b20260922000001"):
+async def _make_app(sf, *, sql_files, publish_ok=True, version="b20260922000001",
+                    stack="vue3-fastapi"):
     """造一个「已发布过 prod」的应用：app_project.current_version + publish success 记录。"""
     slug = _slug()
     app = await app_service.create_app_project(
-        sf, name="上架测试", slug=slug, scale="small", stack="vue3-fastapi",
+        sf, name="上架测试", slug=slug, scale="small", stack=stack,
         materialize=_materialize(sql_files))
     _APPS.append(app)
     cred = await provision.provision_env(sf, slug, "prod")
@@ -179,6 +180,25 @@ async def test_missing_image_rejected(sf, store_root, monkeypatch, actor):
     app = await _make_app(sf, sql_files={"V20260920_01_init.sql": "SELECT 1;\n"})
     with pytest.raises(DeployError):
         await _do_release(sf, app["id"], await actor())
+
+
+async def test_static_stack_rejected_with_honest_message(sf, store_root, images_ok, actor):
+    """规格 2026-11-13 §6：纯前端应用不进商店，且给的是**诚实**的那句话。
+
+    即便镜像替身恒真，闸门 2/3 也必然把 static 拦下（没有 backend 镜像、prod 库没有迁移历史），
+    但那两条文案都在教用户「重新发布一次」——照做还是上不了架。所以断言的是文案而不是"被拒"：
+    拒了但拒错，等于把一次澄清的机会换成一轮客服。
+    """
+    app = await _make_app(sf, sql_files={}, stack="static")
+    with pytest.raises(DeployError) as ei:
+        await _do_release(sf, app["id"], await actor())
+    assert "纯前端静态页" in str(ei.value)
+    assert "重新发布" not in str(ei.value)
+    async with sf() as s:
+        n = (await s.execute(text("SELECT count(*) FROM deploy_record WHERE app_id=:a "
+                                  "AND kind='release' AND status='success'"),
+                             {"a": app["id"]})).scalar()
+    assert n == 0                                   # 闸门链最前面拒绝：不产生包也不记成功账
 
 
 async def test_prefix_violation_rejected(sf, store_root, images_ok, actor):

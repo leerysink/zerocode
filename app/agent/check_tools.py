@@ -20,6 +20,9 @@ OUTPUT_CHARS = 8_000
 RUN_TIMEOUT = 900        # 冷启动 + npm install / mvn 首次下载都可能上分钟
 
 _TS_CHECK = "npm install --no-audit --no-fund --loglevel=error && npx vue-tsc --noEmit"
+# Node 小栈的后端类型检查：与工程自己的 `npm run typecheck` 同一条命令（模板 package.json 里就是
+# tsc --noEmit），所以模型自检红了与本地跑红的会是同一批 file:line。
+_BE_TS_CHECK = "npm install --no-audit --no-fund --loglevel=error && npx tsc --noEmit"
 _FE_BUILD = ("npm install --no-audit --no-fund --loglevel=error && "
              "npx vite build --outDir /tmp/zc-check-dist --emptyOutDir")
 _FALLBACK_NOTE = ("工程未装类型检查器（vue-tsc），已降级为 vite build 编译检查"
@@ -52,7 +55,11 @@ def _backend_check(root, stack: str) -> dict:
         if not (root / "backend" / "pom.xml").is_file():
             raise _CheckError("backend/pom.xml 不存在，无法编译 Java 后端")
         return {"service": "backend", "argv": ["mvn", "-B", "-DskipTests", "compile"]}
-    if stack in ("vue3-fastapi", "vue3-node"):
+    if stack == "vue3-node":
+        if not (root / "backend" / "tsconfig.json").is_file():
+            raise _CheckError("backend/tsconfig.json 不存在，无法执行 TypeScript 类型检查")
+        return {"service": "backend", "argv": ["sh", "-c", _BE_TS_CHECK]}
+    if stack == "vue3-fastapi":
         if not (root / "backend" / "app").is_dir():
             raise _CheckError("backend/app 不存在，无法编译 Python 后端")
         return {"service": "backend", "argv": ["python", "-m", "compileall", "-q", "app"]}
@@ -112,7 +119,7 @@ def build_check_prompt() -> str:
         "\n\n<app_checks>",
         "run_check 在一次性容器里跑平台写死的检查项，只能选 preset、不能传命令：",
         "- frontend_typecheck：前端类型/编译检查（工程有 vue-tsc 就用它，否则降级为 vite build）；",
-        "- backend_compile：后端编译（Python 走 compileall，Java 走 mvn compile）。",
+        "- backend_compile：后端编译（Python 走 compileall，TypeScript 走 tsc --noEmit，Java 走 mvn compile）。",
         "改完一段代码后跑一次即可，冷启动几十秒到几分钟；按输出里的 file:line 自己修，"
         "不要反复跑同一个检查。结果只作参考，不是发布闸门。",
         "</app_checks>",

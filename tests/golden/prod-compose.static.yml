@@ -1,0 +1,11 @@
+name: zc-lailiao-prod
+networks:
+  default: {}
+services:
+  frontend:
+    image: zc-lailiao-frontend:prod-${PROD_VERSION}
+    build: ../frontend
+    networks: [default]
+    ports:
+      - "8210:80"
+    restart: unless-stopped

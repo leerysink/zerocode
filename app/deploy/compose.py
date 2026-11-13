@@ -46,6 +46,19 @@ def _pip_volume() -> str:
 
 PIP_VOLUME = _pip_volume()
 
+# Node 小栈 backend 的依赖卷。挂载点与前端那个一样，但**必须是另一个卷**：
+# 同一个具名卷挂到两个服务的 /src/node_modules，后起来的会把前一套依赖树盖掉（同 MOBILE_VOLUME_NAME 的理由）。
+BE_NODE_VOLUME_NAME = "be_node_modules"
+BE_NODE_MOUNT_PATH = "/src/node_modules"
+
+
+def _be_node_volume() -> str:
+    """与 _fe_volume() 同构：挂载条目与顶层声明同源。"""
+    return f"{BE_NODE_VOLUME_NAME}:{BE_NODE_MOUNT_PATH}"
+
+
+BE_NODE_VOLUME = _be_node_volume()
+
 # 移动栈（vue3-springboot-mobile）dev 期的 uni-app H5 dev server：第二个内部服务。
 # 它**没有 ports:**，一应用一对端口是平台地基（端口池 8210-8399、routes.json 一条、网关取一级子域），
 # 手机访问的仍是 dev_port 上的管理端 vite，由它把 /h5 代理过来（规格 2026-11-03 D-8 / US-05）。
@@ -66,7 +79,19 @@ REDIS_DATA_VOLUME = "redis-data"    # Redis 命名卷：prod 开 AOF，重启不
 
 # prod-compose.yml 的落盘与渲染闸门：一个事实源，两处共用（写死单栈会让新栈发布必挂）
 # 移动栈（vue3-springboot-mobile）与大栈同形：同一种 prod 拓扑，只多一层 H5 静态产物。
-PUBLISHABLE_STACKS = ("vue3-fastapi", "vue3-springboot", MOBILE_STACK)
+# static 也在名单里：它只有一个纯 nginx 服务（_PROD_COMPOSE_STATIC），发布链路按 prod_roles 走。
+PUBLISHABLE_STACKS = ("vue3-fastapi", "vue3-node", "vue3-springboot", MOBILE_STACK, "static")
+
+# 一个 role = 一个应用镜像 tag（zc-{slug}-{role}:prod-{version}）。写死两处的表征不在发布期
+# （compose build 只看文件里的服务），在之后：static 的回滚永远报「backend 镜像已清理」、
+# 删记录时多 rmi 一个不存在的 tag、keep-N 清理白跑一轮。
+_ROLES_BY_STACK = {"static": ("frontend",)}
+DEFAULT_PROD_ROLES = ("frontend", "backend")
+
+
+def prod_roles(stack: str | None) -> tuple[str, ...]:
+    """该栈在 prod 侧产出应用镜像的服务角色（回滚体检 / 记账 / keep-N 清理 / 删记录的遍历面）。"""
+    return _ROLES_BY_STACK.get(stack, DEFAULT_PROD_ROLES)
 
 # 栈私有运行密钥：缺则生成、有则保留。口令不进数据库、不进仓库、AI 禁读（deploy/ 是禁区）。
 # 唯一事实源：.env 的密钥位与生成循环都从 STACK_SECRETS 派生，
@@ -108,15 +133,27 @@ def _npm_env_block() -> str:
     v = _mirror_env("ZEROCODE_NPM_REGISTRY")
     return f"\n    environment:\n      NPM_CONFIG_REGISTRY: {v}" if v else ""
 
-def _prod_build_block(context: str, arg_name: str, url: str | None) -> str:
-    """prod 栈一个 build 标记的渲染值：没镜像源时逐字回退到 `build: ../<context>` 标量形态。
 
+def _npm_env_line() -> str:
+    """**已有** environment: 块的服务补一行 NPM_CONFIG_REGISTRY（与 _pip_env_block 同形）。
+
+    不能复用 _npm_env_block()：它自带 `environment:` 头，落在已有该键的服务里就是一个重复键，
+    yaml 后一个覆盖前一个，dev 后端会静默丢掉 DATABASE_URL。
+    """
+    v = _mirror_env("ZEROCODE_NPM_REGISTRY")
+    return f"\n      NPM_CONFIG_REGISTRY: {v}" if v else ""
+
+def _prod_build_block(context: str, arg_name: str | None, url: str | None) -> str:
+    """prod 栈一个 build 标记的渲染值：没有可注的参数时逐字回退到 `build: ../<context>` 标量形态。
+
+    `arg_name=None` 表示这个构建上下文根本没有镜像源消费方（大栈后端是 maven），与「消费方在但
+    平台没配源」走同一条回退：产物字节都得与 ADR-0025 之前一致。
     返回值不带行尾换行——模板里标记独占一行，行尾由模板自己提供，这样未注入分支与旧模板字节相同
     （ADR-0017「注入块不得独占一行」的约束在这里换了形态：块永不空，所以标记可以独占一行）。
     消费方是应用自己的 Dockerfile（`ARG` + `ENV`）；没声明 ARG 的应用只会收到 BuildKit 的一条
     「build-arg not consumed」警告，不影响构建。
     """
-    if not url:
+    if not url or not arg_name:
         return f"    build: ../{context}"
     return (f"    build:\n"
             f"      context: ../{context}\n"
@@ -158,6 +195,48 @@ __MIGRATE_SVC__
 volumes:
   __FE_VOL_NAME__: {}
   __PIP_VOL_NAME__: {}
+"""
+
+# Node 小栈（Express 5 + TS + pg-promise）的 dev 栈。与 _DEV_COMPOSE 的三处刻意差异：
+# ① DATABASE_URL 是**纯 postgresql://**——pg-promise 不认 SQLAlchemy 的 `+asyncpg` 方言前缀，
+#    注错不在创建期报，而是预览起来、后端连不上库；
+# ② 后端起 `npm run dev`（脚本即事实源，dev 里跑什么由工程自己的 package.json 定，与前端同待遇）；
+# ③ 依赖卷是 be_node_modules 而非 pip 缓存卷。其余（migrate 闸门、端口对外、网络）逐字节同形。
+_DEV_COMPOSE_NODE = """name: zc-__SLUG__-dev
+networks:
+  default: {}
+  zcnet:
+    external: true
+services:
+__MIGRATE_SVC__
+  backend:
+    image: node:20-alpine
+    working_dir: /src
+    volumes:
+      - ../backend:/src
+      - __BE_NODE_VOL__
+    environment:
+      DATABASE_URL: postgresql://${DEV_USER}:${DEV_PASSWORD}@zerocode-pg16:5432/${DEV_DB}
+      APP_PORT: "8000"__NPM_ENV_LINE__
+    command: sh -c "npm install && npm run dev"
+    networks: [default, zcnet]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+  frontend:
+    image: node:20-alpine
+    working_dir: /src
+    volumes:
+      - ../frontend:/src
+      - __FE_VOL__
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0 --port 5173"__NPM_ENV__
+    ports:
+      - "__DEV_PORT__:5173"
+    depends_on:
+      - backend
+volumes:
+  __FE_VOL_NAME__: {}
+  __BE_NODE_VOL_NAME__: {}
 """
 
 _MIGRATE_SVC = """  migrate:
@@ -269,6 +348,18 @@ PROD_USER=__PROD_USER__
 PROD_PASSWORD=__PROD_PASSWORD__
 """
 
+# 小栈 prod 后端的两处栈差异（其余拓扑逐字节相同）：
+#   (数据库连接串方言, 构建期 build arg 名, 该参数读哪个平台环境变量)
+# 方言不是可选项：pg-promise 只认纯 postgresql://，SQLAlchemy 的 +asyncpg 前缀对它非法，而注错的
+# 表征不在创建期——prod 栈照样起，只是 /api/health 的 db 永远 false。
+# maven 栈不在表里：它的数据源是 SPRING_DATASOURCE_*，仓库镜像也没进本次参数范围。
+_PROD_SMALL_BACKEND = {
+    "vue3-fastapi": ("postgresql+asyncpg://${PROD_USER}:${PROD_PASSWORD}@zerocode-pg16:5432/${PROD_DB}",
+                     "PIP_INDEX_URL", "ZEROCODE_PYPI_MIRROR"),
+    "vue3-node": ("postgresql://${PROD_USER}:${PROD_PASSWORD}@zerocode-pg16:5432/${PROD_DB}",
+                  "NPM_CONFIG_REGISTRY", "ZEROCODE_NPM_REGISTRY"),
+}
+
 _PROD_COMPOSE = """name: zc-__SLUG__-prod
 networks:
   default: {}
@@ -280,7 +371,7 @@ __MIGRATE_PROD__
     image: zc-__SLUG__-backend:prod-${PROD_VERSION}
 __BUILD_BACKEND__
     environment:
-      DATABASE_URL: postgresql+asyncpg://${PROD_USER}:${PROD_PASSWORD}@zerocode-pg16:5432/${PROD_DB}
+      DATABASE_URL: __BACKEND_DB_URL__
       APP_PORT: "8000"
     networks: [default, zcnet]
     restart: unless-stopped
@@ -296,6 +387,25 @@ __BUILD_FRONTEND__
     restart: unless-stopped
     depends_on:
       - backend
+"""
+
+# static 的 prod：一个纯 nginx 站点。三处「没有」都有代价，不是省字。
+#   ① 没有 migrate——本栈不铺数据轨（scaffold.has_data_track("static") 为假），产物里没有 sqlchange/，
+#      run_sqlchange 的 fail-closed 闸门见不到目录就 ok=False，挂着它发布必红在迁移步；
+#   ② 没有 backend——prod.py 按 prod_roles("static") 只认 frontend 一个 tag；
+#   ③ 没有 zcnet——外部网络不存在时 compose up 直接失败，而静态站点没有任何进程要访 zerocode-pg16。
+# 只在 default 网络上：网关按宿主端口（__PROD_PORT__ -> 80）路由，不经容器网络。
+_PROD_COMPOSE_STATIC = """name: zc-__SLUG__-prod
+networks:
+  default: {}
+services:
+  frontend:
+    image: zc-__SLUG__-frontend:prod-${PROD_VERSION}
+__BUILD_FRONTEND__
+    networks: [default]
+    ports:
+      - "__PROD_PORT__:80"
+    restart: unless-stopped
 """
 
 _MIGRATE_PROD = """  migrate:
@@ -328,7 +438,7 @@ __MIGRATE_PROD__
     restart: unless-stopped
   backend:
     image: zc-__SLUG__-backend:prod-${PROD_VERSION}
-    build: ../backend
+__BUILD_BACKEND__
     environment:
       SPRING_DATASOURCE_URL: jdbc:postgresql://zerocode-pg16:5432/${PROD_DB}?currentSchema=public&stringtype=unspecified
       SPRING_DATASOURCE_USERNAME: ${PROD_USER}
@@ -376,6 +486,8 @@ def render_dev_compose(meta: dict) -> str:
         tpl, fragments = _FE_ONLY, ()
     elif stack == "vue3-fastapi":
         tpl, fragments = _DEV_COMPOSE, (_MIGRATE_SVC,)
+    elif stack == "vue3-node":
+        tpl, fragments = _DEV_COMPOSE_NODE, (_MIGRATE_SVC,)   # 迁移闸门逐字复用（同库同轨同镜像）
     elif stack == "vue3-springboot":
         tpl, fragments = _DEV_COMPOSE_SB, (_MIGRATE_SVC,)   # 迁移闸门完全复用（同库同轨同镜像）
     elif stack == MOBILE_STACK:
@@ -398,9 +510,12 @@ def render_dev_compose(meta: dict) -> str:
          .replace("__M2_VOL_NAME__", M2_VOLUME_NAME)
          .replace("__PIP_VOL__", _pip_volume())
          .replace("__PIP_VOL_NAME__", PIP_VOLUME_NAME)
+         .replace("__BE_NODE_VOL__", _be_node_volume())
+         .replace("__BE_NODE_VOL_NAME__", BE_NODE_VOLUME_NAME)
          .replace("__SLUG__", slug)
          .replace("__PIP_ENV__", _pip_env_block())
-         .replace("__NPM_ENV__", _npm_env_block()))
+         .replace("__NPM_ENV__", _npm_env_block())
+         .replace("__NPM_ENV_LINE__", _npm_env_line()))
     # 自检：模板声明过的标记必须全部被替换（与 scaffold 的 {{ 残留自检同构，审查 I-3）
     residue = sorted(m for m in _markers_of(sources) if m in y)
     if residue:
@@ -411,21 +526,27 @@ def render_prod_compose(meta: dict) -> str:
     """prod 栈（规格 03 §4.3 / 07）：镜像即产物，不挂源码卷、无 dev server 命令；
     仅前端对外（prod 端口 -> 容器 80，backend 经 nginx 反代，T3b）；migrate 闸门指 PROD_*。"""
     stack = meta.get("stack")
-    if stack == "vue3-fastapi":
+    if stack == "static":
+        tpl, fragments = _PROD_COMPOSE_STATIC, ()
+        db_url, be_arg, be_env = "", None, None
+    elif stack in _PROD_SMALL_BACKEND:
         tpl, fragments = _PROD_COMPOSE, (_MIGRATE_PROD,)
+        db_url, be_arg, be_env = _PROD_SMALL_BACKEND[stack]
     elif stack in ("vue3-springboot", MOBILE_STACK):
         # 移动栈的 prod 与大栈逐字节同形：H5 是前端镜像里的一层静态产物（html/h5），
         # 不是第三个可发布服务——prod.py 的镜像记账/回滚体检只认 frontend+backend 两个 role。
         tpl, fragments = _PROD_COMPOSE_SB, (_MIGRATE_PROD,)   # migrate 片段逐字复用（同库同轨同镜像）
+        db_url, be_arg, be_env = "", None, None               # maven 后端：SPRING_* 数据源，无仓库镜像参数可注
     else:
         raise DeployError(f"栈发布未支持: {stack}", status=400)
     sources = tpl + "".join(fragments)              # 本次渲染用到的全部标记面
-    # build.args 只给真有消费方的构建上下文：fastapi 后端是 pip、两栈前端是 npm；
-    # 大型栈后端是 maven，仓库镜像不在这两个参数范围内（_PROD_COMPOSE_SB 的 backend 因此没有标记）。
+    # build.args 只给真有消费方的构建上下文：小栈后端按 _PROD_SMALL_BACKEND 各自的源、两栈前端是 npm；
+    # 大型栈后端是 maven（be_arg=None），标记存在但渲染回标量形态，产物与 ADR-0025 之前逐字节相同。
+    backend_url = _mirror_env(be_env) if be_env else None
     y = (tpl
          .replace("__MIGRATE_PROD__", _MIGRATE_PROD)
-         .replace("__BUILD_BACKEND__", _prod_build_block(
-             "backend", "PIP_INDEX_URL", _mirror_env("ZEROCODE_PYPI_MIRROR")))
+         .replace("__BACKEND_DB_URL__", db_url)
+         .replace("__BUILD_BACKEND__", _prod_build_block("backend", be_arg, backend_url))
          .replace("__BUILD_FRONTEND__", _prod_build_block(
              "frontend", "NPM_CONFIG_REGISTRY", _mirror_env("ZEROCODE_NPM_REGISTRY")))
          .replace("__PROD_PORT__", str(meta["ports"]["prod"]))

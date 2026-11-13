@@ -6,6 +6,6 @@
 //
 // 名单只能在这里写一次：应用列表与聊天页操作条是同一个闸门的两个入口，
 // 各自写死一份必然漂移（曾经就是列表页放宽到含 springboot、聊天页还停在 vue3-fastapi）。
-export const PUBLISHABLE_STACKS = ['vue3-fastapi', 'vue3-springboot', 'vue3-springboot-mobile']
+export const PUBLISHABLE_STACKS = ['vue3-fastapi', 'vue3-node', 'vue3-springboot', 'vue3-springboot-mobile', 'static']
 
 export const canPublish = (app) => PUBLISHABLE_STACKS.includes(app?.stack)

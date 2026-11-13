@@ -283,6 +283,26 @@ async def test_migrate_gate_blocks_stack_and_emits_result(sf, make_app, seams):
     assert _statuses(events) == ["starting", "error"]      # starting→error 落状态机
 
 
+async def test_start_dev_static_stack_skips_migration_gate(sf, make_app, seams):
+    """US-07：static 起预览不碰迁移闸门，但 migrate_result 事件照发、dev 栈照起。
+
+    三个面各自会坏：① 真调 run_sqlchange → fail-closed 判 ok=False → 静态站点永远起不了预览；
+    ② 只跳过调用不发事件 → 前端迁移面板悬在「迁移中」；③ 顺手把 deploy/ 渲染也跳过 → compose up
+    找不到文件。所以断言的是「没迁移调用 + 有 ok 事件 + 栈起了 + 文件在盘上」。
+    """
+    app = await make_app("zcstatic", prod_port=8292, dev_port=8293, stack="static")
+    hub, events = _hub_spy()
+    seams.docker.script["compose up"] = (0, "Container zc-zcstatic-dev-frontend-1 Started")
+    res = await engine.start_dev(sf, app, notify=hub.publish)
+    assert res["status"] == "running"
+    assert seams.mig_calls == []                            # 压根没进迁移入口
+    mig = _events_of(events, "migrate_result")
+    assert len(mig) == 1 and mig[0]["ok"] is True and mig[0]["env"] == "dev"
+    yml = (ROOT / "zcstatic" / "deploy" / "dev-compose.yml").read_text(encoding="utf-8")
+    assert "migrate" not in yml and "backend:" not in yml   # 渲染的是单服务那份
+    assert _statuses(events) == ["starting", "running"]
+
+
 async def test_dev_log_lines_forwarded_and_migrate_seam(sf, make_app, seams):
     """迁移与启动的每行输出都经 notify 的 dev_log 事件转发；无 notify 时不注入日志回调。
 

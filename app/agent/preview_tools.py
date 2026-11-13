@@ -482,7 +482,8 @@ async def run_preview_tool(ctx, name: str, args: dict, *, confirmed: bool = Fals
 _STACK_HINTS = {
     "vue3-fastapi": "后端 Python 改动由 uvicorn --reload 自动重载；requirements.txt 改动必须重启。",
     "vue3-springboot": "后端 Java 改动不会热更新，必须 preview_restart；前端改动仍走 Vite 热更新。",
-    "vue3-node": "无后端，前端刷新即可；依赖清单改动才需要重启。",
+    "vue3-node": "后端 TS 改动由 tsx watch 自动重启进程（不是模块级热更新，进程会重来一次）；"
+                 "前端仍走 Vite 热更新；package.json 依赖改动必须 preview_restart。",
     "static": "静态页，刷新即可；依赖清单改动才需要重启。",
 }
 
