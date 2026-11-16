@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>ZeroCode 系统架构</title>
+<style>
+  /* ZeroCode 分层架构图 · 可编辑源文件
+     改图：band = 一条泳道（层），flow = 层与层之间的连接说明，改文案直接改 HTML。
+     导出 PNG：用 Playwright（或任何浏览器）以 deviceScaleFactor=2 打开本文件，
+     对 .canvas 元素截图，导出同名 PNG 到 docs/images/。
+     踩过的坑：CSS 注释里不要写带「星号加斜杠」的 glob 路径，它会提前终止注释并吞掉后面的规则。
+     画布宽度锁在 1040 CSS px：README 正文列宽约 900px，收窄画布才能保证缩到正文宽度后
+     最小字号仍不低于 10px（图上任何一处字都不该小于这个折算值）。
+  */
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { background: #edf1f8; }
+  body {
+    font-family: "PingFang SC", "Microsoft YaHei", "Segoe UI", "Noto Sans SC", sans-serif;
+    -webkit-font-smoothing: antialiased;
+    width: max-content;
+  }
+  .canvas {
+    width: 1040px;
+    padding: 24px 22px 18px;
+    background: linear-gradient(158deg, #f8fbff 0%, #eef2f8 65%, #e9eef7 100%);
+  }
+
+  /* ---------- 标题 ---------- */
+  .head { margin-bottom: 16px; }
+  .head h1 { font-size: 23px; color: #1b2436; letter-spacing: .8px; }
+  .head h1 span { color: #3f6df6; }
+  .head p { font-size: 13px; color: #66738e; margin-top: 5px; }
+  .head .meta { margin-top: 9px; display: flex; gap: 7px; flex-wrap: wrap; font-size: 12px; color: #46536e; }
+  .head .meta span { background: #fff; border: 1px solid #dbe2ee; border-radius: 7px; padding: 3px 9px; }
+  .head .meta b { color: #2f6fed; font-weight: 700; font-family: Consolas, monospace; }
+
+  /* ---------- 泳道 ---------- */
+  .band {
+    position: relative; border-radius: 13px; padding: 28px 12px 12px;
+    border: 1px solid var(--line); background: var(--bg);
+    box-shadow: 0 2px 9px rgba(30, 50, 90, .06);
+  }
+  .band > .tag {
+    position: absolute; top: -11px; left: 14px;
+    background: var(--accent); color: #fff; font-size: 13px; font-weight: 600;
+    padding: 4px 12px; border-radius: 18px; box-shadow: 0 2px 6px rgba(30, 50, 90, .22);
+  }
+  .band > .tag em { font-style: normal; opacity: .85; font-weight: 400; margin-left: 6px; font-size: 12px; }
+  .band > .role { position: absolute; top: 9px; right: 13px; font-size: 12px; color: var(--accent); font-weight: 600; }
+  .cards { display: flex; gap: 9px; }
+
+  .card {
+    flex: 1 1 0; min-width: 0; background: #fff;
+    border: 1px solid #dee4ef; border-radius: 10px; padding: 10px 11px;
+    box-shadow: 0 1px 3px rgba(30, 50, 90, .07);
+    border-top: 3px solid var(--accent);
+  }
+  .card.external { border-style: dashed; border-color: #c6cee0; border-top-style: dashed; background: #fdfdff; }
+  .card h3 { font-size: 14px; color: #1f2a3d; line-height: 1.3; display: flex; align-items: center; gap: 6px; }
+  .card h3 i {
+    flex: none; width: 18px; height: 18px; border-radius: 5px;
+    background: var(--accent); color: #fff; font-style: normal;
+    font-size: 12px; font-weight: 700; display: grid; place-items: center;
+  }
+  .card ul { list-style: none; margin-top: 7px; }
+  .card li { font-size: 12px; color: #54617b; line-height: 1.68; padding-left: 10px; position: relative; }
+  .card li::before {
+    content: ""; position: absolute; left: 0; top: 7px;
+    width: 4px; height: 4px; border-radius: 50%; background: var(--accent); opacity: .55;
+  }
+  .card li code {
+    font-family: Consolas, monospace; font-size: 12px; font-weight: 600;
+    color: var(--accent); background: var(--chip); padding: 0 4px; border-radius: 4px;
+  }
+  .card li b { color: #2c3850; font-weight: 700; }
+
+  .entry    { --accent: #2f6fed; --bg: #f3f7ff; --line: #cfdcfb; --chip: #eaf1ff; }
+  .platform { --accent: #6a4bd8; --bg: #f6f4ff; --line: #dcd6f7; --chip: #efeaff; }
+  .engine   { --accent: #d97706; --bg: #fff8ef; --line: #f2e0bf; --chip: #fdeddb; }
+  .product  { --accent: #0e9f6b; --bg: #f1fbf6; --line: #c8ead9; --chip: #dff5ea; }
+  .infra    { --accent: #4a5673; --bg: #f4f6fa; --line: #d7dde9; --chip: #e7ecf5; }
+  .outside  { --accent: #8d5bd8; --bg: #faf7ff; --line: #ded4f2; --chip: #f1ebfd; }
+
+  /* ---------- 层间连接 ---------- */
+  .flow { display: flex; align-items: center; gap: 8px; padding: 7px 0 15px 20px; }
+  .flow .stem { flex: none; width: 2px; height: 18px; background: #a4b1c8; position: relative; }
+  .flow .stem::after {
+    content: ""; position: absolute; bottom: -1px; left: -3.5px;
+    border: 4.5px solid transparent; border-top-color: #7c8ba6; border-bottom: 0;
+  }
+  .flow .pill {
+    font-size: 12px; color: #42506a; background: #fff;
+    border: 1px solid #d7dfec; border-radius: 18px; padding: 3px 10px;
+    box-shadow: 0 1px 2px rgba(30, 50, 90, .05);
+  }
+  .flow .pill b { color: #2f6fed; font-weight: 700; }
+  .flow .pill.side { border-style: dashed; background: #fbfcff; color: #66738e; }
+  .flow .pill.side b { color: #d97706; }
+
+  /* ---------- 图例 ---------- */
+  .legend {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    margin-top: 14px; padding: 9px 13px;
+    background: #fff; border: 1px solid #dee4ef; border-radius: 10px;
+    font-size: 12px; color: #54617b;
+  }
+  .legend .k { display: flex; align-items: center; gap: 5px; }
+  .legend .sw {
+    width: 12px; height: 12px; border-radius: 3px;
+    border: 1px solid var(--line); background: var(--bg); border-top: 3px solid var(--accent);
+  }
+  .legend .sw.dash { border: 1px dashed #b6bfd2; border-top: 3px dashed #8d5bd8; background: #fdfdff; }
+  .legend .foot { color: #8794ad; font-size: 12px; margin-left: auto; }
+</style>
+</head>
+<body>
+<div class="canvas">
+
+  <div class="head">
+    <h1><span>ZeroCode</span> 系统架构</h1>
+    <p>一台跑在你自己机器上的 AI 应用工厂 —— 从对话生成，到发布回退，到分发给整个团队</p>
+    <div class="meta">
+      <span>平台后端 <b>:8100</b></span>
+      <span>前端 dev <b>:8082</b></span>
+      <span>平台库宿主 <b>:5433</b></span>
+      <span>应用端口池 <b>8210–8399</b></span>
+      <span>容器网 <b>zcnet</b></span>
+      <span>连库别名 <b>zerocode-pg16:5432</b></span>
+    </div>
+  </div>
+
+  <div class="band entry">
+    <span class="tag">使用者入口<em>谁在用、用什么地址</em></span>
+    <span class="role">全在浏览器里</span>
+    <div class="cards">
+      <div class="card">
+        <h3><i>1</i>平台控制台</h3>
+        <ul>
+          <li>Vue 3.5 单页：聊天 / 应用 / 商店 / 设置</li>
+          <li>构建产物由后端托管，同源部署</li>
+          <li>写代码的全过程都在这里确认</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3><i>2</i>中央 OpenResty 网关</h3>
+        <ul>
+          <li>通配域名 HTTPS 终止</li>
+          <li><code>routes.json</code> 动态路由，按 mtime 刷新</li>
+          <li>只有正式态 running 才进路由</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3><i>3</i>使用者拿到的地址</h3>
+        <ul>
+          <li>预览 <code>127.0.0.1:82xx</code> 抽屉内嵌</li>
+          <li>局域网 <code>http://IP:端口</code></li>
+          <li>域名 <code>https://应用名.域名</code></li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <div class="flow">
+    <span class="stem"></span>
+    <span class="pill"><b>HTTP</b> /api · <b>WebSocket</b> /ws/chat · /ws/deploy</span>
+    <span class="pill side">网关旁路：HTTPS 直达第 4 层正式端口，<b>不经过平台后端</b></span>
+  </div>
+
+  <div class="band platform">
+    <span class="tag">平台服务层<em>成熟 Agent 不管的那一段</em></span>
+    <span class="role">本机容器 · :8100</span>
+    <div class="cards">
+      <div class="card">
+        <h3><i>1</i>API 路由 + WS 通道</h3>
+        <ul>
+          <li>sessions · apps · files · models · config</li>
+          <li><code>/ws/chat</code> 流式对话与工具事件</li>
+          <li><code>/ws/deploy</code> 只搬运状态，不解释语义</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3><i>2</i>部署套件 deploy</h3>
+        <ul>
+          <li>compose 渲染 · 端口分配 · 建库供给</li>
+          <li>sqlchange 迁移 · 契约与护栏校验</li>
+          <li>事件广播 + 日志环形缓冲供订阅</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3><i>3</i>应用商店 store</h3>
+        <ul>
+          <li>一键上架 → 申请 → 创始人审批</li>
+          <li>自动供给<b>完全独立实例</b>（码+库+地址）</li>
+          <li>升级先在真数据克隆库上预演</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <div class="flow">
+    <span class="stem"></span>
+    <span class="pill">会话消息交给 <b>Agent 循环</b>，工具事件回流成卡片</span>
+    <span class="pill">点「发布」→ 部署套件接管</span>
+  </div>
+
+  <div class="band engine">
+    <span class="tag">AI 引擎层<em>会写代码的那一段</em></span>
+    <span class="role">可换模型，不改流程</span>
+    <div class="cards">
+      <div class="card">
+        <h3><i>1</i>Agent 循环 + 写盘确认</h3>
+        <ul>
+          <li>拆任务、逐文件写、执行中可插话</li>
+          <li>改成什么样，<b>确认后才落盘</b></li>
+          <li>每处改动留 diff，可逐条回看</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3><i>2</i>工具集与上下文</h3>
+        <ul>
+          <li>读写 / 检索 / 跑检查 / 库查询</li>
+          <li><code>ask_user</code> 把歧义摊成选择题</li>
+          <li>@ 引用文件 · 粘原型图 · 一键压缩</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3><i>3</i>模型解析与记忆</h3>
+        <ul>
+          <li>OpenAI 兼容多套凭据，按会话切换</li>
+          <li>是否支持看图可在设置里声明</li>
+          <li>工作区记忆沉淀约定与坑</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <div class="flow">
+    <span class="stem"></span>
+    <span class="pill">确认后的写入落到 <b>应用工作区</b>，数据变更写成 sqlchange</span>
+    <span class="pill side">浏览器自检 sidecar <b>:8101</b> 打开预览页验收</span>
+  </div>
+
+  <div class="band product">
+    <span class="tag">生成产物层<em>每个应用独立成套</em></span>
+    <span class="role">标准工程，可以带走</span>
+    <div class="cards">
+      <div class="card">
+        <h3><i>1</i>代码工作区 apps/{slug}</h3>
+        <ul>
+          <li>backend / frontend / sqlchange</li>
+          <li>独立目录、库、端口，互不干扰</li>
+          <li>不入库：每台机器各自生成</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3><i>2</i>dev 预览栈</h3>
+        <ul>
+          <li><code>zc-{slug}-dev</code> 容器组</li>
+          <li>源码挂载 + 热重载，重启即生效</li>
+          <li>迁移闸门先行，实时日志可订阅</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3><i>3</i>prod 正式栈</h3>
+        <ul>
+          <li><code>zc-{slug}-prod</code> 版本化镜像</li>
+          <li>旧版本不中断，失败自动回退</li>
+          <li>健康检查 + 资源监控 + 一键回滚</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <div class="flow">
+    <span class="stem"></span>
+    <span class="pill">平台经 <b>Docker Engine</b> 起停栈、建库、跑迁移</span>
+    <span class="pill">四档栈：<b>vue3-fastapi</b> · <b>vue3-node</b> · <b>static</b> · <b>vue3-springboot</b></span>
+  </div>
+
+  <div class="band infra">
+    <span class="tag">运行时与基础设施<em>代码与数据自持</em></span>
+    <span class="role">一台机器全栈跑通</span>
+    <div class="cards">
+      <div class="card">
+        <h3><i>1</i>PostgreSQL 16 + pgvector</h3>
+        <ul>
+          <li>平台库 + 每应用独立 dev / prod 库</li>
+          <li>平台 DDL 走 changelog 自动迁移</li>
+          <li>记忆的语义检索靠 vector 扩展</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3><i>2</i>Docker · Compose · zcnet</h3>
+        <ul>
+          <li>dev / prod 两套栈各一组容器</li>
+          <li>命名卷承载依赖缓存与数据</li>
+          <li>端口冲突点名占用者后再分配</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3><i>3</i>Redis 7（大型栈私有）</h3>
+        <ul>
+          <li>登录态与缓存基座，开 AOF 不丢</li>
+          <li>只挂内部网 <code>appredis</code>，不暴端口</li>
+          <li>配 RBAC 权限体系与 JWT 认证</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <div class="flow">
+    <span class="stem"></span>
+    <span class="pill side">唯一出机器的动作：把上下文交给 <b>模型 API</b>；产物与数据都留在本地</span>
+  </div>
+
+  <div class="band outside">
+    <span class="tag">外部依赖<em>可替换、可私有化</em></span>
+    <div class="cards">
+      <div class="card external">
+        <h3><i>外</i>大模型服务</h3>
+        <ul>
+          <li>OpenAI 兼容端点，凭据自己填</li>
+          <li>可指向私有化内网模型</li>
+          <li>不填凭据时聊天会报连接错误</li>
+        </ul>
+      </div>
+      <div class="card external">
+        <h3><i>外</i>镜像源</h3>
+        <ul>
+          <li>apt / PyPI / npm 三源，出包时烘进包</li>
+          <li>同一份源管住平台与它起出的每个栈</li>
+          <li>直连不动时问答里现场改</li>
+        </ul>
+      </div>
+      <div class="card external">
+        <h3><i>外</i>域名与证书</h3>
+        <ul>
+          <li>通配域名 + DNS 解析到部署机</li>
+          <li>备案 + 真证书走 HTTPS，缺则退回 IP</li>
+          <li>网关是可拆项，不装也能用</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <div class="legend">
+    <span class="k"><span class="sw entry"></span>使用者入口</span>
+    <span class="k"><span class="sw platform"></span>平台服务</span>
+    <span class="k"><span class="sw engine"></span>AI 引擎</span>
+    <span class="k"><span class="sw product"></span>AI 生成产物</span>
+    <span class="k"><span class="sw infra"></span>运行时与基础设施</span>
+    <span class="k"><span class="sw dash"></span>虚线 = 外部依赖 / 可旁路</span>
+    <span class="foot">端口、容器名与技术栈均取自仓库源码</span>
+  </div>
+
+</div>
+</body>
+</html>

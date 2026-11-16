@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>ZeroCode 发布流水线</title>
+<style>
+  /* ZeroCode 发布流水线图 · 可编辑源文件
+     七步名称逐字取自前端 PublishModal.vue 的 STEP_LABELS 与后端 app/deploy/prod.py 的 STEPLIST。
+     导出 PNG：用 Playwright（或任何浏览器）以 deviceScaleFactor=2 打开本文件，
+     对 .canvas 元素截图，导出同名 PNG 到 docs/images/。
+     画布宽度与架构图一致锁在 1040 CSS px，保证缩到 README 正文列宽后字号不糊。
+  */
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { background: #edf1f8; }
+  body {
+    font-family: "PingFang SC", "Microsoft YaHei", "Segoe UI", "Noto Sans SC", sans-serif;
+    -webkit-font-smoothing: antialiased;
+    width: max-content;
+  }
+  .canvas {
+    width: 1040px; padding: 24px 22px 18px;
+    background: linear-gradient(158deg, #f9fbff 0%, #eef2f8 70%);
+  }
+
+  .head { margin-bottom: 15px; }
+  .head h1 { font-size: 22px; color: #1b2436; letter-spacing: .6px; }
+  .head h1 span { color: #6a4bd8; }
+  .head p { font-size: 13px; color: #66738e; margin-top: 5px; line-height: 1.6; }
+  .head .meta { margin-top: 8px; display: flex; gap: 7px; flex-wrap: wrap; font-size: 12px; color: #46536e; }
+  .head .meta span { background: #fff; border: 1px solid #dbe2ee; border-radius: 7px; padding: 3px 9px; }
+  .head .meta b { color: #6a4bd8; font-weight: 700; font-family: Consolas, monospace; }
+
+  /* ---------- 主链（两行，折返） ---------- */
+  .chain { display: flex; align-items: stretch; }
+  .step {
+    flex: 1 1 0; min-width: 0; position: relative;
+    background: #fff; border: 1px solid #dee4ef; border-radius: 11px;
+    padding: 13px 11px 11px; box-shadow: 0 2px 7px rgba(30, 50, 90, .07);
+    border-top: 3px solid var(--ac);
+  }
+  .step .no {
+    position: absolute; top: -11px; left: 10px;
+    width: 23px; height: 23px; border-radius: 50%;
+    background: var(--ac); color: #fff; font-size: 12.5px; font-weight: 700;
+    display: grid; place-items: center; box-shadow: 0 2px 5px rgba(30, 50, 90, .24);
+  }
+  .step h3 { font-size: 14.5px; color: #1f2a3d; margin: 3px 0 2px; }
+  .step .key { font-family: Consolas, monospace; font-size: 12px; color: var(--ac); }
+  .step ul { list-style: none; margin-top: 6px; }
+  .step li { font-size: 12px; color: #54617b; line-height: 1.66; padding-left: 10px; position: relative; }
+  .step li::before {
+    content: ""; position: absolute; left: 0; top: 7px;
+    width: 4px; height: 4px; border-radius: 50%; background: var(--ac); opacity: .5;
+  }
+  .step li b { color: #2c3850; font-weight: 700; }
+  .step li code {
+    font-family: Consolas, monospace; font-size: 12px;
+    color: var(--ac); background: #f4f6fb; padding: 0 3px; border-radius: 4px;
+  }
+  .s1 { --ac: #6a4bd8; } .s2 { --ac: #2f6fed; } .s3 { --ac: #0d9488; } .s4 { --ac: #0e9f6b; }
+  .s5 { --ac: #b8860b; } .s6 { --ac: #d97706; } .s7 { --ac: #4a5673; } .s8 { --ac: #0b6b47; }
+
+  .link { flex: none; width: 18px; display: grid; place-items: center; position: relative; }
+  .link::before { content: ""; width: 100%; height: 2px; background: #b3bed4; }
+  .link::after {
+    content: ""; position: absolute; right: 1px;
+    border: 5px solid transparent; border-left-color: #b3bed4; border-right: 0;
+  }
+
+  /* 第一行末 → 第二行首 的折返 */
+  .turn { display: flex; align-items: center; gap: 9px; padding: 9px 2px 17px; }
+  .turn .drop { flex: none; width: 2px; height: 15px; background: #b3bed4; position: relative; }
+  .turn .drop::after {
+    content: ""; position: absolute; bottom: -1px; left: -3.5px;
+    border: 4.5px solid transparent; border-top-color: #b3bed4; border-bottom: 0;
+  }
+  .turn .cap {
+    flex: none; font-size: 12px; color: #42506a; background: #fff;
+    border: 1px dashed #ccd6e6; border-radius: 18px; padding: 3px 11px;
+  }
+  .turn .cap b { color: #6a4bd8; font-weight: 700; }
+  .turn .line { flex: 1 1 auto; height: 2px; background: #b3bed4; }
+
+  /* ---------- 失败面 ---------- */
+  .fail {
+    margin-top: 4px; border-radius: 13px; padding: 14px 14px 12px;
+    background: #fff6f5; border: 1px solid #f2d2cc;
+  }
+  .fail > .tag {
+    display: inline-block; background: #d94a3d; color: #fff;
+    font-size: 12.5px; font-weight: 700; padding: 3px 12px; border-radius: 18px;
+    margin-bottom: 10px; letter-spacing: .4px;
+  }
+  .fail .row { display: flex; gap: 9px; }
+  .fcard {
+    flex: 1 1 0; background: #fff; border: 1px solid #efd4ce; border-left: 3px solid #d94a3d;
+    border-radius: 9px; padding: 10px 11px;
+  }
+  .fcard h4 { font-size: 13.5px; color: #8a2f26; margin-bottom: 4px; }
+  .fcard p { font-size: 12px; color: #6b5350; line-height: 1.7; }
+  .fcard p b { color: #b3372c; font-weight: 700; }
+  .fcard p code { font-family: Consolas, monospace; font-size: 12px; color: #b3372c; }
+
+  /* ---------- 护栏 ---------- */
+  .rails { display: flex; gap: 9px; margin-top: 13px; }
+  .rail {
+    flex: 1 1 0; background: #fff; border: 1px solid #dee4ef; border-radius: 10px;
+    padding: 10px 11px; border-top: 3px solid var(--ac); box-shadow: 0 1px 3px rgba(30,50,90,.06);
+  }
+  .rail h4 { font-size: 13.5px; color: #1f2a3d; margin-bottom: 4px; }
+  .rail p { font-size: 12px; color: #54617b; line-height: 1.7; }
+  .rail p b { color: #2c3850; font-weight: 700; }
+  .rail p code {
+    font-family: Consolas, monospace; font-size: 12px;
+    color: var(--ac); background: #f4f6fb; padding: 0 3px; border-radius: 4px;
+  }
+  .g1 { --ac: #0e9f6b; } .g2 { --ac: #6a4bd8; } .g3 { --ac: #2f6fed; } .g4 { --ac: #d97706; }
+
+  .foot {
+    margin-top: 13px; display: flex; justify-content: space-between; gap: 14px;
+    font-size: 12px; color: #8794ad; line-height: 1.6;
+  }
+  .foot b { color: #46536e; font-weight: 700; }
+</style>
+</head>
+<body>
+<div class="canvas">
+
+  <div class="head">
+    <h1><span>ZeroCode</span> 发布流水线 · 一键上线与自动回退</h1>
+    <p>点「发布」之后由平台代跑的七步。任何一步失败，都不会打断同事正在用的那个版本。</p>
+    <div class="meta">
+      <span>版本号 <b>b&lt;YYYYMMDDHHmmss&gt;</b>，字典序即时间序</span>
+      <span>每应用一对端口，取自池 <b>8210–8399</b></span>
+      <span>running 才写进 <b>routes.json</b></span>
+    </div>
+  </div>
+
+  <div class="chain">
+    <div class="step s1">
+      <span class="no">1</span>
+      <h3>发布前检查</h3>
+      <div class="key">preflight</div>
+      <ul>
+        <li>点名阻断项：文件名、app.json、结构漂移</li>
+        <li>破坏性变更<b>必须人工确认</b></li>
+        <li>可自修项静默补齐反代与镜像源</li>
+      </ul>
+    </div>
+    <div class="link"></div>
+    <div class="step s2">
+      <span class="no">2</span>
+      <h3>镜像构建</h3>
+      <div class="key">build</div>
+      <ul>
+        <li>前后端各出一枚版本化镜像</li>
+        <li><code>zc-{slug}-*:prod-版本</code></li>
+        <li>依赖镜像源按出包策略注入</li>
+      </ul>
+    </div>
+    <div class="link"></div>
+    <div class="step s3">
+      <span class="no">3</span>
+      <h3>数据库供给</h3>
+      <div class="key">provision</div>
+      <ul>
+        <li>缺 prod 分库时现场建库建角色</li>
+        <li>口令落进 <code>deploy/.env</code>，不进代码</li>
+        <li>凭据归属登记在平台库</li>
+      </ul>
+    </div>
+    <div class="link"></div>
+    <div class="step s4">
+      <span class="no">4</span>
+      <h3>数据库迁移</h3>
+      <div class="key">migrate</div>
+      <ul>
+        <li>sqlchange <b>只补跑没跑过的</b></li>
+        <li>数据轨 <code>D*</code> / 结构轨 <code>V*</code> 双轨</li>
+        <li>迁移不过则正式栈不启动</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="turn">
+    <div class="drop"></div>
+    <div class="cap">第一行跑完接第二行 · 全程 <b>/ws/deploy</b> 逐步推进度条</div>
+    <div class="line"></div>
+  </div>
+
+  <div class="chain">
+    <div class="step s5">
+      <span class="no">5</span>
+      <h3>正式栈启动</h3>
+      <div class="key">deploy</div>
+      <ul>
+        <li><code>compose up -d zc-{slug}-prod</code></li>
+        <li>旧版本在新栈就绪前<b>不中断</b></li>
+        <li>端口与路由按新版本接上</li>
+      </ul>
+    </div>
+    <div class="link"></div>
+    <div class="step s6">
+      <span class="no">6</span>
+      <h3>联合体检</h3>
+      <div class="key">health</div>
+      <ul>
+        <li>前端页与后端 <code>/api/health</code> 双探针</li>
+        <li>体检不过：容器保持运行供排查</li>
+        <li>通过即视为该版本可交付</li>
+      </ul>
+    </div>
+    <div class="link"></div>
+    <div class="step s7">
+      <span class="no">7</span>
+      <h3>发布记账</h3>
+      <div class="key">record</div>
+      <ul>
+        <li>版本、地址、状态落库留痕</li>
+        <li>schema 快照归档，供下次 diff</li>
+        <li>进「发布历史」可按版本回滚</li>
+      </ul>
+    </div>
+    <div class="link"></div>
+    <div class="step s8">
+      <span class="no">✓</span>
+      <h3>拿到可访问地址</h3>
+      <div class="key">同事直接打开</div>
+      <ul>
+        <li>局域网 <code>http://IP:端口</code></li>
+        <li>配好网关后 <code>https://应用名.域名</code></li>
+        <li>再点「发布到商店」即全团队复用</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="fail">
+    <span class="tag">任一步失败</span>
+    <div class="row">
+      <div class="fcard">
+        <h4>自动回退上一版本</h4>
+        <p><b>build / migrate / health</b> 任一处抛错，平台立刻把正式栈指回上一个通过体检的版本，不会出现「地址在、页面挂了」的中间态。</p>
+      </div>
+      <div class="fcard">
+        <h4>失败留痕，不当成成功</h4>
+        <p>失败步骤连同日志进发布历史；地址不会指向一个没体检过的版本，网关路由只收 <code>running</code> 的栈。</p>
+      </div>
+      <div class="fcard">
+        <h4>事后一键回滚</h4>
+        <p>发布历史逐版本列着时间、状态与地址，点回滚即切回该版本，<b>不需要重新走一遍构建</b>。</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="rails">
+    <div class="rail g1">
+      <h4>多版本保留</h4>
+      <p>按 <code>keep-5</code> 保留最近数枚版本镜像与结构快照，回滚有货可取，不被下一次发布挤掉。</p>
+    </div>
+    <div class="rail g2">
+      <h4>独立实例升级</h4>
+      <p>商店升级先在<b>真数据的克隆库</b>上预演迁移，通过才动正式库；各实例数据独立、互不可见。</p>
+    </div>
+    <div class="rail g3">
+      <h4>现场产物不被覆盖</h4>
+      <p>升级只替换 <code>backend/</code>、<code>frontend/</code> 等三棵，部署根上的现场产物、凭据与数据不碰。</p>
+    </div>
+    <div class="rail g4">
+      <h4>实时可观测</h4>
+      <p>日志抽屉先拉历史再订阅当前；资源监控看 CPU / 内存 / 库 / 工作区，停炉照实写「未采集」。</p>
+    </div>
+  </div>
+
+  <div class="foot">
+    <span>步骤名逐字取自进度条 <b>PublishModal.STEP_LABELS</b> 与后端 <b>prod.py:STEPLIST</b></span>
+    <span>预览（dev）与正式（prod）是<b>两套互不影响</b>的栈：预览怎么折腾都不动线上</span>
+  </div>
+
+</div>
+</body>
+</html>
