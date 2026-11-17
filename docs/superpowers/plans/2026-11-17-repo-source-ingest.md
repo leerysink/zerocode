@@ -2422,7 +2422,7 @@ async def test_tree_path_with_interior_dot_segment_is_rejected_not_written_raw()
     """manifest 里存 `docs/../oops.md`、盘上落 `oops.md` 是自相矛盾的契约：
     站点照着 manifest 去 fetch 就撞 404。git 树里造不出这种路径，出现即拒，别归一后两存。"""
     tree = [_blob("docs/../oops.md"), _blob("ok.md")]
-    out = await ingest.fetch_repo_snapshot(URL, transport=_transport(tree, FILES2))
+    out = await ingest.fetch_repo_snapshot(URL, transport=_transport(tree, FILES))
     assert "docs/../oops.md" not in out["files"]
     assert {s["reason"] for s in out["manifest"]["skipped"] if
             s["path"] == "docs/../oops.md"} == {"unsafe-path"}
