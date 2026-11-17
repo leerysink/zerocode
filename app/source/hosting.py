@@ -45,13 +45,19 @@ def parse_repo_url(url: str) -> RepoRef | None:
     if parsed.hostname not in _GITEE_HOSTS:
         return None
     segs = [s for s in parsed.path.split("/") if s]
-    # 指向 SKILL.md 的直链不是仓库：交给技能安装的直链通道（同 installer.is_skill_md_url 的口径），
-    # 否则 /owner/repo/raw/master/SKILL.md 会被下面的 tree 形态判定当成坏 URL 报错。
-    if segs and segs[-1].upper() == "SKILL.MD":
+    # 只有「文件直链」形态才让路给技能直链通道：`/raw/` 与 `/blob/` 指向单个文件，
+    # 末段是 SKILL.md 时判成非仓库（口径同 installer.is_skill_md_url）。
+    # `/tree/<ref>/<path>` 是目录形态，末段叫 SKILL.md 也仍然是仓库地址——浏览器复制目录链接
+    # 常常带到最后一段，把它判成「不是仓库」会把真仓库拒在门外（终审 Important 的裁定）。
+    if (len(segs) >= 5 and segs[2] in ("raw", "blob")
+            and segs[-1].upper() == "SKILL.MD"):
         return None
     if len(segs) < 2:
         raise HostingError("Gitee 仓库地址至少要有 owner/repo")
     repo = segs[1][:-4] if segs[1].lower().endswith(".git") else segs[1]
+    if not repo:
+        # 末段只有 `.git`：剥完后缀仓库名是空串，端点会拼成 `…/repos/o/` 这种必然 404 的地址。
+        raise HostingError("Gitee 仓库地址缺少仓库名")
     out = RepoRef(host="gitee.com", owner=segs[0], repo=repo, ref=None, subpath=None)
     if len(segs) > 2:
         if segs[2] != "tree" or len(segs) < 4:

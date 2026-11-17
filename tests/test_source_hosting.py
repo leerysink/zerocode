@@ -20,6 +20,13 @@ def test_dot_git_suffix_stripped():
     assert hosting.parse_repo_url("https://gitee.com/leerys/zerocode.git").repo == "zerocode"
 
 
+def test_dot_git_only_repo_segment_raises():
+    """末段只有 `.git` 时剥完后缀仓库名就成了空串，端点会拼出 `…/repos/o/` 这种
+    必然 404 的地址——判成坏形态当场报错，比发一次注定失败的请求诚实。"""
+    with pytest.raises(hosting.HostingError):
+        hosting.parse_repo_url("https://gitee.com/o/.git")
+
+
 def test_tree_ref_and_subpath():
     ref = hosting.parse_repo_url("https://gitee.com/leerys/zerocode/tree/master/docs/adr")
     assert (ref.ref, ref.subpath) == ("master", "docs/adr")
@@ -37,6 +44,16 @@ def test_unsupported_host_returns_none():
 def test_skill_md_direct_link_is_not_a_repo():
     assert hosting.parse_repo_url(
         "https://gitee.com/leerys/x/raw/master/SKILL.md") is None
+    # 文件页形态（/blob/）同样是指向单个文件，不是仓库
+    assert hosting.parse_repo_url(
+        "https://gitee.com/leerys/x/blob/master/SKILL.md") is None
+
+
+def test_skill_md_under_tree_dir_is_still_a_repo():
+    """`/tree/<ref>/<path>` 指的是目录，末段叫 SKILL.md 也仍是仓库地址：
+    浏览器里复制目录链接容易带上这一层，把它判成「不是仓库」会把真仓库拒在门外。"""
+    ref = hosting.parse_repo_url("https://gitee.com/o/r/tree/master/skills/foo/SKILL.md")
+    assert (ref.ref, ref.subpath) == ("master", "skills/foo/SKILL.md")
 
 
 @pytest.mark.parametrize("bad", [
@@ -60,6 +77,14 @@ def test_tree_with_slashed_ref_is_resolvable_by_caller():
     """含斜杠分支名靠调用方回退重试，这里先按「ref=master、subpath=dev/x」给出初判。"""
     ref = hosting.parse_repo_url("https://gitee.com/o/r/tree/master/dev/x")
     assert (ref.ref, ref.subpath) == ("master", "dev/x")
+
+
+def test_slashed_branch_survives_api_tree_url():
+    """含斜杠的分支名原样留在 tree 端点里：Task 3 把 f"{branch}/{scoped}" 直接喂给
+    api_tree_url，靠的就是 quote 不转义斜杠；此前没有任何测试钉住这条契约。"""
+    ref = hosting.parse_repo_url("https://gitee.com/o/r")
+    assert hosting.api_tree_url(ref, "release/1.2") == (
+        "https://gitee.com/api/v5/repos/o/r/git/trees/release/1.2?recursive=1")
 
 
 def test_endpoint_shapes_match_measured_working_urls():
