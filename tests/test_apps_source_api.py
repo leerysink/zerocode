@@ -168,6 +168,16 @@ async def test_subpath_narrows_the_snapshot(client):
     assert {f["path"] for f in m["files"]} == {"docs/a.md"}
 
 
+async def test_unmatched_subpath_is_400_and_creates_no_app(client):
+    """端点级闸：抓取侧的「该目录下没有可摄入的文本」不许在 HTTP 层被吞成 201。
+    拼错的目录名与「擦干净的输入框」是两件事——后者已由 ingest 归一成仓库根，前者必须报错。"""
+    client.app.state.source_http_transport = _transport(TREE, FILES)
+    r = await client.post("/api/apps", json=_body(source={"url": URL, "subpath": "doc"}))
+    assert r.status_code == 400
+    assert "没有可摄入的文本" in r.json()["detail"]
+    assert not APP_DIR.exists()
+
+
 async def test_explicit_empty_subpath_means_repo_root_not_scan_all(client):
     """三态不许在 HTTP 层被折叠（Task 3 在 ingest.py 里把这条写成契约）：
     `subpath=""` = 就要仓库根，缺省 = 全域扫描，URL 自带 /tree/<ref>/<subpath> = 钻那个目录。

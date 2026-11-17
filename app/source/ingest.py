@@ -52,13 +52,23 @@ class SourceError(Exception):
 def is_eligible(path: str) -> tuple[bool, str | None]:
     """这个仓库路径要不要进快照：返回 (收/不收, 原因)。
 
-    远端树里什么都可能有（`.git/config`、`a\\b.md`、`../x`），先判形态再判内容；
-    反斜杠与越界路径不收，因为落盘侧还要再过一次同一道闸（materialize 的 _safe_rel）。
+    远端树里什么都可能有（`.git/config`、`a\\b.md`、`../x`、`docs/../x.md`），先判形态再判内容；
+    反斜杠与越界路径不收，因为落盘侧还要再过一次同一道闸（materialize 的 _safe_rel）；
+    含内部点段的路径也不收 —— 它落盘会被归一、进 manifest 却是原串，两个字段各说各话。
     """
     if not path or path.startswith("/") or "\\" in path:
         return False, "unsafe-path"
     norm = posixpath.normpath(path)
     if norm.startswith("..") or norm == ".":
+        return False, "unsafe-path"
+    # 内部点段（`docs/../oops.md`）一律拒，不许「归一后双存」：落盘侧按归一名写（`oops.md`），
+    # manifest.files[].path 却存原串，站点照着 manifest 去 fetch 就打到一个不存在的位置 ——
+    # 两个字段各说各话的载荷不是「形状怪」，是自相矛盾的契约。git 树里造不出这种路径，
+    # 它出现就说明输入不可信，出现即拒。
+    # 判的是**原串**的段而不是 norm 的段：normpath 恰好会把 `..` 吃掉，在归一结果里找点段等于
+    # 永远找不到，那样这一条会退化成永不触发的死判。绝对形态也不在这里重判 —— 第一行已经拒过
+    # 前导 `/`，posix 的 normpath 不会把相对串变成绝对串，加一个 isabs 分支只会是死代码。
+    if any(p in (".", "..") for p in path.split("/")):
         return False, "unsafe-path"
     parts = norm.split("/")
     if any(p in IGNORE_DIRS for p in parts[:-1]) or parts[-1] in IGNORE_DIRS:
@@ -136,7 +146,10 @@ async def fetch_repo_snapshot(url: str, *, subpath: str | None = None,
     # 三种意图互不相同，别把空串折叠成 None（口径同 installer 审查 B-1）：
     # 显式 subpath="" 是「就要仓库根」，URL 里的 /tree/<ref>/<subpath> 是「钻这个目录」，
     # 两者都没有才是全域；显式参数优先于 URL 带的路径。
-    scoped = (subpath if subpath is not None else (ref.subpath or "")).strip("/")
+    # 先 .strip() 再 .strip("/")：只有空白字符的 subpath 是「用户把输入框擦干净了」留下的 UI 残留，
+    # 不是一个名叫「三个空格」的目录名 —— 原样当目录用会静默零命中，201 建出一个没有正文的站点。
+    # 归一成仓库根而不是报错，是因为它和显式 "" 是同一个意图，报错反而否定了合法的留空。
+    scoped = (subpath if subpath is not None else (ref.subpath or "")).strip().strip("/")
     # 上限对两个来源一视同仁：原来只卡 subpath 参数，URL 里带的 /tree/<ref>/<subpath> 走的是
     # 同一份拼接却不受限，归一到 scoped 之后再判才封得住。
     if len(scoped) > _SUBPATH_MAX:
@@ -191,7 +204,10 @@ async def fetch_repo_snapshot(url: str, *, subpath: str | None = None,
                 skipped.append({"path": path, "reason": reason})
                 continue
             if scoped and posixpath.dirname(path) != scoped and not path.startswith(scoped + "/"):
-                continue      # 域外文件不进快照，也不算「跳过」——它从来不在本次范围里
+                # 域外且合规的文件不进快照，也不算「跳过」——它从来不在本次范围里。
+                # 判序在这里定型了 counts 的口径：形态/白名单/lockfile 排在范围之前，所以「域外但不合规」
+                # 的条目在上面那一步就已经进 skipped 了，本行放走的只是两头都不记的那些。
+                continue
             try:
                 declared = int(str(e.get("size") or 0))
             except ValueError:
@@ -212,6 +228,13 @@ async def fetch_repo_snapshot(url: str, *, subpath: str | None = None,
                 skipped.append({"path": path, "reason": "too-large"})
                 continue
             picked.append((path, declared))
+        # 显式范围零命中当场报错：静默 201 建一个零篇正文的站点是把失败藏起来 ——
+        # 用户要等到打开页面才发现「摄入成功」了个寂寞，而 400 这一句是能照着改的反馈
+        # （要么目录名打错了，要么留空取整仓）。判的是「用户点名了一个目录」这件事。
+        # 只在 scoped 非空时判：全域输入本来就可能挑不出文本（纯二进制仓库），那是一次合法的空
+        # 快照而不是打错了范围，不许顺手升级成错误（口径见规格 §5.2 与 §5.4）。
+        if scoped and not picked:
+            raise SourceError(f"该目录下没有可摄入的文本：subpath={scoped!r}（范围里有文本正文吗？）")
         if len(picked) > FILE_COUNT_MAX:
             raise SourceError(f"文件数超过上限: {len(picked)} > {FILE_COUNT_MAX}")
         files: dict[str, bytes] = {}

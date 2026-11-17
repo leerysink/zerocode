@@ -83,14 +83,21 @@
 | `files[]` | `path` / `bytes` / `title` / `dir`，按 `path` 排序 | `title` 是正文第一个 ATX 标题（跳过代码围栏内的伪标题），没有则 `null` |
 | `skipped[]` | `{path, reason}`，按 `path` 排序 | 只写前 200 条（`fetch_repo_snapshot` 末尾的字面量截断，无命名常量）；`counts.skipped` 仍是**全量**条数 |
 
-**`counts` 的三个数不构成相加关系**：`listed` 数的是递归树返回的**全部条目**，含目录段（`type=tree`）
-与本次范围外的 blob；`skipped` 只收 blob 条目里被拒的那些，被 `subpath` 挡在范围外的文件既不进快照
-也不计为跳过。所以 `listed ≠ snapshotted + skipped`，README 溯源段与本文都只并列三个数，不写成相加。
+**`counts` 的三个数不构成相加关系**，理由要说准：**计数域不重合**，不是「有些被拒的不计数」。
+`listed` 数的是递归树返回的**全部条目**，含目录段（`type=tree`）与本次范围外的 blob。判定顺序是先判
+形态/白名单/lockfile/声明体积，**后**判 `subpath` 范围（`ingest.fetch_repo_snapshot` 的循环就是这个次序），
+所以 `skipped` 收的是「被某条规则拒掉」的那些，**与它在不在范围内无关**：范围外但不合规的条目照样进
+`skipped`（实测 `subpath=docs` 时，`frontend/package-lock.json` 计 `lockfile`、`node_modules/evil/index.md`
+计 `ignored-dir`，两者都在 `docs/` 之外）。反过来，**范围外且形态合规**的条目两头都不记——它从来不在
+本次范围内，既不进快照也不计为跳过。因此本文与 README 溯源段一律按 `listed ≠ snapshotted + skipped`
+的口径**只并列三个数、不写成相加**：相加式至多偶然成立（只有全树没有目录段、也没有「范围外且合规」的
+blob 时才碰巧相等），把它当恒等式读就是给一条不存在的不变量背书。
 
-`reason` 取值清单（`ingest.is_eligible` + 下载期降级）：`unsafe-path`、`ignored-dir`、`lockfile`、
-`not-text`、`too-large`（声明体积超限或实际下载超限）、`not-found`（raw 返回 404/410）、
-`server-error`（raw 返回 5xx）。单文件取不到不否决整次摄入；安全类拒绝与权限/配额类错误原样上报，
-不用「跳过」掩盖。
+`reason` 取值清单（`ingest.is_eligible` + 下载期降级，取值集合不随 Task 10 变化）：`unsafe-path`
+（越界、前导 `/`、反斜杠，以及带内部点段的树路径如 `docs/../x.md`——落盘会归一、manifest 不会，
+出现即拒）、`ignored-dir`、`lockfile`、`not-text`、`too-large`（声明体积超限或实际下载超限）、
+`not-found`（raw 返回 404/410）、`server-error`（raw 返回 5xx）。单文件取不到不否决整次摄入；
+安全类拒绝与权限/配额类错误原样上报，不用「跳过」掩盖。
 
 ## 3. 用户故事
 
@@ -109,11 +116,13 @@
 ### 收窄范围（subpath 三态）
 
 - **US-05** 用户填「子目录 = docs」→ 只有 `docs/` 下的正文进快照，`manifest.subpath` 为 `docs`，
-  `counts.listed` 仍是**整棵递归树**的条目数（不是该目录下的条数）。
+  `counts.listed` 仍是**整棵递归树**的条目数（不是该目录下的条数）。目录名打错了（`doc`）不产出空站点：
+  范围非空却挑不出一篇正文即一次 **400**，文案给出下一步（§5.2、§5.4）。
 - **US-06** 用户粘 `…/tree/master/docs` 且**不填**子目录 → 沿用地址携带的目录，效果同 US-05。
 - **US-07** 用户粘 `…/tree/master/docs` 且 API 请求显式带 `subpath: ""` → 意图是「就要仓库根」，
   全域入快照、`manifest.subpath` 为 `null`。显式参数优先于 URL 带的路径，这条优先级在 HTTP 层
-  不许折叠（§5.2）。
+  不许折叠（§5.2）。抓取侧先把 `subpath` 的整体空白 strip 掉，所以**只有空白字符的值同归本态**——
+  那是用户把输入框擦干净了，不是一个名叫空格的目录（原来按字面筛会静默零命中）。
 - **US-08** **向导表达不出 US-07**：输入框初值就是空串，若把空串原样发出去，粘目录型 URL 却不填框的人
   会被静默切成「仓库根全域」，与他刚粘的意图相反。所以 `sourcePayload` 在子目录为空白时**不发** `subpath`
   键（等价于 US-06 的「沿用地址携带的目录」）。这是有意的收窄，不是漏实现（§4 D3）。
@@ -123,7 +132,8 @@
 
 ### 失败与零副作用
 
-- **US-10** 抓取失败（配额用尽、私有仓、分支或路径不存在、非支持站点、超预算、URL 指向内网）→
+- **US-10** 抓取失败（配额用尽、私有仓、分支或路径不存在、非支持站点、超预算、URL 指向内网、
+  显式 `subpath` 零命中）→
   `POST /api/apps` 返回 **400 + 一句中文**（文案见 §5.4），并且**不创建应用、不分配端口、不建目录、
   不发一个 raw 请求**：抓取排在建应用之前，零副作用是顺序给的保证，不靠回滚兜。
 - **US-11** 快照落盘阶段失败（远端路径形态非法）→ 仍是一次 400，且 `create_app_project` 的既有回滚
@@ -195,24 +205,28 @@
 | 载荷 | 意图 | 生效范围 | `manifest.subpath` |
 |---|---|---|---|
 | `subpath` 键缺席 | 「沿用地址里带的目录」 | URL 有 `/tree/<ref>/<dir>` 就钻该目录，否则全域 | 该目录，或 `null` |
-| `subpath: ""` | 「就要仓库根」 | **压过** URL 携带的目录，全域 | `null` |
-| `subpath: "docs"` | 「钻这个目录」 | 该目录（含其子目录） | `docs`（去首尾 `/` 后） |
+| `subpath: ""`（含只有空白的 `"   "`） | 「就要仓库根」 | **压过** URL 携带的目录，全域 | `null` |
+| `subpath: "docs"` | 「钻这个目录」 | 该目录（含其子目录）；范围里零命中即 400，不产出空站点 | `docs`（去首尾空白与 `/` 后） |
 
 优先级：显式参数 > URL 携带。HTTP 层原样转发、不许 `or None` 折叠（折叠一次就把「留空即整仓」
 换成「只摄那个子目录」，与用户粘的 URL 相反）。向导只会产生第 1、3 两态，见 US-08。
 
-一个边界事实：只有 `url` 在 HTTP 层 `strip()`，`subpath` 原样转发，抓取侧也只 `strip("/")`。
-所以 `subpath: "   "` 既不是「仓库根」也不是某个目录，而是**按字面**当目录名去筛——筛出零篇正文，
-`manifest.subpath` 里存的还是那串空白。前端 `sourcePayload` 先 trim 再判空，
-因此这个形态只能由直接打 API 的客户端造出来。
+一个边界事实：只有 `url` 在 HTTP 层 `strip()`，`subpath` 原样转发；抓取侧先 `.strip()` 再 `.strip("/")`。
+所以 `subpath: "   "`（只有空白字符）归一成**空**，即「就要仓库根」那一路——那是用户把输入框擦干净了
+留下的 UI 残留，不是一个名叫三个空格的目录名，按字面去筛只会静默零命中。前端 `sourcePayload` 先 trim
+再判空（US-08），因此这个形态本来就只能由直接打 API 的客户端造出来，抓取侧仍按同一条口径归一。
 
-**跟进 · `FIX-SUBPATH-BLANK`｜当前实现如此，非契约意图**：上面那段描述的是今天代码的行为，不是设计要的
-行为。`ingest.fetch_repo_snapshot` 对 `subpath` 只做 `.strip("/")`、不做空白 strip，`hosting.unsafe_path_segment`
-又只认点段与反斜杠，所以「只有空白的 `subpath`」和「打错的目录名」都过了闸，结果是
-**静默建成一个零篇正文的应用**（201，不是 400，`counts.snapshotted` 为 0）。控制器已就此另开代码修复票；
-修完落地后回写本段与 `CONTEXT.md` 的「子目录（`subpath`）三态」。在此之前不要把它当契约引用、
-不要照它补断言当前行为的测试，也不要反过来把上段删掉——上段仍是今天的既成事实。
-全文搜 `FIX-SUBPATH-BLANK` 即可定位本条的所有出现处。
+两条已收口的判据（Task 10，都不是「当前实现如此、非契约意图」）：
+
+- **显式范围零命中 = 400**：`subpath` 归一后非空、但范围里挑不出一篇正文（打错的目录名如 `doc`）时，
+  `fetch_repo_snapshot` 抛「该目录下没有可摄入的文本」，`POST /api/apps` 回 400，不产出零正文的应用。
+  静默 201 是把失败藏到用户打开页面那一刻，报错才是可执行的反馈。
+  这一判**只在范围非空时成立**：仓库根零正文（全域输入撞上纯二进制仓库）仍是一次合法的空快照，不报错。
+  子目录被并进 `ref` 的那一路（US-09）命中后 `subpath` 归 `null`，因而不再走这条判定——那一次树调用
+  已经证明目录真实存在，目录里当真是零文本就是一次合法的空快照，不是打错名字。
+- **带内部点段的树路径 = 拒收**：`is_eligible` 对 `docs/../oops.md` 这类串判 `unsafe-path`，
+  不「归一后双存」——落盘按归一名写、`manifest.files[].path` 按原串存，站点照 manifest 去 fetch
+  就撞 404，这种自相矛盾的载荷不是「形状怪一点」。git 树里造不出这种路径，出现即说明输入不可信。
 
 ### 5.3 落盘产物与读路径
 
@@ -245,6 +259,7 @@ README 缺文件时兜底写成一份只含溯源段的 README，不静默丢出
 | 树自报 `truncated` | `ingest.fetch_repo_snapshot` | 「仓库文件树被截断（truncated），请…收窄范围」 |
 | 声明体积预估超预算 / 下载中累计超预算 | 同上 | 同一个「文本总大小超过上限」，括号里分标「按文件树声明预估」/「下载中按实际字节累计」 |
 | 候选文件数超 `FILE_COUNT_MAX` | 同上 | 「文件数超过上限: {N} > 400」 |
+| 显式 `subpath` 归一后非空、范围里挑不出一篇正文（打错的目录名） | 同上（`picked` 为空且 `scoped` 非空） | 「该目录下没有可摄入的文本：subpath=…（范围里有文本正文吗？）」——全域零正文**不**走这条，仍是合法空快照（§5.2） |
 | 网络层异常 | `ingest.fetch_repo_snapshot` | 「远端请求失败: {异常类型名}」 |
 | 落盘形态非法（今天无已知入口；不可达的理由见 US-11，不是「抓取侧判过同一条」） | `materialize._safe_rel` 的越界判 + `write_snapshot` 写盘前的 `relative_to` 复核 | 「快照路径形态非法: …」/「快照路径越界: …」，由 `create_app_project` 包成「创建应用失败: …」，仍 400 并回滚 |
 
@@ -299,7 +314,8 @@ README 缺文件时兜底写成一份只含溯源段的 README，不静默丢出
   「守卫与 installer 的包装对同一批输入判定一致」。
 - `tests/test_source_hosting.py`：`parse_repo_url` 的接受/拒绝形态（仓库根、`/tree/<ref>`、
   `/tree/<ref>/<subpath>`、`.git` 后缀、SKILL.md 直链让路）与端点拼串，含形态闸的每个坏段。
-- `tests/test_source_ingest.py`：预算与白名单、`subpath` 三态优先级、含斜杠分支的 404 回退、
+- `tests/test_source_ingest.py`：预算与白名单、`subpath` 三态优先级（含「只有空白的值归仓库根」）、
+  显式范围零命中报错（不产出空站点）、含内部点段的树路径按 `unsafe-path` 拒收、含斜杠分支的 404 回退、
   声明体积预估排在单文件剔除之前、`counts` 三数关系、`truncated` 恒 `false`、单文件级降级
   （`not-found`/`server-error`/`too-large`）、URL 已带 ref 时不再问默认分支（配额那条）。
 - `tests/test_source_materialize.py`：落点常量、manifest 的 UTF-8 + LF 字节（中文夹具 + 正向字节断言，
@@ -308,8 +324,8 @@ README 缺文件时兜底写成一份只含溯源段的 README，不静默丢出
   README 追加不覆盖、快照正文里的 `{{...}}` 不触发渲染自检。
 - `tests/test_source_seam.py`：`create_app_project(source=…)` 与商店 `materialize` 正交组合、
   快照失败回滚后不留目录、不带 `source` 时与今天逐字节一致。
-- `tests/test_apps_source_api.py`：抓取先于建应用的零副作用、403/401/非 Gitee/内网 URL/
-  预估超预算这五条 400 路径、`source={}` 的 422、空白 url 不发请求、`subpath` 三态在 HTTP 层不折叠、
+- `tests/test_apps_source_api.py`：抓取先于建应用的零副作用、403/401/非 Gitee/内网 URL/预估超预算/
+  拼错目录名（零命中）这六条 400 路径、`source={}` 的 422、空白 url 不发请求、`subpath` 三态在 HTTP 层不折叠、
   `origin` 只在真摄入时写、响应不新增字段。
 - 前端：`frontend/src/utils/appSource.test.js`（判定那一组）+ `AppsView.test.js` 里
   「AppsView 向导仓库地址接线」那组（接线：真进载荷、带子目录、超长拦下、重置不带旧地址、
@@ -351,5 +367,6 @@ README 缺文件时兜底写成一份只含溯源段的 README，不静默丢出
 | prod 侧读路径 | 发布后经网关域名取同样两个地址均 200（验的是快照真随 `vite build` 进了镜像） | 待填 |
 | 页面钻取 | AI 按 `files[].dir` 分组、`files[].title` 取标题做出浏览页，点两篇不同文档内容真的切换 | 待填 |
 | 零副作用反证 | 故意填一个不存在的分支：创建返回 400，应用列表与工作区都不见该 slug | 待填 |
+| 拼错目录名的 400 文案 | 拿真实仓库把子目录打错一个字母（`docs` → `doc`）再创建一次：返回 400 而不是 201 空站点，且这句文案在向导的报错位**读得通**（能看出是目录名不对、下一步该改成什么），不泄漏内部字段名 | 待填 |
 
 结论回写本文本节并提交，演示应用按用户口径保留为夹具。

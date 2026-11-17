@@ -149,6 +149,34 @@ async def test_absent_subpath_falls_back_to_url_carried_scope():
     assert set(out["files"]) == {"docs/user-manual.md"}
 
 
+async def test_whitespace_only_subpath_is_repo_root_not_a_literal_directory():
+    """只空白的 subpath 是「用户把框擦干净了」，不是「找一个名叫三个空格的目录」。
+    原样当目录用会静默零命中，201 建出一个没有正文的站点。"""
+    out = await ingest.fetch_repo_snapshot(URL, subpath="   ",
+                                           transport=_transport(TREE, FILES))
+    assert out["manifest"]["subpath"] is None
+    assert set(out["files"]) == {"README.md", "docs/user-manual.md"}
+
+
+async def test_subpath_that_matches_nothing_is_an_error_not_an_empty_site():
+    """拼错的目录名（doc / 拼写少一个字）必须当场报错：静默 201 建一个空站点，
+    用户要等到打开页面才发现摄入「成功」了个寂寞。"""
+    with pytest.raises(ingest.SourceError) as e:
+        await ingest.fetch_repo_snapshot(URL, subpath="doc",
+                                         transport=_transport(TREE, FILES))
+    assert "没有可摄入的文本" in str(e.value)
+
+
+async def test_tree_path_with_interior_dot_segment_is_rejected_not_written_raw():
+    """manifest 里存 `docs/../oops.md`、盘上落 `oops.md` 是自相矛盾的契约：
+    站点照着 manifest 去 fetch 就撞 404。git 树里造不出这种路径，出现即拒，别归一后双存。"""
+    tree = [_blob("docs/../oops.md"), _blob("ok.md")]
+    out = await ingest.fetch_repo_snapshot(URL, transport=_transport(tree, FILES))
+    assert "docs/../oops.md" not in out["files"]
+    assert {s["reason"] for s in out["manifest"]["skipped"] if
+            s["path"] == "docs/../oops.md"} == {"unsafe-path"}
+
+
 async def test_truncated_tree_asks_for_subpath():
     with pytest.raises(ingest.SourceError) as e:
         await ingest.fetch_repo_snapshot(URL, transport=_transport(TREE, FILES, truncated=True))
@@ -390,3 +418,6 @@ def test_is_eligible_extension_and_lockfile_and_dir():
     assert ingest.is_eligible("../escape.md")[1] == "unsafe-path"
     assert ingest.is_eligible("/abs.md")[1] == "unsafe-path"
     assert ingest.is_eligible("a\\b.md")[1] == "unsafe-path"
+    # 内部点段判的是原串的段（normpath 会把 `..` 吃掉，只在归一结果上找就等于永不触发）
+    assert ingest.is_eligible("docs/../oops.md")[1] == "unsafe-path"
+    assert ingest.is_eligible("./a.md")[1] == "unsafe-path"
