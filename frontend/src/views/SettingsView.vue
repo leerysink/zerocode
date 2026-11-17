@@ -273,11 +273,25 @@ async function save() {
           </a-form>
         </a-card>
 
-        <a-card title="执行参数" class="zc-card">
+        <a-card title="确认策略" class="zc-card">
           <a-form layout="vertical">
-            <a-form-item label="写入前确认">
+            <a-form-item
+              label="写入前确认"
+              extra="AI 落盘前先给你看改动再动手，覆盖 write/edit/delete/move/revert 五个工具。数据库写入不可回滚，恒确认，不受这一项影响。"
+            >
               <a-switch v-model:checked="store.form.writeConfirm" />
             </a-form-item>
+            <a-form-item
+              label="重启预览需确认"
+              extra="只在预览正在运行时拦一道：重启会中断你正在用的调试。预览停着时模型直接启动、不问；关掉则运行中的也直接重启。这两项都是平台级配置，保存后对所有账号生效。"
+            >
+              <a-switch v-model:checked="store.form.previewConfirmRunning" />
+            </a-form-item>
+          </a-form>
+        </a-card>
+
+        <a-card title="执行参数" class="zc-card">
+          <a-form layout="vertical">
             <a-form-item
               label="需求澄清模式"
               extra="开启后 AI 改文件前会先跟你对齐需求（先给解读、再逐题确认）；这一项按账户生效，关掉只影响你自己"
@@ -355,9 +369,6 @@ async function save() {
             </a-form-item>
             <a-form-item label="预览日志行数" extra="返回给模型的最近日志行数，10..300">
               <a-input-number v-model:value="store.form.previewLogLines" :min="10" :max="300" style="width: 180px" />
-            </a-form-item>
-            <a-form-item label="中断运行中的预览需确认" extra="关掉后模型可以不打招呼直接重启用户正在用的预览">
-              <a-switch v-model:checked="store.form.previewConfirmRunning" />
             </a-form-item>
           </a-form>
         </a-card>
