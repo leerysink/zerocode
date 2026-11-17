@@ -858,3 +858,32 @@ prod 栈未运行导致实时指标缺失时的读数口径：CPU 环退成灰�
 - **共享管理（share management）**：应用卡片 ☰ 菜单里的成员列表与发布审批入口；
   有待审申请时卡片右上角显示角标。共享不可转授，被共享者不能再把应用共享给第三人。
 
+## 仓库源码摄入（repo source ingest）
+
+建应用时粘一个公开 Gitee 仓库地址，平台把该仓库的文本内容抓成快照烘进应用产物（ADR-0051）。
+下面这些是规范词，实现与文档都必须用这些写法：
+
+- **托管源（hosted source）**：公开代码托管站上的一个仓库坐标 `owner/repo[/ref[/subpath]]`，
+  由 `app/source/hosting.py` 从用户粘的 URL 解析而来。当前只接 Gitee（`gitee.com` / `www.gitee.com`），
+  且只接**公开**仓库——私有仓要 token，不在本票。
+- **仓库快照（repo snapshot）**：构建期抓下来的文本正文 + `manifest.json` 索引，落在应用工作区的
+  `frontend/public/source/`。术语说「快照」**不说「镜像」**——镜像留给 Docker 产物。
+  也说「摄入」（ingest，一次性动作），不说「同步」：抓完就与远端再无关系，仓库更新要靠重建应用。
+- **烘快照（bake the snapshot）**：快照随 `vite build` 被原样拷进 `dist`、由静态站点按 `/source/**`
+  直出的那个动作。落点选 `frontend/public/` 正是为了借这条既有机制，不改 vite/nginx 配置、不加 router。
+- **钻取（drill-down）**：**两级**——服务端一次递归全树（`git/trees/{ref}?recursive=1`，不逐层点目录），
+  站点侧按 `manifest.json` 逐文件 fetch 正文。浏览器里**没有多页爬虫**，所以「钻取」不指运行时抓取，
+  生成的页面也不得声称「正在读取 Gitee」。
+- **子目录（`subpath`）三态**：显式 `""` = 「就要仓库根」（压过 URL 携带的目录）、键缺席 =
+  「沿用地址里 `/tree/<ref>/<目录>` 带的目录」、非空 = 「钻这个目录」。三态互不等价，HTTP 层不许折叠；
+  向导只表达得出后两态（输入框初值是空串，把它当「显式仓库根」发出去会违背用户刚粘的 URL）。
+- **载荷契约 `zc-source/1`**：`manifest.json` 的 `schema` 取值，与 `app.json` 的 `zc-app/1` 同族命名。
+
+`manifest.counts` 的三个数**不构成相加关系**：`listed` 是递归树返回的全部条目（含目录段与本次范围外的
+文件），`snapshotted` 是进了快照的正文数，`skipped` 是被白名单/形态/体积规则拒掉的 blob 数，
+被 `subpath` 挡在范围外的文件既不算收录也不算跳过。README 的溯源段与本票所有文档都只并列三个数。
+
+与「技能（skill）」一节里的 `github` 来源（扫仓库找 `SKILL.md`）是**两条通道**：那条仍是 GitHub-only，
+判据（SSRF / URL 形态 / 流式限量 / 逐跳重定向）共用 `app/source/guard.py`，但主机、目标文件、白名单、
+预算、落点各自独立。说「仓库扫描」时先问是哪条通道。
+
