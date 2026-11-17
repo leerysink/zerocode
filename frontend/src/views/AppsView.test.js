@@ -1205,3 +1205,88 @@ describe('AppsView 发布申请与审批', () => {
     expect(mocks.api.approvePublishRequest).toHaveBeenLastCalledWith(1, 55, true)
   })
 })
+
+// ---------- 新建向导「仓库地址」接线（Task 7）----------
+// 纯函数测试只钉得住「判定」，钉不住「调用点」：v-model 名字打错、参数顺序颠倒、输入框挂错步骤、
+// 重置对象漏字段——四种都让功能静默失效而 util 测试全绿。
+describe('AppsView 向导仓库地址接线', () => {
+  // 向导接线：仓库地址真进 createApp 载荷，且重置不带旧地址
+  async function openWizardToStep3(wrapper) {
+    const click = async (label) => {
+      const btn = wrapper.findAll('.stub-a-button').find((b) => b.text().includes(label))
+      expect(btn, `找不到按钮 ${label}`).toBeTruthy()
+      await btn.trigger('click')
+      await flushPromises()
+    }
+    await click('新建应用')                       // a-modal 桩 open 后才渲染内容
+    const step1 = wrapper.findAll('input')        // 应用名称 / 应用标识
+    await step1[0].setValue('来料登记')
+    await step1[1].setValue('lailiao')
+    await click('下一步')                         // nextFrom1 校验 name/slug
+    await click('下一步')                         // nextFrom2：small 档栈合法，不动 form
+    return wrapper.findAll('input')              // 仓库地址 / 子目录
+  }
+
+  it('向导填仓库地址 → createApp 收到 source，且不带 subpath 键', async () => {
+    mocks.api.listApps.mockResolvedValue({ data: STORE_APPS })
+    mocks.api.createApp.mockResolvedValue({ data: { id: 1, slug: 'lailiao' } })
+    const wrapper = mount(AppsView, { global: { stubs: STORE_STUBS } })
+    await flushPromises()
+    const inputs = await openWizardToStep3(wrapper)
+    await inputs[0].setValue('https://gitee.com/o/r/tree/master/docs')
+    const create = wrapper.findAll('.stub-a-button').find((b) => b.text().includes('创建应用'))
+    await create.trigger('click')
+    await flushPromises()
+    expect(mocks.api.createApp).toHaveBeenCalledTimes(1)
+    const payload = mocks.api.createApp.mock.calls[0][0]
+    expect(payload.source).toEqual({ url: 'https://gitee.com/o/r/tree/master/docs' })
+    expect('subpath' in payload.source).toBe(false)   // 空框=不表态，交给 URL 携带的目录
+  })
+
+  it('地址超长 → 拦住不发请求并报错', async () => {
+    mocks.api.listApps.mockResolvedValue({ data: STORE_APPS })
+    const wrapper = mount(AppsView, { global: { stubs: STORE_STUBS } })
+    await flushPromises()
+    const inputs = await openWizardToStep3(wrapper)
+    await inputs[0].setValue('https://gitee.com/o/' + 'r'.repeat(1000))
+    const create = wrapper.findAll('.stub-a-button').find((b) => b.text().includes('创建应用'))
+    await create.trigger('click')
+    await flushPromises()
+    expect(mocks.api.createApp).not.toHaveBeenCalled()
+    expect(mocks.antd.message.error).toHaveBeenCalledWith(expect.stringMatching(/上限/))
+  })
+
+  it('创建成功后重置 → 第二次创建不带 source（不会静默复用上一个仓库）', async () => {
+    mocks.api.listApps.mockResolvedValue({ data: STORE_APPS })
+    mocks.api.createApp.mockResolvedValue({ data: { id: 1, slug: 'lailiao' } })
+    const wrapper = mount(AppsView, { global: { stubs: STORE_STUBS } })
+    await flushPromises()
+    let inputs = await openWizardToStep3(wrapper)
+    await inputs[0].setValue('https://gitee.com/o/r')
+    let create = wrapper.findAll('.stub-a-button').find((b) => b.text().includes('创建应用'))
+    await create.trigger('click')
+    await flushPromises()
+    expect(mocks.api.createApp.mock.calls[0][0].source).toEqual({ url: 'https://gitee.com/o/r' })
+
+    inputs = await openWizardToStep3(wrapper)      // 重置后重走一遍向导
+    const second = wrapper.findAll('.stub-a-button').find((b) => b.text().includes('创建应用'))
+    await second.trigger('click')
+    await flushPromises()
+    expect(mocks.api.createApp).toHaveBeenCalledTimes(2)
+    expect('source' in mocks.api.createApp.mock.calls[1][0]).toBe(false)
+    expect(inputs[0].element.value).toBe('')       // 输入框真的是空的
+  })
+
+  it('子目录说明不再无条件承诺「留空即全域扫描」（评审 Important 1）', async () => {
+    mocks.api.listApps.mockResolvedValue({ data: STORE_APPS })
+    const wrapper = mount(AppsView, { global: { stubs: STORE_STUBS } })
+    await flushPromises()
+    await openWizardToStep3(wrapper)
+    // a-form-item 桩没声明 label/help，两者按 attribute 落进 DOM，所以文案可被断言
+    const help = wrapper.findAll('.stub-a-form-item')
+      .find((i) => i.attributes('label') === '子目录').attributes('help')
+    expect(help).toContain('沿用地址里')                    // 空框 = 继承 URL 携带的目录
+    expect(help).toMatch(/地址不带目录时才全域扫描/)          // 全域扫描是有条件的，不是留空的默认
+    expect(help).not.toMatch(/留空则全域扫描/)
+  })
+})

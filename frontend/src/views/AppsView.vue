@@ -206,7 +206,8 @@ function nextFrom2() {
 async function submit() {
   const v = validateForm(form)
   if (!v.ok) return message.warning(v.msg)
-  // 仓库地址空 / 全空白 → source 缺席（axios 会丢掉 undefined 键），一次远程抓取都不该发生；
+  // 仓库地址空 / 全空白 → 载荷里根本没有 source 键（不是 source: undefined，下面用条件展开
+  // 保证这一点：断言 `'source' in payload` 才钉得住，也不靠 JSON.stringify 顺手丢 undefined）；
   // 超长在前端先拦一次，报错走同一条 message.error，不给后端送一次必然 400 的请求
   let source
   try {
@@ -217,7 +218,7 @@ async function submit() {
   }
   try {
     await createApp({ name: form.name.trim(), slug: form.slug, scale: form.scale,
-                      stack: form.stack, source })
+                      stack: form.stack, ...(source ? { source } : {}) })
     message.success('应用已创建')
     showWizard.value = false
     // 这两个字段必须跟着重置：漏一次，第二次创建就静默带上上一个仓库地址、真的又抓一次远程
@@ -928,7 +929,8 @@ async function doRelease() {
             <a-input v-model:value="form.sourceUrl" allow-clear
                      placeholder="https://gitee.com/owner/repo 或 …/tree/master/docs" />
           </a-form-item>
-          <a-form-item label="子目录" help="可选：只收这个目录下的正文，留空则全域扫描">
+          <a-form-item label="子目录"
+                       help="可选：只收这个目录下的正文；留空则沿用地址里 /tree/&lt;分支&gt;/&lt;目录&gt;，地址不带目录时才全域扫描">
             <a-input v-model:value="form.sourceSubpath" allow-clear placeholder="如 docs" />
           </a-form-item>
         </a-form>
