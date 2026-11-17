@@ -2364,3 +2364,131 @@ git commit -m "docs(source): 记录 Gitee 仓库快照的端到端验收结果"
 3. **契约一致**：`fetch_repo_snapshot` 返回的 `manifest` 字段名 ↔ Task 4 的 `_PROVENANCE` 取键 ↔ Task 9 Step 3 打印的键；`SOURCE_ROOT_PARTS` ↔ `MANIFEST_REL` ↔ 测试里的 `frontend/public/source/...` 路径；`guard.fetch_limited` 参数名 ↔ installer 包装传的关键字。
 4. **回归面**：`test_skills_api.py`、`test_skills_github_api.py`、`test_store_install_seam.py`、`test_apps_api.py`、`test_agent_registry.py`（未改工具面，应当零改动通过）。
 5. **不做**：运行时代理、agent 出网工具、私有仓 token、GitHub 通道、DDL 迁移——谁在评审里提出来，答案是 ADR-0051。
+
+---
+
+## Task 10（评审后追加，非原计划）: subpath 静默空快照、点段路径不一致与 skipped 释义
+
+> 追加理由：Task 8 的实现者复核时发现「空白/拼错的 subpath 静默产出零篇正文的应用」，控制器复现成立；
+> Task 8 的复审又确认「远端树里含点段时 manifest 存的串与落盘归一名不一致」。两条都是本特性自己的
+> 用户可见缺陷，且与一份文档残留（`CONTEXT.md` 把 `skipped` 释义收得过窄）落在同几段文字里，
+> 拆开走会把同一段 spec 改两遍，所以并成一票。
+
+**Files:**
+- Modify: `app/source/ingest.py`（`fetch_repo_snapshot` 的 scoped 归一与零命中判定、`is_eligible` 的点段判定）
+- Modify: `tests/test_source_ingest.py`、`tests/test_apps_source_api.py`（各补用例）
+- Modify: `docs/specs/2026-11-17-repo-source-ingest.md`（§5.2 待修标记改成既成事实、§2.3 skipped 释义）、
+  `CONTEXT.md`（`skipped` 术语按判定顺序重写）
+
+**Interfaces:**
+- Consumes: 既有 `SourceError` 与 `is_eligible` 返回值契约（`(bool, reason|None)`）。
+- Produces: 无新导出名；`manifest.skipped[].reason` 取值集合不变，**新增** `unsafe-path` 的一种触发形态。
+
+### 已复现的三个事实（控制器亲手跑过，不是推断）
+
+```text
+1) subpath="   "  → scoped = "   "（只做 .strip("/")），原样冻进 manifest，零命中 → 201 + 空快照
+2) subpath="docs" → counts={'listed':4,'snapshotted':1,'skipped':2}
+   skipped 含范围外的 frontend/package-lock.json(lockfile) 与 node_modules/evil/index.md(ignored-dir)，
+   而范围外且形态合规的 README.md 两头都不记 —— 因为判定顺序是「先形态/白名单，后范围」
+3) 树路径 "docs/../oops.md"：normpath → "oops.md"，落盘 …/files/oops.md，
+   而 manifest.files[].path 仍存原串 → 站点按 manifest 去 fetch 会打到一个不存在的位置
+```
+
+- [ ] **Step 1: 先写会红的用例（三条）**
+
+`tests/test_source_ingest.py` 追加：
+
+```python
+async def test_whitespace_only_subpath_is_repo_root_not_a_literal_directory():
+    """只空白的 subpath 是「用户把框擦干净了」，不是「找一个名叫三个空格的目录」。
+    原样当目录用会静默零命中，201 建出一个没有正文的站点。"""
+    out = await ingest.fetch_repo_snapshot(URL, subpath="   ",
+                                           transport=_transport(TREE, FILES))
+    assert out["manifest"]["subpath"] is None
+    assert set(out["files"]) == {"README.md", "docs/user-manual.md"}
+
+
+async def test_subpath_that_matches_nothing_is_an_error_not_an_empty_site():
+    """拼错的目录名（doc / 拼写少一个字）必须当场报错：静默 201 建一个空站点，
+    用户要等到打开页面才发现摄入「成功」了个寂寞。"""
+    with pytest.raises(ingest.SourceError) as e:
+        await ingest.fetch_repo_snapshot(URL, subpath="doc",
+                                        transport=_transport(TREE, FILES))
+    assert "没有可摄入的文本" in str(e.value)
+
+
+async def test_tree_path_with_interior_dot_segment_is_rejected_not_written_raw():
+    """manifest 里存 `docs/../oops.md`、盘上落 `oops.md` 是自相矛盾的契约：
+    站点照着 manifest 去 fetch 就撞 404。git 树里造不出这种路径，出现即拒，别归一后两存。"""
+    tree = [_blob("docs/../oops.md"), _blob("ok.md")]
+    out = await ingest.fetch_repo_snapshot(URL, transport=_transport(tree, FILES2))
+    assert "docs/../oops.md" not in out["files"]
+    assert {s["reason"] for s in out["manifest"]["skipped"] if
+            s["path"] == "docs/../oops.md"} == {"unsafe-path"}
+```
+
+`tests/test_apps_source_api.py` 追加一条端点级闸（HTTP 层不许把这条错误吞成 201）：
+
+```python
+async def test_unmatched_subpath_is_400_and_creates_no_app(client):
+    client.app.state.source_http_transport = _transport(TREE, FILES)
+    r = await client.post("/api/apps", json=_body(source={"url": URL, "subpath": "doc"}))
+    assert r.status_code == 400
+    assert "没有可摄入的文本" in r.json()["detail"]
+    assert not APP_DIR.exists()
+```
+
+- [ ] **Step 2: 跑测试确认三条都红**
+
+Run: `PYTHONIOENCODING=utf-8 D:/project/zerocode/.venv/Scripts/python.exe -m pytest tests/test_source_ingest.py tests/test_apps_source_api.py -q`
+Expected: 三条新用例红（前两条现在静默 201/零命中；第三条 manifest 存原串），既有用例不许变红。
+
+- [ ] **Step 3: 实现三处收口**
+
+`app/source/ingest.py`：
+
+```python
+# ① scoped 归一：空白串等同「就要仓库根」，不做字面目录
+    scoped = (subpath if subpath is not None else (ref.subpath or "")).strip().strip("/")
+# ② 显式范围零命中当场报错（只有 scoped 非空时才判，仓库根零正文仍按既成事实走完）
+    if scoped and not picked:
+        raise SourceError(f"该目录下没有可摄入的文本：subpath={scoped!r}（范围里有文本正文吗？）")
+```
+
+```python
+# ③ is_eligible：点段一律拒，不静默归一后双存
+    norm = posixpath.normpath(path)
+    if norm.startswith("..") or norm == "." or posixpath.isabs(norm):
+        return False, "unsafe-path"
+    segments = norm.split("/")
+    if any(seg in (".", "..") for seg in segments):     # 内部点段：落盘会归一，manifest 不会
+        return False, "unsafe-path"
+```
+
+三处都要在代码注释里写明**为什么这样裁**：① 空白是「擦干净框」的 UI 残留，不是目录名；
+② 静默零正文的站点是把失败藏起来，报错才是可执行的反馈；③ 归一后双存会让 manifest 与磁盘各说各话，
+而 git 根本造不出这种路径，出现即说明输入不可信。
+
+- [ ] **Step 4: 跑定向测试**
+
+Run: `PYTHONIOENCODING=utf-8 D:/project/zerocode/.venv/Scripts/python.exe -m pytest tests/test_source_ingest.py tests/test_apps_source_api.py tests/test_source_hosting.py tests/test_source_guard.py tests/test_source_materialize.py -q`
+Expected: 全绿、无 warning。**不得跑全量 pytest**（本票硬约束）。
+
+- [ ] **Step 5: 同步两份文档的同几段文字**
+
+- spec §5.2：把 `FIX-SUBPATH-BLANK` 的「当前实现如此，非契约意图」改成已收口的事实
+  （空白=仓库根、零命中=400），并把标记删掉——留着会指到一个不再存在的缺陷。
+- spec §2.3 与 `CONTEXT.md` 的 `skipped` 释义：**按判定顺序**重写。口径是
+  「先判形态/白名单/体积，后判 `subpath` 范围」，所以 `skipped` **包含范围外但不合规**的条目，
+  而**范围外且合规**的条目两头都不记；因此 `listed ≠ snapshotted + skipped` 依旧成立，
+  但理由不是「有些被拒的不计数」，而是「计数域不重合」。
+  原写法「本次范围内被拒的 blob 条数」是错的（已复现：`subpath=docs` 时 lockfile 与 ignored-dir 都计入）。
+- Task 9 的验收小节补一项：拿真实仓库试一次「拼错目录名」，确认 400 文案在 UI 上读得通。
+
+- [ ] **Step 6: 提交**
+
+```bash
+git add app/source/ingest.py tests/test_source_ingest.py tests/test_apps_source_api.py docs/specs/2026-11-17-repo-source-ingest.md CONTEXT.md
+git commit -m "fix(source): 空白与拼错的 subpath 不再静默产出空快照，含点段的树路径一律拒收"
+```
