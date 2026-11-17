@@ -457,6 +457,36 @@ async def test_summary_excludes_other_owners_app(two_auth_clients, tmp_path):
     assert aid_alice in ids_alice
 
 
+async def test_summary_includes_shared_apps_for_collaborator(two_auth_clients, tmp_path):
+    """Ticket 003：被共享者的 summary = 自有 + 被共享（显式并集，不靠改 list_apps 的 owner 过滤）。
+
+    alice 是创始人，这里只借她造应用；判权靶心在 bob（非创始人、被共享者）的可见集。"""
+    alice, bob = two_auth_clients
+    sf = alice.app.state.session_factory
+    alice_uid = (await alice.get("/api/auth/me")).json()["id"]
+    bob_uid = (await bob.get("/api/auth/me")).json()["id"]
+    aid_shared = await _make_app(sf, "sumSh1", tmp_path / "s1", owner=alice_uid,
+                                 prod_port=8370, dev_port=8371)
+    aid_own = await _make_app(sf, "sumSh2", tmp_path / "s2", owner=bob_uid,
+                              prod_port=8372, dev_port=8373)
+    async with sf() as s:
+        await s.execute(text("INSERT INTO app_share (app_id, user_id, created_by) "
+                             "VALUES (:a, :u, :c)"),
+                        {"a": aid_shared, "u": bob_uid, "c": alice_uid})
+        await s.commit()
+    ids = [it["app_id"] for it in
+           (await bob.get("/api/apps/metrics/summary")).json()["items"]]
+    assert sorted(ids) == sorted([aid_own, aid_shared])
+    # 撤销共享后立即从批量读数里消失（并集来自实时共享表，不是缓存）
+    async with sf() as s:
+        await s.execute(text("DELETE FROM app_share WHERE app_id=:a AND user_id=:u"),
+                        {"a": aid_shared, "u": bob_uid})
+        await s.commit()
+    ids = [it["app_id"] for it in
+           (await bob.get("/api/apps/metrics/summary")).json()["items"]]
+    assert ids == [aid_own]
+
+
 async def test_summary_founder_sees_all(two_auth_clients, tmp_path):
     """创始人（首注册者）走 list_apps 的全局语义：items 含他人应用，不另写第二套权限判据。"""
     alice, bob = two_auth_clients

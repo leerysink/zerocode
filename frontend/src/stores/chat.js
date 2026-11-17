@@ -7,6 +7,7 @@
 // / tool_progress(预览工具的临时进度，不落库不进气泡，收到结果/终态即清)
 // / session_title(首条消息自动命名，就地更新侧栏标题)
 // / interaction_expired(后端已无这次确认/回答的挂起点：把待答卡收口成已中断并解锁输入)；
+// / share_revoked(共享被撤销/自行退出：服务端随后以 4404 关闭旁观连接，视图提示并回应用页)；
 // 终态 = error / status(idle|error)，busy、status(running) 与 steering_done 都不是。
 // message_done 是**轮次收口**而非终态：工具轮在派发工具前也发一次，一次执行可以有多条。
 // compacting / compaction_done / notice 三者驱动聊天流里同一枚压缩标记：开始放一枚，终态就地定稿
@@ -268,6 +269,12 @@ export function applyEvent(store, ev) {
         }
       }
       break
+    case 'share_revoked':
+      // 撤销/退出（Ticket 010）：服务端推完这一帧就以 4404 关闭旁观连接。
+      // 视图层据此提示「共享已撤销」并回应用页；连接本身由 onclose 的 4404 分支安静收掉。
+      store.shareRevoked = true
+      endRunState(store)
+      break
   }
 }
 
@@ -300,7 +307,14 @@ export const useChatStore = defineStore('chat', {
     pendingEchoId: '', // 最近一次乐观上行的 client_msg_id，精确回滚/摘角标用
     pendingOutbox: {}, // client_msg_id -> {sessionId, text, attachments}：未被后端确认的乐观消息
     retrying: false, // retry 重传中：防止连点并发重复上传
+    shareRevoked: false, // 旁观中共享被撤销/自行退出（Ticket 010）：视图提示并回应用页
   }),
+  getters: {
+    // 当前会话所属工作区的角色（GET /workspaces 带回，规格 §5.3）：只读旁观据此收口交互。
+    // 列表未加载时给 null——渲染按所有者放行，写操作仍由后端兜底。
+    currentWorkspaceRole: (state) =>
+      state.workspaces.find((w) => w.id === state.currentWorkspaceId)?.role || null,
+  },
   actions: {
     async loadWorkspaces() {
       this.workspaces = (await listWorkspaces()).data
@@ -315,6 +329,8 @@ export const useChatStore = defineStore('chat', {
       this._detachSocket()
       this.currentSessionId = id
       if (workspaceId != null) this.currentWorkspaceId = workspaceId
+      // 新会话开一场新旁观：清掉上一次撤销标记，否则同一页里再被撤销时 watch 看不到变化
+      this.shareRevoked = false
       this._resetOpenState()
       // 缓存命中就立刻摆出来、不显加载态；未命中则清空残余，让「旧内容在等」不再发生
       const cached = this.sessionCache[id]
@@ -339,7 +355,8 @@ export const useChatStore = defineStore('chat', {
         this.messages = data
         this.loadedSessionId = id
         this.loadingSession = false
-        // 历史装入之后才连：hub 补发的待答卡若先到，会被随后装入的历史整体替换掉
+        // 历史装入之后才连：hub 补发的待答卡若先到，会被随后装入的历史整体替换掉。
+        // 角色由后端判（owner→现状 / collaborator→只读旁观，Ticket 008），前端同一入口连接。
         this.connect(id)
       } else {
         this.loadingSession = false

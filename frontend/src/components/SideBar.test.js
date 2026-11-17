@@ -15,7 +15,7 @@ import { createPinia, setActivePinia } from 'pinia'
 vi.mock('../api', () => ({
   // SideBar 直接使用
   listSessions: vi.fn(), deleteSession: vi.fn(), createSession: vi.fn(),
-  listApps: vi.fn(), renameApp: vi.fn(), deleteApp: vi.fn(),
+  listApps: vi.fn(), listSharedApps: vi.fn(), renameApp: vi.fn(), deleteApp: vi.fn(),
   // chat store 使用（loadAll 仍要拉工作区名给文件面板/输入区做名称回显）
   listWorkspaces: vi.fn(), getMessages: vi.fn(), getSessionDetail: vi.fn(),
   listModels: vi.fn(), patchSessionModel: vi.fn(),
@@ -26,8 +26,8 @@ vi.mock('../api', () => ({
 vi.mock('ant-design-vue', () => ({ message: { success: vi.fn(), error: vi.fn(), warning: vi.fn() } }))
 
 import {
-  listApps, listSessions, listWorkspaces, createSession, renameApp, deleteApp, deleteSession,
-  getSessionLiveStatuses,
+  listApps, listSharedApps, listSessions, listWorkspaces, createSession, renameApp, deleteApp,
+  deleteSession, getSessionLiveStatuses,
 } from '../api'
 import { message } from 'ant-design-vue'
 import SideBar from './SideBar.vue'
@@ -137,10 +137,11 @@ function sessions(n, workspaceId = 1) {
   }))
 }
 
-async function mountSideBar({ appRows = [APP], wsRows = [LEGACY_WS], sessionRows, liveRows = [], props } = {}) {
+async function mountSideBar({ appRows = [APP], sharedRows = [], wsRows = [LEGACY_WS], sessionRows, liveRows = [], props } = {}) {
   const pinia = createPinia()
   setActivePinia(pinia)
   listApps.mockResolvedValue({ data: appRows })
+  listSharedApps.mockResolvedValue({ data: sharedRows })
   listWorkspaces.mockResolvedValue({ data: wsRows })
   listSessions.mockImplementation(async (wsId) => ({ data: sessionRows ?? sessions(8, wsId) }))
   getSessionLiveStatuses.mockResolvedValue({ data: { sessions: liveRows } })
@@ -540,5 +541,42 @@ describe('SideBar 删除会话', () => {
     await flushPromises()
     expect(deleteSession).toHaveBeenCalledWith(100)
     expect(spy).toHaveBeenCalledWith(100)
+  })
+})
+
+describe('SideBar 共享给我（Ticket 007）', () => {
+  const SHARED = {
+    id: 21, workspace_id: 5, name: '订单台账', slug: 'orders', status_dev: 'stopped',
+    owner_nickname: '张三', role: 'collaborator', root_path: 'D:/apps/orders',
+  }
+
+  it('没有共享应用时整块不渲染', async () => {
+    const { wrapper } = await mountSideBar()
+    expect(wrapper.find('.zc-shared-title').exists()).toBe(false)
+    expect(wrapper.find('.zc-shared-group').exists()).toBe(false)
+  })
+
+  it('共享分组列出应用与所有者昵称，按共享工作区拉会话', async () => {
+    const { wrapper } = await mountSideBar({ sharedRows: [SHARED] })
+    expect(wrapper.find('.zc-shared-title').text()).toContain('共享给我')
+    const group = wrapper.find('.zc-shared-group')
+    expect(group.find('.zc-ws-name').text()).toBe('订单台账')
+    expect(group.find('.zc-owner').text()).toBe('张三')
+    expect(group.findAll('.zc-session')).toHaveLength(5)
+    expect(listSessions).toHaveBeenCalledWith(5)
+  })
+
+  it('共享分组只读：无 +、无 ⋯ 菜单、会话行无删除', async () => {
+    const { wrapper } = await mountSideBar({ sharedRows: [SHARED] })
+    const group = wrapper.find('.zc-shared-group')
+    expect(group.find('.zc-add').exists()).toBe(false)
+    expect(group.find('.zc-menu-btn').exists()).toBe(false)
+    expect(group.find('.zc-del').exists()).toBe(false)
+  })
+
+  it('点共享会话打开只读聊天（openSession 带共享工作区 id）', async () => {
+    const { wrapper, store } = await mountSideBar({ sharedRows: [SHARED] })
+    await wrapper.find('.zc-shared-group .zc-session').trigger('click')
+    expect(store.openSession).toHaveBeenCalledWith(100, 5)
   })
 })

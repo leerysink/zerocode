@@ -50,12 +50,42 @@ class PublishIn(BaseModel):
     confirmDestructive: bool = False
 
 
+class DecideRequestIn(BaseModel):
+    force: bool = False
+    confirmDestructive: bool = False
+
+
+class RejectRequestIn(BaseModel):
+    reason: str = ""
+
+
 class RollbackIn(BaseModel):
     version: str
 
 
 def _http(e: DeployError) -> HTTPException:
     return HTTPException(e.status, str(e))
+
+
+async def _require_app(request: Request, app_id: int) -> tuple[dict, str]:
+    """app_id 取应用的唯一入口（Ticket 000）：返回 (应用, 角色)，判权全在接缝里。
+
+    端点不再各自拼 `get_app(..., owner_user_id=...)`：不可见/不存在同一 404 由
+    `app_service.get_app_for_user` 一处给出；角色留给后续票的 `require_owner` 增权。
+    """
+    return await app_service.get_app_for_user(
+        request.app.state.session_factory, app_id, request.state.actor["id"])
+
+
+async def _require_app_owner(request: Request, app_id: int) -> dict:
+    """仅所有者可用的端点的取应用入口：可见（含被共享）但非所有者 → 403。
+
+    与 `_require_app` 同一条判权接缝，只多一步 `require_owner`——被共享者已在「共享给我」
+    里看得见应用，403 是诚实口径（规格 §5.6）；后续票逐条放开的端点改回 `_require_app`。
+    """
+    app, role = await _require_app(request, app_id)
+    app_service.require_owner(role)
+    return app
 
 
 def _reject_if_task_running(request: Request, app_id: int) -> None:
@@ -68,8 +98,8 @@ def _reject_if_task_running(request: Request, app_id: int) -> None:
         raise DeployError(deploy_tasks.BUSY_MESSAGE, status=409)
 
 
-# 隔离接缝（Ticket 006）：以下端点内的 get_app 均传当前账号，别人的应用 404；
-# validate-slug 的 taken 故意不传——slug 全局 UNIQUE，预检必须看全量。
+# 判权收口（Ticket 000）：以下端点取应用一律经 `_require_app`（单点判权），
+# validate-slug 的 taken 例外——slug 全局 UNIQUE，预检必须看全量。
 
 
 @router.post("", status_code=201)   # brief Interfaces：创建成功返回 201（示例代码漏写，测试为契约）
@@ -97,15 +127,186 @@ async def validate(request: Request, body: SlugIn):
 
 @router.get("")
 async def list_all(request: Request):
-    return await app_service.list_apps(request.app.state.session_factory,
-                                       owner_user_id=request.state.actor["id"])
+    sf = request.app.state.session_factory
+    items = await app_service.list_apps(sf, owner_user_id=request.state.actor["id"])
+    pending = await app_service.apps_with_pending_requests(sf, [a["id"] for a in items])
+    for a in items:
+        a["role"] = "owner"
+        # 待审角标（S3）按应用算：存在任何成员的 pending 申请，所有者卡片就亮角标
+        a["pending_publish"] = a["id"] in pending
+    return items
+
+
+@router.get("/shared")
+async def list_shared(request: Request):
+    """「共享给我」（规格 §5.3）：与自有列表同形状，另带 owner_nickname / role。
+
+    必须声明在 `/{app_id}` 之前：否则 "shared" 会被当成 app_id 去解析。
+    """
+    sf = request.app.state.session_factory
+    uid = request.state.actor["id"]
+    items = await app_service.list_shared_apps(sf, uid)
+    # 卡片状态机按**本人**的最近一条申请算：别人的待审申请不该让我的卡片显示「待审批」
+    latest = await app_service.latest_requests_of_user(
+        sf, [a["id"] for a in items], uid)
+    for a in items:
+        a["role"] = "collaborator"
+        req = latest.get(a["id"])
+        a["publish_request"] = req
+        a["pending_publish"] = bool(req and req["status"] == "pending")
+    return items
+
+
+# ---------- 共享管理（规格 §5.1）：入口仅所有者，被共享者可自退 ----------
+
+class ShareIn(BaseModel):
+    user_id: int
+
+
+@router.get("/{app_id}/share")
+async def share_list(request: Request, app_id: int):
+    sf = request.app.state.session_factory
+    try:
+        await _require_app_owner(request, app_id)
+        return {
+            "members": await app_service.list_share_members(sf, app_id),
+            # 待审区块（S4）：申请人昵称 + 申请时间 + 批准/驳回入口
+            "pending_request": await app_service.pending_request_of_app(sf, app_id),
+        }
+    except DeployError as e:
+        raise _http(e)
+
+
+@router.post("/{app_id}/share", status_code=201)
+async def share_add(request: Request, app_id: int, body: ShareIn):
+    sf = request.app.state.session_factory
+    try:
+        await _require_app_owner(request, app_id)
+        return await app_service.add_share(sf, app_id=app_id, user_id=body.user_id,
+                                           created_by=request.state.actor["id"])
+    except DeployError as e:
+        raise _http(e)
+
+
+@router.post("/{app_id}/share/leave")
+async def share_leave(request: Request, app_id: int):
+    """被共享者主动退出：只认 collaborator——所有者没有共享行，自然 404（规格 §5.1）。
+
+    退出即收口（S13）：待审申请作废（remove_share 同事务），正在旁观该应用的连接
+    由 hub 按 (工作区, 本人) 精准关闭（4404 + share_revoked），他人的连接不受影响。
+    """
+    sf = request.app.state.session_factory
+    try:
+        app, role = await _require_app(request, app_id)
+        if role != "collaborator":
+            raise DeployError("共享关系不存在", status=404)
+        await app_service.remove_share(sf, app_id=app_id,
+                                       user_id=request.state.actor["id"])
+        await request.app.state.hub.close_watchers_for(
+            workspace_id=app["workspace_id"], user_id=request.state.actor["id"])
+    except DeployError as e:
+        raise _http(e)
+    return {"ok": True}
+
+
+@router.delete("/{app_id}/share/{user_id}")
+async def share_remove(request: Request, app_id: int, user_id: int):
+    """所有者撤销共享：与自退同一条收口（待审申请作废 + 关闭该用户的旁观连接）。"""
+    sf = request.app.state.session_factory
+    try:
+        app = await _require_app_owner(request, app_id)
+        await app_service.remove_share(sf, app_id=app_id, user_id=user_id)
+        await request.app.state.hub.close_watchers_for(
+            workspace_id=app["workspace_id"], user_id=user_id)
+    except DeployError as e:
+        raise _http(e)
+    return {"ok": True}
+
+
+# ---------- 发布申请与审批（规格 §2.3/§5.2，ADR-0050）：被共享者申请，所有者批准即执行 ----------
+
+@router.post("/{app_id}/publish-requests", status_code=201)
+async def create_publish_request(request: Request, app_id: int):
+    """被共享者发起发布申请：待审唯一（S18）、发布中不收（409）；所有者无需申请（403）。"""
+    sf = request.app.state.session_factory
+    try:
+        _app, role = await _require_app(request, app_id)
+        if role != "collaborator":
+            raise DeployError("所有者可直接发布，无需申请", status=403)
+        return await app_service.create_publish_request(
+            sf, app_id=app_id, requester_id=request.state.actor["id"])
+    except DeployError as e:
+        raise _http(e)
+
+
+@router.post("/{app_id}/publish-requests/{request_id}/approve", status_code=202)
+async def approve_publish_request(request: Request, app_id: int, request_id: int,
+                                  body: DecideRequestIn | None = None):
+    """批准即执行（S4/D4）：先跑与直接发布**同一份**闸门（Ticket 001 的 `_publish_gates`），
+    通过后才置 approved 并异步发布；闸门失败申请保持 pending，可重试（D15/S19）。
+
+    `_spawn` 的受理竞态与「闸门失败保 pending」同理：发布没能受理就把申请退回 pending，
+    不留「已批准但从未发布」的假状态。
+    """
+    sf = request.app.state.session_factory
+    hub = request.app.state.deploy_hub
+    body = body or DecideRequestIn()
+    try:
+        app = await _require_app_owner(request, app_id)
+        req = await app_service.get_publish_request(sf, app_id=app_id, request_id=request_id)
+        if req["status"] != "pending":
+            raise DeployError("该申请已处理，无法重复审批", status=409)
+        # chat_active 的 409 detail 是字典：原样上抛，前端按 code 弹强制确认（与直接发布同形状）
+        await _publish_gates(request, app, force=body.force)
+        decided = await app_service.decide_publish_request(
+            sf, request_id=request_id, status="approved",
+            decided_by=request.state.actor["id"])
+        try:
+            _spawn(request, app_id, lambda: prod.publish(
+                sf, app, notify=hub.publish, force=body.force,
+                confirm_destructive=body.confirmDestructive,
+                on_success=lambda: _after_publish(request, app_id)))
+        except DeployError:
+            await app_service.reopen_publish_request(sf, request_id)
+            raise
+    except DeployError as e:
+        raise _http(e)
+    return {"ok": True, "request": decided}
+
+
+@router.post("/{app_id}/publish-requests/{request_id}/reject")
+async def reject_publish_request(request: Request, app_id: int, request_id: int,
+                                 body: RejectRequestIn):
+    """驳回必须填理由（S4）：空理由 400、非 pending 409；理由落库供申请人查看。"""
+    sf = request.app.state.session_factory
+    try:
+        await _require_app_owner(request, app_id)
+        return await app_service.reject_publish_request(
+            sf, app_id=app_id, request_id=request_id, reason=body.reason,
+            decided_by=request.state.actor["id"])
+    except DeployError as e:
+        raise _http(e)
+
+
+@router.delete("/{app_id}/publish-requests/{request_id}")
+async def withdraw_publish_request(request: Request, app_id: int, request_id: int):
+    """申请人撤回（S12）：非本人 403、非 pending 409。"""
+    sf = request.app.state.session_factory
+    try:
+        await _require_app(request, app_id)
+        return await app_service.withdraw_publish_request(
+            sf, app_id=app_id, request_id=request_id,
+            user_id=request.state.actor["id"])
+    except DeployError as e:
+        raise _http(e)
 
 
 @router.get("/{app_id}")
 async def detail(request: Request, app_id: int):
     try:
-        return await app_service.get_app(request.app.state.session_factory, app_id,
-                                         owner_user_id=request.state.actor["id"])
+        app, role = await _require_app(request, app_id)
+        app["role"] = role
+        return app
     except DeployError as e:
         raise _http(e)
 
@@ -118,8 +319,8 @@ async def rename(request: Request, app_id: int, body: AppRenameIn):
     prod 未运行时只留下 params_stale，下一次发布会重建（ADR-0042）。
     """
     try:
-        app = await app_service.rename_app(request.app.state.session_factory, app_id, body.name,
-                                           owner_user_id=request.state.actor["id"])
+        await _require_app_owner(request, app_id)
+        app = await app_service.rename_app(request.app.state.session_factory, app_id, body.name)
         with suppress(Exception):
             await request.app.state.apk_builder.enqueue(app_id, app=app)
         with suppress(Exception):
@@ -142,7 +343,7 @@ async def remove(request: Request, app_id: int):
     """
     sf = request.app.state.session_factory
     try:
-        app = await app_service.get_app(sf, app_id, owner_user_id=request.state.actor["id"])
+        app = await _require_app_owner(request, app_id)
         app_service.ensure_deletable(app)
         _reject_if_task_running(request, app_id)
         for warning in await engine.down_app_stacks(app["slug"]):
@@ -173,10 +374,13 @@ def _spawn(request: Request, app_id: int, coro_factory) -> None:
 
 
 async def _dev_task(request: Request, app_id: int, action, *, docker_gate: bool = False,
-                    env: str = "dev") -> dict:
+                    env: str = "dev", owner_only: bool = True) -> dict:
     """生命周期端点共用一条链：取应用 →（启动类）同步 Docker 预检 → 起后台任务 → 202。
 
     `action` 在**请求时**按模块属性取出（engine.start_dev 等），monkeypatch 才拦得住。
+
+    `owner_only=False`（dev 起停/重启与 prod 启停/重启）对被共享者放行（Ticket 003/004）：
+    起停预览不产生版本、不改代码，prod 运维同属「可上手操作」；发布/回滚仍是所有者动作。
 
     `docker_gate`（start/restart 开）：Task 11 的预检契约是「零事件、异常原样上抛**供 REST 映射 503**」，
     这个映射点只在同步调用时存在——放进 create_task 后用户只会看到 202 + WS 静默（审查 I-1，探针实证）。
@@ -193,7 +397,10 @@ async def _dev_task(request: Request, app_id: int, action, *, docker_gate: bool 
     sf = request.app.state.session_factory
     hub = request.app.state.deploy_hub
     try:
-        app = await app_service.get_app(sf, app_id, owner_user_id=request.state.actor["id"])
+        if owner_only:
+            app = await _require_app_owner(request, app_id)
+        else:
+            app, _role = await _require_app(request, app_id)
         if docker_gate and env == "prod" and app["status_prod"] == "publishing":
             raise DeployError("发布/回滚进行中，请等待完成", status=409)
         if docker_gate:
@@ -209,24 +416,24 @@ async def _dev_task(request: Request, app_id: int, action, *, docker_gate: bool 
 
 @router.post("/{app_id}/dev/start", status_code=202)
 async def dev_start(request: Request, app_id: int):
-    return await _dev_task(request, app_id, engine.start_dev, docker_gate=True)
+    return await _dev_task(request, app_id, engine.start_dev, docker_gate=True, owner_only=False)
 
 
 @router.post("/{app_id}/dev/stop", status_code=202)
 async def dev_stop(request: Request, app_id: int):
-    return await _dev_task(request, app_id, engine.stop_dev)
+    return await _dev_task(request, app_id, engine.stop_dev, owner_only=False)
 
 
 @router.post("/{app_id}/dev/restart", status_code=202)
 async def dev_restart(request: Request, app_id: int):
-    return await _dev_task(request, app_id, engine.restart_dev, docker_gate=True)
+    return await _dev_task(request, app_id, engine.restart_dev, docker_gate=True, owner_only=False)
 
 
 @router.get("/{app_id}/dev/status")
 async def dev_status(request: Request, app_id: int):
     sf = request.app.state.session_factory
     try:
-        app = await app_service.get_app(sf, app_id, owner_user_id=request.state.actor["id"])
+        app, _role = await _require_app(request, app_id)
         return await engine.dev_status(sf, app)
     except DeployError as e:
         raise _http(e)
@@ -237,7 +444,7 @@ async def app_urls(request: Request, app_id: int):
     """应用 prod 访问地址（规格 05 §5 / 通配域名网关）：只回 domain=https://{slug}.zerocode.com，无副作用只读。"""
     sf = request.app.state.session_factory
     try:
-        app = await app_service.get_app(sf, app_id, owner_user_id=request.state.actor["id"])
+        app, _role = await _require_app(request, app_id)
         from app.deploy import nics
         return await nics.app_urls(sf, app)
     except DeployError as e:
@@ -251,7 +458,8 @@ async def mobile_info(request: Request, app_id: int):
     """移动端弹框数据源：dev/prod 两条 H5 地址 + APK 构建状态/壳版本/图标（只读）。"""
     sf = request.app.state.session_factory
     try:
-        app = await app_service.get_app(sf, app_id, owner_user_id=request.state.actor["id"])
+        # Ticket 004：被共享者可看弹框并重打 APK；图标覆盖/小程序写入仍仅所有者。
+        app, _role = await _require_app(request, app_id)
         return await mobile.info(sf, app)
     except DeployError as e:
         raise _http(e)
@@ -265,7 +473,7 @@ async def mobile_rebuild_apk(request: Request, app_id: int):
     """
     sf = request.app.state.session_factory
     try:
-        app = await app_service.get_app(sf, app_id, owner_user_id=request.state.actor["id"])
+        app, _role = await _require_app(request, app_id)
         if not mobile.is_mobile(app):
             raise DeployError("仅移动端应用支持 APK 构建", status=400)
         if app.get("status_prod") != "running":
@@ -281,7 +489,8 @@ async def mobile_icon(request: Request, app_id: int):
     """图标预览：自定义优先，否则按应用名实时生成 SVG。cookie 鉴权随同源请求自动带上。"""
     sf = request.app.state.session_factory
     try:
-        app = await app_service.get_app(sf, app_id, owner_user_id=request.state.actor["id"])
+        # 只读预览随弹框一起放行；覆盖/恢复自动图标（PUT/DELETE）仍仅所有者。
+        app, _role = await _require_app(request, app_id)
         if not mobile.is_mobile(app):
             raise DeployError("仅移动端应用支持移动端分发", status=400)
         path = apkbuild.custom_icon_path(app["slug"])
@@ -299,7 +508,7 @@ async def mobile_upload_icon(request: Request, app_id: int, file: UploadFile = F
     """上传图标覆盖自动图标：PNG/JPEG 魔数 + ≤2MB；成功即触发重建（prod 未运行则留到下次发布）。"""
     sf = request.app.state.session_factory
     try:
-        app = await app_service.get_app(sf, app_id, owner_user_id=request.state.actor["id"])
+        app = await _require_app_owner(request, app_id)
         if not mobile.is_mobile(app):
             raise DeployError("仅移动端应用支持移动端分发", status=400)
         data = await file.read(shell.MOBILE_ICON_MAX_BYTES + 1)
@@ -323,7 +532,7 @@ async def mobile_reset_icon(request: Request, app_id: int):
     """恢复自动图标（删掉自定义覆盖），同样触发重建。"""
     sf = request.app.state.session_factory
     try:
-        app = await app_service.get_app(sf, app_id, owner_user_id=request.state.actor["id"])
+        app = await _require_app_owner(request, app_id)
         if not mobile.is_mobile(app):
             raise DeployError("仅移动端应用支持移动端分发", status=400)
         removed = apkbuild.delete_icon(app["slug"])
@@ -345,7 +554,7 @@ async def miniprogram_bind(request: Request, app_id: int, appid: str = Form(...)
     """
     sf = request.app.state.session_factory
     try:
-        app = await app_service.get_app(sf, app_id, owner_user_id=request.state.actor["id"])
+        app = await _require_app_owner(request, app_id)
         if not mobile.is_mobile(app):
             raise DeployError("仅移动端应用支持小程序分发", status=400)
         data = await file.read(mpcreds.KEY_MAX_BYTES + 1)
@@ -369,7 +578,7 @@ async def miniprogram_unbind(request: Request, app_id: int):
     """解绑小程序账号：清 DB 行与密钥文件；正在跑的任务按当前轮失败收口。"""
     sf = request.app.state.session_factory
     try:
-        app = await app_service.get_app(sf, app_id, owner_user_id=request.state.actor["id"])
+        app = await _require_app_owner(request, app_id)
         if not mobile.is_mobile(app):
             raise DeployError("仅移动端应用支持小程序分发", status=400)
         await mpcreds.unbind(sf, app)
@@ -386,7 +595,7 @@ async def miniprogram_preview(request: Request, app_id: int):
     """
     sf = request.app.state.session_factory
     try:
-        app = await app_service.get_app(sf, app_id, owner_user_id=request.state.actor["id"])
+        app = await _require_app_owner(request, app_id)
         if not mobile.is_mobile(app):
             raise DeployError("仅移动端应用支持小程序分发", status=400)
         binding = await mpcreds.get_binding(sf, app_id)
@@ -407,7 +616,7 @@ async def miniprogram_upload(request: Request, app_id: int):
     """
     sf = request.app.state.session_factory
     try:
-        app = await app_service.get_app(sf, app_id, owner_user_id=request.state.actor["id"])
+        app = await _require_app_owner(request, app_id)
         if not mobile.is_mobile(app):
             raise DeployError("仅移动端应用支持小程序分发", status=400)
         binding = await mpcreds.get_binding(sf, app_id)
@@ -427,7 +636,8 @@ async def miniprogram_preview_image(request: Request, app_id: int):
     """预览码图片：同源 <img> 自带会话 cookie；不落公开目录，未生成时 404。"""
     sf = request.app.state.session_factory
     try:
-        app = await app_service.get_app(sf, app_id, owner_user_id=request.state.actor["id"])
+        # 已生成的预览码是只读展示；生成（POST preview）与上传仍仅所有者。
+        app, _role = await _require_app(request, app_id)
         if not mobile.is_mobile(app):
             raise DeployError("仅移动端应用支持小程序分发", status=400)
         path = mpbuild.preview_path(app["slug"])
@@ -474,7 +684,7 @@ async def sql_apply(request: Request, app_id: int):
     sf = request.app.state.session_factory
     hub = request.app.state.deploy_hub
     try:
-        app = await app_service.get_app(sf, app_id, owner_user_id=request.state.actor["id"])
+        app = await _require_app_owner(request, app_id)
         _spawn(request, app_id, lambda: _run_sqlchange(sf, app, hub))
     except DeployError as e:
         raise _http(e)
@@ -507,7 +717,7 @@ async def dev_reset(request: Request, app_id: int):
     sf = request.app.state.session_factory
     hub = request.app.state.deploy_hub
     try:
-        app = await app_service.get_app(sf, app_id, owner_user_id=request.state.actor["id"])
+        app = await _require_app_owner(request, app_id)
         _spawn(request, app_id, lambda: _reset_dev(sf, app, hub))
     except DeployError as e:
         raise _http(e)
@@ -520,7 +730,7 @@ async def sql_records(request: Request, app_id: int, env: str = "dev"):
         raise HTTPException(400, "env 仅支持 dev/prod")
     sf = request.app.state.session_factory
     try:
-        app = await app_service.get_app(sf, app_id, owner_user_id=request.state.actor["id"])
+        app, _role = await _require_app(request, app_id)
     except DeployError as e:
         raise _http(e)
     cred = await read_cred(sf, app["slug"], env)
@@ -545,7 +755,7 @@ async def sql_files(request: Request, app_id: int):
     口径只影响本 UI 列表——商店上架锚点取自 sqlchange_history（DB），与本目录 glob 无关（不伤打包）。"""
     sf = request.app.state.session_factory
     try:
-        app = await app_service.get_app(sf, app_id, owner_user_id=request.state.actor["id"])
+        app, _role = await _require_app(request, app_id)
         root = await engine._app_root(sf, app)
     except DeployError as e:
         raise _http(e)
@@ -572,7 +782,7 @@ async def scaffold_backfill(request: Request, app_id: int):
     from app.deploy import schemadiff
     sf = request.app.state.session_factory
     try:
-        app = await app_service.get_app(sf, app_id, owner_user_id=request.state.actor["id"])
+        app = await _require_app_owner(request, app_id)
         root = await engine._app_root(sf, app)
     except DeployError as e:
         raise _http(e)
@@ -618,35 +828,46 @@ async def _after_publish(request: Request, app_id: int) -> None:
             logger.exception("发布成功后的%s入队失败（不影响发布结果） app_id=%s", name, app_id)
 
 
+async def _publish_gates(request: Request, app: dict, *, force: bool) -> None:
+    """发布闸门单源（Ticket 001）：任务互斥 → publishing 并发闸 → chat 确认 → 同步预检。
+
+    直接发布（本文件 `publish`）与「批准发布申请」（Ticket 009）共用这一处判据，
+    两条路径都不许复制判词。chat 闸门只看**本应用工作区**的活跃会话（别的应用在改
+    代码不该挡住这次发布）；409 detail 是字典 `{code, message}`——前端按
+    `code === 'chat_active'` 弹强制确认，不能只吃字符串（`_http` 的 str detail
+    通道给不了这个分支能力）。
+    """
+    app_id = app["id"]
+    _reject_if_task_running(request, app_id)
+    if app["status_prod"] == "publishing":
+        # _spawn 只挡本进程在跑的任务；publishing 可能是上一进程遗留，按状态再挡一道
+        raise DeployError("发布进行中，请等待完成", status=409)
+    if not force:
+        active = list(request.app.state.hub.running_session_ids())
+        if active:
+            async with request.app.state.session_factory() as s:
+                hit = (await s.execute(text(
+                    "SELECT 1 FROM chat_session WHERE workspace_id=:w AND id = ANY(:ids) LIMIT 1"),
+                    {"w": app["workspace_id"], "ids": active})).first()
+            if hit:
+                raise HTTPException(409, {
+                    "code": "chat_active",
+                    "message": "当前 AI 正在修改代码，发布的可能是不完整版本，是否继续？"})
+    await prod.preflight_docker()
+
+
 @router.post("/{app_id}/publish", status_code=202)
 async def publish(request: Request, app_id: int, body: PublishIn):
     """一键发布（04 §5 / FR4-09 chat 闸门 + publishing 并发双保险）。
 
-    闸门顺序：任务互斥（`_spawn` 契约）→ 状态并发闸 → chat 确认 → 同步预检 → 受理。
-    chat 闸门只看**本应用工作区**的活跃会话（别的应用在改代码不该挡住这次发布）；
-    409 detail 是字典 `{code, message}`——前端按 `code === 'chat_active'` 弹强制确认，
-    不能只吃字符串（`_http` 的 str detail 通道给不了这个分支能力）。
+    闸门序列（任务互斥 → 状态并发闸 → chat 确认 → 同步预检）全在 `_publish_gates`：
+    与「批准发布申请」共用，这里只做取应用 + 受理。
     """
     sf = request.app.state.session_factory
     hub = request.app.state.deploy_hub
     try:
-        app = await app_service.get_app(sf, app_id, owner_user_id=request.state.actor["id"])
-        _reject_if_task_running(request, app_id)
-        if app["status_prod"] == "publishing":
-            # _spawn 只挡本进程在跑的任务；publishing 可能是上一进程遗留，按状态再挡一道
-            raise DeployError("发布进行中，请等待完成", status=409)
-        if not body.force:
-            active = list(request.app.state.hub.running_session_ids())
-            if active:
-                async with sf() as s:
-                    hit = (await s.execute(text(
-                        "SELECT 1 FROM chat_session WHERE workspace_id=:w AND id = ANY(:ids) LIMIT 1"),
-                        {"w": app["workspace_id"], "ids": active})).first()
-                if hit:
-                    raise HTTPException(409, {
-                        "code": "chat_active",
-                        "message": "当前 AI 正在修改代码，发布的可能是不完整版本，是否继续？"})
-        await prod.preflight_docker()
+        app = await _require_app_owner(request, app_id)
+        await _publish_gates(request, app, force=body.force)
         _spawn(request, app_id, lambda: prod.publish(sf, app, notify=hub.publish,
                                                      force=body.force,
                                                      confirm_destructive=body.confirmDestructive,
@@ -664,7 +885,7 @@ async def rollback(request: Request, app_id: int, body: RollbackIn):
     sf = request.app.state.session_factory
     hub = request.app.state.deploy_hub
     try:
-        app = await app_service.get_app(sf, app_id, owner_user_id=request.state.actor["id"])
+        app = await _require_app_owner(request, app_id)
         _reject_if_task_running(request, app_id)
         if app["status_prod"] == "publishing":
             # 终审 I-2：与 publish 端点同款二次闸——_spawn 只挡本进程，publishing 可能是
@@ -679,17 +900,19 @@ async def rollback(request: Request, app_id: int, body: RollbackIn):
 
 @router.post("/{app_id}/prod/start", status_code=202)
 async def prod_start(request: Request, app_id: int):
-    return await _dev_task(request, app_id, prod.prod_start, docker_gate=True, env="prod")
+    return await _dev_task(request, app_id, prod.prod_start, docker_gate=True, env="prod",
+                           owner_only=False)
 
 
 @router.post("/{app_id}/prod/stop", status_code=202)
 async def prod_stop(request: Request, app_id: int):
-    return await _dev_task(request, app_id, prod.prod_stop, env="prod")
+    return await _dev_task(request, app_id, prod.prod_stop, env="prod", owner_only=False)
 
 
 @router.post("/{app_id}/prod/restart", status_code=202)
 async def prod_restart(request: Request, app_id: int):
-    return await _dev_task(request, app_id, prod.prod_restart, docker_gate=True, env="prod")
+    return await _dev_task(request, app_id, prod.prod_restart, docker_gate=True, env="prod",
+                           owner_only=False)
 
 
 @router.get("/{app_id}/prod/status")
@@ -697,7 +920,7 @@ async def prod_status(request: Request, app_id: int):
     """直返引擎结果（含 urls 块）：端点不裁字段、不加包装（04 §5 接口表）。"""
     sf = request.app.state.session_factory
     try:
-        app = await app_service.get_app(sf, app_id, owner_user_id=request.state.actor["id"])
+        app, _role = await _require_app(request, app_id)
         return await prod.prod_status(sf, app)
     except DeployError as e:
         raise _http(e)
@@ -708,7 +931,7 @@ async def list_records(request: Request, app_id: int, limit: int = 50):
     """发布历史（04 §4.5）：新→旧，UI 历史抽屉与排查入口共用。"""
     sf = request.app.state.session_factory
     try:
-        await app_service.get_app(sf, app_id, owner_user_id=request.state.actor["id"])
+        await _require_app(request, app_id)
         return await records.list_for(sf, app_id, limit=limit)
     except DeployError as e:
         raise _http(e)
@@ -724,7 +947,7 @@ async def delete_record(request: Request, app_id: int, rid: int):
     """
     sf = request.app.state.session_factory
     try:
-        app = await app_service.get_app(sf, app_id, owner_user_id=request.state.actor["id"])
+        app = await _require_app_owner(request, app_id)
     except DeployError as e:
         raise _http(e)
     async with sf() as s:

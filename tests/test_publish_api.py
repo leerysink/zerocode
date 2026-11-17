@@ -294,6 +294,28 @@ async def test_publish_409_when_status_publishing(client, monkeypatch, no_prefli
     assert not called
 
 
+async def test_publish_delegates_to_shared_gate_function(client, monkeypatch, no_preflight):
+    """Ticket 001 接线：publish 不内联闸门判据——(app, force) 交给 `_publish_gates` 单源。
+
+    替身一被调用就直接 409：若端点绕开它把判词复制回来，这里会 202 而钉红。
+    批准发布申请（Ticket 009）接入后，同一函数即两条调用路径的共用闸门。
+    """
+    from app.api import apps as apps_api
+
+    aid = await _mk(client)
+    seen = []
+
+    async def sentinel(request, app, *, force):
+        seen.append((app["id"], force))
+        raise DeployError("闸门替身命中", status=409)
+
+    monkeypatch.setattr(apps_api, "_publish_gates", sentinel)
+    r = await client.post(f"/api/apps/{aid}/publish", json={"force": True})
+    assert r.status_code == 409 and "闸门替身命中" in r.json()["detail"]
+    assert seen == [(aid, True)]                 # force 原样透传给闸门
+    assert aid not in client.app.state.dev_tasks  # 闸门拦下时不留后台任务
+
+
 # ---------- 回滚（04 §4.4）：版本号格式校验 → 202 ----------
 
 async def test_rollback_bad_version_400(client):

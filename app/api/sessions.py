@@ -5,7 +5,8 @@ from pydantic import BaseModel
 from sqlalchemy import text
 
 from app.agent.model_resolver import resolve_model
-from app.services import attachment_service, browser_shot_service, config_service
+from app.deploy.errors import DeployError
+from app.services import app_service, attachment_service, browser_shot_service, config_service
 from app.services.session_title_service import DEFAULT_TITLE
 
 router = APIRouter(prefix="/api/sessions")
@@ -20,22 +21,33 @@ class TitleIn(BaseModel):
 class ModelIn(BaseModel):
     model_config_id: int | None = None
 
-async def _require_ws(s, ws_id: int, uid: int) -> None:
-    hit = (await s.execute(text(
-        "SELECT 1 FROM workspace WHERE id = :i AND owner_user_id = :u"),
-        {"i": ws_id, "u": uid})).first()
-    if not hit:
+async def _require_ws(request: Request, ws_id: int, uid: int) -> str:
+    """工作区判权单点（Ticket 000）：不可见/不存在/无主同一 404，返回角色。
+    读端点直接用；写端点再过 `_require_owner`（Ticket 007）。"""
+    role = await app_service.workspace_role(request.app.state.session_factory, ws_id, uid)
+    if role is None:
         raise HTTPException(404, "工作区不存在")
+    return role
 
-async def _require_session(s, session_id: int, uid: int) -> None:
-    """会话传递隔离（Ticket 005）：会话经 workspace 归属用户，不加列只 JOIN 收口；
-    不存在与他人的行同一 404，不给探测留差异。"""
-    hit = (await s.execute(text(
-        "SELECT 1 FROM chat_session cs JOIN workspace w ON w.id = cs.workspace_id "
-        "WHERE cs.id = :i AND w.owner_user_id = :u"),
-        {"i": session_id, "u": uid})).first()
-    if not hit:
+async def _require_session(request: Request, session_id: int, uid: int) -> str:
+    """会话传递隔离（Ticket 005）：会话经 workspace 判权，不加列只走一处；
+    不存在与他人的行同一 404，不给探测留差异。返回角色（Ticket 007 供写端点增权）。"""
+    sf = request.app.state.session_factory
+    async with sf() as s:
+        wid = (await s.execute(text(
+            "SELECT workspace_id FROM chat_session WHERE id = :i"),
+            {"i": session_id})).scalar()
+    role = await app_service.workspace_role(sf, wid, uid) if wid is not None else None
+    if role is None:
         raise HTTPException(404, "会话不存在")
+    return role
+
+def _require_owner(role: str) -> None:
+    """会话写端点（新建/改名/切模型/删除）仅所有者：已可见但无权 → 403（规格 §5.4）。"""
+    try:
+        app_service.require_owner(role)
+    except DeployError as e:
+        raise HTTPException(e.status, str(e))
 
 async def _effective_model_of(app, session_id: int, cfg: dict) -> dict:
     """前端只关心「这条会话最终会用哪个模型、会不会看图」：只回五个字段，
@@ -66,7 +78,7 @@ async def _pending_steering_of(app, session_id: int, raw: list) -> list[dict]:
 async def create_session(request: Request, body: SessionIn):
     uid = request.state.actor["id"]
     async with request.app.state.session_factory() as s:
-        await _require_ws(s, body.workspace_id, uid)
+        _require_owner(await _require_ws(request, body.workspace_id, uid))
         row = (await s.execute(text(
             "INSERT INTO chat_session (workspace_id, title) VALUES (:w, :t) RETURNING id, workspace_id, title, status, created_at, updated_at"),
             {"w": body.workspace_id, "t": body.title or DEFAULT_TITLE})).mappings().first()
@@ -77,7 +89,7 @@ async def create_session(request: Request, body: SessionIn):
 async def list_sessions(request: Request, workspace_id: int):
     uid = request.state.actor["id"]
     async with request.app.state.session_factory() as s:
-        await _require_ws(s, workspace_id, uid)
+        await _require_ws(request, workspace_id, uid)
         rows = (await s.execute(text(
             "SELECT id, workspace_id, title, status, created_at, updated_at FROM chat_session "
             "WHERE workspace_id=:w ORDER BY updated_at DESC"), {"w": workspace_id})).mappings().all()
@@ -94,9 +106,13 @@ async def live_session_status(request: Request):
     uid = request.state.actor["id"]
     hub = request.app.state.hub
     async with request.app.state.session_factory() as s:
+        # 归属集合 = 自有 + 被共享工作区（Ticket 008 / 规格 §2.4）：被共享者在左栏
+        # 也要看到共享会话的运行/等待/完成/失败角标，与所有者侧同一份事实。
         ids = [r[0] for r in (await s.execute(text(
             "SELECT cs.id FROM chat_session cs JOIN workspace w ON w.id = cs.workspace_id "
-            "WHERE w.owner_user_id = :u"), {"u": uid})).all()]
+            "WHERE w.owner_user_id = :u OR EXISTS ("
+            "  SELECT 1 FROM app_share sh JOIN app_project a ON a.id = sh.app_id "
+            "  WHERE a.workspace_id = w.id AND sh.user_id = :u)"), {"u": uid})).all()]
     out = []
     for sid in ids:
         running = sid in hub.running
@@ -118,7 +134,7 @@ async def live_session_status(request: Request):
 async def session_detail(request: Request, session_id: int):
     uid = request.state.actor["id"]
     async with request.app.state.session_factory() as s:
-        await _require_session(s, session_id, uid)
+        await _require_session(request, session_id, uid)
         row = (await s.execute(text(
             "SELECT id, workspace_id, title, status, todo_state, model_config_id "
             "FROM chat_session WHERE id=:i"), {"i": session_id})).mappings().first()
@@ -138,7 +154,7 @@ async def session_detail(request: Request, session_id: int):
 async def rename_session(request: Request, session_id: int, body: TitleIn):
     uid = request.state.actor["id"]
     async with request.app.state.session_factory() as s:
-        await _require_session(s, session_id, uid)
+        _require_owner(await _require_session(request, session_id, uid))
         r = await s.execute(text("UPDATE chat_session SET title=:t, updated_at=now() WHERE id=:i"), {"t": body.title, "i": session_id})
         await s.commit()
         if r.rowcount == 0:
@@ -149,7 +165,7 @@ async def rename_session(request: Request, session_id: int, body: TitleIn):
 async def set_session_model(request: Request, session_id: int, body: ModelIn):
     uid = request.state.actor["id"]
     async with request.app.state.session_factory() as s:
-        await _require_session(s, session_id, uid)
+        _require_owner(await _require_session(request, session_id, uid))
         if body.model_config_id is not None:
             # 档案存在性按当前账号验（Ticket 007）：别人的档案与不存在同口径 404，不泄露存在性
             # kind 必限 chat（Ticket 005）：会话只能绑对话档案，否则这里返回 ok、
@@ -173,7 +189,7 @@ async def set_session_model(request: Request, session_id: int, body: ModelIn):
 async def delete_session(request: Request, session_id: int):
     uid = request.state.actor["id"]
     async with request.app.state.session_factory() as s:
-        await _require_session(s, session_id, uid)
+        _require_owner(await _require_session(request, session_id, uid))
         await s.execute(text("DELETE FROM chat_session WHERE id=:i"), {"i": session_id})
         await s.commit()
     # 兜底删除附件目录：commit 之后执行，remove_session_dir 自身吞掉 OSError，不影响删除响应
@@ -192,7 +208,7 @@ def _compaction_notice(mark) -> dict:
 async def get_messages(request: Request, session_id: int):
     uid = request.state.actor["id"]
     async with request.app.state.session_factory() as s:
-        await _require_session(s, session_id, uid)
+        await _require_session(request, session_id, uid)
         rows = (await s.execute(text(
             "SELECT id, seq, role, content, reasoning, tool_call_id, tool_name, tool_args, tool_result, created_at "
             "FROM message WHERE session_id=:i ORDER BY seq"), {"i": session_id})).mappings().all()
@@ -220,7 +236,7 @@ async def get_messages(request: Request, session_id: int):
 async def list_file_changes(request: Request, session_id: int):
     uid = request.state.actor["id"]
     async with request.app.state.session_factory() as s:
-        await _require_session(s, session_id, uid)
+        await _require_session(request, session_id, uid)
         rows = (await s.execute(text(
             "SELECT id, path, action, diff, created_at FROM file_change "
             "WHERE session_id=:i ORDER BY id DESC"), {"i": session_id})).mappings().all()
@@ -238,7 +254,7 @@ async def get_file_change(request: Request, session_id: int, change_id: int):
     归属仍走会话闸门：记录号单独摆出去不构成直取全库的口子。"""
     uid = request.state.actor["id"]
     async with request.app.state.session_factory() as s:
-        await _require_session(s, session_id, uid)
+        await _require_session(request, session_id, uid)
         row = (await s.execute(text(
             "SELECT fc.id, fc.path, fc.action, fc.diff, fc.before_content, fc.after_content, "
             "       fc.created_at, w.id AS workspace_id, w.name AS workspace_name "

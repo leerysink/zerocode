@@ -682,3 +682,28 @@ describe('openSession 装载顺序、切换瞬态与缓存', () => {
     expect(s.sessionCache[5]).toBeUndefined()
   })
 })
+
+// ---------- Ticket 010：撤销/退出收口 ----------
+describe('share_revoked（撤销/退出旁观）', () => {
+  it('置位撤销标记并解锁执行态（连接随后由 4404 静默收掉）', () => {
+    const s = mk()
+    s.running = true
+    s.compacting = true
+    applyEvent(s, { type: 'share_revoked' })
+    expect(s.shareRevoked).toBe(true)
+    expect(s.running).toBe(false)
+    expect(s.compacting).toBe(false)
+  })
+
+  it('openSession 清掉上一次的撤销标记：同一页里再被撤销仍能触发', async () => {
+    setActivePinia(createPinia())
+    const s = useChatStore()
+    s.connect = vi.fn()
+    const { getMessages, getSessionDetail } = await import('../api')
+    getMessages.mockResolvedValue({ data: [] })
+    getSessionDetail.mockResolvedValue({ data: null })
+    s.shareRevoked = true
+    await s.openSession(9)
+    expect(s.shareRevoked).toBe(false)
+  })
+})

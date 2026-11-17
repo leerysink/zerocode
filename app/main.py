@@ -166,6 +166,9 @@ def create_app(database_url: str | None = None) -> FastAPI:
     # 登录体系（Ticket 002 / ADR-0003）：/api/auth register/login/logout/me（guard 中间件在后续票接入）
     from app.api import auth as auth_api
     app.include_router(auth_api.router)
+    # 账号列表（规格 2026-11-16 §5.1）：共享管理选人，任一登录账号可读
+    from app.api import users as users_api
+    app.include_router(users_api.router)
     app.include_router(config_router)
     app.include_router(workspaces.router)
     app.include_router(sessions.router)

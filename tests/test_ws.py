@@ -7,10 +7,11 @@
 依次补发 tool_result({"cancelled": true}) → error("已取消") → status(idle)，
 读 3 条才与「tail 含 error(已取消)+status」断言自洽。
 """
-import asyncio, json, secrets, tempfile
+import asyncio, contextlib, json, secrets, tempfile
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import text as _sql
+from starlette.websockets import WebSocketDisconnect
 from app import main as main_module
 from app.db import make_engine
 from app.hub import ChatHub
@@ -553,6 +554,31 @@ def test_ws_reconnect_replays_running_status(client):
     with client.websocket_connect(f"/ws/chat/{sid}") as ws3:
         ws3.send_json({"type": "user_message", "content": "hi"})
         assert ws3.receive_json()["type"] == "message_done"
+
+
+def test_ws_reconnect_during_cancel_does_not_replay_running(client):
+    """停止已请求、run 还在收口（如浏览器会话 DELETE 未返回）：重连不得补发 running 快照。
+
+    用户点停止后往往紧接着点左侧会话标题（= 重连）；此时若补发 status(running)，界面又把
+    任务立成「运行中」，而终态帧发往的是旧连接，就永远停在运行中。白盒构造收口窗口，
+    顺带钉住窗口内的上行被拒为 busy 且不进插话队列（否则会被下一轮误注入）。
+    """
+    import asyncio
+    hub = client.app.state.hub
+    sid = client.zc_sid
+    ev = asyncio.Event()
+    ev.set()
+    hub.running.add(sid)
+    hub.cancel_events[sid] = ev
+    try:
+        with client.websocket_connect(f"/ws/chat/{sid}") as ws:
+            ws.send_json({"type": "user_message", "content": "还在跑吗"})
+            head = ws.receive_json()
+            assert head["type"] == "busy" and "正在停止" in head["message"]
+            assert hub.pending.get(sid) in (None, [])
+    finally:
+        hub.running.discard(sid)
+        hub.cancel_events.pop(sid, None)
 
 
 def test_ws_reconnect_recovers_pending_ask_from_history(client):
@@ -1134,3 +1160,293 @@ def test_ws_confirm_switch_can_be_turned_off_from_config(client, monkeypatch):
 
     assert captured["cfg"]["agent.preview_confirm_running"] is False
     assert captured["cfg"]["agent.preview_wait_seconds"] == pt.DEFAULT_WAIT_SECONDS  # 其余键取代码默认值
+
+# ---------- Ticket 008：被共享者实时旁观（只读 WS） ----------
+
+def _jar_token(client):
+    """取 jar 里的 zc_actor 值。同名 cookie 可能因 domain 不同并存（httpx 的
+    Cookies.get 会抛 CookieConflict），这里直接扫 jar 取最后一条。"""
+    vals = [c.value for c in client.cookies.jar if c.name == "zc_actor"]
+    return vals[-1] if vals else None
+
+
+def _set_token(client, token) -> None:
+    """先 clear 再 set：保证 jar 里始终只有一条 zc_actor（同名不同 domain 的并存
+    会让后续 httpx 的 get 抛 CookieConflict，也会让请求带两条同名 Cookie）。"""
+    client.cookies.clear()
+    if token:
+        client.cookies.set("zc_actor", token)
+
+
+def _register_actor(client, prefix: str) -> dict:
+    """注册一个旁路账号（随机昵称）并还原调用者 cookie：返回 {id, token, nickname}。"""
+    saved = _jar_token(client)
+    nick = f"{prefix}-{secrets.token_hex(4)}"
+    r = client.post("/api/auth/register", json={"nickname": nick, "password": "test-pw"})
+    assert r.status_code == 200, r.text
+    token = r.cookies.get("zc_actor")   # 注册响应自己的 Set-Cookie，不翻易冲突的 jar
+    _set_token(client, token)
+    me = client.get("/api/auth/me").json()
+    _set_token(client, saved)
+    return {"id": me["id"], "token": token, "nickname": nick}
+
+
+@contextlib.contextmanager
+def _acting_as(client, token: str):
+    """临时把 cookie 切成另一个账号。
+
+    先 clear 再 set：jar 里已有同域 zc_actor，叠 set 会发两条同名 Cookie
+    （test_isolation_ws_auth 同款教训）。已建立的 WS 连接不受影响——握手已完成。
+    """
+    saved = _jar_token(client)
+    _set_token(client, token)
+    try:
+        yield
+    finally:
+        _set_token(client, saved)
+
+
+def _plant_shared_app(client, *, owner_id: int, collab_id: int) -> int:
+    """把 fixture 自建的 workspace 直插成 app_project 并共享给 collab（判权靶心，不烧创建链）。
+
+    app_project 行由用例末尾删掉：fixture teardown 删 workspace 时若还有应用行，
+    会顺路执行 down_app_stacks（docker compose down）——本文件不碰 docker 链路。
+    """
+    from app.deploy import ports
+
+    async def _go():
+        sf = client.app.state.session_factory
+        async with sf() as s:
+            prod_port, dev_port = await ports.allocate_pair(s, probe=lambda p: True)
+            aid = (await s.execute(_sql(
+                "INSERT INTO app_project (workspace_id, name, slug, scale, stack, "
+                "prod_port, dev_port, owner_user_id) VALUES (:w, '旁观应用', :sl, "
+                "'small', 'vue3-fastapi', :pp, :dp, :o) RETURNING id"),
+                {"w": client.zc_wsid, "sl": f"ws-watch-{secrets.token_hex(4)}",
+                 "pp": prod_port, "dp": dev_port, "o": owner_id})).scalar()
+            await s.execute(_sql(
+                "INSERT INTO app_share (app_id, user_id, created_by) VALUES (:a, :u, :o)"),
+                {"a": aid, "u": collab_id, "o": owner_id})
+            await s.commit()
+        return aid
+
+    return client.portal.call(_go)
+
+
+def _grant_share(client, app_id: int, user_id: int, created_by: int) -> None:
+    """补一行 app_share（给第二个被共享者用；应用行由 _plant_shared_app 负责清理）。"""
+    async def _go():
+        sf = client.app.state.session_factory
+        async with sf() as s:
+            await s.execute(_sql(
+                "INSERT INTO app_share (app_id, user_id, created_by) VALUES (:a, :u, :o)"),
+                {"a": app_id, "u": user_id, "o": created_by})
+            await s.commit()
+    client.portal.call(_go)
+
+
+def _drop_planted_app(client, app_id: int) -> None:
+    async def _go():
+        sf = client.app.state.session_factory
+        async with sf() as s:
+            await s.execute(_sql("DELETE FROM app_project WHERE id = :i"), {"i": app_id})
+            await s.commit()
+    client.portal.call(_go)
+
+
+def test_ws_collaborator_watches_live_run_readonly(client):
+    """被共享者用同一入口连 WS：登记为 watcher，不占也不摘所有者的 emit 槽。
+
+    - 连入补发 status(running) 与挂起中的提问（同一张卡，只发给这条连接）；
+    - 任意上行（插话/答题/确认/停止/压缩）一律 error「共享旁观为只读」，hub 状态不变；
+    - 所有者侧事件序列不受旁观连接接/断影响（emits 槽仍是同一对象，watcher 走另一张表）。
+    """
+    owner = client.get("/api/auth/me").json()
+    collab = _register_actor(client, "ws-collab")
+    aid = _plant_shared_app(client, owner_id=owner["id"], collab_id=collab["id"])
+    hub = client.app.state.hub
+    sid = client.zc_sid
+    calls = {"n": 0}
+
+    def factory(cfg):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return ScriptedLLM([done(None, [_ask_tool_call("c1", "选哪个")]), done("答完了")])
+        return ScriptedLLM([done("第二次")])
+
+    client.app.state.llm_factory = factory
+    try:
+        with client.websocket_connect(f"/ws/chat/{sid}") as ws_owner:
+            ws_owner.send_json({"type": "user_message", "content": "开始"})
+            for _ in range(6):
+                if ws_owner.receive_json()["type"] == "ask_user":
+                    break
+            else:
+                pytest.fail("所有者应收到提问卡")
+            owner_emit = hub.emits.get(sid)
+            assert owner_emit is not None
+
+            with _acting_as(client, collab["token"]):
+                with client.websocket_connect(f"/ws/chat/{sid}") as ws_c:
+                    # 重连补发同一份挂起事实：只在旁观连接上出现（不走 hub.emit_event，
+                    # 否则所有者会把同一张卡再收一遍）
+                    assert ws_c.receive_json() == {"type": "status", "status": "running"}
+                    replay = ws_c.receive_json()
+                    assert replay["type"] == "ask_user"
+                    assert replay["questions"][0]["question"] == "选哪个"
+
+                    # 旁观连接既不占作者槽，也不出现在作者槽里
+                    assert hub.emits.get(sid) is owner_emit
+                    assert len(hub.watchers.get(sid, ())) == 1
+
+                    # 角标与所有者同源：被共享会话出现在被共享者的 live-status 里
+                    ls = client.get("/api/sessions/live-status").json()["sessions"]
+                    assert [(x["session_id"], x["running"], x["waiting"]) for x in ls] == [
+                        (sid, True, "ask")]
+
+                    # 任意上行 → 只读拒绝；不改 hub 任何状态
+                    for frame in (
+                        {"type": "user_message", "content": "插一句"},
+                        {"type": "ask_submit", "answers": [{"answer": "我答"}]},
+                        {"type": "confirm", "approved": True},
+                        {"type": "cancel"},
+                        {"type": "compact"},
+                    ):
+                        ws_c.send_json(frame)
+                        assert ws_c.receive_json() == {
+                            "type": "error", "message": "共享旁观为只读"}
+                    assert sid in hub.pending_asks      # 答题没被兑现
+                    assert not hub.is_cancelling(sid)   # 停止没生效
+                    assert sid not in hub.compacting
+                    assert hub.pending.get(sid, []) == []   # 插话没入队
+
+                    # 所有者照常收尾；旁观者同帧收到（fan-out），槽仍是 owner 的
+                    ws_owner.send_json({"type": "ask_submit",
+                                        "answers": [{"answer": "选 A"}]})
+                    tail_o = []
+                    for _ in range(12):
+                        ev = ws_owner.receive_json()
+                        tail_o.append(ev)
+                        if ev["type"] == "status":
+                            break
+                    assert any(e["type"] == "tool_result"
+                               and e["result"]["answers"] == [{"answer": "选 A"}]
+                               for e in tail_o), tail_o
+                    assert any(e["type"] == "message_done" and e["content"] == "答完了"
+                               for e in tail_o), tail_o
+                    tail_c = []
+                    for _ in range(12):
+                        ev = ws_c.receive_json()
+                        tail_c.append(ev)
+                        if ev["type"] == "status":
+                            break
+                    assert any(e["type"] == "message_done" and e["content"] == "答完了"
+                               for e in tail_c)
+                    assert hub.emits.get(sid) is owner_emit
+
+                # 旁观断开：只清 watcher 表，所有者的槽原封不动
+                assert sid not in hub.watchers
+                assert hub.emits.get(sid) is owner_emit
+
+            # 断开旁观后所有者发起新一轮：仍然完整可驱动（槽没被误摘）
+            ws_owner.send_json({"type": "user_message", "content": "第二次"})
+            tail_o, got_done = [], False
+            for _ in range(10):
+                ev = ws_owner.receive_json()
+                tail_o.append(ev)
+                if ev["type"] == "message_done" and ev["content"] == "第二次":
+                    got_done = True
+                if ev["type"] == "status":
+                    break
+            assert got_done, tail_o
+
+        # 旁观者那句「插一句」没有任何落库痕迹
+        rows = client.get(f"/api/sessions/{sid}/messages").json()
+        assert all("插一句" not in (r.get("content") or "") for r in rows)
+    finally:
+        _drop_planted_app(client, aid)
+
+
+def test_ws_collaborator_watcher_replays_pending_confirm(client):
+    """确认卡与提问卡同一道补发闸：旁观者连入即看到「正在等所有者确认」。
+
+    直接摆 hub.pending_confirms 这一份挂起事实（真实路径由 runner 下发事件后经
+    hub.confirm 登记同一 dict）；本用例的靶心是 _watch_only 的补发接线。
+    """
+    owner = client.get("/api/auth/me").json()
+    collab = _register_actor(client, "ws-collab")
+    aid = _plant_shared_app(client, owner_id=owner["id"], collab_id=collab["id"])
+    hub = client.app.state.hub
+    sid = client.zc_sid
+    hub.pending_confirms[sid] = {"tool": "write_file", "summary": "写入 a.txt",
+                                 "args": {"path": "a.txt"}}
+    try:
+        with _acting_as(client, collab["token"]):
+            with client.websocket_connect(f"/ws/chat/{sid}") as ws_c:
+                assert ws_c.receive_json() == {
+                    "type": "confirm_request", "tool": "write_file",
+                    "summary": "写入 a.txt", "args": {"path": "a.txt"}}
+    finally:
+        hub.pending_confirms.pop(sid, None)
+        _drop_planted_app(client, aid)
+
+
+def test_ws_stranger_without_share_gets_4404(client):
+    """共享不扩散可见性：没有 app_share 行的账号连该会话流仍 4404。"""
+    other = _register_actor(client, "ws-stranger")
+    with _acting_as(client, other["token"]):
+        with pytest.raises(WebSocketDisconnect) as ei:
+            with client.websocket_connect(f"/ws/chat/{client.zc_sid}") as ws:
+                ws.receive_json()
+    assert ei.value.code == 4404
+    assert client.zc_sid not in client.app.state.hub.watchers
+
+
+def test_ws_revoke_closes_target_watcher_only(client):
+    """S13/S14：撤销共享 → 该用户的旁观连接先收 share_revoked，再以 4404 关闭；
+    同应用另一位被共享者的旁观连接与所有者的 emit 槽都不受影响。"""
+    owner = client.get("/api/auth/me").json()
+    owner_token = _jar_token(client)
+    collab = _register_actor(client, "ws-collab")
+    other = _register_actor(client, "ws-collab2")
+    aid = _plant_shared_app(client, owner_id=owner["id"], collab_id=collab["id"])
+    _grant_share(client, aid, other["id"], owner["id"])
+    hub = client.app.state.hub
+    sid = client.zc_sid
+    client.app.state.llm_factory = lambda cfg: ScriptedLLM([done("撤销后照跑")])
+
+    stack = contextlib.ExitStack()
+    try:
+        with client.websocket_connect(f"/ws/chat/{sid}") as ws_owner:
+            owner_emit = hub.emits.get(sid)
+            with _acting_as(client, collab["token"]):
+                ws_c = stack.enter_context(client.websocket_connect(f"/ws/chat/{sid}"))
+            with _acting_as(client, other["token"]):
+                ws_other = stack.enter_context(client.websocket_connect(f"/ws/chat/{sid}"))
+            assert len(hub.watchers.get(sid, ())) == 2
+
+            # 所有者撤销 collab 的共享
+            r = client.delete(f"/api/apps/{aid}/share/{collab['id']}")
+            assert r.status_code == 200
+            # 目标连接：先收到撤销帧，随后 4404 断开（不是网络抖动，前端据此不再重连）
+            assert ws_c.receive_json() == {"type": "share_revoked"}
+            with pytest.raises(WebSocketDisconnect) as ei:
+                ws_c.receive_json()
+            assert ei.value.code == 4404
+            # 旁观登记表只剩另一位；所有者的槽原封不动
+            assert len(hub.watchers.get(sid, ())) == 1
+            assert hub.emits.get(sid) is owner_emit
+
+            # 另一位旁观者照常收下行：撤销不误伤别人的旁观连接
+            ws_owner.send_json({"type": "user_message", "content": "跑一轮"})
+            got = []
+            for _ in range(10):
+                ev = ws_other.receive_json()
+                got.append(ev)
+                if ev["type"] == "status":
+                    break
+            assert any(e["type"] == "message_done" and e["content"] == "撤销后照跑"
+                       for e in got), got
+    finally:
+        stack.close()
+        _drop_planted_app(client, aid)

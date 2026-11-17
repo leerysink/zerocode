@@ -3,12 +3,15 @@
 // 回滚不在这里执行——确认链走 emit('rollback', version)，由父级打开 PublishModal
 // （autoStart 模式）单点调 rollbackApp：进度通道与发布共用同一条 WS 订阅（T7 注：
 // rollback 复用 publish_step 事件协议），错误收口也只在弹层一处呈现。
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { Modal, message } from 'ant-design-vue'
 import { appRecords, deleteRecord } from '../api'
 
 const props = defineProps({ app: { type: Object, required: true } })
 const emit = defineEmits(['rollback'])
+// 被共享者只读历史（Ticket 003）：回滚与删记录都是所有者动作，入口在这里直接不渲染。
+// app.role 由列表接口给出（own=owner / 共享给我=collaborator）；未知一律按所有者处理。
+const isOwner = computed(() => props.app.role !== 'collaborator')
 
 const STEP_LABELS = {
   preflight: '发布前检查', build: '镜像构建', provision: '数据库供给', migrate: '数据库迁移',
@@ -99,13 +102,15 @@ async function remove(r) {
         <template v-else-if="column.key === 'duration'">{{ duration(record) }}</template>
         <template v-else-if="column.key === 'actions'">
           <a-button size="middle" class="zc-btn-log" @click="viewing = record">查看日志</a-button>
-          <a-button size="middle" class="zc-btn-rollback" :disabled="!canRollback(record)"
-                    :title="canRollback(record) ? '' : '仅历史发布版本可回滚'"
-                    @click="askRollback(record)">回滚到此版本</a-button>
-          <a-popconfirm title="删除该记录？关联发布镜像会尽力清理，数据库数据不受影响。"
-                        @confirm="remove(record)">
-            <a-button size="middle" class="zc-btn-del">删除</a-button>
-          </a-popconfirm>
+          <template v-if="isOwner">
+            <a-button size="middle" class="zc-btn-rollback" :disabled="!canRollback(record)"
+                      :title="canRollback(record) ? '' : '仅历史发布版本可回滚'"
+                      @click="askRollback(record)">回滚到此版本</a-button>
+            <a-popconfirm title="删除该记录？关联发布镜像会尽力清理，数据库数据不受影响。"
+                          @confirm="remove(record)">
+              <a-button size="middle" class="zc-btn-del">删除</a-button>
+            </a-popconfirm>
+          </template>
         </template>
       </template>
     </a-table>

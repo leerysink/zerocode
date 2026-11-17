@@ -18,6 +18,9 @@ const props = defineProps({
   open: { type: Boolean, default: false },
 })
 const emit = defineEmits(['update:open'])
+// 被共享者（Ticket 004）：可见 H5/二维码/APK 状态，可重打 APK；图标覆盖与小程序写入
+// 都是所有者动作，入口不渲染（后端同样 403）。
+const isOwner = computed(() => props.app.role !== 'collaborator')
 
 const INFO_POLL_MS = 3000
 const ICON_MAX_BYTES = 2 * 1024 * 1024
@@ -340,15 +343,17 @@ async function resetIcon() {
             <div class="zc-m-icon-actions">
               <span class="zc-m-k">应用图标</span>
               <span class="zc-apk-meta">{{ info.icon?.custom ? '自定义' : '自动生成' }}</span>
-              <input ref="iconInput" type="file" accept="image/png,image/jpeg" class="zc-icon-input"
-                     @change="onIconFile" />
-              <a-button size="small" class="zc-icon-pick" :loading="iconUploading" @click="pickIcon">
-                <upload-outlined /> 上传图标
-              </a-button>
-              <a-button v-if="info.icon?.custom" size="small" class="zc-icon-reset"
-                        :disabled="iconUploading" @click="resetIcon">
-                <undo-outlined /> 恢复自动
-              </a-button>
+              <template v-if="isOwner">
+                <input ref="iconInput" type="file" accept="image/png,image/jpeg" class="zc-icon-input"
+                       @change="onIconFile" />
+                <a-button size="small" class="zc-icon-pick" :loading="iconUploading" @click="pickIcon">
+                  <upload-outlined /> 上传图标
+                </a-button>
+                <a-button v-if="info.icon?.custom" size="small" class="zc-icon-reset"
+                          :disabled="iconUploading" @click="resetIcon">
+                  <undo-outlined /> 恢复自动
+                </a-button>
+              </template>
             </div>
           </div>
 
@@ -408,7 +413,10 @@ async function resetIcon() {
         </div>
       </section>
 
-      <miniprogram-panel :app-id="app.id" :mp="info.miniprogram" @refresh="load(true)" />
+      <miniprogram-panel v-if="isOwner" :app-id="app.id" :mp="info.miniprogram" @refresh="load(true)" />
+      <p v-else class="zc-m-tip">
+        被共享者只读：可查看地址与 APK 状态、重打 APK；图标覆盖与小程序操作由应用所有者执行。
+      </p>
     </div>
     <div v-else class="zc-mobile-fail">
       <p>{{ error || '移动端信息不可用' }}</p>

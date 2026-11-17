@@ -23,14 +23,34 @@ class SqlBatchIn(BaseModel):
     statements: list[str]
 
 
-async def _load_app(request: Request, app_id: int) -> dict:
+async def _load_app_role(request: Request, app_id: int) -> tuple[dict, str]:
+    """DB 操作台判权：创始人维持既有 bypass（`user_id=None`），其余走唯一判权入口。"""
     actor = request.state.actor
     owner = None if actor.get("is_founder") else actor["id"]
     try:
-        return await app_service.get_app(request.app.state.session_factory, app_id,
-                                         owner_user_id=owner)
+        return await app_service.get_app_for_user(
+            request.app.state.session_factory, app_id, owner)
     except DeployError as e:
         raise HTTPException(e.status, str(e))
+
+
+async def _load_app(request: Request, app_id: int) -> dict:
+    """读面（审计/表/结构/数据）对被共享者放行（Ticket 006）：能看见就能读。"""
+    app, _role = await _load_app_role(request, app_id)
+    return app
+
+
+def _require_select_only(role: str, statements: list[str]) -> None:
+    """被共享者只读（规格 2026-11-16 §2.6）：整批全部是 SELECT 才执行。
+
+    逐条 `classify_op`，任一条不是 select（`SELECT ... INTO` 与函数式写归入 other）
+    整批 403——先判完再执行，不出现「前半段成功、后半段被拒」。所有者不受限。
+    """
+    if role == "owner":
+        return
+    for sql in statements:
+        if svc.has_executable_content(sql) and svc.classify_op(sql) != "select":
+            raise HTTPException(403, "共享只读：仅允许 SELECT")
 
 
 @router.get("/{app_id}/db/audit")
@@ -120,13 +140,14 @@ async def db_table_data(request: Request, app_id: int, env: str, table: str,
 
 @router.post("/{app_id}/db/{env}/sql")
 async def db_sql_exec(request: Request, app_id: int, env: str, body: SqlIn):
-    app = await _load_app(request, app_id)
+    app, role = await _load_app_role(request, app_id)
     actor_id = request.state.actor["id"]
     sf = request.app.state.session_factory
     try:
         svc.validate_env(env)
     except DeployError as e:
         raise HTTPException(e.status, str(e))
+    _require_select_only(role, [body.sql])
     op = svc.classify_op(body.sql)
     t0 = time.monotonic()
     try:
@@ -157,7 +178,7 @@ async def db_sql_batch(request: Request, app_id: int, env: str, body: SqlBatchIn
     状态码分界：connect() 之前/之外的失败走 HTTP（400 非法 env / 400 无可执行语句 /
     404 非归属 / 409 凭据缺失 / 503 建连失败）；connect() 之内逐条执行的失败走结果项、
     整体 200——否则拿不到前 i-1 条的结果。单条 /sql 一律 500 的旧行为故意保持不变。"""
-    app = await _load_app(request, app_id)
+    app, role = await _load_app_role(request, app_id)
     actor_id = request.state.actor["id"]
     sf = request.app.state.session_factory
     try:
@@ -167,6 +188,8 @@ async def db_sql_batch(request: Request, app_id: int, env: str, body: SqlBatchIn
     # 全空白/纯注释（含空数组）在建连前就拒：不把注释当语句送 PG，也不留痕。
     if not any(svc.has_executable_content(s) for s in body.statements):
         raise HTTPException(400, "没有可执行的语句")
+    # 被共享者：整批先判完再执行（含写即 403），绝不出现「前半段成功」
+    _require_select_only(role, body.statements)
     try:
         results = await svc.execute_batch(request, app["slug"], env, body.statements)
     except DeployError as e:

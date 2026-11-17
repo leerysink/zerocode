@@ -11,6 +11,9 @@
 - emits：按会话分槽的下行发送器（session_id → async (session_id, event) -> None），
   同会话后连覆盖；断连 drop 清槽（仅清自己注入的槽，防误删后连者的槽），
   跨会话互不串扰（终审修复轮2：原全局单槽会被任意会话的连接覆盖导致事件串线）。
+- watchers：只读旁观连接（被共享者，Ticket 008）。与 emits 分开登记：旁观者连入/断开
+  不得覆盖或摘掉所有者的 emit 槽；emit_event 向该会话的 owner 槽与全部 watcher 各发一份。
+  上行由 ws 层直接拒绝，hub 不接收观者的任何状态变更。
 - pending_asks / pending_confirms：挂起中的提问卡/确认卡载荷。WS 连入时由 replay_pending
   补发（同一张卡的恢复，不是重复提问、重复确认）——两张卡都画在消息流的调用行上，而**待答**
   的那次调用还没有 tool 行（工具行要等结果回来才落库），刷新后历史里没有可贴标记的行，
@@ -37,6 +40,13 @@ class ChatHub:
         # 回到「未解除」状态），这是既有代价，不为它加一层持久化。
         self.clarify_waived: dict[int, bool] = {}
         self.emits: dict[int, callable] = {}  # session_id → 下行发送器: async (session_id, event) -> None
+        # 只读旁观者（Ticket 008）：session_id → {emit, ...}。绝不动 emits，
+        # 所有者的槽不被夺走；断连只摘自己那一份。
+        self.watchers: dict[int, set] = {}
+        # 旁观连接的归属与断连手段（Ticket 010）：emit → {session_id, workspace_id,
+        # user_id, close}。撤销共享时据此按 (工作区, 用户) 精准关闭，别人的旁观连接与
+        # 所有者的 emit 槽一概不碰。
+        self.watcher_meta: dict = {}
 
     def queue(self, session_id, item, max_pending) -> bool:
         """插话入队（保序）。队列满则拒收，由 ws 侧回 busy 非终态提示。"""
@@ -59,6 +69,50 @@ class ChatHub:
         if self.emits.get(session_id) is emit:
             self.emits.pop(session_id, None)
 
+    def add_watcher(self, session_id, emit, *, workspace_id=None, user_id=None, close=None):
+        """登记只读旁观连接：集合与 emits 分开，旁观者永远不占所有者那一槽。
+
+        close 是「服务端主动断开这条连接」的协程（撤销共享时用，Ticket 010）；
+        没给就只登记发送器（纯事件扇出的旧路径不受影响）。
+        """
+        self.watchers.setdefault(session_id, set()).add(emit)
+        if close is not None:
+            self.watcher_meta[emit] = {"session_id": session_id,
+                                       "workspace_id": workspace_id,
+                                       "user_id": user_id, "close": close}
+
+    def drop_watcher(self, session_id, emit):
+        self.watcher_meta.pop(emit, None)
+        group = self.watchers.get(session_id)
+        if not group:
+            return
+        group.discard(emit)
+        if not group:
+            self.watchers.pop(session_id, None)
+
+    async def close_watchers_for(self, *, workspace_id, user_id) -> int:
+        """撤销共享/退出后关闭该工作区下该用户的全部旁观连接（Ticket 010）。
+
+        只认 (workspace_id, user_id) 两张牌：同应用其他被共享者的连接、所有者的
+        emit 槽都不动。返回真正发起关闭的连接数（测试与端点可观测）。
+        发出关闭即注销登记：连接已判死，继续留在扇出表里只会有静默失败的发送；
+        连接自身 finally 的 drop_watcher 是幂等的，重复清理无害。
+        """
+        closed = 0
+        for group in list(self.watchers.values()):
+            for emit in list(group):
+                meta = self.watcher_meta.get(emit)
+                if not meta or meta["workspace_id"] != workspace_id \
+                        or meta["user_id"] != user_id:
+                    continue
+                closed += 1
+                self.drop_watcher(meta["session_id"], emit)
+                try:
+                    await meta["close"]()
+                except Exception:
+                    pass  # 已断开/正在收口：撤销本身不因断连失败而失败
+        return closed
+
     def active_session_ids(self) -> list:
         """当前有活跃下行流的会话：emits 登记表键集快照（只说明 WS 连着，不代表在跑）。"""
         return list(self.emits)
@@ -73,10 +127,16 @@ class ChatHub:
         return list(self.running)
 
     async def emit_event(self, session_id, event):
-        """向指定会话的当前连接下发事件；该会话无连接（槽为空）时静默丢弃。"""
+        """向指定会话的当前连接下发事件；该会话无连接（槽为空）时静默丢弃。
+
+        旁观连接（Ticket 008）与 owner 槽各收一份，同一事件同一形状；旁观者发得慢
+        不影响别人的事实语义——发送器自己吞掉断连异常（见 ws.py）。
+        """
         emit = self.emits.get(session_id)
         if emit:
             await emit(session_id, event)
+        for watcher in list(self.watchers.get(session_id, ())):
+            await watcher(session_id, event)
 
     async def ask(self, session_id, questions, timeout):
         fut = asyncio.get_running_loop().create_future()
@@ -146,3 +206,9 @@ class ChatHub:
         self.pending.pop(session_id, None)
         self._resolve(self.ask_futures, session_id, None)
         self._resolve(self.confirm_futures, session_id, False)
+
+    def is_cancelling(self, session_id) -> bool:
+        """停止已请求、run 尚未走完收口。对外不再宣称「运行中」：
+        重连补发 status(running) 会把刚停的任务在界面上立回来（侧栏转圈/停止按钮复活）。"""
+        ev = self.cancel_events.get(session_id)
+        return ev is not None and ev.is_set()

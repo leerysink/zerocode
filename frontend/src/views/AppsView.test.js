@@ -16,6 +16,10 @@ const mocks = vi.hoisted(() => ({
     releaseToStore: vi.fn(), renameApp: vi.fn(), deleteApp: vi.fn(), openFolder: vi.fn(),
     appMetricsCurrent: vi.fn(), appMobile: vi.fn(), uploadMobileApk: vi.fn(),
     appMetricsSummary: vi.fn(),
+    listSharedApps: vi.fn(), listUsers: vi.fn(), getAppShare: vi.fn(),
+    addAppShare: vi.fn(), removeAppShare: vi.fn(), leaveAppShare: vi.fn(), authMe: vi.fn(),
+    createPublishRequest: vi.fn(), approvePublishRequest: vi.fn(),
+    rejectPublishRequest: vi.fn(), withdrawPublishRequest: vi.fn(),
     wsUrl: vi.fn(() => 'ws://test'),
   },
   antd: { message: { success: vi.fn(), error: vi.fn(), info: vi.fn(), warning: vi.fn() },
@@ -68,6 +72,9 @@ const STUBS = {
   'a-space': slot('a-space'),
   'a-button': slot('a-button'),
   'a-tag': slot('a-tag'),
+  'a-badge': { name: 'a-badge', props: ['dot', 'title'], render() {
+    return h('span', { class: 'stub-badge', 'data-dot': this.dot ? 'true' : 'false',
+      title: this.title || undefined }, this.$slots.default?.()) } },
   'a-modal': { name: 'a-modal', props: ['open', 'width', 'title', 'centered', 'footer'],
     render() { return h('div', { class: 'stub-a-modal' }, [this.$slots.title?.(), this.$slots.default?.()]) } },
   'a-drawer': { name: 'a-drawer', props: ['open'], render() {
@@ -101,7 +108,6 @@ async function mountView(summary) {
   await flushPromises()
   return wrapper
 }
-
 // execCommand 是浏览器 API，happy-dom 没实现，只能桩。桩里读真实 DOM：断言的是「复制那一刻页面上
 // 那个临时节点承载的文本」，也就是降级路径真的把地址搬进了可被选中的节点，而不是桩自己记的参数。
 function stubExecCommand(copiedText, impl = () => true) {
@@ -116,6 +122,7 @@ function stubExecCommand(copiedText, impl = () => true) {
 beforeEach(() => {
   vi.clearAllMocks()
   mocks.cfg.form.openFolderMode = 'auto'
+  mocks.api.listSharedApps.mockResolvedValue({ data: [] })
   vi.spyOn(window, 'setInterval').mockReturnValue(0)
 })
 
@@ -372,11 +379,12 @@ describe('AppsView 商店接线', () => {
 
 // ---------- 卡片动作分层（2026-11-13 改版）：工具条常驻平铺，☰ 只留破坏性动作 ----------
 describe('AppsView 卡片折叠菜单', () => {
-  it('☰ 只收纳两个破坏性动作，其余动作不点开也在卡片上', async () => {
+  it('☰ 收着共享管理与两个破坏性动作，其余动作不点开也在卡片上', async () => {
     const wrapper = await mountView()
     const card = wrapper.findAll('.stub-card')[0]
     const menu = card.find('.stub-dropdown')
     expect(menu.exists()).toBe(true)
+    expect(menu.text()).toContain('共享管理')
     expect(menu.text()).toContain('重建 dev')
     expect(menu.text()).toContain('删除应用')
     // 曾经这些都在下拉里，点开才看得见——改版后它们常驻，菜单里不该再有
@@ -751,7 +759,7 @@ describe('AppsView 仪表卡', () => {
     expect(card.find('.zc-toolbar').classes()).not.toContain('is-pinned')
   })
 
-  it('八个低频动作常驻卡片 DOM（不点开也在），☰ 只剩两个破坏性动作', async () => {
+  it('八个低频动作常驻卡片 DOM（不点开也在），☰ 收着共享管理与两个破坏性动作', async () => {
     const wrapper = await mountView()
     const card = wrapper.findAll('.stub-card')[0]
     for (const k of ['preview', 'history', 'metrics', 'copy', 'folder', 'logs', 'rename', 'db']) {
@@ -762,7 +770,8 @@ describe('AppsView 仪表卡', () => {
     expect(items.length).toBeGreaterThanOrEqual(8)
     for (const it of items) expect(it.find('[role="img"]').exists()).toBe(true)
     const menu = card.findAll('.zc-app-menu-item')
-    expect(menu).toHaveLength(2)
+    expect(menu).toHaveLength(3)
+    expect(card.find('.zc-menu-share').exists()).toBe(true)
     expect(card.find('.zc-menu-reset').exists()).toBe(true)
     expect(card.find('.zc-menu-del').exists()).toBe(true)
   })
@@ -838,5 +847,361 @@ describe('AppsView 页头总控区', () => {
     expect(s['应用']).toBe('0')
     expect(s['运行中']).toBe('0')
     expect(s['平均 CPU']).toBe('—')
+  })
+})
+
+// ---------- 应用共享（规格 2026-11-16）：共享给我独立区块 + 共享管理弹框 ----------
+const SHARED_APPS = [
+  { id: 91, name: '共享甲', slug: 'shara', stack: 'vue3-fastapi', scale: 'small',
+    dev_port: 8391, prod_port: 8491, status_dev: 'running', status_prod: 'stopped',
+    current_version: 'b20260920100000', preview_url: 'http://10.0.1.25:8391',
+    workspace_id: 91, owner_nickname: '老王', role: 'collaborator',
+    pending_publish: false, publish_request: null },
+]
+
+const OWN_USERS = [
+  { id: 1, nickname: 'owner', is_founder: true },
+  { id: 7, nickname: '老王', is_founder: false },
+]
+
+describe('AppsView 共享给我与共享管理', () => {
+  it('共享给我为空时整块不渲染，页头统计只算自有应用', async () => {
+    const wrapper = await mountView()
+    expect(mocks.api.listSharedApps).toHaveBeenCalled()
+    expect(wrapper.find('.zc-shared').exists()).toBe(false)
+    expect(wrapper.find('.zc-hero-count').text()).toBe(String(APPS.length))
+  })
+
+  it('共享区块标注所有者昵称；卡片 ☰ 只留「退出共享」，且不计入页头统计', async () => {
+    mocks.api.listSharedApps.mockResolvedValue({ data: SHARED_APPS })
+    const wrapper = await mountView()
+
+    const block = wrapper.find('.zc-shared')
+    expect(block.exists()).toBe(true)
+    expect(block.text()).toContain('共享给我')
+    expect(block.text()).toContain('所有者：老王')
+
+    const card = block.find('.stub-card')
+    expect(card.text()).toContain('共享甲')
+    expect(card.text()).toContain('b20260920100000')
+    // S13：协作方唯一的菜单动作是退出共享；删除/重命名/重建/共享管理都不在
+    expect(card.find('.zc-card-menu-btn').exists()).toBe(true)
+    expect(card.find('.zc-menu-leave').text()).toContain('退出共享')
+    for (const k of ['rename', 'reset', 'del', 'release', 'share']) {
+      expect(card.find(`.zc-menu-${k}`).exists()).toBe(false)
+    }
+    expect(card.find('.zc-act-publish').exists()).toBe(false)
+    expect(card.text()).not.toContain('删除应用')
+
+    // 页头统计与「我的应用」徽标只算自有应用：共享块单卡不影响 4
+    expect(wrapper.find('.zc-hero-count').text()).toBe(String(APPS.length))
+    expect(wrapper.findAll('.zc-grid')).toHaveLength(2)   // 自有网格 + 共享网格
+  })
+
+  it('共享卡工具条按权限裁剪：只留预览/地址/观测/历史/工程/DB，不放破坏性动作', async () => {
+    mocks.api.listSharedApps.mockResolvedValue({ data: SHARED_APPS })
+    const wrapper = await mountView()
+    const card = wrapper.find('.zc-shared .stub-card')
+
+    for (const k of ['preview', 'copy', 'metrics', 'history', 'logs', 'files', 'db']) {
+      expect(card.find(`.zc-tb-item.zc-menu-${k}`).exists()).toBe(true)
+    }
+    // 每个动作都得带图标（纯文字标签 + 无图标 = 一排空白方块）
+    for (const it of card.findAll('.zc-tb-item')) expect(it.find('[role="img"]').exists()).toBe(true)
+    // S9：协作方没有「打开工程目录」系统入口，工程文件只走网页工作台
+    expect(card.find('.zc-menu-folder').exists()).toBe(false)
+    expect(card.text()).not.toContain('打开工程目录')
+    // 重命名 / 重建 dev / 发布 / 上架商店 / 共享管理都不在协作方卡上
+    expect(card.find('.zc-menu-rename').exists()).toBe(false)
+    expect(card.find('.zc-menu-reset').exists()).toBe(false)
+    expect(card.find('.zc-act-publish').exists()).toBe(false)
+    expect(card.find('.zc-menu-release').exists()).toBe(false)
+    // dev/prod 胶囊都保留：协作方自己能把预览与生产拉起来（004）；发布按钮仍不在
+    expect(card.find('.zc-env-dev').exists()).toBe(true)
+    expect(card.find('.zc-env-prod').exists()).toBe(true)
+  })
+
+  it('共享卡「工程文件」直接开只读工作台整页，不调系统直开端点', async () => {
+    const open = stubOpen()
+    mocks.api.listSharedApps.mockResolvedValue({ data: SHARED_APPS })
+    const wrapper = await mountView()
+
+    await wrapper.find('.zc-shared .zc-menu-files').trigger('click')
+    await flushPromises()
+
+    expect(mocks.api.openFolder).not.toHaveBeenCalled()
+    expect(open.mock.calls[0][1]).toBe('zerocode-files-91')
+    expect(decodeURIComponent(open.mock.calls[0][0])).toBe('/workspaces/91/files?name=共享甲')
+  })
+
+  it('共享卡「退出共享」先确认再调 leaveAppShare，成功后重新拉列表', async () => {
+    mocks.api.leaveAppShare.mockResolvedValue({ data: { ok: true } })
+    mocks.api.listSharedApps.mockResolvedValue({ data: SHARED_APPS })
+    const wrapper = await mountView()
+
+    await wrapper.find('.zc-shared .zc-menu-leave').trigger('click')
+    expect(mocks.api.leaveAppShare).not.toHaveBeenCalled()
+    expect(mocks.antd.Modal.confirm).toHaveBeenCalledTimes(1)
+    const opts = mocks.antd.Modal.confirm.mock.calls[0][0]
+    expect(opts.title).toContain('共享甲')
+    expect(opts.okType).toBe('danger')
+
+    mocks.api.listSharedApps.mockResolvedValue({ data: [] })
+    await opts.onOk()
+    await flushPromises()
+
+    expect(mocks.api.leaveAppShare).toHaveBeenCalledWith(91)
+    expect(wrapper.find('.zc-shared').exists()).toBe(false)
+  })
+
+  it('共享卡 dev 启停/重启直连后端（按钮文案随状态切换）', async () => {
+    mocks.api.devStart.mockResolvedValue({ data: { ok: true } })
+    mocks.api.devStop.mockResolvedValue({ data: { ok: true } })
+    mocks.api.devRestart.mockResolvedValue({ data: { ok: true } })
+    mocks.api.listSharedApps.mockResolvedValue({ data: SHARED_APPS })
+    const wrapper = await mountView()
+
+    const dev = wrapper.find('.zc-shared .zc-env-dev')
+    const [toggle, restart] = dev.findAll('.zc-env-btn')
+    expect(toggle.attributes('aria-label')).toBe('停止预览')   // status_dev=running
+    await toggle.trigger('click')
+    expect(mocks.api.devStop).toHaveBeenCalledWith(91)
+    await restart.trigger('click')
+    expect(mocks.api.devRestart).toHaveBeenCalledWith(91)
+  })
+
+  it('共享卡 prod 启停直连后端（Ticket 004），发布按钮不在协作方卡上', async () => {
+    mocks.api.prodStart.mockResolvedValue({ data: { ok: true } })
+    mocks.api.listSharedApps.mockResolvedValue({ data: SHARED_APPS })
+    const wrapper = await mountView()
+
+    const prod = wrapper.find('.zc-shared .zc-env-prod')
+    // 胶囊里第一个按钮现在是「申请发布」，启停始终是最后一个
+    const toggle = prod.findAll('.zc-env-btn').at(-1)
+    expect(toggle.attributes('aria-label')).toBe('启动正式')   // status_prod=stopped
+    await toggle.trigger('click')
+    expect(mocks.api.prodStart).toHaveBeenCalledWith(91)
+    expect(prod.find('.zc-act-publish').exists()).toBe(false)
+  })
+
+  it('页头统计严格只算自有：共享应用的运行桶与 CPU 都不进页头', async () => {
+    mocks.api.listSharedApps.mockResolvedValue({
+      data: [{ ...SHARED_APPS[0], status_prod: 'running' }],
+    })
+    const wrapper = await mountView(summaryOf([
+      item(), item({ app_id: 91, prod_status: 'running', cpu: { value: 90, ts: 't' } }),
+    ]))
+    const s = Object.fromEntries(wrapper.find('.zc-hero').findAll('.zc-stat')
+      .map((c) => [c.find('.zc-stat-label').text(), c.find('.zc-stat-value').text()]))
+    expect(s['运行中']).toBe('1')          // 夹具里只有自有 1 个在跑；共享的 running 不算
+    expect(s['平均 CPU']).toBe('12.5 %')   // 只含自有读数，不被共享应用的 90% 拉高
+  })
+
+  it('共享管理弹框：打开即拉成员与账号列表（剔除自己），成员可移除', async () => {
+    mocks.api.getAppShare.mockResolvedValue({ data: {
+      members: [{ user_id: 7, nickname: '老王', created_at: '2026-11-16T08:00:00+00:00' }],
+      pending_request: null } })
+    mocks.api.listUsers.mockResolvedValue({ data: OWN_USERS })
+    mocks.api.authMe.mockResolvedValue({ data: { id: 1 } })
+    mocks.api.removeAppShare.mockResolvedValue({ data: { ok: true } })
+
+    const wrapper = await mountView()
+    await wrapper.findAll('.zc-menu-share')[0].trigger('click')
+    await flushPromises()
+
+    expect(mocks.api.getAppShare).toHaveBeenCalledWith(1)
+    expect(wrapper.vm.shareM.users.map((u) => u.id)).toEqual([7])   // 自己不进候选
+    const member = wrapper.find('.zc-share-member')
+    expect(member.text()).toContain('老王')
+
+    await member.find('.stub-a-button').trigger('click')
+    await flushPromises()
+    expect(mocks.api.removeAppShare).toHaveBeenCalledWith(1, 7)
+  })
+
+  it('共享管理弹框：选人后点「共享」调 addAppShare 并刷新成员列表', async () => {
+    let members = []
+    mocks.api.getAppShare.mockImplementation(async () => ({ data: { members, pending_request: null } }))
+    mocks.api.listUsers.mockResolvedValue({ data: OWN_USERS })
+    mocks.api.authMe.mockResolvedValue({ data: { id: 1 } })
+    mocks.api.addAppShare.mockImplementation(async () => {
+      members = [{ user_id: 7, nickname: '老王', created_at: '2026-11-16T08:00:00+00:00' }]
+      return { data: members[0] }
+    })
+
+    const wrapper = await mountView()
+    await wrapper.findAll('.zc-menu-share')[0].trigger('click')
+    await flushPromises()
+
+    wrapper.vm.shareM.pick = 7
+    await wrapper.vm.$nextTick()
+    await wrapper.find('.zc-share-add .stub-a-button').trigger('click')
+    await flushPromises()
+
+    expect(mocks.api.addAppShare).toHaveBeenCalledWith(1, 7)
+    expect(wrapper.find('.zc-share-member').text()).toContain('老王')
+  })
+})
+
+// ---------- 发布申请与审批（Ticket 009，ADR-0050）：被共享者申请 → 所有者批准即执行 ----------
+const PENDING_REQ = { id: 55, status: 'pending', reason: null,
+                      created_at: '2026-11-16T08:00:00+00:00' }
+const pendingShare = (over = {}) => ({
+  data: [{ ...SHARED_APPS[0], pending_publish: true, publish_request: PENDING_REQ, ...over }],
+})
+
+describe('AppsView 发布申请与审批', () => {
+  it('共享卡 prod 段的「发布」位置是「申请发布」：点击调 createPublishRequest', async () => {
+    mocks.api.createPublishRequest.mockResolvedValue({ data: PENDING_REQ })
+    mocks.api.listSharedApps.mockResolvedValue({ data: SHARED_APPS })
+    const wrapper = await mountView()
+
+    const apply = wrapper.find('.zc-shared .zc-act-apply')
+    expect(apply.exists()).toBe(true)
+    expect(apply.text()).toContain('申请发布')
+    expect(apply.attributes('aria-label')).toBe('申请发布')
+    await apply.trigger('click')
+    await flushPromises()
+    expect(mocks.api.createPublishRequest).toHaveBeenCalledWith(91)
+  })
+
+  it('栈闸门同样收窄协作方：名单外栈的「申请发布」置灰', async () => {
+    mocks.api.listSharedApps.mockResolvedValue({
+      data: [{ ...SHARED_APPS[0], stack: 'vue3-deno' }],
+    })
+    const wrapper = await mountView()
+    expect(wrapper.find('.zc-shared .zc-act-apply').attributes('disabled')).toBeDefined()
+  })
+
+  it('发布中（publishing）时「申请发布」置灰，理由在 title 上', async () => {
+    mocks.api.listSharedApps.mockResolvedValue({
+      data: [{ ...SHARED_APPS[0], status_prod: 'publishing' }],
+    })
+    const wrapper = await mountView()
+    const apply = wrapper.find('.zc-shared .zc-act-apply')
+    expect(apply.attributes('disabled')).toBeDefined()
+    expect(apply.attributes('title')).toContain('发布中')
+  })
+
+  it('待审批：按钮置灰写「待审批」，旁边给撤回入口，点击调 withdrawPublishRequest', async () => {
+    mocks.api.withdrawPublishRequest.mockResolvedValue({ data: { ok: true } })
+    mocks.api.listSharedApps.mockResolvedValue(pendingShare())
+    const wrapper = await mountView()
+
+    const prod = wrapper.find('.zc-shared .zc-env-prod')
+    expect(prod.find('.zc-act-apply').exists()).toBe(false)
+    const waiting = prod.findAll('.zc-env-btn').find((b) => b.attributes('aria-label') === '待审批')
+    expect(waiting.attributes('disabled')).toBeDefined()
+    expect(waiting.text()).toContain('待审批')
+    await prod.find('.zc-act-withdraw').trigger('click')
+    await flushPromises()
+    expect(mocks.api.withdrawPublishRequest).toHaveBeenCalledWith(91, 55)
+  })
+
+  it('驳回：理由常驻卡片，按钮变「重新申请」', async () => {
+    mocks.api.listSharedApps.mockResolvedValue({
+      data: [{ ...SHARED_APPS[0], publish_request: {
+        id: 56, status: 'rejected', reason: '版本说明太潦草',
+        created_at: '2026-11-16T08:00:00+00:00' } }],
+    })
+    const wrapper = await mountView()
+    const card = wrapper.find('.zc-shared .stub-card')
+
+    expect(card.find('.zc-reject-reason').text()).toContain('版本说明太潦草')
+    const apply = card.find('.zc-act-apply')
+    expect(apply.text()).toContain('重新申请')
+    expect(apply.attributes('aria-label')).toBe('重新申请发布')
+  })
+
+  it('所有者卡片：pending_publish 时 ☰ 上挂红点，没有待审的卡片不挂', async () => {
+    mocks.api.listApps.mockResolvedValue({
+      data: [{ ...APPS[0], pending_publish: true }, APPS[1], APPS[2], APPS[3]],
+    })
+    mocks.api.appMetricsSummary.mockResolvedValue(summaryOf([]))
+    const wrapper = mount(AppsView, { global: { stubs: STUBS } })
+    await flushPromises()
+
+    const badges = wrapper.findAll('.stub-badge')
+    expect(badges).toHaveLength(APPS.length)
+    expect(badges[0].attributes('data-dot')).toBe('true')
+    expect(badges[0].attributes('title')).toContain('待审批')
+    expect(badges[1].attributes('data-dot')).toBe('false')
+  })
+
+  it('共享管理弹框待审区块：申请人 + 时间，批准调 approvePublishRequest(appId, rid)', async () => {
+    let pending = { ...PENDING_REQ, requester_id: 7, requester_nickname: '老王' }
+    mocks.api.getAppShare.mockImplementation(async () => ({ data: { members: [], pending_request: pending } }))
+    mocks.api.listUsers.mockResolvedValue({ data: OWN_USERS })
+    mocks.api.authMe.mockResolvedValue({ data: { id: 1 } })
+    mocks.api.approvePublishRequest.mockImplementation(async () => {
+      pending = null
+      return { data: { ok: true } }
+    })
+
+    const wrapper = await mountView()
+    await wrapper.findAll('.zc-menu-share')[0].trigger('click')
+    await flushPromises()
+
+    const block = wrapper.find('.zc-share-pending')
+    expect(block.exists()).toBe(true)
+    expect(block.text()).toContain('老王')
+    expect(block.text()).toContain('申请发布新版本')
+
+    await block.findAll('.stub-a-button').find((b) => b.text().includes('批准')).trigger('click')
+    await flushPromises()
+    expect(mocks.api.approvePublishRequest).toHaveBeenCalledWith(1, 55, false)
+    expect(wrapper.find('.zc-share-pending').exists()).toBe(false)   // 刷新后区块消失
+  })
+
+  it('待审区块驳回：理由为空置灰，填了理由才调 rejectPublishRequest(appId, rid, reason)', async () => {
+    let pending = { ...PENDING_REQ, requester_id: 7, requester_nickname: '老王' }
+    mocks.api.getAppShare.mockImplementation(async () => ({ data: { members: [], pending_request: pending } }))
+    mocks.api.listUsers.mockResolvedValue({ data: OWN_USERS })
+    mocks.api.authMe.mockResolvedValue({ data: { id: 1 } })
+    mocks.api.rejectPublishRequest.mockImplementation(async () => {
+      pending = null
+      return { data: { ok: true } }
+    })
+
+    const wrapper = await mountView()
+    await wrapper.findAll('.zc-menu-share')[0].trigger('click')
+    await flushPromises()
+
+    const block = wrapper.find('.zc-share-pending')
+    const rejectBtn = block.findAll('.stub-a-button').find((b) => b.text().includes('驳回'))
+    expect(rejectBtn.attributes('disabled')).toBeDefined()
+
+    wrapper.vm.shareM.rejectReason = '版本说明太潦草'
+    await wrapper.vm.$nextTick()
+    expect(rejectBtn.attributes('disabled')).toBeUndefined()
+    await rejectBtn.trigger('click')
+    await flushPromises()
+    expect(mocks.api.rejectPublishRequest).toHaveBeenCalledWith(1, 55, '版本说明太潦草')
+  })
+
+  it('批准撞上 chat_active（409）：弹确认框，确认后带 force 重试', async () => {
+    mocks.api.getAppShare.mockResolvedValue({ data: {
+      members: [], pending_request: { ...PENDING_REQ, requester_id: 7, requester_nickname: '老王' } } })
+    mocks.api.listUsers.mockResolvedValue({ data: OWN_USERS })
+    mocks.api.authMe.mockResolvedValue({ data: { id: 1 } })
+    mocks.api.approvePublishRequest
+      .mockRejectedValueOnce({ response: { status: 409, data: { detail: {
+        code: 'chat_active', message: 'AI 正在修改代码，稍后再发布' } } } })
+      .mockResolvedValueOnce({ data: { ok: true } })
+
+    const wrapper = await mountView()
+    await wrapper.findAll('.zc-menu-share')[0].trigger('click')
+    await flushPromises()
+
+    await wrapper.find('.zc-share-pending').findAll('.stub-a-button')
+      .find((b) => b.text().includes('批准')).trigger('click')
+    await flushPromises()
+
+    expect(mocks.antd.Modal.confirm).toHaveBeenCalledTimes(1)
+    const opts = mocks.antd.Modal.confirm.mock.calls[0][0]
+    expect(opts.content).toContain('AI 正在修改代码')
+    await opts.onOk()
+    await flushPromises()
+    expect(mocks.api.approvePublishRequest).toHaveBeenLastCalledWith(1, 55, true)
   })
 })

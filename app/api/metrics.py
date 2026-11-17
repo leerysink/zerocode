@@ -38,14 +38,16 @@ SUMMARY_SERIES_KINDS = ("cpu", "memory")
 async def _load_app(request: Request, app_id: int) -> dict:
     """取应用并做归属校验：owner 看自己、创始人看全部；别人的/未知的一律 404。
 
-    鉴权只这一处，current/history 共用：非创始人传 owner_user_id 走 get_app 的归属过滤（命中不到
-    即 404，与不存在同口径不暴露存在性）；创始人（is_founder）传 None 绕过过滤。复用
-    get_app 现有语义，不新增存在性区分。"""
+    鉴权只这一处，current/history 共用：非创始人传 user_id 走 `get_app_for_user` 的归属过滤
+    （命中不到即 404，与不存在同口径不暴露存在性）；创始人（is_founder）传 None 走同一接缝的
+    bypass（规格 §2.5：这个例外保持原样，不扩散到其他端点）。"""
     actor = request.state.actor
     owner = None if actor.get("is_founder") else actor["id"]
     try:
-        return await app_service.get_app(request.app.state.session_factory, app_id,
-                                         owner_user_id=owner)
+        # Ticket 003：被共享者与所有者同权看指标（只读观测）；不可见仍由接缝统一 404。
+        app, _role = await app_service.get_app_for_user(
+            request.app.state.session_factory, app_id, owner)
+        return app
     except DeployError as e:
         raise HTTPException(e.status, str(e))
 
@@ -104,16 +106,19 @@ async def _series_batch(session_factory, app_ids: list[int], kinds: tuple[str, .
 async def metrics_summary(request: Request):
     """应用页仪表卡的批量取数：当前账号可见的每个应用一条，含最近点 + 近 1h 曲线。
 
-    权限只有一条判据——沿用 app_service.list_apps 的 owner 过滤（创始人看全部），不在这里再写
-    一遍 SQL 权限，免得长出第二套「谁能看谁」。别人的应用不是 404 而是**不出现在 items 里**：
-    批量端点没有「那一个应用」可供 404，缺席本身就是不暴露存在性的口径。
-    停炉语义与 current 一致：cpu/memory 连点带曲线一起归空，不把残留读数画成趋势。"""
+    权限只有一条判据——沿用 app_service 的可见集（Ticket 003 起非创始人 = 自有 + 被共享；
+    创始人看全部），不在这里再写一遍 SQL 权限，免得长出第二套「谁能看谁」。别人的应用不是
+    404 而是**不出现在 items 里**：批量端点没有「那一个应用」可供 404，缺席本身就是不暴露
+    存在性的口径。停炉语义与 current 一致：cpu/memory 连点带曲线一起归空，不把残留读数画成趋势。"""
     actor = request.state.actor
     owner = None if actor.get("is_founder") else actor["id"]
-    apps = await app_service.list_apps(request.app.state.session_factory, owner_user_id=owner)
+    sf = request.app.state.session_factory
+    apps = await app_service.list_apps(sf, owner_user_id=owner)
+    if owner is not None:
+        # 「被共享」不来自 list_apps 的 owner 过滤：显式并集，共享与自有同权出读数。
+        apps = apps + await app_service.list_shared_apps(sf, owner)
     if not apps:
         return {"window": SUMMARY_WINDOW_LABEL, "items": []}
-    sf = request.app.state.session_factory
     ids = [int(a["id"]) for a in apps]
     latest = await _latest_batch(sf, ids)
     series = await _series_batch(sf, ids, SUMMARY_SERIES_KINDS, SUMMARY_WINDOW, SUMMARY_MAX_POINTS)

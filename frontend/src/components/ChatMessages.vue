@@ -63,6 +63,9 @@ function isBrowserTool(m) {
   return BROWSER_SESSION_TOOL_NAMES.includes(m.name || '')
 }
 
+// 只读旁观（Ticket 008）：被共享者的待答卡只展示，不提供任何可点的出口
+const watchOnly = computed(() => store.currentWorkspaceRole === 'collaborator')
+
 // 提问卡：ask_user 调用行一律渲染成卡片，待答/已答由有没有结果行决定（见 AskUserCard）。
 // 题目已在归一化阶段整形好；没有题目（模型给了空参数）就落回折叠块，不画一张空卡。
 function isAskCard(m) {
@@ -236,8 +239,10 @@ onBeforeUnmount(cancelFill)
                其余落回通用折叠块。
                字段一律是归一化后的 name/args/result，实时与历史同形（见 messageModel.js）。 -->
           <div v-else-if="item.m.role === 'tool'" class="zc-msg is-tool">
-            <AskUserCard v-if="isAskCard(item.m)" :questions="item.m.questions" :result="item.m.result" />
-            <ConfirmCard v-else-if="confirmCardState(item.m)" :msg="item.m" :state="confirmCardState(item.m)" :progress="liveProgress(item.m, item.i)" />
+            <AskUserCard v-if="isAskCard(item.m)" :questions="item.m.questions" :result="item.m.result"
+                         :watch-only="watchOnly" />
+            <ConfirmCard v-else-if="confirmCardState(item.m)" :msg="item.m" :state="confirmCardState(item.m)"
+                         :progress="liveProgress(item.m, item.i)" :watch-only="watchOnly" />
             <TodoCard v-else-if="item.m.name === 'todo_write' && item.m.args && item.m.args.todos" :todos="item.m.args.todos" />
             <PageInspectCard v-else-if="isPageCard(item.m, item.i)" :msg="item.m" :progress="liveProgress(item.m, item.i)" />
             <BrowserFlowCard v-else-if="isBrowserCard(item.m, item.i)" :msg="item.m" :progress="liveProgress(item.m, item.i)" />

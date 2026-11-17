@@ -89,7 +89,11 @@ async def publish_to_store(request: Request, app_id: int, body: ReleaseIn,
     刻意不套 `_spawn` 单任务闸门：它不碰容器，与 dev/prod 生命周期任务不互踩。
     """
     sf = request.app.state.session_factory
+    from app.services import app_service
     try:
+        # 上架仅所有者（规格 2026-11-16 §5.4）：release 服务按 id 直取应用，判权必须在这里先过接缝
+        _app, role = await app_service.get_app_for_user(sf, app_id, actor["id"])
+        app_service.require_owner(role)
         return await release_svc.create_release(
             sf, app_id=app_id, title=body.title, summary=body.summary,
             actor_id=actor["id"])
@@ -185,7 +189,8 @@ async def store_link(request: Request, app_id: int, actor: dict = Actor):
     sf = request.app.state.session_factory
     from app.services import app_service
     try:
-        app = await app_service.get_app(sf, app_id, owner_user_id=actor["id"])
+        app, role = await app_service.get_app_for_user(sf, app_id, actor["id"])
+        app_service.require_owner(role)   # 商店绑定不对被共享者开放（规格 §5.4 仅 owner）
         if not app.get("store"):
             raise DeployError("该应用不是商店实例", status=404)
     except DeployError as e:

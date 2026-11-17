@@ -23,6 +23,9 @@ const props = defineProps({
   workspaceId: { type: [Number, String], required: true },
   workspaceName: { type: String, default: '' },
   initialFile: { type: String, default: '' },
+  // 被共享工作区整页只读（规格 2026-11-16 §2.6）：保存与系统打开由后端 403 兜底，
+  // 这里关掉编辑入口，Ctrl+S 只提示不发请求。
+  workspaceReadOnly: { type: Boolean, default: false },
 })
 
 const treeData = ref([])
@@ -208,7 +211,7 @@ async function ensureLoaded(path) {
     loading: true,
     loaded: false,
     error: '',
-    readOnly: isReadOnlyPath(path),
+    readOnly: props.workspaceReadOnly || isReadOnlyPath(path),
     dirty: false,
   })
   try {
@@ -222,7 +225,7 @@ async function ensureLoaded(path) {
       loading: false,
       loaded: true,
       error: '',
-      readOnly: isReadOnlyPath(path),
+      readOnly: props.workspaceReadOnly || isReadOnlyPath(path),
       dirty: false,
     })
   } catch (e) {
@@ -234,7 +237,7 @@ async function ensureLoaded(path) {
       loading: false,
       loaded: false,
       error: e?.response?.data?.detail || '读取失败',
-      readOnly: isReadOnlyPath(path),
+      readOnly: props.workspaceReadOnly || isReadOnlyPath(path),
       dirty: false,
     })
   }
@@ -317,6 +320,10 @@ function flashSaved() {
 async function saveActive() {
   const path = active.value
   if (!path || saving.value || conflict.value) return
+  if (props.workspaceReadOnly) {
+    message.info('共享只读：不能保存修改')
+    return
+  }
   const entry = files.value[path]
   if (!entry || !entry.loaded || entry.loading || entry.error || entry.readOnly || !entry.dirty) return
   const content = entry.content
@@ -567,7 +574,7 @@ watch(() => props.workspaceId, async () => {
         :saved-content="activeEntry?.savedContent ?? ''"
         :loading="!!activeEntry?.loading"
         :error="activeEntry?.error || ''"
-        :read-only="!!activeEntry?.readOnly"
+        :read-only="workspaceReadOnly || !!activeEntry?.readOnly"
         :theme="theme"
         :open-paths="openPaths"
         @update:content="onContent"
@@ -581,7 +588,7 @@ watch(() => props.workspaceId, async () => {
         :path="active"
         :content="activeEntry?.content ?? ''"
         :cursor="cursor"
-        :read-only="!!activeEntry?.readOnly"
+        :read-only="workspaceReadOnly || !!activeEntry?.readOnly"
         :save-text="saveText"
         :theme="theme"
         @toggle-theme="toggleTheme"

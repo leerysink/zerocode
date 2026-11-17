@@ -664,3 +664,35 @@ describe('MobileModal 小程序预览码（规格 2026-11-09 US-16）', () => {
     expect(w.find('.zc-mp-error').text()).toContain('尚未绑定小程序账号')
   })
 })
+
+describe('MobileModal 被共享者边界（Ticket 004）', () => {
+  async function mountAsCollaborator(over = {}) {
+    vi.stubGlobal('location', { hostname: 'localhost' })
+    mocks.api.appMobile.mockResolvedValue({ data: { ...INFO, ...over } })
+    const wrapper = mount(MobileModal, {
+      props: { app: { id: 12, name: '乙', role: 'collaborator' }, open: true },
+      global: { stubs: { 'a-modal': ModalStub, 'a-button': ButtonStub, 'a-spin': SpinStub } },
+    })
+    mounted.push(wrapper)
+    await flushPromises()
+    return wrapper
+  }
+
+  it('图标覆盖与小程序操作区不渲染，只留只读提示', async () => {
+    const w = await mountAsCollaborator()
+    expect(w.find('.zc-icon-pick').exists()).toBe(false)
+    expect(w.find('.zc-icon-reset').exists()).toBe(false)
+    expect(w.find('.zc-icon-input').exists()).toBe(false)
+    expect(w.find('.zc-mp').exists()).toBe(false)       // 整块小程序面板不挂载
+    expect(w.text()).toContain('被共享者只读')
+  })
+
+  it('地址/二维码照常可用，APK 可重打', async () => {
+    mocks.api.rebuildMobileApk.mockResolvedValue({ data: { ok: true } })
+    const w = await mountAsCollaborator()
+    expect(w.find('.zc-m-copy').attributes('disabled')).toBeUndefined()
+    await w.find('.zc-apk-rebuild').trigger('click')
+    await flushPromises()
+    expect(mocks.api.rebuildMobileApk).toHaveBeenCalledWith(12)
+  })
+})

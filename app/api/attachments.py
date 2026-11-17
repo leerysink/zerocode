@@ -10,17 +10,24 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse
 from sqlalchemy import text
 
-from app.services import attachment_service as att
+from app.services import app_service, attachment_service as att
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
 
-async def _owns_session(s, session_id: int, uid: int) -> bool:
-    return (await s.execute(text(
-        "SELECT 1 FROM chat_session cs JOIN workspace w ON w.id = cs.workspace_id "
-        "WHERE cs.id=:i AND w.owner_user_id=:u"), {"i": session_id, "u": uid})).first() is not None
+async def _session_role(request: Request, session_id: int) -> str | None:
+    """会话 → 工作区 → 角色的单点判权（Ticket 000）：附件按「所聊会话的可见性」判，
+    会话本身经 workspace_role 收口，不在这里再拼一遍归属 JOIN。"""
+    sf = request.app.state.session_factory
+    async with sf() as s:
+        wid = (await s.execute(text(
+            "SELECT workspace_id FROM chat_session WHERE id=:i"),
+            {"i": session_id})).scalar()
+    if wid is None:
+        return None
+    return await app_service.workspace_role(sf, wid, request.state.actor["id"])
 
 
 @router.post("/api/sessions/{session_id}/attachments", status_code=201)
@@ -31,8 +38,12 @@ async def upload_attachment(request: Request, session_id: int, filename: str = "
         raise HTTPException(400, "仅支持图片文件")
     sf = request.app.state.session_factory
     async with sf() as s:
-        if not await _owns_session(s, session_id, uid):
+        role = await _session_role(request, session_id)
+        if role is None:
             raise HTTPException(404, "会话不存在")
+        if role != "owner":
+            # 上传仅所有者（规格 §2.6/§5.4）：被共享者已可见会话 → 403 诚实口径
+            raise HTTPException(403, "仅应用所有者可执行此操作")
         staged = await att.staged_bytes(sf, session_id)
     if staged >= att.MAX_MESSAGE_BYTES:
         raise HTTPException(413, "单条消息图片合计不能超过 10MB")
@@ -65,16 +76,13 @@ async def upload_attachment(request: Request, session_id: int, filename: str = "
 
 @router.get("/api/attachments/{attachment_id}")
 async def get_attachment(request: Request, attachment_id: int):
-    uid = request.state.actor["id"]
     sf = request.app.state.session_factory
     async with sf() as s:
         row = (await s.execute(text(
-            "SELECT a.storage_path, a.mime, a.filename FROM message_attachment a "
-            "JOIN chat_session cs ON cs.id = a.session_id "
-            "JOIN workspace w ON w.id = cs.workspace_id "
-            "WHERE a.id=:i AND w.owner_user_id=:u"),
-            {"i": attachment_id, "u": uid})).mappings().first()
-    if not row:
+            "SELECT a.storage_path, a.mime, a.filename, a.session_id FROM message_attachment a "
+            "WHERE a.id=:i"), {"i": attachment_id})).mappings().first()
+        role = await _session_role(request, row["session_id"]) if row else None
+    if not row or role is None:
         raise HTTPException(404, "附件不存在")
     path = att.resolve_storage_path(row["storage_path"])
     if path is None or not path.is_file():

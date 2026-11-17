@@ -5,14 +5,18 @@
 import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { message, Modal } from 'ant-design-vue'
 import {
-  AppstoreOutlined, CloudUploadOutlined, CopyOutlined, DashboardOutlined,
+  AppstoreOutlined, ClockCircleOutlined, CloudUploadOutlined, CopyOutlined, DashboardOutlined,
   DatabaseOutlined, DeleteOutlined, EditOutlined,
-  EyeOutlined, FolderOpenOutlined, HistoryOutlined, MenuOutlined, MobileOutlined, PlayCircleOutlined,
-  PoweroffOutlined, ProfileOutlined, RedoOutlined, ReloadOutlined, RocketOutlined, ShopOutlined,
+  EyeOutlined, FolderOpenOutlined, HistoryOutlined, LogoutOutlined, MenuOutlined, MobileOutlined,
+  PlayCircleOutlined, PoweroffOutlined, ProfileOutlined, RedoOutlined, ReloadOutlined,
+  RocketOutlined, ShareAltOutlined, ShopOutlined,
 } from '@ant-design/icons-vue'
 import {
-  appUrls, appMetricsSummary, createApp, deleteApp, devReset, devRestart, devStart, devStatus, devStop,
-  listApps, openFolder, prodStart, prodStop, releaseToStore, renameApp, validateAppSlug,
+  addAppShare, appUrls, appMetricsSummary, approvePublishRequest, authMe, createApp,
+  createPublishRequest, deleteApp, devReset, devRestart, devStart, devStatus, devStop,
+  getAppShare, leaveAppShare, listApps, listSharedApps, listUsers, openFolder, prodStart,
+  prodStop, rejectPublishRequest, releaseToStore, removeAppShare, renameApp, validateAppSlug,
+  withdrawPublishRequest,
 } from '../api'
 import { fmtBytes, fmtPct } from '../utils/metricsFormat'
 import PublishHistory from '../components/PublishHistory.vue'
@@ -29,6 +33,8 @@ import { isMobileApp } from '../utils/mobileApp'
 import { useConfigStore } from '../stores/config'
 
 const apps = ref([])
+// 「共享给我」（规格 2026-11-16 §5.3）：独立区块、不混排；页头统计只算自有应用
+const sharedApps = ref([])
 const loading = ref(true)
 const showWizard = ref(false)
 const current = ref(0)
@@ -44,6 +50,10 @@ const urlsCache = reactive({})
 const copyFail = reactive({ key: '', url: '' })
 const rename = reactive({ open: false, app: null, name: '' })
 const del = reactive({ open: false, app: null })
+// 共享管理弹框：members 来自 GET share，users 是选人下拉（已剔掉自己，后端也挡自共享）；
+// pendingReq 是待审发布申请（S4 审批区块），rejectReason 是驳回理由草稿
+const shareM = reactive({ open: false, app: null, members: [], users: [], pick: undefined,
+                          pendingReq: null, rejectReason: '', loading: false, busy: false })
 const openingFolder = ref(false)
 const cfg = useConfigStore()
 // 仪表带数据：整页一次批量取（appMetricsSummary），按 app_id 贴回卡片。
@@ -72,6 +82,12 @@ async function load(silent = false) {
     apps.value = (await listApps()).data
   } catch (e) {
     if (!silent) message.error(e?.response?.data?.detail || '应用列表加载失败')
+  }
+  // 共享给我单独取：失败不拖垮自有列表（两块数据互不依赖），静默轮询同样不弹错
+  try {
+    sharedApps.value = (await listSharedApps()).data
+  } catch (e) {
+    if (!silent) message.error(e?.response?.data?.detail || '共享应用加载失败')
   } finally {
     if (!silent) loading.value = false
   }
@@ -149,7 +165,11 @@ const stats = computed(() => {
     else if (s === 'running') n.running += 1
     else n.stopped += 1
   }
-  const cpus = msum.items.map((it) => (it.cpu ? Number(it.cpu.value) : null)).filter(Number.isFinite)
+  // 平均 CPU 只算自有应用：summary 现在也带被共享应用（Ticket 003），页头若不收窄，
+  // 「我的应用」的统计会被别人的负载拉偏——这一块的口径始终是「我的」。
+  const own = new Set(apps.value.map((a) => a.id))
+  const cpus = msum.items.filter((it) => own.has(it.app_id))
+    .map((it) => (it.cpu ? Number(it.cpu.value) : null)).filter(Number.isFinite)
   n.cpuText = cpus.length ? fmtPct(cpus.reduce((x, y) => x + y, 0) / cpus.length) : '—'
   return n
 })
@@ -300,6 +320,142 @@ async function doRename() {
     await load()
   } catch (e) {
     message.error(e?.response?.data?.detail || '重命名失败')
+  }
+}
+
+// ---- 共享管理（规格 2026-11-16 §5.1）：仅自有卡片入口 ----
+const shareOptions = computed(() => shareM.users.map((u) => ({
+  value: u.id, label: u.is_founder ? `${u.nickname}（创始人）` : u.nickname,
+})))
+const fmtShareTime = (iso) => (iso ? new Date(iso).toLocaleString('zh-CN', { hour12: false }) : '')
+
+async function openShare(a) {
+  Object.assign(shareM, { open: true, app: a, members: [], users: [], pick: undefined,
+    pendingReq: null, rejectReason: '', loading: true, busy: false })
+  try {
+    const [mem, users, me] = await Promise.all([getAppShare(a.id), listUsers(), authMe()])
+    shareM.members = mem.data?.members || []
+    shareM.pendingReq = mem.data?.pending_request || null
+    // 自己不进候选：后端对自共享回 400，这里提前把这条路从界面上去掉
+    shareM.users = (users.data || []).filter((u) => u.id !== me.data?.id)
+  } catch (e) {
+    message.error(e?.response?.data?.detail || '共享信息加载失败')
+  } finally {
+    shareM.loading = false
+  }
+}
+async function refreshMembers() {
+  const { data } = await getAppShare(shareM.app.id)
+  shareM.members = data?.members || []
+  shareM.pendingReq = data?.pending_request || null
+}
+async function doShare() {
+  if (!shareM.app || !shareM.pick) return
+  shareM.busy = true
+  try {
+    await addAppShare(shareM.app.id, shareM.pick)
+    message.success('已共享')
+    shareM.pick = undefined
+    await refreshMembers()
+  } catch (e) {
+    message.error(e?.response?.data?.detail || '共享失败')
+  } finally {
+    shareM.busy = false
+  }
+}
+async function doUnshare(m) {
+  if (!shareM.app) return
+  try {
+    await removeAppShare(shareM.app.id, m.user_id)
+    message.success(`已移除 ${m.nickname}`)
+    await refreshMembers()
+  } catch (e) {
+    message.error(e?.response?.data?.detail || '移除失败')
+  }
+}
+
+// ---- 发布申请与审批（规格 §2.3/§5.2，ADR-0050）----
+// 被共享者侧：待审时同一个按钮置灰，卡片上给撤回入口；驳回理由常驻卡片直到下一次申请。
+function rejectedReason(a) {
+  const req = a.publish_request
+  return req && req.status === 'rejected' ? (req.reason || '') : ''
+}
+async function applyPublish(a) {
+  try {
+    await createPublishRequest(a.id)
+    message.success('已提交发布申请，等待所有者审批')
+    await load(true)
+  } catch (e) {
+    message.error(e?.response?.data?.detail || '申请发布失败')
+  }
+}
+async function withdrawPublish(a) {
+  if (!a.publish_request?.id) return
+  try {
+    await withdrawPublishRequest(a.id, a.publish_request.id)
+    message.success('已撤回发布申请')
+    await load(true)
+  } catch (e) {
+    message.error(e?.response?.data?.detail || '撤回失败')
+  }
+}
+// 退出共享（S13）：只删自己那一行 app_share，不删会话/文件/发布记录；确认后卡片随刷新消失。
+// 所有者重新共享即恢复原样，所以确认文案不写成「永久移除」。
+function askLeaveShare(a) {
+  Modal.confirm({
+    title: `退出共享「${a.name}」？`,
+    content: '退出后该应用将从「共享给我」消失；所有者重新共享即可恢复可见。',
+    okText: '退出共享', okType: 'danger', cancelText: '取消',
+    onOk: async () => {
+      try {
+        await leaveAppShare(a.id)
+        message.success('已退出共享')
+        await load(true)
+      } catch (e) {
+        message.error(e?.response?.data?.detail || '退出失败')
+      }
+    },
+  })
+}
+// 所有者侧审批：批准即执行（后端先跑与直接发布同一道闸门）；chat_active 的 409 与直接发布
+// 同形状，按 code 弹强制确认后带 force 重试。
+async function doApprove(force = false) {
+  if (!shareM.app || !shareM.pendingReq) return
+  shareM.busy = true
+  try {
+    await approvePublishRequest(shareM.app.id, shareM.pendingReq.id, force)
+    message.success('已批准，正在发布新版本')
+    await refreshMembers()
+    await load(true)
+  } catch (e) {
+    const detail = e?.response?.data?.detail
+    if (e?.response?.status === 409 && detail && detail.code === 'chat_active') {
+      Modal.confirm({
+        title: 'AI 正在修改代码', content: detail.message,
+        okText: '继续发布', cancelText: '等一等',
+        onOk: () => doApprove(true),
+      })
+    } else {
+      message.error(typeof detail === 'string' ? detail : '审批未受理')
+    }
+  } finally {
+    shareM.busy = false
+  }
+}
+async function doReject() {
+  const reason = shareM.rejectReason.trim()
+  if (!shareM.app || !shareM.pendingReq || !reason) return
+  shareM.busy = true
+  try {
+    await rejectPublishRequest(shareM.app.id, shareM.pendingReq.id, reason)
+    message.success('已驳回')
+    shareM.rejectReason = ''
+    await refreshMembers()
+    await load(true)
+  } catch (e) {
+    message.error(e?.response?.data?.detail || '驳回失败')
+  } finally {
+    shareM.busy = false
   }
 }
 
@@ -463,9 +619,11 @@ async function doRelease() {
     </div>
 
     <a-spin v-if="loading" class="zc-spin" />
-    <a-empty v-else-if="!apps.length" description="还没有应用——点「新建应用」，用一句话描述你要的软件"
+    <template v-else>
+    <a-empty v-if="!apps.length && !sharedApps.length"
+             description="还没有应用——点「新建应用」，用一句话描述你要的软件"
              style="margin-top: 80px" />
-    <div v-else class="zc-grid">
+    <div v-if="apps.length" class="zc-grid">
       <a-card v-for="a in apps" :key="a.id" class="zc-card zc-metric-card"
               :style="{ '--zc-rail': statusColor(a.status_prod) }">
         <template #title>
@@ -475,19 +633,26 @@ async function doRelease() {
           <a-tag class="zc-card-tag">{{ a.scale === 'large' ? '大型' : '小型' }} · {{ a.stack }}</a-tag>
         </template>
         <template #extra>
-          <a-dropdown :trigger="['click']" placement="bottomRight">
-            <menu-outlined class="zc-card-menu-btn" title="破坏性操作" @click.stop />
-            <template #overlay>
-              <div class="zc-app-menu">
-                <!-- ☰ 只剩这两个会删数据/删应用的动作。平铺进工具条等于把误点的代价摊到每次点击上，
-                     而它们本来各自带一次确认框，收在这里是对的。 -->
-                <div class="zc-app-menu-item zc-menu-reset" @click.stop="resetDev(a)"><redo-outlined /> 重建 dev</div>
-                <div class="zc-app-menu-item zc-app-menu-danger zc-menu-del" @click.stop="openDelete(a)">
-                  <delete-outlined /> 删除应用
+          <!-- S3 待审角标：有 pending 发布申请就在 ☰ 上点一颗红点；随 5s 轮询消失于批准/驳回/撤回之后 -->
+          <a-badge :dot="a.pending_publish" class="zc-pending-badge"
+                   :title="a.pending_publish ? '有发布申请待审批' : ''">
+            <a-dropdown :trigger="['click']" placement="bottomRight">
+              <menu-outlined class="zc-card-menu-btn" title="破坏性操作" @click.stop />
+              <template #overlay>
+                <div class="zc-app-menu">
+                  <!-- ☰ 收着共享管理与两个会删数据/删应用的动作。平铺进工具条等于把误点的代价摊到每次
+                       点击上，而它们本来各自带一次确认框，收在这里是对的。 -->
+                  <div class="zc-app-menu-item zc-menu-share" @click.stop="openShare(a)">
+                    <share-alt-outlined /> 共享管理
+                  </div>
+                  <div class="zc-app-menu-item zc-menu-reset" @click.stop="resetDev(a)"><redo-outlined /> 重建 dev</div>
+                  <div class="zc-app-menu-item zc-app-menu-danger zc-menu-del" @click.stop="openDelete(a)">
+                    <delete-outlined /> 删除应用
+                  </div>
                 </div>
-              </div>
-            </template>
-          </a-dropdown>
+              </template>
+            </a-dropdown>
+          </a-badge>
         </template>
         <p class="zc-line">
           预览：{{ statusText(a.status_dev) }} · 端口 {{ a.dev_port }}
@@ -600,6 +765,117 @@ async function doRelease() {
       </a-card>
     </div>
 
+    <!-- 「共享给我」（规格 2026-11-16 §5.3/§5.6）：独立区块、不混排；为空时整块不渲染。
+         动作按被共享者权限裁剪：可起停/重启 dev、预览、看观测与历史；破坏性动作与发布留在所有者卡片。 -->
+    <section v-if="sharedApps.length" class="zc-shared" aria-label="共享给我">
+      <h3 class="zc-shared-title">
+        <share-alt-outlined /> 共享给我
+        <span class="zc-shared-count">{{ sharedApps.length }}</span>
+      </h3>
+      <div class="zc-grid">
+        <a-card v-for="a in sharedApps" :key="`shared-${a.id}`" class="zc-card zc-shared-card"
+                :style="{ '--zc-rail': statusColor(a.status_prod) }">
+          <template #title>
+            <span class="zc-dot" :style="{ background: statusColor(a.status_dev) }" />
+            <span class="zc-card-name">{{ a.name }}</span>
+            <a-tag class="zc-share-owner-tag">所有者：{{ a.owner_nickname }}</a-tag>
+            <a-tag class="zc-card-tag">{{ a.scale === 'large' ? '大型' : '小型' }} · {{ a.stack }}</a-tag>
+          </template>
+          <template #extra>
+            <!-- 共享卡 ☰ 只有「退出共享」一个动作（S13）：协作方唯一的离开方式，不删任何数据 -->
+            <a-dropdown :trigger="['click']" placement="bottomRight">
+              <menu-outlined class="zc-card-menu-btn" title="共享操作" @click.stop />
+              <template #overlay>
+                <div class="zc-app-menu">
+                  <div class="zc-app-menu-item zc-app-menu-danger zc-menu-leave"
+                       @click.stop="askLeaveShare(a)"><logout-outlined /> 退出共享</div>
+                </div>
+              </template>
+            </a-dropdown>
+          </template>
+          <p class="zc-line">
+            预览：{{ statusText(a.status_dev) }} · 端口 {{ a.dev_port }}
+            <a v-if="a.status_dev === 'running'" :href="a.preview_url" target="_blank">打开</a>
+          </p>
+          <p class="zc-line sub">
+            正式：<span class="zc-dot" :style="{ background: statusColor(a.status_prod) }" />{{ statusText(a.status_prod) }}
+            <template v-if="a.current_version"> · {{ a.current_version }}</template>
+          </p>
+          <p v-if="copyFail.key === `card:${a.id}`" class="zc-line zc-copy-manual">{{ copyFail.url }}</p>
+          <!-- 环境胶囊：dev 自助起停（003）；prod 起停/重启也开放给协作方（004），但发布仍走所有者/申请 -->
+          <div class="zc-acts">
+            <div class="zc-env-group zc-env-dev"
+                 title="测试环境（dev）：直接跑工程目录里的代码，独立 dev 端口与 _dev 库">
+              <i class="zc-env-dot" :style="{ background: statusColor(a.status_dev) }" />
+              <span class="zc-env-name">dev</span>
+              <button type="button" class="zc-env-btn" :aria-label="devToggleLabel(a)" @click="toggleDev(a)">
+                <poweroff-outlined v-if="a.status_dev === 'running'" />
+                <play-circle-outlined v-else /><span class="zc-tb-label">{{ devToggleLabel(a) }}</span>
+              </button>
+              <button type="button" class="zc-env-btn" aria-label="重启预览" @click="restartDev(a)">
+                <reload-outlined /><span class="zc-tb-label">重启</span>
+              </button>
+            </div>
+            <div class="zc-env-group zc-env-prod"
+                 title="生产环境（prod）：跑已发布的版本，独立 prod 端口与 _prod 库">
+              <i class="zc-env-dot" :style="{ background: statusColor(a.status_prod) }" />
+              <span class="zc-env-name">prod</span>
+              <!-- 被共享者没有直接发布权（ADR-0049）：同一位置放「申请发布」，所有者批准即执行（ADR-0050） -->
+              <template v-if="a.publish_request?.status === 'pending'">
+                <button type="button" class="zc-env-btn zc-env-btn-prim" disabled
+                        aria-label="待审批" title="已提交发布申请，等待所有者审批">
+                  <clock-circle-outlined /><span class="zc-tb-label">待审批</span>
+                </button>
+                <button type="button" class="zc-env-btn zc-act-withdraw" aria-label="撤回申请"
+                        title="撤回发布申请" @click="withdrawPublish(a)">
+                  <delete-outlined /><span class="zc-tb-label">撤回申请</span>
+                </button>
+              </template>
+              <button v-else type="button" class="zc-env-btn zc-env-btn-prim zc-act-apply"
+                      :disabled="!canPublish(a) || a.status_prod === 'publishing'"
+                      :aria-label="a.publish_request?.status === 'rejected' ? '重新申请发布' : '申请发布'"
+                      :title="!canPublish(a) ? '该栈暂不支持发布'
+                        : (a.status_prod === 'publishing' ? '应用正在发布中' : '申请发布新版本（需所有者批准）')"
+                      @click="applyPublish(a)">
+                <cloud-upload-outlined /><span class="zc-tb-label">{{
+                  a.publish_request?.status === 'rejected' ? '重新申请' : '申请发布' }}</span>
+              </button>
+              <button type="button" class="zc-env-btn" :aria-label="prodToggleLabel(a)" @click="toggleProd(a)">
+                <poweroff-outlined v-if="a.status_prod === 'running'" />
+                <play-circle-outlined v-else /><span class="zc-tb-label">{{ prodToggleLabel(a) }}</span>
+              </button>
+            </div>
+          </div>
+          <!-- 驳回理由常驻卡片直到下一次申请：toast 刷新就没了，理由必须留在原地 -->
+          <p v-if="rejectedReason(a)" class="zc-line zc-reject-reason">
+            发布申请被驳回：{{ rejectedReason(a) }}
+          </p>
+          <div class="zc-toolbar" role="group" aria-label="只读操作">
+            <button type="button" class="zc-tb-item zc-menu-preview" @click.stop="openPreview(a)">
+              <eye-outlined /><span class="zc-tb-label">预览</span></button>
+            <button type="button" class="zc-tb-item zc-menu-copy"
+                    @click.stop="copyUrl(a.preview_url, `card:${a.id}`)">
+              <copy-outlined /><span class="zc-tb-label">复制预览地址</span></button>
+            <button type="button" class="zc-tb-item zc-menu-metrics" @click.stop="openMetrics(a)">
+              <dashboard-outlined /><span class="zc-tb-label">资源监控</span></button>
+            <button type="button" class="zc-tb-item zc-menu-history" @click.stop="openHistory(a)">
+              <history-outlined /><span class="zc-tb-label">发布历史</span></button>
+            <button type="button" class="zc-tb-item zc-menu-logs" @click.stop="openLogs(a)">
+              <profile-outlined /><span class="zc-tb-label">查看日志</span></button>
+            <!-- 只读工程文件走网页工作台（S9）：协作方没有「打开工程目录」的系统入口 -->
+            <button type="button" class="zc-tb-item zc-menu-files" @click.stop="openFilesPage(a)">
+              <folder-open-outlined /><span class="zc-tb-label">工程文件</span></button>
+            <a class="zc-tb-item zc-menu-db" :href="`/apps/${a.id}/db`" target="_blank" @click.stop>
+              <database-outlined /><span class="zc-tb-label">DB 操作</span></a>
+            <button v-if="isMobileApp(a)" type="button" class="zc-tb-item zc-menu-mobile"
+                    @click.stop="openMobile(a)">
+              <mobile-outlined /><span class="zc-tb-label">移动端</span></button>
+          </div>
+        </a-card>
+      </div>
+    </section>
+    </template>
+
     <a-modal v-model:open="showWizard" title="新建应用" :footer="null" width="560px" destroy-on-close>
       <a-steps :current="current" size="small" style="margin-bottom: 20px"
                :items="[{ title: '起名字' }, { title: '选规模' }, { title: '选技术栈' }]" />
@@ -641,6 +917,43 @@ async function doRelease() {
           <a-button type="primary" @click="submit">创建应用</a-button>
         </div>
       </div>
+    </a-modal>
+
+    <!-- 共享管理（规格 2026-11-16 §5.1）：成员列表 + 选人共享 + 移除 + 待审发布申请 -->
+    <a-modal v-model:open="shareM.open" :title="`共享管理 · ${shareM.app?.name || ''}`"
+             :footer="null" width="520px" destroy-on-close>
+      <div class="zc-share-add">
+        <a-select v-model:value="shareM.pick" show-search :options="shareOptions"
+                  placeholder="选择一个账号共享给 TA" style="flex: 1" />
+        <a-button type="primary" :disabled="!shareM.pick" :loading="shareM.busy"
+                  @click="doShare">共享</a-button>
+      </div>
+      <!-- 待审区块（S4）：申请人 + 时间 + 批准/驳回。批准即执行，驳回必须填理由 -->
+      <div v-if="shareM.pendingReq" class="zc-share-pending">
+        <p class="zc-share-pending-head">
+          <clock-circle-outlined />
+          <b class="zc-share-pending-nick">{{ shareM.pendingReq.requester_nickname }}</b>
+          申请发布新版本
+          <span class="zc-share-pending-time">{{ fmtShareTime(shareM.pendingReq.created_at) }}</span>
+        </p>
+        <div class="zc-share-pending-acts">
+          <a-input v-model:value="shareM.rejectReason" size="small" placeholder="驳回理由（必填）"
+                   class="zc-share-reason" />
+          <a-button size="small" danger :disabled="!shareM.rejectReason.trim()" :loading="shareM.busy"
+                    @click="doReject">驳回</a-button>
+          <a-button size="small" type="primary" :loading="shareM.busy" @click="doApprove()">批准并发布</a-button>
+        </div>
+      </div>
+      <a-spin v-if="shareM.loading" />
+      <a-empty v-else-if="!shareM.members.length" description="还没有共享给任何人" />
+      <ul v-else class="zc-share-members">
+        <li v-for="m in shareM.members" :key="m.user_id" class="zc-share-member">
+          <span class="zc-share-nick">{{ m.nickname }}</span>
+          <span class="zc-share-time">{{ fmtShareTime(m.created_at) }}</span>
+          <a-button size="small" type="text" danger @click="doUnshare(m)">移除</a-button>
+        </li>
+      </ul>
+      <p class="zc-modal-tip">共享长期有效，可随时移除；被共享者不能删除或重命名该应用。</p>
     </a-modal>
 
     <a-drawer v-model:open="preview.open" :title="`预览 · ${preview.app?.name || ''}`" width="80%">
@@ -863,6 +1176,40 @@ async function doRelease() {
 .zc-tb-item:hover .zc-tb-label, .zc-tb-item:focus-visible .zc-tb-label,
 .zc-env-btn:hover .zc-tb-label, .zc-env-btn:focus-visible .zc-tb-label {
   opacity: 1; transform: translateX(-50%) translateY(0); }
+
+/* ===== 共享（规格 2026-11-16）：共享给我独立区块 + 共享管理弹框 ===== */
+.zc-shared { margin-top: 30px; }
+.zc-shared-title { display: flex; align-items: center; gap: 8px; margin: 0 0 14px;
+                   font-size: 15px; font-weight: 600; color: var(--zc-text); }
+.zc-shared-count { min-width: 20px; padding: 0 7px; border-radius: 10px;
+                   background: rgba(91, 122, 157, 0.12); color: var(--zc-primary);
+                   font-size: 12px; font-weight: 600; line-height: 20px; text-align: center; }
+.zc-share-owner-tag { margin-inline-start: 8px; font-weight: 400; vertical-align: middle;
+                      color: var(--zc-primary); background: rgba(91, 122, 157, 0.08);
+                      border-color: rgba(91, 122, 157, 0.30); }
+.zc-share-add { display: flex; gap: 10px; margin: 4px 0 16px; }
+.zc-share-members { list-style: none; margin: 0; padding: 0; border: 1px solid var(--zc-border);
+                    border-radius: 8px; overflow: hidden; }
+.zc-share-member { display: flex; align-items: center; gap: 12px; padding: 8px 12px; }
+.zc-share-member + .zc-share-member { border-top: 1px solid var(--zc-border); }
+.zc-share-nick { font-size: 13px; font-weight: 600; color: var(--zc-text); }
+.zc-share-time { flex: 1; font-size: 12px; color: var(--zc-text-sub); }
+
+/* ===== 发布申请与审批（ADR-0050）===== */
+/* 待审角标：红点挂在 ☰ 上；批准/驳回/撤回后随 5s 轮询自灭，不靠额外接口 */
+.zc-pending-badge { display: inline-flex; }
+/* 被共享者卡上的驳回理由行：常驻到下一次申请，toast 刷新就没了的理由不算数 */
+.zc-reject-reason { margin: 6px 0 0; padding: 4px 8px; border-radius: 4px; font-size: 12px;
+                    color: #b96a6a; background: #fdf3f2; }
+/* 共享管理弹框的待审区块：申请人 + 时间 + 驳回理由输入 + 两个决策动作 */
+.zc-share-pending { margin: 0 0 16px; padding: 10px 12px; border: 1px solid rgba(196, 154, 68, 0.34);
+                    border-radius: 8px; background: rgba(196, 154, 68, 0.06); }
+.zc-share-pending-head { display: flex; align-items: center; gap: 6px; margin: 0;
+                         font-size: 13px; color: var(--zc-text); }
+.zc-share-pending-nick { font-weight: 600; }
+.zc-share-pending-time { margin-inline-start: auto; font-size: 12px; color: var(--zc-text-sub); }
+.zc-share-pending-acts { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+.zc-share-reason { flex: 1; }
 
 @media (prefers-reduced-motion: reduce) {
   .zc-metric-card, .zc-metric-card::before, .zc-tb-item, .zc-tb-label,

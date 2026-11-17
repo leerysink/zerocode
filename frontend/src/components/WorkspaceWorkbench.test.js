@@ -520,6 +520,20 @@ describe('WorkspaceWorkbench 编辑与保存', () => {
     expect(saveFile).not.toHaveBeenCalled()
   })
 
+  it('被共享工作区（workspaceReadOnly）：浏览不受限，所有文件只读，Ctrl+S 不发请求并提示「共享只读」', async () => {
+    const wrapper = await mountWb({ workspaceReadOnly: true })
+    await select(wrapper, 'a.md')
+
+    expect(readFile).toHaveBeenCalledWith(7, 'a.md') // 读面照常
+    expect(editor(wrapper).props('readOnly')).toBe(true)
+    expect(wrapper.find('.zc-wb-ro').text()).toBe('只读')
+
+    await markDirty(wrapper) // 即使有人绕过编辑器置上脏态，写请求仍在闸外
+    await pressSave(wrapper)
+    expect(saveFile).not.toHaveBeenCalled()
+    expect(message.info).toHaveBeenCalledWith('共享只读：不能保存修改')
+  })
+
   it('关闭脏页签先确认：取消保留页签与脏态，确认后丢弃并关闭', async () => {
     const wrapper = await mountWb()
     await select(wrapper, 'a.md')

@@ -49,13 +49,23 @@ async def create_workspace(request: Request, body: WsIn):
 
 @router.get("/workspaces")
 async def list_workspaces(request: Request):
-    # 隔离收口（Ticket 005）：列表只认自己的归属行
+    """自有 + 被共享工作区（规格 2026-11-16 §5.3）：每项带 role。
+
+    被共享以应用为锚（`app_share → app_project.workspace_id`），与 `workspace_role` 同一判据；
+    列表用一处 EXISTS 判完，不逐行调 `workspace_role` 变成 N+1。`role` 让内置文件管理器
+    刷新后也能自己进只读模式，不依赖从应用页跳转时带参数。
+    """
     uid = request.state.actor["id"]
     async with request.app.state.session_factory() as s:
         rows = (await s.execute(text(
             "SELECT w.id, w.name, w.root_path, w.created_at, "
-            "(SELECT count(*) FROM chat_session cs WHERE cs.workspace_id = w.id) AS session_count "
-            "FROM workspace w WHERE w.owner_user_id = :u ORDER BY w.id DESC"),
+            "(SELECT count(*) FROM chat_session cs WHERE cs.workspace_id = w.id) AS session_count, "
+            "CASE WHEN w.owner_user_id = :u THEN 'owner' ELSE 'collaborator' END AS role "
+            "FROM workspace w "
+            "WHERE w.owner_user_id = :u OR EXISTS ("
+            "  SELECT 1 FROM app_share sh JOIN app_project a ON a.id = sh.app_id "
+            "  WHERE a.workspace_id = w.id AND sh.user_id = :u) "
+            "ORDER BY w.id DESC"),
             {"u": uid})).mappings().all()
     return [dict(r) for r in rows]
 
@@ -66,24 +76,29 @@ async def delete_workspace(request: Request, ws_id: int):
     app_project 行靠 FK CASCADE 跟走，端口随记录在库里释放——容器不跟着停就是把同一个端口原封不动
     埋给下一个应用。prod 栈一停网关路由必须同步摘，否则那个域名从「还在跑」变成 502；发布中的应用
     照旧拒删（那条路径正在往这台栈上落版本），闸门与 apps 侧共用 `ensure_deletable`。
+
+    判权走 `workspace_role` 单点（Ticket 000）：删除仅所有者——不可见/不存在/无主同一 404；
+    已可见但非所有者（002 起的被共享者）403，与规格 §5.6「已可见无权执行」同口径。
     """
     uid = request.state.actor["id"]
     sf = request.app.state.session_factory
+    role = await app_service.workspace_role(sf, ws_id, uid)
+    if role is None:
+        raise HTTPException(404, "工作区不存在")
+    if role != "owner":
+        raise HTTPException(403, "仅应用所有者可执行此操作")
     async with sf() as s:
-        # 带着 owner 一起查：他人的工作区必须查不到应用，否则下面 ensure_deletable 会把 404 变成
-        # 409「发布中拒删」——那等于告诉对方这个 id 后面真有个应用
         row = (await s.execute(text(
-            "SELECT a.slug, a.status_prod FROM app_project a JOIN workspace w ON w.id = a.workspace_id "
-            "WHERE a.workspace_id = :i AND w.owner_user_id = :u"), {"i": ws_id, "u": uid})).mappings().first()
+            "SELECT a.slug, a.status_prod FROM app_project a WHERE a.workspace_id = :i"),
+            {"i": ws_id})).mappings().first()
         try:
             app_service.ensure_deletable(dict(row) if row else {})
         except DeployError as e:
             raise HTTPException(e.status, str(e))
-        r = await s.execute(text("DELETE FROM workspace WHERE id = :i AND owner_user_id = :u"),
-                            {"i": ws_id, "u": uid})
+        r = await s.execute(text("DELETE FROM workspace WHERE id = :i"), {"i": ws_id})
         await s.commit()
         if r.rowcount == 0:
-            # 不存在与他人的行同一 404，不给探测留差异
+            # 闸门与删除之间的并发删除：与从未存在同一 404
             raise HTTPException(404, "工作区不存在")
     if row:
         for warning in await engine.down_app_stacks(row["slug"]):

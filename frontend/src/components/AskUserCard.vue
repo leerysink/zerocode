@@ -12,6 +12,9 @@ import { askOutcomeOf } from '../stores/messageModel'
 const props = defineProps({
   questions: { type: Array, default: () => [] },
   result: { type: Object, default: null },
+  // 只读旁观（Ticket 008）：待答卡也只展示题目与选项，不给选项/输入/按钮，
+  // 明确写「等待所有者操作」——被共享者的任何上行都会被后端拒。
+  watchOnly: { type: Boolean, default: false },
 })
 const store = useChatStore()
 
@@ -95,6 +98,18 @@ function isPicked(label) {
       <!-- 待答态：单题可交互表单 -->
       <template v-else>
         <div class="zc-ask-question">{{ question.question }}</div>
+        <!-- 旁观（Ticket 008）：题目与选项照展，交互一律不渲染，等待所有者作答 -->
+        <template v-if="watchOnly">
+          <div v-if="hasOptions" class="zc-ask-options is-readonly">
+            <div v-for="opt in question.options" :key="opt.label" class="zc-opt">
+              <span class="zc-opt-label">{{ opt.label }}</span>
+              <a-tag v-if="opt.recommended" color="blue" class="zc-opt-rec">推荐</a-tag>
+              <div v-if="opt.description" class="zc-opt-desc">{{ opt.description }}</div>
+            </div>
+          </div>
+          <div class="zc-ask-waiting">等待所有者操作</div>
+        </template>
+        <template v-else>
         <template v-if="hasOptions">
           <div v-if="multi" class="zc-ask-options">
             <a-checkbox-group :value="picked || []" @update:value="onPick">
@@ -132,6 +147,7 @@ function isPicked(label) {
           <a-button type="link" size="small" class="zc-ask-decline" @click="store.declineAsk()">不再提问，自行决定</a-button>
           <a-button type="primary" :disabled="!answer" @click="submit">提交回答</a-button>
         </div>
+        </template>
       </template>
     </div>
   </div>
@@ -207,6 +223,12 @@ function isPicked(label) {
 .zc-opt.is-dim { opacity: 0.5; }
 .zc-opt.is-dim .zc-opt-label { color: var(--zc-text-sub); }
 .zc-ask-free { margin-top: 6px; }
+/* 旁观待答：没有可点出口，只说明在等谁 */
+.zc-ask-waiting {
+  margin-top: 8px;
+  font-size: 12.5px;
+  color: var(--zc-text-sub);
+}
 .zc-ask-free-answer {
   margin-top: 6px;
   padding: 6px 10px;

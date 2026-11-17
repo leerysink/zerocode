@@ -59,6 +59,11 @@ const SiderStub = {
     }, this.$slots.default ? this.$slots.default() : [])
   },
 }
+const MemoryPanelStub = {
+  name: 'MemoryPanel',
+  props: ['workspaceId'],
+  render: () => h('div', { class: 'stub-memory' }),
+}
 const STUBS = {
   'a-layout-sider': SiderStub,
   'a-tabs': slotDiv('a-tabs'),
@@ -74,17 +79,18 @@ const STUBS = {
   'a-breadcrumb': slotDiv('a-breadcrumb'),
   'a-tooltip': slotDiv('a-tooltip'),
   DiffBlock: true,
+  MemoryPanel: MemoryPanelStub,
 }
 
 // mode 走真实链路：ensureLoaded 从 /api/config 取值，故桩上 fs.open_folder_mode
-async function mountPanel(mode = 'auto', nodes = []) {
+async function mountPanel(mode = 'auto', nodes = [], props = {}) {
   const pinia = createPinia()
   setActivePinia(pinia)
   getConfig.mockResolvedValue({ data: { 'fs.open_folder_mode': mode } })
   tree.mockResolvedValue({ data: nodes })
   listDir.mockResolvedValue({ data: { path: '', parent: null, entries: [] } })
   const wrapper = mount(FilePanel, {
-    props: { workspaceId: 7 },
+    props: { workspaceId: 7, ...props },
     global: { plugins: [pinia], stubs: STUBS },
   })
   await flushPromises()
@@ -325,5 +331,22 @@ describe('FilePanel 变更记录的查看具体入口', () => {
     expect(blocks[0].props('changeId')).toBe(345)
     expect(blocks[0].props('sessionId')).toBe(12)
     expect(blocks[1].props('changeId')).toBe(346)
+  })
+})
+
+describe('FilePanel 共享只读（Ticket 007）', () => {
+  it('只读：隐藏「打开文件夹」与记忆页签，文件预览仍可用', async () => {
+    const wrapper = await mountPanel('auto', [], { readOnly: true })
+    const labels = wrapper.findAll('.zc-fp-toolbar')[0].findAll('button').map((b) => b.text().trim())
+    expect(labels).toEqual(['刷新'])
+    expect(wrapper.find('.stub-memory').exists()).toBe(false)
+    expect(tree).toHaveBeenCalledWith(7)
+  })
+
+  it('所有者：两个入口都在，记忆页签照常渲染', async () => {
+    const wrapper = await mountPanel('auto')
+    const labels = wrapper.findAll('.zc-fp-toolbar')[0].findAll('button').map((b) => b.text().trim())
+    expect(labels).toEqual(['刷新', '打开文件夹'])
+    expect(wrapper.find('.stub-memory').exists()).toBe(true)
   })
 })

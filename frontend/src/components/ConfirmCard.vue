@@ -14,6 +14,8 @@ const props = defineProps({
   // 临时进度（tool_progress）：只有 preview_restart 会发，且只在该工具**已受理开跑**后才有，
   // 所以它同时是「后端真的收到了我的点击」的证据——见下方 acked。
   progress: { type: Object, default: null },
+  // 只读旁观（Ticket 008）：待答态只留痕，按钮换「等待所有者操作」
+  watchOnly: { type: Boolean, default: false },
 })
 const store = useChatStore()
 
@@ -59,8 +61,11 @@ const bodyText = computed(() => (pending.value ? props.msg.confirmSummary || '' 
     <pre v-else-if="argsSummary" class="zc-confirm-args">{{ argsSummary }}</pre>
     <div v-if="acked" class="zc-confirm-progress">{{ progress.line }}</div>
     <div v-if="pending" class="zc-confirm-actions">
-      <a-button type="primary" :disabled="acked" :loading="acked" @click="store.confirm(true)">{{ okLabel }}</a-button>
-      <a-button :disabled="acked" @click="store.confirm(false)">{{ copy.no }}</a-button>
+      <span v-if="watchOnly" class="zc-confirm-waiting">等待所有者操作</span>
+      <template v-else>
+        <a-button type="primary" :disabled="acked" :loading="acked" @click="store.confirm(true)">{{ okLabel }}</a-button>
+        <a-button :disabled="acked" @click="store.confirm(false)">{{ copy.no }}</a-button>
+      </template>
     </div>
   </div>
 </template>
@@ -138,5 +143,10 @@ const bodyText = computed(() => (pending.value ? props.msg.confirmSummary || '' 
   display: flex;
   gap: 8px;
   margin-top: 10px;
+}
+/* 旁观待答：没有可点出口，只说明在等谁 */
+.zc-confirm-waiting {
+  font-size: 12.5px;
+  color: var(--zc-text-sub);
 }
 </style>

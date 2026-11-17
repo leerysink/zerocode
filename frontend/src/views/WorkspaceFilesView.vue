@@ -5,14 +5,41 @@
 // 本页只管「地址 → 该不该挂工作台」这一件事：树、页签与编辑行为都在 WorkspaceWorkbench 里。
 // id 全程按字符串透传（不转 Number）；非法地址一个目录请求都不发——后端按归属校验会给 404，
 // 但那要等请求回来才知道，这里先挡住，页面也不会挂出一个空壳。
-import { computed } from 'vue'
+// 角色也从后端取（Ticket 005）：刷新/收藏直达时不经过应用页，不能靠入口带参数才知道是只读。
+import { computed, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
+import { listWorkspaces } from '../api'
 import WorkspaceWorkbench from '../components/WorkspaceWorkbench.vue'
 import { normalizeWorkspaceId } from '../utils/openFolder'
 
 const route = useRoute()
 
 const workspaceId = computed(() => normalizeWorkspaceId(route.params.id))
+
+const role = ref('')
+const roleLoading = ref(false)
+const missing = ref(false)
+const isCollaborator = computed(() => role.value === 'collaborator')
+
+async function loadRole() {
+  role.value = ''
+  missing.value = false
+  if (!workspaceId.value) return
+  roleLoading.value = true
+  try {
+    const { data } = await listWorkspaces()
+    const hit = (data || []).find((w) => String(w.id) === workspaceId.value)
+    if (hit) role.value = hit.role || 'owner'
+    else missing.value = true
+  } catch {
+    // 拉不到角色就停在错误态：不猜「也许能写」，也不挂一个连角色都判不了的工作台
+    missing.value = true
+  } finally {
+    roleLoading.value = false
+  }
+}
+
+watch(workspaceId, loadRole, { immediate: true })
 
 // 名字由入口带在 query 上（入口本来就知道名字，不为一个标题再请求一次工作区）。
 // 手改地址可能给出 ?name=a&name=b，vue-router 会解析成数组：取第一个，不能让它渲染成「a,b」。
@@ -37,6 +64,8 @@ const heading = computed(() => {
   <div class="zc-wsv">
     <div class="zc-wsv-head">
       <h2 :title="heading">{{ heading }}</h2>
+      <span v-if="isCollaborator" class="zc-wsv-ro-tag">只读</span>
+      <span v-if="isCollaborator" class="zc-wsv-ro-hint">被共享：可浏览与下载，不能保存</span>
     </div>
 
     <a-alert
@@ -47,11 +76,21 @@ const heading = computed(() => {
       message="工作区地址不正确"
       description="地址里的 /workspaces/后面的数字不是你的工作区，请从应用卡片或聊天页右栏重新打开。"
     />
+    <div v-else-if="roleLoading" class="zc-wsv-loading">加载中…</div>
+    <a-alert
+      v-else-if="missing"
+      class="zc-wsv-bad"
+      type="error"
+      show-icon
+      message="工作区不存在或无权访问"
+      description="这个工作区不在你的名下，也没有共享给你。请从应用卡片或聊天页右栏重新打开。"
+    />
     <div v-else class="zc-wsv-body">
       <WorkspaceWorkbench
         :workspace-id="workspaceId"
         :workspace-name="workspaceName"
         :initial-file="initialFile"
+        :workspace-read-only="isCollaborator"
       />
     </div>
   </div>
@@ -84,6 +123,25 @@ const heading = computed(() => {
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
+}
+.zc-wsv-ro-tag {
+  flex: none;
+  padding: 0 8px;
+  border: 1px solid var(--zc-border);
+  border-radius: 10px;
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--zc-text-sub);
+}
+.zc-wsv-ro-hint {
+  flex: none;
+  font-size: 12px;
+  color: var(--zc-text-sub);
+}
+.zc-wsv-loading {
+  margin-top: 16px;
+  font-size: 13px;
+  color: var(--zc-text-sub);
 }
 .zc-wsv-bad {
   margin-top: 16px;

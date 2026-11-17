@@ -17,6 +17,8 @@ steering_done（带 client_msg_id）；压缩中、队列排满或图片插话�
 
 按会话分槽：同会话后连连接覆盖该会话的 emit 槽，下行事件随之切到新连接；
 断连 drop 自己的槽（防僵尸槽），跨会话互不串扰（终审修复轮2）。
+被共享者（Ticket 008）连入进入旁观模式：登记到 hub.watchers，绝不覆盖 owner 的 emit 槽；
+补发运行态与挂起卡后只收下行，任何上行一律回 error「共享旁观为只读」，不落库、不触业务。
 runner 的 send 为单参签名，这里经 hub 会话槽晚绑定转发；LLM 实例按 run
 解析一次（cfg 本就每 run 取一次，避免测试注入的工厂每轮重放轮次）；
 模型来源按会话逐级回退：会话绑定 model_config → 默认模型 → 全局 llm.*
@@ -58,6 +60,54 @@ def _parse_attachment_ids(raw_ids) -> list[int]:
     return out
 
 
+async def _watch_only(ws: WebSocket, session_id: int, hub, *,
+                      workspace_id: int, user_id: int) -> None:
+    """被共享者的只读旁观连接（Ticket 008）。
+
+    - 登记进 hub.watchers（与 owner 的 emits 分表，连入/断开都不碰 owner 的槽）；
+    - 连入补发 status(running) 与挂起中的提问/确认——只发给这一条连接，
+      不走 hub.emit_event，否则 owner 会把同一张卡再收一遍；
+    - 上行内容不看、不解析业务：一律回 error「共享旁观为只读」，不落库、不改 hub 状态；
+    - 撤销/退出（Ticket 010）时服务端主动推一帧 share_revoked 再以 4404 关闭：
+      前端据此提示「共享已撤销」并回应用页；不用 close reason 传语义（reason 会被
+      代理/浏览器版本吞掉，事件帧是可靠的）。
+    """
+    async def emit(sid: int, event: dict):
+        try:
+            await ws.send_text(json.dumps(event, ensure_ascii=False))
+        except Exception:
+            pass  # 连接已断开等场景：静默丢弃
+
+    async def close():
+        try:
+            await ws.send_text(json.dumps({"type": "share_revoked"}, ensure_ascii=False))
+        except Exception:
+            pass
+        try:
+            await ws.close(code=4404)
+        except Exception:
+            pass
+
+    hub.add_watcher(session_id, emit, workspace_id=workspace_id,
+                    user_id=user_id, close=close)
+    try:
+        if session_id in hub.running and not hub.is_cancelling(session_id):
+            await emit(session_id, {"type": "status", "status": "running"})
+        questions = hub.pending_asks.get(session_id)
+        if questions is not None:
+            await emit(session_id, {"type": "ask_user", "questions": questions})
+        payload = hub.pending_confirms.get(session_id)
+        if payload is not None:
+            await emit(session_id, {"type": "confirm_request", **payload})
+        while True:
+            await ws.receive_text()
+            await emit(session_id, {"type": "error", "message": "共享旁观为只读"})
+    except WebSocketDisconnect:
+        pass
+    finally:
+        hub.drop_watcher(session_id, emit)
+
+
 @router.websocket("/ws/chat/{session_id}")
 async def ws_chat(ws: WebSocket, session_id: int):
     # WS 认证收口（Ticket 009 / spec §3 故事12）：/ws scope 不走 HTTP guard 中间件，
@@ -67,18 +117,20 @@ async def ws_chat(ws: WebSocket, session_id: int):
     # close code 被吞（浏览器只见 1006），前端 onclose 按 4401 跳登录就无从判断。
     # 校验本身在 accept 前完成：被拒连接从不注册 emit 槽/不触任何业务。
     from app.store import identity
+    from app.services import app_service
     actor = await identity.by_token(
         ws.app.state.session_factory, ws.cookies.get(identity.ACTOR_COOKIE))
     if actor is None:
         await ws.accept()
         await ws.close(code=4401)
         return
-    async with ws.app.state.session_factory() as s:
-        owner = (await s.execute(_sql(
-            "SELECT w.owner_user_id FROM chat_session cs "
-            "JOIN workspace w ON w.id = cs.workspace_id WHERE cs.id=:i"),
+    sf = ws.app.state.session_factory
+    async with sf() as s:
+        wid = (await s.execute(_sql(
+            "SELECT workspace_id FROM chat_session WHERE id=:i"),
             {"i": session_id})).scalar()
-    if owner != actor["id"]:
+    role = await app_service.workspace_role(sf, wid, actor["id"]) if wid is not None else None
+    if role is None:
         await ws.accept()
         await ws.close(code=4404)
         return
@@ -86,6 +138,11 @@ async def ws_chat(ws: WebSocket, session_id: int):
     await ws.accept()
     app = ws.app
     hub = app.state.hub
+
+    if role == "collaborator":
+        await _watch_only(ws, session_id, hub,
+                          workspace_id=wid, user_id=actor["id"])
+        return
 
     async def emit(sid: int, event: dict):
         try:
@@ -104,7 +161,9 @@ async def ws_chat(ws: WebSocket, session_id: int):
     # 重连状态自洽：连入时该会话仍在跑（刷新页面/断线重连/另开标签页），补发一帧
     # status(running) 快照，让前端把「停止」按钮亮回来。不补则前端 openSession 一律
     # 视为空闲 → 输入框解锁而后端仍在执行，用户每发一句都撞拒绝（死循环根因之一）。
-    if session_id in hub.running:
+    # 停止已请求、run 正在收口（如浏览器会话 DELETE 尚未返回）时不补：用户刚点了停止，
+    # 此刻补发等于把任务在界面上重新立成「运行中」，收口帧又只发往旧连接时就永远停在运行中。
+    if session_id in hub.running and not hub.is_cancelling(session_id):
         await emit(session_id, {"type": "status", "status": "running"})
     # 挂起中的提问/确认在重连时补发：切走、刷新、另开标签页后卡片不消失，
     # ask/confirm future 不会永久挂起（否则会话卡死，用户既答不了也停不掉）。
@@ -164,6 +223,11 @@ async def ws_chat(ws: WebSocket, session_id: int):
                     continue
 
                 if session_id in hub.running:
+                    if hub.is_cancelling(session_id):
+                        # 停止已请求、run 正在收口：插话会进一个不会再读队列的 run，
+                        # 留在 hub.pending 里被下一轮误当成新插话注入。等收口完成再发。
+                        await reject("正在停止上一轮，请稍候再发", cid, running=False)
+                        continue
                     # 执行中再发一句 = **插话（steering）**：入队等下一个工具边界注入，
                     # 不另起一轮 run、也不再当错误拒收（历史上回 error 造成过
                     # 「发不出也停不掉」的死循环，见 a0cecb1）。

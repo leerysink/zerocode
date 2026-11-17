@@ -6,6 +6,8 @@
 // 组头左侧箭头示折叠态，点击折叠/展开成员（默认展开）；按住组头上下拖可改文件夹顺序——
 // 折叠态与顺序都只记在本机 localStorage（见 useSidebarFolders），换浏览器回到服务端默认序。
 // 成员默认显 5 条，「展开其余 N 个会话」放开全部；hover 出删除。
+// 「共享给我」（Ticket 007 / 规格 §2.2）：自有分组下方独立区块，组头只读——不可拖、无 `+`、
+// 无重命名/删除菜单、会话行无删除；会话本身可点开（只读聊天的实现在 ChatView）。
 import { computed, onMounted, reactive, ref } from 'vue'
 import { message } from 'ant-design-vue'
 import {
@@ -13,7 +15,10 @@ import {
   DeleteOutlined, EllipsisOutlined, FolderOutlined, LoadingOutlined, PlusOutlined,
   RightOutlined, SettingOutlined, ShopOutlined,
 } from '@ant-design/icons-vue'
-import { createSession, deleteApp, deleteSession, listApps, listSessions, renameApp } from '../api'
+import {
+  createSession, deleteApp, deleteSession, listApps, listSessions, listSharedApps,
+  renameApp,
+} from '../api'
 import { useChatStore } from '../stores/chat'
 import { useSessionLiveStatus } from '../composables/useSessionLiveStatus'
 import { useSidebarFolders } from '../composables/useSidebarFolders'
@@ -64,6 +69,7 @@ function onBadgeClick(s, wsId) {
 const showNew = ref(false)
 const loading = ref(true)
 const apps = ref([])
+const sharedApps = ref([])
 const expand = reactive({}) // wsId -> 已展开全部（默认 false = 每组显 5 条）
 const rename = reactive({ open: false, app: null, name: '' })
 const del = reactive({ open: false, app: null, typed: '' })
@@ -102,11 +108,14 @@ function moreCount(wsId) {
 async function loadAll() {
   loading.value = true
   try {
-    const [res] = await Promise.all([listApps(), store.loadWorkspaces()])
+    const [res, sharedRes] = await Promise.all([
+      listApps(), listSharedApps(), store.loadWorkspaces(),
+    ])
     apps.value = res.data
+    sharedApps.value = sharedRes.data
     syncOrder(res.data) // 补进新建的应用、剔掉已删的，存的顺序才跟真实行对得上
     await Promise.all(
-      apps.value.map(async (a) => {
+      [...res.data, ...sharedRes.data].map(async (a) => {
         store.sessionsByWs[a.workspace_id] = (await listSessions(a.workspace_id)).data
       })
     )
@@ -258,6 +267,51 @@ async function doDelete() {
           </a>
         </div>
       </div>
+      <template v-if="sharedApps.length">
+        <div class="zc-shared-title">共享给我</div>
+        <div v-for="app in sharedApps" :key="`shared-${app.id}`" class="zc-shared-group">
+          <div class="zc-shared-head" :title="`所有者：${app.owner_nickname}`">
+            <folder-outlined />
+            <span class="zc-ws-name">{{ app.name }}</span>
+            <span class="zc-owner">{{ app.owner_nickname }}</span>
+            <span class="zc-count">{{ sessionsOf(app.workspace_id).length }}</span>
+          </div>
+          <div class="zc-group-body">
+            <div v-if="!sessionsOf(app.workspace_id).length" class="zc-none">暂无会话</div>
+            <div
+              v-for="s in visibleSessions(app.workspace_id)"
+              :key="`shared-session-${s.id}`"
+              class="zc-session"
+              :class="{ active: s.id === store.currentSessionId }"
+              @click="store.openSession(s.id, app.workspace_id)"
+            >
+              <span class="zc-title">{{ s.title }}</span>
+              <span
+                v-if="badgeOf(s)"
+                class="zc-session-status"
+                :class="`is-${badgeOf(s)}`"
+                :title="BADGE_TEXT[badgeOf(s)]"
+                :aria-label="BADGE_TEXT[badgeOf(s)]"
+                @click.stop="onBadgeClick(s, app.workspace_id)"
+              >
+                <loading-outlined v-if="badgeOf(s) === 'running'" spin />
+                <clock-circle-outlined v-else-if="badgeOf(s) === 'waiting'" />
+                <check-circle-filled v-else-if="badgeOf(s) === 'completed'" />
+                <close-circle-filled v-else />
+              </span>
+              <span class="zc-time">{{ relativeTime(s.updated_at) }}</span>
+            </div>
+            <a v-if="hasMore(app.workspace_id)" class="zc-more"
+               @click="expand[app.workspace_id] = true">
+              展开其余 {{ moreCount(app.workspace_id) }} 个会话
+            </a>
+            <a v-else-if="expand[app.workspace_id] && sessionsOf(app.workspace_id).length > VISIBLE"
+               class="zc-more" @click="expand[app.workspace_id] = false">
+              收起
+            </a>
+          </div>
+        </div>
+      </template>
     </div>
     <div class="zc-footer">
       <div class="zc-footer-row">
@@ -484,6 +538,34 @@ async function doDelete() {
   padding: 2px 8px 2px 24px;
   font-size: 12px;
   color: var(--zc-text-sub);
+}
+/* 「共享给我」区块（Ticket 007）：与自有分组同形，但组头只读——不可拖、无 +、无 ⋯ */
+.zc-shared-title {
+  margin: 14px 4px 6px;
+  font-size: 12px;
+  color: var(--zc-text-sub);
+}
+.zc-shared-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border-radius: 4px;
+  font-weight: 500;
+  color: var(--zc-text);
+  user-select: none;
+}
+.zc-shared-head:hover {
+  background: var(--zc-bg);
+}
+.zc-owner {
+  flex-shrink: 0;
+  padding: 0 6px;
+  font-size: 11px;
+  line-height: 18px;
+  color: var(--zc-text-sub);
+  background: var(--zc-bg);
+  border-radius: 9px;
 }
 .zc-footer {
   border-top: 1px solid var(--zc-border);

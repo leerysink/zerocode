@@ -193,6 +193,19 @@
     color: var(--zc-db-warn);
   }
 
+  // 被共享者只读横幅（Ticket 006）：信息色，与 prod 警示条区分开
+  .zc-db-ro-banner {
+    flex: 0 0 auto;
+    margin: 0;
+    padding: 6px 12px;
+    font-size: 12px;
+    border: 0;
+    border-bottom: 1px solid #cfe0f5;
+    border-radius: 0;
+    background: #f0f6ff;
+    color: #2b5cab;
+  }
+
   // ---- 主体：左对象树 + 右内容，中间一条分隔而不是 12px 空隙 ----
   .zc-db-body {
     flex: 1 1 auto;
@@ -456,6 +469,17 @@
     border-radius: var(--zc-db-radius);
     background: var(--zc-db-warn-bg);
     color: var(--zc-db-warn);
+    font-size: 12px;
+  }
+
+  .zc-db-ro-hint {
+    margin-bottom: 8px;
+    padding: 6px 10px;
+    border: 1px solid #cfe0f5;
+    border-left: 3px solid #2b5cab;
+    border-radius: var(--zc-db-radius);
+    background: #f0f6ff;
+    color: #2b5cab;
     font-size: 12px;
   }
 

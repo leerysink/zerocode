@@ -83,13 +83,13 @@ const STUBS = {
   'a-tag': TagStub,
 }
 
-function mountCard(question) {
+function mountCard(question, props = {}) {
   setActivePinia(createPinia())
   const store = useChatStore()
   const send = vi.fn()
   store._ws = { readyState: 1, send }
   const w = mount(AskUserCard, {
-    props: { questions: [question] },
+    props: { questions: [question], ...props },
     global: { stubs: STUBS },
   })
   return { w, send }
@@ -161,5 +161,29 @@ describe('AskUserCard 单题卡', () => {
     await w.find('.stub-textarea').setValue('小明')
     await btn(w, '提交回答').trigger('click')
     expect(JSON.parse(send.mock.calls[0][0]).answers).toEqual([{ answer: '小明' }])
+  })
+})
+
+describe('AskUserCard 共享旁观（Ticket 008）', () => {
+  it('watch-only：题目与选项照展，无输入框/按钮，提示等待所有者操作', () => {
+    const { w, send } = mountCard(
+      { question: '选哪个', options: [{ label: 'A' }, { label: 'B', recommended: true }] },
+      { watchOnly: true },
+    )
+    expect(w.text()).toContain('选哪个')
+    expect(w.findAll('.zc-opt')).toHaveLength(2)
+    expect(w.text()).toContain('推荐')
+    expect(w.find('.stub-textarea').exists()).toBe(false)
+    expect(btn(w, '提交回答')).toBeUndefined()
+    expect(btn(w, '自行决定')).toBeUndefined()
+    expect(btn(w, '取消执行')).toBeUndefined()
+    expect(w.find('.zc-ask-waiting').text()).toContain('等待所有者操作')
+    expect(send).not.toHaveBeenCalled()
+  })
+
+  it('watch-only 无选项的题也不给输入框', () => {
+    const { w } = mountCard({ question: '叫什么名字？' }, { watchOnly: true })
+    expect(w.find('.stub-textarea').exists()).toBe(false)
+    expect(w.text()).toContain('等待所有者操作')
   })
 })

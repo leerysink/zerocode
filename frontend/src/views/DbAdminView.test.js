@@ -6,7 +6,7 @@ import { Comment, h } from 'vue'
 import { flushPromises, mount } from '@vue/test-utils'
 
 const mocks = vi.hoisted(() => ({
-  api: { dbTables: vi.fn(), dbTableSchema: vi.fn(), dbTableData: vi.fn(), dbSqlExec: vi.fn(), dbSqlBatch: vi.fn(), dbAudit: vi.fn() },
+  api: { dbTables: vi.fn(), dbTableSchema: vi.fn(), dbTableData: vi.fn(), dbSqlExec: vi.fn(), dbSqlBatch: vi.fn(), dbAudit: vi.fn(), getApp: vi.fn() },
   antd: { message: { success: vi.fn(), error: vi.fn(), info: vi.fn(), warning: vi.fn() },
     Modal: { confirm: vi.fn(({ onOk }) => onOk && onOk()) } },
   route: { params: { id: '1' } },
@@ -66,6 +66,7 @@ beforeEach(() => {
   mocks.api.dbTables.mockResolvedValue({ data: { tables: [{ name: 'widgets', type: 'BASE TABLE' }] } })
   mocks.api.dbTableSchema.mockResolvedValue({ data: { columns: [{ name: 'id', type: 'integer', nullable: false, default: null }], primary_key: ['id'], indexes: [] } })
   mocks.api.dbTableData.mockResolvedValue({ data: { columns: ['id', 'name'], rows: [{ id: 1, name: 'a' }], total: 1, truncated: false } })
+  mocks.api.getApp.mockResolvedValue({ data: { id: 1, role: 'owner' } })
 })
 
 it('挂载拉表并渲染树节点', async () => {
@@ -616,5 +617,56 @@ describe('DB 操作台样式单源 db-admin.less', () => {
   it('边界：样式全收在作用域内，不允许声明全局 colorPrimary 覆盖', () => {
     expect(lessSource).not.toMatch(/^\s*:root\s*\{/m)
     expect(lessSource).not.toMatch(/^\s*body\s*\{/m)
+  })
+})
+
+// ---------- Ticket 006: 被共享者只读 ----------
+
+describe('DbAdminView 被共享者只读（Ticket 006）', () => {
+  it('角色来自应用详情：协作者显示只读横幅，所有者不显示', async () => {
+    mocks.api.getApp.mockResolvedValue({ data: { id: 1, role: 'collaborator' } })
+    const w = mount(DbAdminView, { global: { stubs: STUBS } })
+    await flushPromises()
+
+    expect(mocks.api.getApp).toHaveBeenCalledWith('1')
+    expect(w.find('.zc-db-ro-banner').exists()).toBe(true)
+    expect(w.find('.zc-db-ro-banner').text()).toContain('共享只读')
+
+    mocks.api.getApp.mockResolvedValue({ data: { id: 1, role: 'owner' } })
+    const own = mount(DbAdminView, { global: { stubs: STUBS } })
+    await flushPromises()
+    expect(own.find('.zc-db-ro-banner').exists()).toBe(false)
+  })
+
+  it('协作者：行内编辑按钮禁用、点击不开弹框，提示语指向只读', async () => {
+    mocks.api.getApp.mockResolvedValue({ data: { id: 1, role: 'collaborator' } })
+    const w = mountGrid()
+    await flushPromises()
+    await w.find('.zc-tree-node').trigger('click')
+    await flushPromises()
+
+    const btn = dataGrid(w).find('.zc-db-row-edit')
+    expect(btn.attributes('disabled')).toBeDefined()
+    expect(w.find('.zc-db-row-edit-wrap').attributes('title')).toContain('共享只读')
+    expect(w.find('.zc-db-ro-hint').text()).toContain('仅允许 SELECT')
+
+    await btn.trigger('click')
+    await flushPromises()
+    expect(w.find('.zc-db-modal').exists()).toBe(false)
+  })
+
+  it('执行写语句被后端拒绝时，把 403 的「共享只读」原文提示出来', async () => {
+    mocks.api.getApp.mockResolvedValue({ data: { id: 1, role: 'collaborator' } })
+    mocks.api.dbSqlBatch.mockRejectedValue({
+      response: { data: { detail: '共享只读：仅允许 SELECT' } },
+    })
+    const w = mount(DbAdminView, { global: { stubs: STUBS } })
+    await flushPromises()
+
+    await w.findComponent(SqlConsole).vm.submit(['UPDATE widgets SET name = 1'])
+    await flushPromises()
+
+    expect(mocks.api.dbSqlBatch).toHaveBeenCalledWith('1', 'dev', ['UPDATE widgets SET name = 1'])
+    expect(mocks.antd.message.error).toHaveBeenCalledWith('共享只读：仅允许 SELECT')
   })
 })

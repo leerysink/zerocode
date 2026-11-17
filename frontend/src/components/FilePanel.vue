@@ -22,6 +22,9 @@ const props = defineProps({
   workspaceId: { type: Number, required: true },
   width: { type: Number, default: 300 },
   collapsed: { type: Boolean, default: false },
+  // 被共享工作区（Ticket 007）：文件与变更可读，「打开文件夹」与记忆页签收掉——
+  // 后者不属共享范围（规格 §2.6），前者服务端也 403。
+  readOnly: { type: Boolean, default: false },
 })
 
 const store = useChatStore()
@@ -164,7 +167,7 @@ onMounted(loadTree)
             <template #icon><reload-outlined /></template>
             刷新
           </a-button>
-          <a-button size="small" :loading="opening" @click="openWorkspaceFolder">
+          <a-button v-if="!readOnly" size="small" :loading="opening" @click="openWorkspaceFolder">
             <template #icon><folder-open-outlined /></template>
             打开文件夹
           </a-button>
@@ -218,7 +221,7 @@ onMounted(loadTree)
           />
         </div>
       </a-tab-pane>
-      <a-tab-pane key="memory" tab="记忆">
+      <a-tab-pane v-if="!readOnly" key="memory" tab="记忆">
         <MemoryPanel :workspace-id="props.workspaceId" />
       </a-tab-pane>
     </a-tabs>

@@ -5,12 +5,24 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { message, Modal } from 'ant-design-vue'
 import { EditOutlined, HistoryOutlined, ReloadOutlined, SaveOutlined, TableOutlined } from '@ant-design/icons-vue'
-import { dbTables, dbTableSchema, dbTableData, dbSqlExec, dbAudit } from '../api'
+import { dbTables, dbTableSchema, dbTableData, dbSqlExec, dbAudit, getApp } from '../api'
 import SqlConsole from '../components/SqlConsole.vue'
 
 const route = useRoute()
 const appId = route.params.id
 const env = ref('dev')
+
+// 被共享者（Ticket 006）：读面与 SELECT 由后端放行，这里只把写入口收起来并给出横幅。
+// 角色从应用详情取而不是入口参数——操作台是新标签直达页，刷新后也得知道自己只读。
+const isCollaborator = ref(false)
+async function loadRole() {
+  try {
+    const { data } = await getApp(appId)
+    isCollaborator.value = data?.role === 'collaborator'
+  } catch {
+    // 角色拉不到按所有者渲染：写操作仍由后端 403 兜底，展示层失败不改变权限
+  }
+}
 const tables = ref([])
 const selected = ref(null)
 const schema = ref(null)
@@ -82,11 +94,13 @@ function onSort(col) {
   page.value = 1; loadData()
 }
 function openEdit(row) {
-  if (!canEdit()) return // 无主键表按钮已禁用，这里防绕过禁用态直接调用
+  if (!canEdit()) return // 无主键表或只读角色按钮已禁用，这里防绕过禁用态直接调用
   editRow.value = { ...row } // 编辑副本：改到一半取消，表格里的原值不应被动过
   editOpen.value = true
 }
-const canEdit = () => (schema.value?.primary_key || []).length > 0
+const canEdit = () => !isCollaborator.value && (schema.value?.primary_key || []).length > 0
+const editTitle = computed(() => (isCollaborator.value ? '共享只读：仅允许 SELECT'
+  : canEdit() ? '编辑该行' : '该表无主键，无法按行定位，编辑已禁用'))
 const isPk = (c) => (schema.value?.primary_key || []).includes(c)
 const q = (s) => `"${String(s).replace(/"/g, '""')}"`
 const lit = (v) => (v === null || v === undefined) ? 'NULL'
@@ -167,9 +181,13 @@ async function refresh() {
   if (selected.value) { await selectTable(selected.value); await loadData() }
 }
 
-onMounted(loadTables)
+onMounted(() => {
+  loadRole()
+  loadTables()
+})
 defineExpose({ selected, schema, selectTable, loadData, saveEdits, canEdit, openAudit, refresh, fetchAudit,
-  auditEnv, auditOp, selectionText, formatTs, cellText, editRow, editOpen, openEdit })
+  auditEnv, auditOp, selectionText, formatTs, cellText, editRow, editOpen, openEdit,
+  isCollaborator, editTitle })
 </script>
 
 <template>
@@ -182,6 +200,8 @@ defineExpose({ selected, schema, selectTable, loadData, saveEdits, canEdit, open
         <a-button class="zc-db-audit-btn" @click="openAudit"><history-outlined />操作历史</a-button>
       </div>
     </div>
+    <a-alert v-if="isCollaborator" class="zc-db-ro-banner" type="info" show-icon
+             message="共享只读：可查看表结构与数据、执行 SELECT；写操作由应用所有者执行" />
     <a-alert v-if="env === 'prod'" class="zc-db-prod-warn" type="warning" show-icon
              message="直改 prod 会绕过发布迁移轨，请确认你知道自己在做什么" />
     <div class="zc-db-body">
@@ -202,7 +222,10 @@ defineExpose({ selected, schema, selectTable, loadData, saveEdits, canEdit, open
           <a-tab-pane key="data" tab="数据">
             <div v-if="!selected" class="zc-db-placeholder">选择左侧表以查看数据</div>
             <div v-else class="zc-db-tab-body">
-              <div v-if="!canEdit()" class="zc-db-edit-disabled">
+              <div v-if="isCollaborator" class="zc-db-ro-hint">
+                共享只读：行内编辑已禁用，查询控制台仅允许 SELECT
+              </div>
+              <div v-else-if="!canEdit()" class="zc-db-edit-disabled">
                 该表无主键，行内编辑已禁用（仍可浏览，改数据请用查询控制台）
               </div>
               <a-table size="small" :dataSource="rows" :rowKey="(r, i) => i"
@@ -215,8 +238,7 @@ defineExpose({ selected, schema, selectTable, loadData, saveEdits, canEdit, open
                      所以这里只处理 __actions，不必也不该把行号列与数据列接过来。 -->
                 <template #bodyCell="{ column, record }">
                   <template v-if="column.key === '__actions'">
-                    <span class="zc-db-row-edit-wrap"
-                          :title="canEdit() ? '编辑该行' : '该表无主键，无法按行定位，编辑已禁用'">
+                    <span class="zc-db-row-edit-wrap" :title="editTitle">
                       <button class="zc-db-row-edit" :disabled="!canEdit()" @click.stop="openEdit(record)">
                         <edit-outlined />编辑
                       </button>

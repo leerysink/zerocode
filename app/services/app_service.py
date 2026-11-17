@@ -307,6 +307,158 @@ async def get_app(session_factory, app_id: int, *, owner_user_id: int | None = N
     return _with_public_urls(d)
 
 
+async def get_app_for_user(session_factory, app_id: int,
+                           user_id: int | None) -> tuple[dict, str]:
+    """按 app_id 取应用的**唯一判权入口**：返回 (应用详情, 角色)。
+
+    角色：`owner`（`app_project.owner_user_id`）或 `collaborator`（`app_share` 命中，
+    规格 §2.5）。两者都不是与不存在**同一 404、同一句文案**——存在性本身就是要藏的信息。
+    `user_id=None` 是创始人/内部链路的既有 bypass（与 `get_app(**owner_user_id=None)`
+    同一语义）：不筛归属，角色按 owner 返回。
+    """
+    async with session_factory() as s:
+        owner_row = (await s.execute(text(
+            "SELECT owner_user_id FROM app_project WHERE id = :i"),
+            {"i": app_id})).first()
+        if owner_row is None:
+            raise DeployError("应用不存在", status=404)
+        if user_id is None or owner_row[0] == user_id:
+            return await get_app(session_factory, app_id), "owner"
+        shared = (await s.execute(text(
+            "SELECT 1 FROM app_share WHERE app_id = :i AND user_id = :u"),
+            {"i": app_id, "u": user_id})).first()
+    if shared is None:
+        raise DeployError("应用不存在", status=404)
+    return await get_app(session_factory, app_id), "collaborator"
+
+
+async def list_shared_apps(session_factory, user_id: int) -> list[dict]:
+    """「共享给我」列表（规格 §5.3）：与 `list_apps` 同形状，另带 `owner_nickname`。
+
+    被共享者只拿到自己那一行 `app_share` 命中的应用；排序与自有列表同口径（新→旧）。
+    """
+    async with session_factory() as s:
+        rows = (await s.execute(text(
+            "SELECT a.id, a.workspace_id, a.name, a.slug, a.scale, a.stack, a.prod_port, a.dev_port, "
+            "a.status_dev, a.status_prod, a.current_version, a.origin, a.created_at, a.updated_at, "
+            "w.root_path, o.nickname AS owner_nickname "
+            "FROM app_share sh "
+            "JOIN app_project a ON a.id = sh.app_id "
+            "JOIN actor o ON o.id = a.owner_user_id "
+            "LEFT JOIN workspace w ON w.id = a.workspace_id "
+            "WHERE sh.user_id = :u ORDER BY a.id DESC"), {"u": user_id})).mappings().all()
+        links = (await s.execute(text(
+            "SELECT l.app_id, l.release_id, l.channel, l.detach_reason, l.applied_fingerprint, "
+            "l.last_upgraded_at, r.version AS release_version, r.slug AS release_slug, "
+            "r.title AS release_title FROM app_instance_link l "
+            "JOIN app_release r ON r.id = l.release_id"))).mappings().all()
+    by_app = {int(l["app_id"]): to_dict(l) for l in links}
+    out = []
+    for r in rows:
+        d = to_dict(r)
+        d["store"] = by_app.get(int(d["id"]))
+        out.append(_with_public_urls(d))
+    return out
+
+
+# ---------- 共享关系 CRUD（规格 §5.1）：端点只做状态码映射，判据都在这里 ----------
+
+async def list_share_members(session_factory, app_id: int) -> list[dict]:
+    async with session_factory() as s:
+        rows = (await s.execute(text(
+            "SELECT sh.user_id, ac.nickname, sh.created_at FROM app_share sh "
+            "JOIN actor ac ON ac.id = sh.user_id WHERE sh.app_id = :i "
+            "ORDER BY sh.created_at, sh.id"), {"i": app_id})).mappings().all()
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["created_at"] = d["created_at"].isoformat()
+        out.append(d)
+    return out
+
+
+async def add_share(session_factory, *, app_id: int, user_id: int,
+                    created_by: int) -> dict:
+    """共享给某个账号：自共享 400、用户不存在 404、已共享 409（规格 §5.1/§5.6）。
+
+    并发重复由 `UNIQUE (app_id, user_id)` 兜底——预检只是把常见路径的文案说清楚。
+    """
+    if user_id == created_by:
+        raise DeployError("不能共享给应用所有者自己", status=400)
+    async with session_factory() as s:
+        nickname = (await s.execute(text(
+            "SELECT nickname FROM actor WHERE id = :u"), {"u": user_id})).scalar()
+        if nickname is None:
+            raise DeployError("用户不存在", status=404)
+        if (await s.execute(text(
+                "SELECT 1 FROM app_share WHERE app_id = :i AND user_id = :u"),
+                {"i": app_id, "u": user_id})).first():
+            raise DeployError("该用户已在共享列表中", status=409)
+        try:
+            created_at = (await s.execute(text(
+                "INSERT INTO app_share (app_id, user_id, created_by) VALUES (:i, :u, :c) "
+                "RETURNING created_at"), {"i": app_id, "u": user_id, "c": created_by})).scalar()
+            await s.commit()
+        except IntegrityError:
+            await s.rollback()
+            raise DeployError("该用户已在共享列表中", status=409)
+    return {"user_id": user_id, "nickname": nickname, "created_at": created_at.isoformat()}
+
+
+async def remove_share(session_factory, *, app_id: int, user_id: int) -> None:
+    """撤销共享（所有者）或主动退出（被共享者）：同一行、同一判据；未共享 404。
+
+    只删 `app_share` 行，不删会话/文件/发布记录（规格 §8）——重新共享即恢复可见。
+    同一事务里把该用户在此应用上**待审**的发布申请置 cancelled（S13）：审批入口随共享
+    一起消失，pending 不能悬空；已批准/已驳回的历史申请不动（审批节点已越过）。
+    """
+    async with session_factory() as s:
+        hit = (await s.execute(text(
+            "DELETE FROM app_share WHERE app_id = :i AND user_id = :u RETURNING id"),
+            {"i": app_id, "u": user_id})).first()
+        if hit is None:
+            raise DeployError("共享关系不存在", status=404)
+        await s.execute(text(
+            "UPDATE app_publish_request SET status='cancelled' "
+            "WHERE app_id = :i AND requester_id = :u AND status = 'pending'"),
+            {"i": app_id, "u": user_id})
+        await s.commit()
+
+
+async def workspace_role(session_factory, workspace_id: int,
+                         user_id: int | None) -> str | None:
+    """按 workspace_id 判权的唯一入口（Ticket 000）：返回 owner / collaborator / None。
+
+    `None` = 不可见（不存在、他人、无主遗留行同一口径），调用方统一 404。
+    `user_id=None` 是创始人 bypass（创始人「看全部」目前只有指标域在用，见 metrics._load_app）。
+    被共享者经 `app_share → app_project.workspace_id` 命中（Ticket 005）：共享以应用为锚，
+    工作区本身没有独立的共享表。
+    """
+    async with session_factory() as s:
+        row = (await s.execute(text(
+            "SELECT owner_user_id FROM workspace WHERE id = :i"),
+            {"i": workspace_id})).first()
+        if row is None:
+            return None
+        if user_id is None or row[0] == user_id:
+            return "owner"
+        hit = (await s.execute(text(
+            "SELECT 1 FROM app_share sh JOIN app_project a ON a.id = sh.app_id "
+            "WHERE a.workspace_id = :w AND sh.user_id = :u"),
+            {"w": workspace_id, "u": user_id})).first()
+    return "collaborator" if hit else None
+
+
+def require_owner(role: str) -> None:
+    """端点级增权（Ticket 000 起由写端点调用）：已可见但非所有者 → 403。
+
+    读路径的不可见用 404（藏存在性）；走到这里说明对方已经看得见这个资源，
+    403 是诚实口径，也是被共享者唯一能拿到的「为什么点不动」的反馈（规格 §2.5/§5.6）。
+    """
+    if role != "owner":
+        raise DeployError("仅应用所有者可执行此操作", status=403)
+
+
 async def get_app_by_workspace(session_factory, workspace_id: int, *,
                                owner_user_id: int | None = None) -> dict | None:
     """按工作区反查唯一应用行（Agent 预览工具的身份来源，规格 2026-10-29 §5.1）。
@@ -336,30 +488,26 @@ async def get_app_by_workspace(session_factory, workspace_id: int, *,
     return await get_app(session_factory, ids[0])
 
 
-async def rename_app(session_factory, app_id: int, name: str, *,
-                     owner_user_id: int | None = None) -> dict:
+async def rename_app(session_factory, app_id: int, name: str) -> dict:
     """应用改名：app_project.name 与 workspace.name 同事务更新，slug/端口/目录不动。
 
     两张表都写是这里唯一的非显然处：应用页读 app_project.name，侧栏分组名与文件面板面包屑读
     workspace.name（GET /workspaces 直接取自该列），只改一边就会出现「应用页新名、侧栏旧名」。
 
-    `owner_user_id`（Ticket 006）：入口即取即验，别人的行 404，UPDATE 永远摸不到。
+    归属不在本函数判：调用方（apps.rename）先过 `get_app_for_user` 的单点判权，
+    这里按 id 直写，避免「服务层一道闸、端点又一道闸」的双份实现（Ticket 000 收口）。
     """
     new_name = check_name(name)
     async with session_factory() as s:
-        sql = "SELECT workspace_id FROM app_project WHERE id = :i"
-        params: dict = {"i": app_id}
-        if owner_user_id is not None:
-            sql += " AND owner_user_id = :u"
-            params["u"] = owner_user_id
-        wid = (await s.execute(text(sql), params)).scalar()
+        wid = (await s.execute(text(
+            "SELECT workspace_id FROM app_project WHERE id = :i"), {"i": app_id})).scalar()
         if wid is None:
             raise DeployError("应用不存在", status=404)
         await s.execute(text("UPDATE app_project SET name = :n, updated_at = now() WHERE id = :i"),
                         {"n": new_name, "i": app_id})
         await s.execute(text("UPDATE workspace SET name = :n WHERE id = :i"), {"n": new_name, "i": wid})
         await s.commit()
-    return await get_app(session_factory, app_id, owner_user_id=owner_user_id)
+    return await get_app(session_factory, app_id)
 
 
 def ensure_deletable(app: dict) -> None:
@@ -393,3 +541,167 @@ async def delete_app(session_factory, app_id: int) -> dict:
     await gateway_routes.refresh(session_factory)
     snap["databases"] = [f"{snap['slug']}_dev", f"{snap['slug']}_prod"]
     return snap
+
+
+# ---------- 发布申请（规格 §2.3/§5.2，ADR-0050）：状态机与判据只在这里 ----------
+
+_REQUEST_COLS = ("id, app_id, requester_id, status, reason, decided_by, decided_at, created_at")
+
+
+def _request_row(r) -> dict:
+    d = dict(r)
+    for k in ("decided_at", "created_at"):
+        if d.get(k) is not None:
+            d[k] = d[k].isoformat()
+    return d
+
+
+async def get_publish_request(session_factory, *, app_id: int, request_id: int) -> dict:
+    """按 (app_id, rid) 取一条申请：路径上的 app 与 rid 不匹配即当不存在（不给探测留差异）。"""
+    async with session_factory() as s:
+        row = (await s.execute(text(
+            f"SELECT {_REQUEST_COLS} FROM app_publish_request "
+            "WHERE id = :r AND app_id = :a"),
+            {"r": request_id, "a": app_id})).mappings().first()
+    if not row:
+        raise DeployError("发布申请不存在", status=404)
+    return _request_row(row)
+
+
+async def pending_request_of_app(session_factory, app_id: int) -> dict | None:
+    """该应用当前的待审申请（含申请人昵称）；共享管理弹框的待审区块数据源。"""
+    async with session_factory() as s:
+        row = (await s.execute(text(
+            "SELECT r.id, r.requester_id, ac.nickname AS requester_nickname, r.created_at "
+            "FROM app_publish_request r JOIN actor ac ON ac.id = r.requester_id "
+            "WHERE r.app_id = :i AND r.status = 'pending'"), {"i": app_id})).mappings().first()
+    return _request_row(row) if row else None
+
+
+async def apps_with_pending_requests(session_factory, app_ids: list[int]) -> set[int]:
+    """一次查出哪些应用有待审申请（自有列表的待审角标，S3；避免逐应用查库）。"""
+    if not app_ids:
+        return set()
+    async with session_factory() as s:
+        rows = (await s.execute(text(
+            "SELECT DISTINCT app_id FROM app_publish_request "
+            "WHERE status = 'pending' AND app_id = ANY(:ids)"),
+            {"ids": list(app_ids)})).all()
+    return {int(r[0]) for r in rows}
+
+
+async def latest_requests_of_user(session_factory, app_ids: list[int],
+                                  user_id: int) -> dict[int, dict]:
+    """每个应用里**当前用户最近一条**申请（共享卡片的状态机与驳回理由来源，S12）。
+
+    「共享给我」的 pending_publish 按本人算：别人还有待审申请不该让我的卡片显示「待审批」。
+    带上 `id`：撤回（`DELETE .../publish-requests/{rid}`）需要它，列表不再多点一次接口。
+    """
+    if not app_ids:
+        return {}
+    async with session_factory() as s:
+        rows = (await s.execute(text(
+            "SELECT DISTINCT ON (app_id) id, app_id, status, reason, created_at "
+            "FROM app_publish_request WHERE requester_id = :u AND app_id = ANY(:ids) "
+            "ORDER BY app_id, created_at DESC, id DESC"),
+            {"u": user_id, "ids": list(app_ids)})).mappings().all()
+    out: dict[int, dict] = {}
+    for r in rows:
+        d = _request_row(r)
+        app_id = int(d.pop("app_id"))
+        out[app_id] = d
+    return out
+
+
+async def create_publish_request(session_factory, *, app_id: int,
+                                 requester_id: int) -> dict:
+    """被共享者发起发布申请：发布中 409、已有待审 409（S12/S18）。
+
+    并发双申请由 `ux_app_publish_request_pending` 兜底：两条同时过预检时，
+    第二条撞索引走同一句 409 文案——预检只说清楚常见路径，唯一性才是判据。
+    """
+    async with session_factory() as s:
+        status_prod = (await s.execute(text(
+            "SELECT status_prod FROM app_project WHERE id = :i"), {"i": app_id})).scalar()
+        if status_prod is None:
+            raise DeployError("应用不存在", status=404)
+        if status_prod == "publishing":
+            raise DeployError("应用正在发布中，请稍后再申请", status=409)
+        if (await s.execute(text(
+                "SELECT 1 FROM app_publish_request WHERE app_id = :i AND status = 'pending'"),
+                {"i": app_id})).first():
+            raise DeployError("已有待审批的发布申请，请等待处理", status=409)
+        try:
+            row = (await s.execute(text(
+                "INSERT INTO app_publish_request (app_id, requester_id) VALUES (:a, :u) "
+                "RETURNING id, status, created_at"),
+                {"a": app_id, "u": requester_id})).mappings().first()
+            await s.commit()
+        except IntegrityError:
+            await s.rollback()
+            raise DeployError("已有待审批的发布申请，请等待处理", status=409)
+    d = _request_row(row)
+    return {"id": d["id"], "status": d["status"], "created_at": d["created_at"]}
+
+
+async def decide_publish_request(session_factory, *, request_id: int, status: str,
+                                 decided_by: int, reason: str | None = None) -> dict:
+    """审批收口（approved / rejected）：条件 UPDATE 只允许 pending 被改，并发双批输者 409。
+
+    调用方（approve 端点）必须在**发布闸门通过之后**才调这里：规格 §2.3 要求闸门失败时
+    申请保持 pending，可重试（D15）。
+    """
+    async with session_factory() as s:
+        row = (await s.execute(text(
+            "UPDATE app_publish_request SET status = :st, reason = COALESCE(:rs, reason), "
+            "decided_by = :u, decided_at = now() WHERE id = :r AND status = 'pending' "
+            f"RETURNING {_REQUEST_COLS}"),
+            {"st": status, "rs": reason, "u": decided_by, "r": request_id})).mappings().first()
+        await s.commit()
+    if not row:
+        raise DeployError("该申请已处理，无法重复审批", status=409)
+    return _request_row(row)
+
+
+async def reopen_publish_request(session_factory, request_id: int) -> None:
+    """把刚批准的申请退回 pending：`_spawn` 在闸门与受理之间的竞态里失败时，
+    不能留下「已批准但从未发布」的假状态（闸门失败保持 pending 的延伸）。"""
+    async with session_factory() as s:
+        await s.execute(text(
+            "UPDATE app_publish_request SET status = 'pending', decided_by = NULL, "
+            "decided_at = NULL WHERE id = :r AND status = 'approved'"), {"r": request_id})
+        await s.commit()
+
+
+async def reject_publish_request(session_factory, *, app_id: int, request_id: int,
+                                 reason: str, decided_by: int) -> dict:
+    """驳回必填理由（S4）：空理由 400、非 pending 409。理由落库供申请人查看。"""
+    req = await get_publish_request(session_factory, app_id=app_id, request_id=request_id)
+    if req["status"] != "pending":
+        raise DeployError("该申请已处理，无法重复审批", status=409)
+    clean = (reason or "").strip()
+    if not clean:
+        raise DeployError("驳回理由不能为空", status=400)
+    return await decide_publish_request(session_factory, request_id=request_id,
+                                        status="rejected", decided_by=decided_by,
+                                        reason=clean)
+
+
+async def withdraw_publish_request(session_factory, *, app_id: int, request_id: int,
+                                   user_id: int) -> dict:
+    """申请人撤回（S12）：非本人 403、非 pending 409；只改状态，不删行（留痕）。"""
+    req = await get_publish_request(session_factory, app_id=app_id, request_id=request_id)
+    if req["requester_id"] != user_id:
+        raise DeployError("只能撤回自己发起的发布申请", status=403)
+    if req["status"] != "pending":
+        raise DeployError("只有待审批的申请可以撤回", status=409)
+    async with session_factory() as s:
+        row = (await s.execute(text(
+            "UPDATE app_publish_request SET status = 'withdrawn', decided_by = :u, "
+            "decided_at = now() WHERE id = :r AND status = 'pending' "
+            f"RETURNING {_REQUEST_COLS}"),
+            {"u": user_id, "r": request_id})).mappings().first()
+        await s.commit()
+    if not row:
+        raise DeployError("只有待审批的申请可以撤回", status=409)
+    return _request_row(row)

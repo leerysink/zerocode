@@ -68,6 +68,22 @@ export const patchSessionModel = (id, modelConfigId) =>
 
 // ---- 部署发布套件（应用管理） ----
 export const listApps = () => http.get('/apps')
+// 共享（规格 2026-11-16 §5.1）：账号列表供选人；共享关系 CRUD 仅所有者，自退被共享者可用
+export const listSharedApps = () => http.get('/apps/shared')
+export const listUsers = () => http.get('/users')
+export const getAppShare = (id) => http.get(`/apps/${id}/share`)
+export const addAppShare = (id, userId) => http.post(`/apps/${id}/share`, { user_id: userId })
+export const removeAppShare = (id, userId) => http.delete(`/apps/${id}/share/${userId}`)
+export const leaveAppShare = (id) => http.post(`/apps/${id}/share/leave`)
+// 发布申请（规格 §2.3/§5.2，ADR-0050）：被共享者申请、所有者批准即执行、申请人可撤回。
+// approve 的 force 对应 chat_active 强制确认分支（与直接发布同形状）
+export const createPublishRequest = (id) => http.post(`/apps/${id}/publish-requests`)
+export const approvePublishRequest = (id, rid, force = false) =>
+  http.post(`/apps/${id}/publish-requests/${rid}/approve`, { force })
+export const rejectPublishRequest = (id, rid, reason) =>
+  http.post(`/apps/${id}/publish-requests/${rid}/reject`, { reason })
+export const withdrawPublishRequest = (id, rid) =>
+  http.delete(`/apps/${id}/publish-requests/${rid}`)
 // 单应用详情：两条 SELECT 的纯 DB 读，回体带 status_dev 与 preview_url。
 // 聊天页预览状态的轮询目标——刻意不用 devStatus，那个接口每次都 `docker compose ps` 起子进程。
 export const getApp = (id) => http.get(`/apps/${id}`)

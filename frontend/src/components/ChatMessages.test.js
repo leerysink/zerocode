@@ -293,6 +293,31 @@ describe('预览工具在消息流里的渲染', () => {
     expect(w.find('.zc-confirm-args').text()).toContain('a.txt')
   })
 
+  it('共享旁观：待答确认卡只展示内容与「等待所有者操作」，不给按钮（Ticket 008）', async () => {
+    const w = mountMessages([
+      { role: 'tool', name: 'write_file', args: { path: 'a.txt', content: 'hi' }, awaitingConfirm: true },
+    ])
+    const store = useChatStore()
+    store.currentWorkspaceId = 7
+    store.workspaces = [{ id: 7, name: '共享应用', role: 'collaborator' }]
+    await nextTick()
+    expect(w.find('.zc-confirm').exists()).toBe(true)
+    expect(w.find('.zc-confirm-waiting').text()).toContain('等待所有者操作')
+    expect(w.findAll('.zc-confirm-actions button')).toHaveLength(0)
+  })
+
+  it('所有者视角的待答确认卡照旧有批准/拒绝按钮', async () => {
+    const w = mountMessages([
+      { role: 'tool', name: 'write_file', args: { path: 'a.txt', content: 'hi' }, awaitingConfirm: true },
+    ])
+    const store = useChatStore()
+    store.currentWorkspaceId = 7
+    store.workspaces = [{ id: 7, name: '自有应用', role: 'owner' }]
+    await nextTick()
+    expect(w.find('.zc-confirm-waiting').exists()).toBe(false)
+    expect(w.findAll('.zc-confirm-actions button')).toHaveLength(2)
+  })
+
   it('刷新后 hub 补发的标记能重建可交互的待答确认卡', () => {
     // 刷新/切会话回到会话时，store.messages 是历史行：待确认的那次调用还没有 tool 行
     // （工具行要等执行完才落库），卡片只能靠重连补发的 confirm_request 重建。

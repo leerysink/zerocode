@@ -13,6 +13,11 @@ vi.mock('../api', () => ({
   wsUrl: vi.fn(() => 'ws://test'),
 }))
 
+// 视图只调 message.warning 提示撤销；整模块桩掉（本文件模板组件走 STUBS，不依赖真 antd）
+vi.mock('ant-design-vue', () => ({
+  message: { success: vi.fn(), warning: vi.fn(), error: vi.fn(), info: vi.fn() },
+}))
+
 vi.mock('../components/SideBar.vue', async () => {
   const { h } = await import('vue')
   return {
@@ -35,13 +40,14 @@ vi.mock('../components/FilePanel.vue', async () => {
   return {
     default: {
       name: 'FilePanel',
-      props: ['workspaceId', 'width', 'collapsed'],
+      props: ['workspaceId', 'width', 'collapsed', 'readOnly'],
       render() {
         return h('aside', {
           class: 'stub-file-panel',
           'data-workspace': String(this.workspaceId),
           'data-width': String(this.width),
           'data-collapsed': String(this.collapsed),
+          'data-read-only': String(this.readOnly),
         })
       },
     },
@@ -63,6 +69,7 @@ vi.mock('../components/TodoBar.vue', async () => {
 
 import ChatView from './ChatView.vue'
 import { useChatStore } from '../stores/chat'
+import { getMessages, getSessionDetail } from '../api'
 import { PANELS_STORAGE_KEY } from '../composables/useChatSidePanels'
 
 enableAutoUnmount(afterEach)
@@ -167,5 +174,89 @@ describe('ChatView 侧栏手柄', () => {
 
     window.dispatchEvent(new MouseEvent('pointerup', { clientX: 360 }))
     expect(dumpPanels().leftWidth).toBe(320)
+  })
+})
+
+describe('ChatView 共享只读（Ticket 007）', () => {
+  class FakeWS {
+    static opened = []
+    constructor(url) { FakeWS.opened.push(url) }
+    close() {}
+    send() {}
+  }
+  let realWS
+  beforeEach(() => {
+    FakeWS.opened = []
+    realWS = globalThis.WebSocket
+    globalThis.WebSocket = FakeWS
+    getMessages.mockResolvedValue({ data: [] })
+    getSessionDetail.mockResolvedValue({
+      data: { id: 1, workspace_id: 7, todo_state: [], effective_model: null },
+    })
+  })
+  afterEach(() => { globalThis.WebSocket = realWS })
+
+  it('被共享工作区：隐藏输入区、显示「共享旁观 · 只读」，右栏带只读标记', async () => {
+    const { wrapper, store } = await mountView({ workspaceId: 7 })
+    store.workspaces = [{ id: 7, name: '订单台账', role: 'collaborator' }]
+    await nextTick()
+
+    expect(wrapper.find('.stub-input').exists()).toBe(false)
+    expect(wrapper.find('.zc-readonly-bar').text()).toContain('共享旁观')
+    expect(wrapper.find('.zc-readonly-bar').text()).toContain('只读')
+    expect(wrapper.find('.stub-file-panel').attributes('data-read-only')).toBe('true')
+  })
+
+  it('被共享工作区打开会话照常连 WS：后端按角色切旁观只读（Ticket 008）', async () => {
+    const { store } = await mountView({ workspaceId: 7 })
+    store.workspaces = [{ id: 7, name: '订单台账', role: 'collaborator' }]
+
+    await store.openSession(1, 7)
+
+    // 旁观也走同一个入口：连上后后端只下发事件、任何上行一律只读拒绝
+    expect(FakeWS.opened).toEqual(['ws://test'])
+    expect(store.currentSessionId).toBe(1)
+  })
+
+  it('所有者工作区不受影响：输入区在，打开会话照常连 WS', async () => {
+    const { wrapper, store } = await mountView({ workspaceId: 7 })
+    store.workspaces = [{ id: 7, name: '自有应用', role: 'owner' }]
+    await nextTick()
+
+    expect(wrapper.find('.stub-input').exists()).toBe(true)
+    expect(wrapper.find('.zc-readonly-bar').exists()).toBe(false)
+    expect(wrapper.find('.stub-file-panel').attributes('data-read-only')).toBe('false')
+
+    await store.openSession(1, 7)
+    expect(FakeWS.opened).toEqual(['ws://test'])
+  })
+})
+
+// ---------- Ticket 010：撤销/退出旁观收口 ----------
+// happy-dom 的 location.assign 不可直接改，按项目惯例整桩替换 + 还原（AccountBar.test 同款）
+function stubLocation() {
+  const assign = vi.fn()
+  const saved = window.location
+  Object.defineProperty(window, 'location', { value: { assign }, writable: true, configurable: true })
+  return { assign, restore: () => Object.defineProperty(window, 'location', { value: saved, writable: true, configurable: true }) }
+}
+
+describe('ChatView 共享撤销', () => {
+  it('收到 share_revoked（store 标记置位）：提示「共享已撤销」并整页回应用页', async () => {
+    const { assign, restore } = stubLocation()
+    const { message } = await import('ant-design-vue')
+    const { store } = await mountView()
+    vi.useFakeTimers()
+    try {
+      store.shareRevoked = true
+      await nextTick()
+      expect(message.warning).toHaveBeenCalledWith('共享已撤销，已退出旁观')
+      expect(assign).not.toHaveBeenCalled()   // 先让人看清提示
+      vi.advanceTimersByTime(600)
+      expect(assign).toHaveBeenCalledWith('/apps')
+    } finally {
+      vi.useRealTimers()
+      restore()
+    }
   })
 })

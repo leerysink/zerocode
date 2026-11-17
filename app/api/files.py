@@ -5,23 +5,35 @@ from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 from app.agent.tools import BINARY_EXTS, MAX_READ_BYTES, resolve_in_workspace
+from app.deploy.errors import DeployError
 from app.workspace_ignore import IGNORE_DIRS, IGNORE_PATH_TAILS  # noqa: F401  re-export 给既有调用点
 from app.workspace_ignore import is_ignored_dir as _is_ignored_dir
 
 router = APIRouter(prefix="/api")
 
-async def _root_of(request: Request, ws_id: int) -> Path:
-    """工作区根目录统一接缝（fs_tree/fs_ls/download/read/save 共用）：
-    隔离收口（Ticket 005）——不属于自己的工作区与不存在同一 404。"""
+async def _root_of(request: Request, ws_id: int, *, owner_only: bool = False) -> Path:
+    """工作区根目录统一接缝（fs_tree/fs_ls/download/read/save/open-folder 共用）：
+    判权走 `app_service.workspace_role` 单点（Ticket 000）——不属于自己的工作区、不存在、
+    无主遗留行同一 404，不给探测留差异。
+
+    被共享者（Ticket 005）读面放行；写端点传 `owner_only=True`——已可见但无权是 403，
+    与规格 §5.6 同口径。`deploy/` 的服务端围栏在下面各端点另行执行，不因共享放宽。
+    """
     from sqlalchemy import text
-    uid = request.state.actor["id"]
-    async with request.app.state.session_factory() as s:
-        row = (await s.execute(text(
-            "SELECT root_path FROM workspace WHERE id=:i AND owner_user_id=:u"),
-            {"i": ws_id, "u": uid})).first()
-    if not row:
+    from app.services import app_service
+    sf = request.app.state.session_factory
+    role = await app_service.workspace_role(sf, ws_id, request.state.actor["id"])
+    if role is None:
         raise HTTPException(404, "工作区不存在")
-    return Path(row[0])
+    if owner_only:
+        try:
+            app_service.require_owner(role)
+        except DeployError as e:
+            raise HTTPException(e.status, str(e))
+    async with sf() as s:
+        root = (await s.execute(text(
+            "SELECT root_path FROM workspace WHERE id=:i"), {"i": ws_id})).scalar()
+    return Path(root)
 
 @router.get("/fs/tree")
 async def fs_tree(request: Request, workspace_id: int):
@@ -140,7 +152,7 @@ async def fs_open_folder(request: Request, body: OpenFolderIn):
     前提是浏览器与后端同机——这点由前端判定（frontend/src/utils/openFolder.js），
     判错或本机没有图形会话时，前端据本端点的非 2xx 降级到内置文件管理器。
     """
-    root = await _root_of(request, body.workspace_id)
+    root = await _root_of(request, body.workspace_id, owner_only=True)
     if not root.is_dir():
         raise HTTPException(400, "工作区目录不存在或已被移除")
     try:
@@ -178,7 +190,7 @@ class SaveIn(BaseModel):
 
 @router.put("/files/save")
 async def files_save(request: Request, body: SaveIn):
-    root = await _root_of(request, body.workspace_id)
+    root = await _root_of(request, body.workspace_id, owner_only=True)
     try:
         f = resolve_in_workspace(root, body.path)
     except Exception as e:
