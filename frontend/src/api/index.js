@@ -87,7 +87,7 @@ export const withdrawPublishRequest = (id, rid) =>
 // 单应用详情：两条 SELECT 的纯 DB 读，回体带 status_dev 与 preview_url。
 // 聊天页预览状态的轮询目标——刻意不用 devStatus，那个接口每次都 `docker compose ps` 起子进程。
 export const getApp = (id) => http.get(`/apps/${id}`)
-export const createApp = (data) => http.post('/apps', data) // {name, slug, scale, stack}
+export const createApp = (data) => http.post('/apps', data) // {name, slug, scale, stack, source?:{url, subpath?}}
 // 侧栏分组行的两个入口：改名只动显示名（slug 是目录/库/镜像名的锚点，不可改）；
 // 删除只删平台记录，工程目录与应用数据库保留（M1 裁定），响应 kept 里带回保留位置。
 export const renameApp = (id, name) => http.patch(`/apps/${id}`, { name })

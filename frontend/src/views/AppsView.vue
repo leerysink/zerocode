@@ -24,6 +24,7 @@ import MetricsModal from '../components/MetricsModal.vue'
 import MobileModal from '../components/MobileModal.vue'
 import PublishModal from '../components/PublishModal.vue'
 import { LARGE_STACKS, SMALL_STACKS, slugFromName, validateForm } from '../utils/appForm'
+import { sourcePayload } from '../utils/appSource'
 import { copyText } from '../utils/clipboard'
 import DeployLogPanel from '../components/DeployLogPanel.vue'
 import BackButton from '../components/BackButton.vue'
@@ -64,7 +65,8 @@ const LIVE_PROD = ['running', 'unhealthy']
 const RING_C = 97.39            // r=15.5 的周长（环只画 0-100，超出的部分留给下面的真实数字）
 const NO_SAMPLE = '未采集'
 const NOT_LIVE = '停炉未采集'
-const form = reactive({ name: '', slug: '', slugTouched: false, scale: 'small', stack: 'vue3-fastapi' })
+const form = reactive({ name: '', slug: '', slugTouched: false, scale: 'small',
+  stack: 'vue3-fastapi', sourceUrl: '', sourceSubpath: '' })
 let timer = null
 let metricsTimer = null
 
@@ -204,11 +206,23 @@ function nextFrom2() {
 async function submit() {
   const v = validateForm(form)
   if (!v.ok) return message.warning(v.msg)
+  // 仓库地址空 / 全空白 → source 缺席（axios 会丢掉 undefined 键），一次远程抓取都不该发生；
+  // 超长在前端先拦一次，报错走同一条 message.error，不给后端送一次必然 400 的请求
+  let source
   try {
-    await createApp({ name: form.name.trim(), slug: form.slug, scale: form.scale, stack: form.stack })
+    source = sourcePayload(form.sourceUrl, form.sourceSubpath)
+  } catch (e) {
+    message.error(e.message)
+    return
+  }
+  try {
+    await createApp({ name: form.name.trim(), slug: form.slug, scale: form.scale,
+                      stack: form.stack, source })
     message.success('应用已创建')
     showWizard.value = false
-    Object.assign(form, { name: '', slug: '', slugTouched: false, scale: 'small', stack: 'vue3-fastapi' })
+    // 这两个字段必须跟着重置：漏一次，第二次创建就静默带上上一个仓库地址、真的又抓一次远程
+    Object.assign(form, { name: '', slug: '', slugTouched: false, scale: 'small',
+      stack: 'vue3-fastapi', sourceUrl: '', sourceSubpath: '' })
     current.value = 0
     await load()
   } catch (e) {
@@ -908,6 +922,14 @@ async function doRelease() {
             <a-select v-model:value="form.stack" :options="form.scale === 'large'
               ? LARGE_STACKS
               : SMALL_STACKS" />
+          </a-form-item>
+          <a-form-item label="仓库地址"
+                       help="可选：Gitee 公开仓库地址，创建时把仓库文本内容烘成快照，站点可从 /source/ 读">
+            <a-input v-model:value="form.sourceUrl" allow-clear
+                     placeholder="https://gitee.com/owner/repo 或 …/tree/master/docs" />
+          </a-form-item>
+          <a-form-item label="子目录" help="可选：只收这个目录下的正文，留空则全域扫描">
+            <a-input v-model:value="form.sourceSubpath" allow-clear placeholder="如 docs" />
           </a-form-item>
         </a-form>
         <p class="zc-tip">数据库将自动使用 PostgreSQL（dev / prod 两套独立库）。</p>
