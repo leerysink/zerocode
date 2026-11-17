@@ -15,6 +15,9 @@ from app.deploy.nics import app_url
 from app.deploy.ports import allocate_pair
 from app.deploy.settings import REPO_ROOT, deploy_cfg, preview_url, resolve_apps_root
 from app.deploy.slugs import validate_slug
+# 快照铺源排在 app.deploy 之后导入：app/source/materialize.py 只依赖 app.deploy.scaffold，
+# 不回流本模块，故这条 import 不成环。
+from app.source import materialize as source_materialize
 
 SCALES = ("small", "large")
 SMALL_STACKS = ("vue3-fastapi", "vue3-node", "static")
@@ -145,6 +148,7 @@ async def _delete_rows(session_factory, app_id: int) -> None:
 async def create_app_project(session_factory, *, name: str, slug: str, scale: str,
                              stack: str, root: str | None = None,
                              origin: str | None = None, materialize=None,
+                             source: dict | None = None,
                              owner_user_id: int | None = None) -> dict:
     """原子创建一个应用工程：任一步失败即回滚（平台记录 + 供给 + 目录），抛 DeployError。
 
@@ -152,6 +156,10 @@ async def create_app_project(session_factory, *, name: str, slug: str, scale: st
     （从包 copy 源码 + 锚点 sqlchange），从而复用本函数的端口分配、app.json、原子回滚。
     `origin`：安装来源标记（`store:<release_id>`），自建应用为 NULL。
     `owner_user_id`：归属用户（登录后的 actor id），新建行落此列（Ticket 003 扩展态）。
+
+    `source`：仓库快照载荷（app/source/ingest.py 的返回）。给出时**先**按 materialize（或栈模板）
+    铺源，**再**把快照落到 frontend/public/source/ 并给 README 追加溯源段——顺序不能反，
+    scaffold 的占位符残留自检跑在铺源里，快照正文里的 `{{APP_NAME}}` 不该被它判成残留。
     """
     name_stripped = check_name(name)
     validate_slug(slug)
@@ -176,6 +184,8 @@ async def create_app_project(session_factory, *, name: str, slug: str, scale: st
             lambda rp, mp: scaffold.render_layers(
                 [TEMPLATES / layer for layer in template_layers_of(stack)], rp, mp,
                 scaffold.has_data_track(stack)))
+        if source is not None:
+            render = source_materialize.compose_with_source(render, source)
         render(root_path, mapping)   # R-C 已保证模板目录存在
         app = await _insert_rows(session_factory, name=name_stripped, slug=slug, scale=scale,
                                  stack=stack, root=root_path, prod_port=prod_port,
