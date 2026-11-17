@@ -557,7 +557,9 @@ def parse_repo_url(url: str) -> RepoRef | None:
     if parsed.hostname not in _GITEE_HOSTS:
         return None
     segs = [s for s in parsed.path.split("/") if s]
-    if len(segs) == 1 and segs[0].upper() == "SKILL.MD":
+    # 指向 SKILL.md 的直链不是仓库：交给技能安装的直链通道（同 installer.is_skill_md_url 的口径），
+    # 否则 /owner/repo/raw/master/SKILL.md 会被下面的 tree 形态判定当成坏 URL 报错。
+    if segs and segs[-1].upper() == "SKILL.MD":
         return None
     if len(segs) < 2:
         raise HostingError("Gitee 仓库地址至少要有 owner/repo")
