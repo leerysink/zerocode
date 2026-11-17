@@ -10,6 +10,7 @@ tests/test_source_guard.py / test_source_hosting.py / test_source_ingest.py 同�
 import json
 import os
 from pathlib import Path
+from urllib.parse import unquote
 
 import pytest
 
@@ -131,6 +132,36 @@ def test_path_traversal_cannot_escape_snapshot_dir(tmp_path):
     assert not (tmp_path / "frontend" / "public" / "source" / "escape.md").exists()
     assert not (tmp_path / "frontend" / "public" / "escape.md").exists()
     assert _sandbox_entries(tmp_path) == [], "拒一个形态必须零副作用"
+
+
+def test_manifest_url_resolves_to_the_name_written_on_disk(tmp_path):
+    """终审 F4 的另一半：编码字段与 `write_snapshot` 必须说同一件事，而这只有在写侧可证。
+
+    抓取侧（`test_source_ingest.py`）钉的是「manifest 里长这样」，这里钉的是「照 url 去盘上取，
+    取得到同一篇正文」。两半合起来才是「站点 fetch 得到」这条契约。
+    """
+    weird = "docs/c#1.md"
+    payload = _payload()
+    payload["files"] = {weird: "# 标题带井号".encode("utf-8")}
+    payload["manifest"]["files"] = [{"path": weird, "url": materialize.snapshot_file_url(weird),
+                                     "bytes": 3, "title": "标题带井号", "dir": "docs"}]
+    materialize.write_snapshot(tmp_path, payload)
+    entry = json.loads((tmp_path / materialize.MANIFEST_REL).read_text(encoding="utf-8"))["files"][0]
+    assert entry["path"] == weird                       # 展示字段仍是仓库原路径
+    assert entry["url"] == "/source/files/docs/c%231.md"
+    rel = unquote(entry["url"][len(materialize.FILES_URL_PREFIX):])
+    assert entry["url"] != materialize.FILES_URL_PREFIX + entry["path"], "url 没编码，就是原串拼接"
+    assert rel == entry["path"], "解码后必须回到盘上那个名字（编码是可逆的，不是改名）"
+    assert (tmp_path / "frontend/public/source/files" / rel).read_bytes() == payload["files"][weird]
+
+
+def test_provenance_sends_the_site_to_files_url_not_path(tmp_path):
+    """README 的出处段是生成侧 AI 唯一的说明书：它指 `files[].url`（机器字段）而不是
+    `files[].path`（展示字段）—— 照 path 拼 fetch，带 `#`/`?`/`%` 的那几篇会 404 或打到别处。"""
+    materialize.append_readme_provenance(tmp_path, _payload()["manifest"])
+    text = (tmp_path / "README.md").read_text(encoding="utf-8")
+    assert "files[].url" in text
+    assert "files[].path" in text        # 两个字段各自的身份要写明白
 
 
 def test_readme_gets_provenance_section_and_keeps_template_text(tmp_path):

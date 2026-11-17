@@ -6,6 +6,7 @@ transport 经 app.state.source_http_transport 注入（照 app.state.skills_http
 """
 import json
 import shutil
+from urllib.parse import unquote
 
 import httpx
 import pytest
@@ -15,7 +16,7 @@ from app import config as app_config
 from app.db import make_engine, make_session_factory
 from app.deploy import provision
 from app.deploy.settings import REPO_ROOT
-from app.source import materialize
+from app.source import ingest, materialize
 
 pytestmark = pytest.mark.asyncio
 SLUG = "zcesrcapi"
@@ -46,6 +47,9 @@ def _transport(tree, files, *, status=200, requests=None):
                                   if status == 200 else {"message": "no"})
         if p.startswith("/leerys/zerocode/raw/"):
             fp = "/".join(p.split("/")[5:])
+            # raw 端点收到的是百分号编码后的路径（`hosting.raw_file_url` 里的 `quote(path)`），
+            # 夹具按解码后的仓库原路径查表，才演得出 `docs/c#1.md` 这类名字的真实往返。
+            fp = unquote(fp)
             return httpx.Response(200, content=files.get(fp, b"")) if fp in files \
                 else httpx.Response(404)
         return httpx.Response(404)
@@ -280,3 +284,85 @@ async def test_declared_oversize_tree_is_400_without_downloading(client):
     assert "总大小" in r.json()["detail"]
     assert not any("/raw/" in u for u in reqs)
     assert not APP_DIR.exists()
+
+
+# ---- 终审整枝期的三条跨任务结论（F1 凭证泄漏 / F2 坏 URL 成 500 / F4 manifest 的 fetch 目标）----
+
+
+async def test_url_with_credentials_is_400_and_stores_nothing(client):
+    """终审 F1（安全）：粘在 URL 里的 token 曾经一路通过 SSRF 判据，最后冻进 `manifest.sourceUrl`
+    与 README 出处行 —— 而 `manifest.json` 是发布后 `/source/manifest.json` 上公开可读的文件，
+    这正是本特性的全部意义。
+
+    这条用例断言的不是「状态码是 400」，而是**存储形态**：拒在建应用之前，所以工作区、快照目录、
+    manifest、README 与 app 行统统不存在，凭证没有一个字节落盘；400 detail 里也不出现它
+    （detail 会进响应体与访问日志，把凭证从快照搬到那里等于没修）。
+    """
+    reqs = []
+    client.app.state.source_http_transport = _transport(TREE, FILES, requests=reqs)
+    r = await client.post("/api/apps", json=_body(
+        source={"url": "https://oauth2:GLtok-SECRET123@gitee.com/leerys/zerocode"}))
+    assert r.status_code == 400, r.text
+    assert "SECRET123" not in r.text
+    assert "令牌" in r.json()["detail"]
+    assert reqs == []
+    assert not APP_DIR.exists(), "带凭证的 URL 却留下了工作区"
+    _assert_no_snapshot("带凭证的 URL 居然落了快照")
+    assert await _app_rows(client) == []
+
+
+async def test_unparsable_url_is_400_not_500(client):
+    """终审 F2：未闭合的 IPv6（`http://[::1/x`）在守卫之前抛的是**裸 ValueError**，
+    曾经直接穿过这里那句 `except SourceError` → 一次 500 + traceback，而规格 US-10/§5.4
+    承诺的是「失败只以 400 类领域错误出去」。现在映射是全函数。
+    """
+    reqs = []
+    client.app.state.source_http_transport = _transport(TREE, FILES, requests=reqs)
+    for bad in ("http://[::1/x", "https://[::1"):
+        r = await client.post("/api/apps", json=_body(source={"url": bad}))
+        assert r.status_code == 400, (bad, r.text)
+        assert "URL 形态非法" in r.json()["detail"]
+    assert reqs == []
+    assert not APP_DIR.exists()
+    assert await _app_rows(client) == []
+
+
+async def test_wall_clock_budget_exhausted_is_400_and_creates_no_app(client, monkeypatch):
+    """终审 F5：一次摄入有一条**聚合墙钟**预算（httpx 的 20 秒是每段读超时，封不住慢滴）。
+    端点级要钉的是不变量 (e)：超线发生在建应用之前 —— 没有应用行、没有目录、没有任何请求。
+    """
+    reqs = []
+    client.app.state.source_http_transport = _transport(TREE, FILES, requests=reqs)
+    monkeypatch.setattr(ingest, "WALL_CLOCK_BUDGET_SECONDS", 0.0)
+    r = await client.post("/api/apps", json=_body())
+    assert r.status_code == 400, r.text
+    assert "时间预算" in r.json()["detail"]
+    assert reqs == []
+    assert not APP_DIR.exists()
+    assert await _app_rows(client) == []
+
+
+async def test_manifest_url_is_the_fetch_target_and_matches_the_name_on_disk(client):
+    """终审 F4 端点级：`files[].url` 必须是页面真能 fetch 到的地址。
+
+    这里能给的证明是「url 解码后正好落在写侧的快照目录里，且那个文件真实存在」——
+    站点侧 `fetch(entry.url)` 打的就是它（Vite 把 `public/` 原样直出，规格 §2.2/§5.3）。
+    只断言 `path` 会替「带 `#` 的那篇永远 404」作假证：原串拼进 fetch 打不到任何文件。
+    """
+    tree = [_blob("docs/c#1.md"), _blob("docs/a b.md"), _blob("docs/a%20b.md")]
+    bodies = {e["path"]: b"# x" for e in tree}
+    client.app.state.source_http_transport = _transport(tree, bodies)
+    r = await client.post("/api/apps", json=_body())
+    assert r.status_code == 201, r.text
+    m = _manifest()
+    assert {f["path"] for f in m["files"]} == set(bodies), "展示字段必须仍是仓库原路径"
+    assert {f["url"] for f in m["files"]} == {
+        "/source/files/docs/c%231.md",
+        "/source/files/docs/a%20b.md",
+        "/source/files/docs/a%2520b.md",    # 字面 %20 再编码一次，不然会被解回 'a b.md'
+    }
+    files_dir = APP_DIR / materialize.FILES_REL_PREFIX
+    for entry in m["files"]:
+        assert entry["url"].startswith(materialize.FILES_URL_PREFIX)
+        landing = files_dir / unquote(entry["url"][len(materialize.FILES_URL_PREFIX):])
+        assert landing.is_file(), f"manifest 给的 url 在盘上取不到：{entry}"

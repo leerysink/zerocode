@@ -45,8 +45,78 @@ def test_url_length_cap():
     assert "字符上限" in str(e.value)
 
 
+# 终审 F1：`urlparse().hostname` 按定义不含 userinfo，所以 SSRF 判据对「URL 里内嵌的凭证」天生盲。
+# 这条链路的后果不是「拿到了私有内容」（端点全部按硬编码 host 重拼、从不带鉴权头，token 一个字节
+# 都不生效），而是凭证被原样冻进 manifest.sourceUrl 与 README 出处行 —— manifest 正是发布后
+# **公开站点**上的一个文件。所以拒在共用的守卫层，两条通道一起受益。
+CREDENTIAL_URLS = [
+    "https://oauth2:GLtok-SECRET123@gitee.com/leerys/zerocode",
+    "https://user@gitee.com/leerys/zerocode",
+    "https://user:pw@gitee.com/leerys/zerocode",
+    # 空用户名也算 userinfo：`@` 一出现就改写了权威段，hostname 已经不是看起来那个主机
+    "https://@gitee.com/leerys/zerocode",
+    "https://gitee.com@198.51.100.7/leerys/zerocode",
+]
+
+
+@pytest.mark.parametrize("url", CREDENTIAL_URLS)
+def test_validate_http_url_rejects_credentials_in_url(url):
+    with pytest.raises(guard.GuardError) as e:
+        guard.validate_http_url(url)
+    assert "令牌" in str(e.value)
+    # 文案不许回显 URL：400 detail 会进响应体与访问日志，把凭证从快照搬到那里等于没修
+    assert "SECRET123" not in str(e.value)
+    assert "@" not in str(e.value)
+
+
+@pytest.mark.parametrize("url", CREDENTIAL_URLS)
+def test_installer_translates_credential_rejection(url):
+    """通道一致性：技能侧的薄包装必须把同一条拒绝翻成 SkillError（→400），而不是漏成 500。"""
+    with pytest.raises(installer.SkillError) as e:
+        installer._validate_http_url(url)
+    assert "令牌" in str(e.value)
+    assert "SECRET123" not in str(e.value)
+
+
+# 终审 F2：未闭合的 IPv6 字面量让 urlparse 抛**裸 ValueError**。它在调用方自己的 try 之前触发，
+# 于是 api 层那句 `except SourceError` 根本看不见 —— 一次 500 + traceback，破掉「失败只以
+# 400 类领域错误出去」这条分支级不变量（规格 US-10 / §5.4 承诺的是 400）。
+UNPARSABLE_URLS = ["http://[::1/x", "https://[::1", "http://[bad/x/path"]
+
+
+@pytest.mark.parametrize("url", UNPARSABLE_URLS)
+def test_validate_http_url_turns_parse_error_into_guard_error(url):
+    with pytest.raises(guard.GuardError) as e:
+        guard.validate_http_url(url)
+    assert "URL 形态非法" in str(e.value)
+
+
+@pytest.mark.parametrize("url", UNPARSABLE_URLS)
+def test_installer_translates_parse_error(url):
+    with pytest.raises(installer.SkillError):
+        installer._validate_http_url(url)
+
+
 def test_public_host_passes():
     guard.validate_http_url("https://gitee.com/leerys/zerocode")
+
+
+async def test_unparsable_redirect_target_never_escapes_as_value_error():
+    """重定向落点由远端 Response 决定，比用户粘的串更不可信，所以它也在 F2 的口径之内。
+
+    实测这一形态今天由 httpx 自己先判掉（`URL(location)` 解析失败 → `RemoteProtocolError`，
+    它是 `httpx.HTTPError` 的子类，两条通道的包装层都翻译它）。守卫内部那道
+    `urljoin`/`urlparse` 的 ValueError 收口是第二层：将来 httpx 放宽校验时它接管，
+    两层加起来的铁律是「裸 ValueError 不许递给调用方」—— 这条用例钉的就是这一句。
+    """
+    async def handler(request):
+        return httpx.Response(302, headers={"location": "//[::1/x"})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    with pytest.raises(httpx.HTTPError):        # 换成 ValueError 逃逸，这里直接红
+        await guard.fetch_limited(client, "https://example.com/a", "a",
+                                  required=True, max_bytes=10)
+    await client.aclose()
 
 
 async def test_fetch_limited_streams_and_caps_size():

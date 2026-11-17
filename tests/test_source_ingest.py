@@ -9,6 +9,7 @@ pytestmark，否则纯同步用例每个多刷一条 PytestWarning，同 test_so
 test_source_hosting.py）。
 """
 import json
+from urllib.parse import unquote
 
 import pytest
 
@@ -65,6 +66,10 @@ def _transport(tree, files, *, default_branch="master", truncated=False,
                 fp = rest[len(raw_ref) + 1:]
             else:
                 fp = "/".join(rest.split("/")[1:])
+            # 真实 raw 端点收到的是百分号编码后的路径（`hosting.raw_file_url` 里 `quote(path)`），
+            # 夹具按解码后的仓库原路径查表 —— 否则 `docs/c#1.md` 这种名字永远匹配不上，
+            # 「树里的 path ↔ 拿到的正文」这条真实对应就演不出来。
+            fp = unquote(fp)
             if raw_status and fp in raw_status:
                 return httpx.Response(raw_status[fp], json={"message": "gone"})
             if fp in files:
@@ -406,6 +411,97 @@ async def test_internal_url_rejected_before_any_request():
             await ingest.fetch_repo_snapshot(bad, transport=_transport([], {}, requests=calls))
     # 「拒绝在任何请求之前」是这条用例的全部价值：一次请求都不许发出去
     assert calls == []
+
+
+async def test_credential_in_url_is_rejected_before_any_request():
+    """终审 F1：这条链路的泄漏面是**公开站点**，不是「抓到了私有内容」。
+
+    `urlparse().hostname` 按定义不含 userinfo，SSRF 判据对它是盲的；而端点全部按硬编码 host
+    重拼、从不带鉴权头，所以那个 token 一个请求都不生效 —— 它唯一的作用是原样冻进
+    `manifest.sourceUrl`（再由 materialize 抄进 README 出处行），而 `manifest.json` 正是发布后
+    `/source/manifest.json` 上那个公开可读的文件。判在共用的守卫层，这里钉摄入侧的三个后果：
+    零请求、不返回任何载荷、错误文本自己也不带凭证（它会进 400 detail 与访问日志）。
+    """
+    calls = []
+    secret_url = "https://oauth2:GLtok-SECRET123@gitee.com/leerys/zerocode"
+    with pytest.raises(ingest.SourceError) as e:
+        await ingest.fetch_repo_snapshot(secret_url, transport=_transport(TREE, FILES,
+                                                                         requests=calls))
+    assert calls == []
+    assert "令牌" in str(e.value)
+    assert "SECRET123" not in str(e.value)
+
+
+async def test_unparsable_url_is_a_source_error_not_a_bare_value_error():
+    """终审 F2：未闭合的 IPv6 让 `urlparse` 抛裸 ValueError，而它排在 `ingest` 那个大 try 之前 ——
+    漏出去就是一次 500，`app/api/apps.py` 的 `except SourceError` 根本看不见它。
+    """
+    calls = []
+    for bad in ("http://[::1/x", "https://[::1"):
+        with pytest.raises(ingest.SourceError) as e:
+            await ingest.fetch_repo_snapshot(bad, transport=_transport(TREE, FILES, requests=calls))
+        assert "URL 形态非法" in str(e.value)
+    assert calls == []
+
+
+async def test_manifest_files_carry_a_percent_encoded_fetch_url():
+    """终审 F4：`path` 是给人看的原串，`url` 才是页面拿去 fetch 的目标。
+
+    上游 raw 端点早就按 `quote(path)` 编码（`test_raw_path_quotes_reserved_chars` 钉着），
+    写盘侧落的是 normpath 归一名，唯独 manifest 存原串 —— 站点照抄 `path` 拼 fetch 时，
+    `#` 会掉进 URL 片段（静默 404）、`?` 变成查询串、`%XX` 会被再解一次码打到**另一篇**正文。
+    """
+    tree = [_blob("docs/c#1.md"), _blob("docs/a%20b.md"), _blob("docs/q?x.md"),
+            _blob("docs/a b.md")]
+    files = {e["path"]: b"# x" for e in tree}
+    out = await ingest.fetch_repo_snapshot(URL, transport=_transport(tree, files))
+    by_path = {f["path"]: f["url"] for f in out["manifest"]["files"]}
+    assert by_path == {
+        "docs/c#1.md": "/source/files/docs/c%231.md",
+        "docs/a%20b.md": "/source/files/docs/a%2520b.md",   # 字面的 %20 必须再编码一次
+        "docs/q?x.md": "/source/files/docs/q%3Fx.md",
+        "docs/a b.md": "/source/files/docs/a%20b.md",
+    }
+    # path 一个字节都不动：编码只发生在 url 上，展示字段不许被顺手改掉
+    assert {f["path"] for f in out["manifest"]["files"]} == {e["path"] for e in tree}
+
+
+async def test_wall_clock_budget_stops_the_download_and_names_the_limit(monkeypatch):
+    """终审 F5：条数与字节预算封不住**时间**。
+
+    `_client` 的 `timeout=20.0` 是每段读超时：一个每 19 秒吐一个字节的慢滴响应能把它无限续期，
+    而创建请求是同步等的（向导没有 axios 超时）。这里用可替换的单调时钟接缝演「每下一篇正文过
+    30 秒墙钟」、预算 45 秒：第一篇与第二篇照收（闸判在每次下载之前，不推翻已完成的工作），
+    过期之后**一个 raw 都不许多发**，并且以 SourceError 收口（400，不是 500）。
+    真 sleep 会把这条变成 flaky 计时用例，所以走 `_monotonic` 这层接缝。
+    """
+    import httpx
+
+    tree = [_blob(f"d{i}.md") for i in range(5)]
+    files = {f"d{i}.md": b"# x" for i in range(5)}
+    calls: list[str] = []
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(ingest, "_monotonic", lambda: clock["t"])
+    monkeypatch.setattr(ingest, "WALL_CLOCK_BUDGET_SECONDS", 45.0)
+
+    async def handler(request):
+        calls.append(str(request.url))
+        p = request.url.path
+        if "/git/trees/" in p:
+            return httpx.Response(200, json={"tree": tree, "truncated": False})
+        if p.startswith("/leerys/zerocode/raw/"):
+            clock["t"] += 30                      # 慢滴：这篇正文花掉 30 秒
+            fp = "/".join(p[len("/leerys/zerocode/raw/"):].split("/")[1:])
+            return httpx.Response(200, content=files[fp])
+        return httpx.Response(200, json={"default_branch": "master"})
+
+    with pytest.raises(ingest.SourceError) as e:
+        await ingest.fetch_repo_snapshot(URL, transport=httpx.MockTransport(handler))
+    raws = [c for c in calls if "/raw/" in c]
+    assert len(raws) == 2, f"预算 45 秒、每篇 30 秒：只该下到第二篇，实际 {raws}"
+    assert len(raws) < len(tree)                  # 绝不是「下完再判」
+    assert "时间预算" in str(e.value)
+    assert "subpath" in str(e.value)              # 文案要给出下一步（收窄范围）
 
 
 async def test_unsupported_host_says_which_hosts_work():

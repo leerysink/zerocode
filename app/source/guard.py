@@ -7,6 +7,11 @@
 
 重定向不交给 httpx 自动跟随：逐跳 Manual redirect，落点先过 SSRF 预检再发下一跳，
 内网落点根本不被连接；跨主机落点按请求摘掉 authorization（不永久突变共享 client）。
+
+**`GuardError` 是这里的唯一业务出口**：裸 `ValueError`（urlparse 的坏形态）之类的标准库异常一律
+在守卫内部翻成 `GuardError`，绝不外泄。调用方的包装层（`installer._validate_http_url`/`_get_limited`
+→ `SkillError`，`ingest.fetch_repo_snapshot` → `SourceError`）只翻译 `GuardError`，漏一条出去
+就是一次 HTTP 500 —— 两条通道的 400 映射表都是按「守卫只会抛 GuardError/RefMissing」写的。
 """
 import ipaddress
 import re
@@ -51,12 +56,27 @@ def reject_internal_host(host: str | None) -> None:
 
 
 def validate_http_url(url: str, *, max_len: int = MAX_URL_LEN) -> None:
-    """仅 http/https、长度在上限内、主机落在公网。"""
+    """仅 http/https、长度在上限内、主机落在公网、**URL 里不带内嵌凭证**。"""
     if len(url) > max_len:
         raise GuardError(f"URL 超过 {max_len} 字符上限")
-    parsed = urlparse(url)
+    try:
+        parsed = urlparse(url)
+    except ValueError as e:
+        # urlparse 对未闭合的 IPv6 字面量（`http://[::1/x`）抛的是**裸 ValueError**，而它排在调用方
+        # 自己的 try 之前——漏出去就是 HTTP 500 + 一条 traceback，把「只往外抛领域错误」这条不变量
+        # 从守卫这里破掉。守卫是两条通道唯一的入口，收口在这里，映射表才仍然是全函数。
+        raise GuardError("URL 形态非法：这个地址解析不出主机名（方括号或主机部分不完整？）") from e
     if parsed.scheme.lower() not in ("http", "https"):
         raise GuardError("仅支持 http/https 直链")
+    # 内嵌凭证一律拒收（终审 F1，安全）。为什么 SSRF 判据看不见它：`urlparse().hostname` 按定义
+    # 不含 userinfo，于是 `https://oauth2:TOKEN@gitee.com/o/r` 一路通过；而后面每个端点都按硬编码
+    # host 重拼、从不带鉴权头，所以那个 token **一个请求都不生效**，却会被原样冻进 manifest.sourceUrl
+    # 与 README 的出处行——manifest 正是发布后公开站点上的一个文件（本特性的全部意义就是它公开可读）。
+    # 平台侧永远匿名抓取，所以「拒绝」不损失任何能力，只关掉一条把用户凭证挂到公网的路径。
+    # 文案刻意不回显 URL：400 detail 会进响应体与访问日志，把凭证从快照搬到这里等于没修。
+    if parsed.username is not None or parsed.password is not None:
+        raise GuardError("URL 里不允许携带账号或访问令牌（在主机名前面写用户名的那种写法）："
+                         "本能力只匿名读取公开仓库，凭证不会生效，却会随快照泄漏到公开站点")
     reject_internal_host(parsed.hostname)
 
 
@@ -74,8 +94,15 @@ async def fetch_limited(client, url: str, label: str, *, required: bool,
                     err.status_code = resp.status_code
                     raise err
                 raise RefMissing(label)
-            target = urljoin(url, loc)
-            tp = urlparse(target)
+            # 落点由远端 Response 决定，比用户粘的串更不可信，所以它也在「守卫不外泄非领域异常」
+            # 这条之内：未闭合的 IPv6 会让 urljoin/urlparse 抛裸 ValueError（urljoin 内部也解析
+            # ref），两句一起包。今天 httpx 先把这个形态判成 RemoteProtocolError（其父类
+            # httpx.HTTPError 由两条通道各自翻译），这里是 httpx 放宽校验后接管的第二层保险。
+            try:
+                target = urljoin(url, loc)
+                tp = urlparse(target)
+            except ValueError as e:
+                raise GuardError("重定向目标形态非法：解析不出主机名") from e
             if tp.scheme.lower() not in ("http", "https"):
                 raise GuardError("重定向目标协议不允许")
             reject_internal_host(tp.hostname)

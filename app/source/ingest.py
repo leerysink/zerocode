@@ -10,6 +10,9 @@
 - TOTAL_MAX_BYTES = 8 MB 比技能的 10 MB 保守，因为快照要烘进应用镜像（Dockerfile 的
   `COPY . .`），镜像里塞几十 MB 噪声是给发布链添堵；
 - FILE_COUNT_MAX = 400：一次官网文档站够装几百篇，再多就是整仓 mirror，不是素材快照。
+- WALL_CLOCK_BUDGET_SECONDS = 120 秒：前三个数封的都是字节与条数，**不是时间**——httpx 的
+  `timeout` 是每段读超时，慢滴响应能在创建请求里无限续期。故另加一条聚合墙钟预算，
+  在每个出网步骤之前检查，超线即 `SourceError`（抛在建应用之前，零副作用那条不受影响）。
 
 不出网的部分一律前置：URL 预检、host 支持判定、ref/subpath 的路径形态闸、树元数据的声明体积
 都在第一个字节下载之前，所以「失败零副作用」是结构保证，不是靠 try/finally 兜出来的。
@@ -22,10 +25,11 @@ import datetime
 import json
 import posixpath
 import re
+import time
 
 import httpx
 
-from app.source import guard, hosting
+from app.source import guard, hosting, materialize
 from app.source.guard import GuardError
 from app.workspace_ignore import IGNORE_DIRS
 
@@ -34,6 +38,15 @@ MAX_FILE_BYTES = 200 * 1024
 TOTAL_MAX_BYTES = 8 * 1024 * 1024
 FILE_COUNT_MAX = 400
 _SUBPATH_MAX = 500
+# 整次摄入的**墙钟**预算。为什么字节预算不够：`FILE_COUNT_MAX`/`TOTAL_MAX_BYTES` 封的是条数和
+# 字节，而 `_client` 的 `timeout=20.0` 在 httpx 里是**每段读**超时不是每次请求超时——一个每 19 秒
+# 吐一个字节的慢滴响应可以把它无限次续期，创建请求就此挂住（向导同步等、axios 没有超时）。
+# 120 秒是「400 篇串行下载 + 若干次 API 调用」的现实上限，也远在网关空闲超时之内；
+# 数值口径写进规格 §6，实测偏差由 §9 的耗时验收项复核。
+WALL_CLOCK_BUDGET_SECONDS = 120.0
+
+# 单调时钟走这层间接：用例要演「慢滴响应」，真 sleep 会把它变成 flaky 计时，这里留一个可替换接缝。
+_monotonic = time.monotonic
 
 TEXT_EXTS = {".md", ".mdx", ".txt", ".rst", ".json", ".yaml", ".yml", ".csv", ".toml", ".ini"}
 LOCKFILE_NAMES = {"package-lock.json", "pnpm-lock.yaml", "yarn.lock", "npm-shrinkwrap.json",
@@ -111,8 +124,24 @@ def _require_safe_shape(value: str | None, label: str) -> None:
 
 
 def _client(transport=None) -> httpx.AsyncClient:
-    """不传 follow_redirects：重定向交给 guard.fetch_limited 逐跳预检。"""
+    """不传 follow_redirects：重定向交给 guard.fetch_limited 逐跳预检。
+
+    `timeout=20.0` 是**每段读**超时，不是整次摄入的时限，所以它必须与
+    `WALL_CLOCK_BUDGET_SECONDS` 配套看：前者管一次停顿，后者管总时长。
+    """
     return httpx.AsyncClient(transport=transport, timeout=20.0)
+
+
+def _check_time_budget(deadline: float) -> None:
+    """墙钟预算闸：排在每一个出网步骤之前，超线即一次可执行的 400。
+
+    判在步骤之前而不是包在 await 外面，是因为这里要拦的是「别再发起下一次下载」，
+    而单个响应内部的慢滴仍由 httpx 的读超时兜（`_client`）——两道各管一段，别混成一谈。
+    """
+    if _monotonic() >= deadline:
+        raise SourceError(
+            f"快照抓取超过 {WALL_CLOCK_BUDGET_SECONDS:g} 秒的时间预算，已中止"
+            "（仓库过大或响应过慢？请用 /tree/<ref>/<subpath> 或 subpath 参数收窄范围）")
 
 
 async def _get_json(client, url: str, label: str, *, max_bytes: int = TREE_MAX_BYTES) -> dict:
@@ -130,6 +159,8 @@ async def fetch_repo_snapshot(url: str, *, subpath: str | None = None,
                               transport=None) -> dict:
     """抓 Gitee 仓库文本快照，返回 {"manifest": {...}, "files": {...}}。"""
     try:
+        # 只翻译 GuardError：`guard.validate_http_url` 的坏形态（含 F2 的裸 ValueError）已经在
+        # 守卫内部收成了 GuardError，所以这一层之外没有任何异常该逃到 api 层（逃出去就是 500）。
         guard.validate_http_url(url)
     except GuardError as e:
         raise SourceError(str(e)) from e
@@ -158,11 +189,15 @@ async def fetch_repo_snapshot(url: str, *, subpath: str | None = None,
     # URL 本身不是合法仓库形态」，两条通道都受益），这里补上解析层看不到的一半：显式 subpath 参数
     # 归并出来的 scoped，加上后面远端 JSON 给的默认分支与合并候选。
     _require_safe_shape(scoped, "子路径")
+    # 预算从「准备出网」这一刻起算，而不是从第一个字节起算：晚一点建都要留足整段下载的时间。
+    deadline = _monotonic() + WALL_CLOCK_BUDGET_SECONDS
     client = _client(transport)
     try:
+        _check_time_budget(deadline)
         branch = ref.ref or hosting.default_branch_of(
             await _get_json(client, hosting.api_repo_url(ref), "仓库信息"))
         _require_safe_shape(branch, "分支")   # default_branch 是远端返回的，一样不许带点段
+        _check_time_budget(deadline)
         tree_json = await _fetch_tree(client, ref, branch)
         if tree_json is None:
             # 含斜杠分支名（feature/x）在 URL 里天然歧义：404 时把已判定的子目录并进 ref 再试一次。
@@ -181,6 +216,7 @@ async def fetch_repo_snapshot(url: str, *, subpath: str | None = None,
                     raise SourceError(
                         f"分支与子路径合并结果异常：{merged!r} 不以 {base_branch!r} 为前缀")
                 branch = merged
+                _check_time_budget(deadline)
                 tree_json = await _fetch_tree(client, ref, branch)
                 # 子路径已经并进 ref：命中与否都不再单独提它，否则 404 文案重复拼一遍、
                 # 命中时又会把同一个目录当 subpath 二次过滤。
@@ -241,6 +277,9 @@ async def fetch_repo_snapshot(url: str, *, subpath: str | None = None,
         titles: list[dict] = []
         running = 0
         for path, _ in picked:
+            # 逐篇之前查墙钟预算：慢滴响应靠 httpx 的读超时兜不住总时长，这一闸拦的是
+            # 「还要不要再发起下一次下载」，超线时已经收下的正文随整次摄入一起作废（不建应用）。
+            _check_time_budget(deadline)
             try:
                 data = await guard.fetch_limited(
                     client, hosting.raw_file_url(ref, branch, path), path,
@@ -265,12 +304,20 @@ async def fetch_repo_snapshot(url: str, *, subpath: str | None = None,
                     f"文本总大小超过上限（下载中按实际字节累计）: {running} > {TOTAL_MAX_BYTES} 字节")
             files[path] = data
             text = data.decode("utf-8", "replace")
-            titles.append({"path": path, "bytes": len(data),
+            titles.append({"path": path,
+                           # url = 站点侧的 fetch 目标（编码后的落盘名），path = 给人看的仓库原路径：
+                           # 上游 raw 端点已经 quote 过一遍、写盘侧又按 normpath 归一，只有 path 是原串，
+                           # 让页面直接 fetch 它等于把 `#` 当片段、把 `%XX` 再解一次码（终审 F4）。
+                           "url": materialize.snapshot_file_url(path),
+                           "bytes": len(data),
                            "title": first_heading(text), "dir": posixpath.dirname(path)})
         return {
             "manifest": {
                 "schema": "zc-source/1",
                 "host": "gitee", "owner": ref.owner, "repo": ref.repo, "ref": branch,
+                # 用户粘的原始 URL 全文（契约如此）。它**按构造**不可能带 `user:token@`：
+                # `guard.validate_http_url` 在第一个请求之前就把带凭证的 URL 拒了（终审 F1），
+                # 这个字段会随 manifest.json 发到公开站点，还会被 materialize 原样抄进 README 出处行。
                 "sourceUrl": url,
                 "fetchedAt": datetime.datetime.now(datetime.timezone.utc)
                     .replace(microsecond=0).isoformat(),
