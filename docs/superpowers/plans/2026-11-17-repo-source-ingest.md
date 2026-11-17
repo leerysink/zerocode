@@ -1771,6 +1771,8 @@ async def test_explicit_empty_subpath_means_repo_root_not_scan_all(client):
     assert m["subpath"] is None                     # 仓库根归一成 None（快照不是一条子目录）
     assert {f["path"] for f in m["files"]} == {"README.md", "docs/a.md"}
 
+    # 同一个 SLUG 连发两次：中间必须自己清一遍，否则第二次会撞「目录已存在」与 slug UNIQUE。
+    await _wipe()
     client.app.state.source_http_transport = _transport(TREE, FILES)
     r2 = await client.post("/api/apps", json=_body(
         source={"url": f"{URL}/tree/master/docs", "subpath": ""}))
