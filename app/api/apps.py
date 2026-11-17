@@ -24,10 +24,16 @@ from app.deploy.errors import DeployError
 from app.deploy.provision import read_cred
 from app.deploy.slugs import suggest_slug, validate_slug
 from app.services import app_service
+from app.source import ingest as source_ingest
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/apps")
+
+
+class SourceIn(BaseModel):
+    url: str
+    subpath: str | None = None
 
 
 class AppIn(BaseModel):
@@ -35,6 +41,7 @@ class AppIn(BaseModel):
     slug: str
     scale: str
     stack: str
+    source: SourceIn | None = None
 
 
 class SlugIn(BaseModel):
@@ -104,10 +111,25 @@ def _reject_if_task_running(request: Request, app_id: int) -> None:
 
 @router.post("", status_code=201)   # brief Interfaces：创建成功返回 201（示例代码漏写，测试为契约）
 async def create_app(request: Request, body: AppIn):
+    # 快照先抓后建：抓取失败时端口未分配、目录未建、库未供给，零副作用是顺序给的保证，
+    # 不是靠回滚兜出来的（建应用一旦落库就要 teardown dev/prod，别让摄入替它背）。
+    # 空串/全空格的 url 一律当「没填」：既不是一次网络请求，也不许拦住正常创建；
+    # 形状不对的 source（缺 url）由 SourceIn 在 schema 层拒掉，够不到接缝。
+    source = None
+    origin = None
+    raw_url = (body.source.url or "").strip() if body.source else ""
+    if raw_url:
+        try:
+            source = await source_ingest.fetch_repo_snapshot(
+                raw_url, subpath=(body.source.subpath or None),
+                transport=getattr(request.app.state, "source_http_transport", None))
+        except source_ingest.SourceError as e:
+            raise HTTPException(400, str(e))
+        origin = f"repo:{source['manifest']['host']}"   # VARCHAR(60)：只放短标记，URL 全文在 manifest 里
     try:
         return await app_service.create_app_project(
             request.app.state.session_factory, name=body.name, slug=body.slug,
-            scale=body.scale, stack=body.stack,
+            scale=body.scale, stack=body.stack, source=source, origin=origin,
             owner_user_id=request.state.actor["id"])   # 扩展态落归属（Ticket 003）
     except DeployError as e:
         raise _http(e)
