@@ -2047,7 +2047,7 @@ export const createApp = (data) => http.post('/apps', data) // {name, slug, scal
 
 纯函数测试只钉得住「判定」，钉不住「调用点」：`v-model` 名字打错、参数顺序颠倒、输入框挂错步骤、
 重置对象漏字段——四种都让功能静默失效而 util 测试全绿。而 Task 9 的端到端是**等人下令**的票，
-不能把唯一一道闸押在它身上。以下三条加在文件末尾（复用既有的 `STORE_STUBS` 与 `mocks`，
+不能把唯一一道闸押在它身上。以下四条加在文件末尾（复用既有的 `STORE_STUBS` 与 `mocks`，
 `a-modal` 桩只在 `open` 时渲染，所以必须真点「新建应用」；每步的 `input` 顺序按上面读过的模板事实写）：
 
 ```js
@@ -2085,7 +2085,7 @@ export const createApp = (data) => http.post('/apps', data) // {name, slug, scal
   })
 
   it('填了子目录 → source 带 subpath 键（钉 form.sourceSubpath 的 v-model）', async () => {
-    // 上面三条都没往 inputs[1] 里打过字：把 v-model:value="form.sourceSubpath" 打错一个字母，
+    // 其余三条向导用例都没往 inputs[1] 里打过字：把 v-model:value="form.sourceSubpath" 打错一个字母，
     // 三条照样全绿而子目录永远发不出去。这一条专门补这个方向。
     mocks.api.listApps.mockResolvedValue({ data: STORE_APPS })
     mocks.api.createApp.mockResolvedValue({ data: { id: 1, slug: 'lailiao' } })
@@ -2135,8 +2135,8 @@ export const createApp = (data) => http.post('/apps', data) // {name, slug, scal
   })
 ```
 
-三条各自钉一类静默失效：调用点漏传、前端预检旁路、重置漏字段。第 1 条与第 3 条同时钉住
-「空框不落 `subpath` 键」这条裁定——把它写成断言，后人就不能顺手改回折叠。
+四条各自钉一类静默失效：调用点漏传、子目录 `v-model` 打错名、前端预检旁路、重置漏字段。
+第 1 条与第 4 条同时钉住「空框不落 `subpath` 键」这条裁定——把它写成断言，后人就不能顺手改回折叠。
 
 - [ ] **Step 7: 跑前端相关回归**
 
