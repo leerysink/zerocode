@@ -100,6 +100,14 @@ def test_readme_gets_provenance_section_and_keeps_template_text(tmp_path):
     assert "manifest.json" in text
 
 
+def test_provenance_without_readme_still_documents_snapshot(tmp_path):
+    """没有模板 README 的工作区（纯快照铺底）也要留下一份「快照在哪、怎么用」的说明。"""
+    materialize.append_readme_provenance(tmp_path, _payload()["manifest"])
+    text = (tmp_path / "README.md").read_text(encoding="utf-8")
+    assert text.startswith("# 仓库源码快照")
+    assert "frontend/public/source/manifest.json" in text
+
+
 def test_compose_with_source_renders_then_writes(tmp_path):
     from app.deploy import scaffold
     tpl = _fake_template(tmp_path)
