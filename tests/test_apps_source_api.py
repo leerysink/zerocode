@@ -4,6 +4,7 @@
 transport 经 app.state.source_http_transport 注入（照 app.state.skills_http_transport 的形状，
 见 tests/test_skills_github_api.py:73），真网络一个都不碰。
 """
+import json
 import shutil
 
 import httpx
@@ -14,11 +15,16 @@ from app import config as app_config
 from app.db import make_engine, make_session_factory
 from app.deploy import provision
 from app.deploy.settings import REPO_ROOT
+from app.source import materialize
 
 pytestmark = pytest.mark.asyncio
 SLUG = "zcesrcapi"
 APP_DIR = REPO_ROOT / "apps" / SLUG
 URL = "https://gitee.com/leerys/zerocode"
+# 快照的读路径钉在 materialize 的写路径常量上（同 tests/test_source_seam.py:76）：
+# 这里再硬编一遍 "frontend/public/source/..."，目录改名时测试会假绿或假红，而读不出真实契约。
+SNAPSHOT_DIR = APP_DIR / "/".join(materialize.SOURCE_ROOT_PARTS)
+MANIFEST_PATH = APP_DIR / materialize.MANIFEST_REL
 
 
 def _blob(p, size=20):
@@ -95,12 +101,25 @@ async def _app_rows(client):
     return (await client.get("/api/apps")).json()
 
 
+def _manifest():
+    """读落盘 manifest：路径走 materialize.MANIFEST_REL，与写侧同源。"""
+    return json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+
+
+def _assert_no_snapshot(reason: str) -> None:
+    """「没摄入」要断言的是快照本身，不是 `frontend/public` 存不存在——
+    static 模板今天恰好没有 public/，等哪天模板加了一个 public/，
+    旧断言就会替「其实落了快照」这件事作假证。"""
+    assert not SNAPSHOT_DIR.exists(), reason
+    assert not MANIFEST_PATH.exists(), reason
+
+
 async def test_create_with_source_snapshots_into_workspace(client):
     client.app.state.source_http_transport = _transport(TREE, FILES)
     r = await client.post("/api/apps", json=_body())
     assert r.status_code == 201, r.text
-    assert (APP_DIR / "frontend/public/source/manifest.json").is_file()
-    assert (APP_DIR / "frontend/public/source/files/docs/a.md").read_bytes() == b"# A\n"
+    assert MANIFEST_PATH.is_file()
+    assert (APP_DIR / f"{materialize.FILES_REL_PREFIX}docs/a.md").read_bytes() == b"# A\n"
     # 读库直接用 app.state.session_factory：brief 原文的 make_session_factory(...) 拿到的是
     # sessionmaker 而非 engine，SQLAlchemy 直接 ArgumentError（夹具笔误，断言本身不变）。
     async with client.app.state.session_factory() as s:
@@ -137,24 +156,52 @@ async def test_empty_source_url_is_ignored(client):
     """空串当没填：不许把一个空格变成一次网络请求，也不许报错拦住正常创建。"""
     r = await client.post("/api/apps", json=_body(source={"url": "   "}))
     assert r.status_code == 201, r.text
-    assert not (APP_DIR / "frontend" / "public").exists()
+    _assert_no_snapshot("空 url 却落了快照")
 
 
 async def test_subpath_narrows_the_snapshot(client):
     client.app.state.source_http_transport = _transport(TREE, FILES)
     r = await client.post("/api/apps", json=_body(source={"url": URL, "subpath": "docs"}))
     assert r.status_code == 201, r.text
-    import json
-    m = json.loads((APP_DIR / "frontend/public/source/manifest.json").read_text(encoding="utf-8"))
+    m = _manifest()
     assert m["subpath"] == "docs"
     assert {f["path"] for f in m["files"]} == {"docs/a.md"}
+
+
+async def test_explicit_empty_subpath_means_repo_root_not_scan_all(client):
+    """三态不许在 HTTP 层被折叠（Task 3 在 ingest.py 里把这条写成契约）：
+    `subpath=""` = 就要仓库根，缺省 = 全域扫描，URL 自带 /tree/<ref>/<subpath> = 钻那个目录。
+    仓库根形态与全域恰好同产物，所以这里断言的是「参数原样传下去、没被 `or None` 折成缺省」。
+
+    两条请求都发：第一条是 brief 的原始形态（URL 不带目录，此时 "" 与缺省**确实**同产物，
+    它只守住「显式空串不能把快照弄窄」）；第二条才照出 `or None`——URL 带着 /tree/master/docs
+    而请求显式 subpath=""，折叠一次就把「就要仓库根」悄悄换成「钻那个目录」，Task 7 向导
+    「留空即整仓 + 粘目录 URL」正是这条路径。语义本身由 tests/test_source_ingest.py 的
+    test_explicit_empty_subpath_overrides_url_carried_scope /
+    test_absent_subpath_falls_back_to_url_carried_scope 钉在 ingest 层，这里只钉 HTTP 层不折叠。
+    """
+    client.app.state.source_http_transport = _transport(TREE, FILES)
+    r = await client.post("/api/apps", json=_body(source={"url": URL, "subpath": ""}))
+    assert r.status_code == 201, r.text
+    m = _manifest()
+    assert m["subpath"] is None                     # 仓库根归一成 None（快照不是一条子目录）
+    assert {f["path"] for f in m["files"]} == {"README.md", "docs/a.md"}
+
+    await _wipe()
+    r = await client.post("/api/apps",
+                          json=_body(source={"url": f"{URL}/tree/master/docs", "subpath": ""}))
+    assert r.status_code == 201, r.text
+    m = _manifest()
+    # 显式 "" 优先于 URL 带进来的目录：折叠成 None 的话这里会是 "docs" + 只剩 docs/a.md
+    assert m["subpath"] is None, "subpath=\"\" 被 HTTP 层折成了缺省，URL 里的目录反过来赢了"
+    assert {f["path"] for f in m["files"]} == {"README.md", "docs/a.md"}
 
 
 async def test_request_without_source_field_still_creates_normally(client):
     r = await client.post("/api/apps", json={"name": "无快照", "slug": SLUG,
                                              "scale": "small", "stack": "static"})
     assert r.status_code == 201, r.text
-    assert not (APP_DIR / "frontend" / "public").exists()
+    _assert_no_snapshot("没带 source 却落了快照")
 
 
 async def test_source_on_unsupported_stack_reports_clearly(client):
@@ -163,7 +210,7 @@ async def test_source_on_unsupported_stack_reports_clearly(client):
     r = await client.post("/api/apps", json=_body(stack="vue3-springboot", scale="large",
                                                   source={"url": URL}))
     assert r.status_code == 201, r.text
-    assert (APP_DIR / "frontend/public/source/files/README.md").is_file()
+    assert (APP_DIR / f"{materialize.FILES_REL_PREFIX}README.md").is_file()
 
 
 # ---- 接线层的三条裁定（Task 5 审查遗留 + 401/超预算两条错误路径）----
@@ -187,7 +234,7 @@ async def test_blank_source_url_makes_no_request_at_all(client):
     for blank in ("", "   ", "\t\n"):
         r = await client.post("/api/apps", json=_body(source={"url": blank, "subpath": "docs"}))
         assert r.status_code == 201, (blank, r.text)
-        assert not (APP_DIR / "frontend" / "public").exists()
+        _assert_no_snapshot(f"url={blank!r} 却落了快照")
         await _wipe()
     assert reqs == []
 

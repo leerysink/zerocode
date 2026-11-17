@@ -133,6 +133,22 @@ async def test_subpath_narrows_snapshot_scope():
     assert out["manifest"]["subpath"] == "docs"
 
 
+async def test_explicit_empty_subpath_overrides_url_carried_scope():
+    """显式 "" = 就要仓库根，必须盖掉 URL 带进来的 /tree/master/docs。"""
+    out = await ingest.fetch_repo_snapshot(f"{URL}/tree/master/docs", subpath="",
+                                           transport=_transport(TREE, FILES))
+    assert out["manifest"]["subpath"] is None
+    assert set(out["files"]) == {"README.md", "docs/user-manual.md"}
+
+
+async def test_absent_subpath_falls_back_to_url_carried_scope():
+    """不传 subpath 时才用 URL 里的目录——与上一条只差 `subpath=""`，产物必须不同。"""
+    out = await ingest.fetch_repo_snapshot(f"{URL}/tree/master/docs",
+                                           transport=_transport(TREE, FILES))
+    assert out["manifest"]["subpath"] == "docs"
+    assert set(out["files"]) == {"docs/user-manual.md"}
+
+
 async def test_truncated_tree_asks_for_subpath():
     with pytest.raises(ingest.SourceError) as e:
         await ingest.fetch_repo_snapshot(URL, transport=_transport(TREE, FILES, truncated=True))

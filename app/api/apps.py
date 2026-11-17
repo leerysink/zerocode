@@ -115,13 +115,16 @@ async def create_app(request: Request, body: AppIn):
     # 不是靠回滚兜出来的（建应用一旦落库就要 teardown dev/prod，别让摄入替它背）。
     # 空串/全空格的 url 一律当「没填」：既不是一次网络请求，也不许拦住正常创建；
     # 形状不对的 source（缺 url）由 SourceIn 在 schema 层拒掉，够不到接缝。
+    # subpath 一律原样转发，**不许**再 `or None`：app/source/ingest.py:136-139 把三态写成契约
+    # （显式 "" = 就要仓库根，URL 自带的 /tree/<ref>/<subpath> = 钻那个目录，两者都没有才是全域，
+    # 显式参数优先）。折叠一次就把「留空即整仓」悄悄换成「只摄那个子目录」——评审 Important 1。
     source = None
     origin = None
     raw_url = (body.source.url or "").strip() if body.source else ""
     if raw_url:
         try:
             source = await source_ingest.fetch_repo_snapshot(
-                raw_url, subpath=(body.source.subpath or None),
+                raw_url, subpath=body.source.subpath,
                 transport=getattr(request.app.state, "source_http_transport", None))
         except source_ingest.SourceError as e:
             raise HTTPException(400, str(e))
