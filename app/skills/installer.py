@@ -11,64 +11,41 @@ SkillError（api 层 400），不让 httpx/文件系统异常裸外溢成 500。
 重定向不交给 httpx 自动跟随：逐跳 Manual redirect，落点先过 SSRF 预检再发请求
 （002 收口 001 复审 Minor-1 的「事后拦读」残留）。
 """
-import ipaddress
 import json
 import posixpath
 import re
-from urllib.parse import quote, urljoin, urlparse
+from urllib.parse import quote, urlparse
 
 import httpx
 
 from app.config import github_mirror, github_token
 from app.skills.library import (TOTAL_MAX_BYTES, FILE_COUNT_MAX, MAX_FILE_BYTES, NAME_MAX,
                                 SkillError, check_size_budget, parse_skill_md)
+from app.source import guard
+from app.source.guard import MAX_URL_LEN as _URL_MAX
 
 # markdown 链接 ](...) 里的相对引用（排除绝对 URL、根路径、锚点）
 _LINK = re.compile(r"\]\(([^)\s]+)")
 
-_URL_MAX = 1000   # user_skill.source_url VARCHAR(1000)
 _NAME_MAX = NAME_MAX   # 单一真源：library.NAME_MAX（AI 生成通道在落库前也用它守卫）
-_MAX_REDIRECTS = 5
 _REF_ATTEMPTS_MAX = 200  # 直链引用尝试数硬上限：链接条数不得线性放大请求数（复审 M-2）
-_REDIR_STATUSES = {301, 302, 303, 307, 308}
 
-
-class _RefMissing(Exception):
-    """引用的附属文件取不到（非 200/网络异常）——尽力而为，跳过不阻塞安装。"""
+# 判据已下沉到 app/source/guard.py（与仓库快照摄入通道共用），这里只保留翻译层
+_RefMissing = guard.RefMissing
 
 
 def _reject_internal_host(host: str | None) -> None:
-    """入站 URL 与重定向落点共用：拒内网/保留地址与混淆数字 IP 写法（审查 I-1/M-1）。
-
-    字面 IP 直接判网段；纯数字/16 进制点分形态（127.1、2130706433、0x7f000001 等
-    inet_aton 缩写）一律拒，防 Linux 解析回环。域名不做 DNS 解析校验（边界，
-    防 DNS rebinding 的解析后校验见 spec §5「安全预检」，单机部署假定下不做）。
-    """
-    if not host:
-        raise SkillError("URL 缺少主机名")
-    h = host.strip("[]").rstrip(".")  # IPv6 包裹方括号 + 尾点 FQDN 形态归一（127.1. ≠ 域名）
-    if h == "localhost" or h.endswith(".localhost"):
-        raise SkillError("不允许指向内网地址")
     try:
-        ip = ipaddress.ip_address(h)
-    except ValueError:
-        parts = h.split(".")
-        if parts and all(re.fullmatch(r"0[xX][0-9a-fA-F]+|\d+", p) for p in parts):
-            raise SkillError("不允许 IP 缩写/混淆写法")
-        return  # 域名：不做解析后校验
-    if (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
-            or ip.is_unspecified or ip.is_multicast):
-        raise SkillError("不允许指向内网/保留地址")
+        guard.reject_internal_host(host)
+    except guard.GuardError as e:
+        raise SkillError(str(e)) from e
 
 
 def _validate_http_url(url: str) -> None:
-    """安装前安全预检：仅 http(s)、长度在 DDL 上限内、主机落在公网（spec §5 安全预检）。"""
-    if len(url) > _URL_MAX:
-        raise SkillError(f"URL 超过 {_URL_MAX} 字符上限")
-    parsed = urlparse(url)
-    if parsed.scheme.lower() not in ("http", "https"):
-        raise SkillError("仅支持 http/https 直链")
-    _reject_internal_host(parsed.hostname)
+    try:
+        guard.validate_http_url(url, max_len=_URL_MAX)
+    except guard.GuardError as e:
+        raise SkillError(str(e)) from e
 
 
 def _relative_refs(md: str) -> list[str]:
@@ -126,53 +103,17 @@ def _oversize_error(msg: str) -> SkillError:
 
 async def _get_limited(client: httpx.AsyncClient, url: str, label: str, *,
                        required: bool, max_bytes: int = MAX_FILE_BYTES,
-                       _hops: int = 0, _hdrs: dict | None = None) -> bytes:
-    """流式下载并边下边限长；非 200 按 required 语义抛 SkillError/_RefMissing。
-
-    重定向手动逐跳：Location 先过 SSRF 预检再发下一跳请求，内网落点根本不被连接。
-    跨主机落点按请求摘除 authorization（复审 N-1：不永久突变共享 client，
-    同一次安装里后续同源调用仍可带 token）。
-    """
-    async with client.stream("GET", url, headers=_hdrs) as resp:
-        if resp.status_code in _REDIR_STATUSES:
-            loc = resp.headers.get("location")
-            if not loc or _hops >= _MAX_REDIRECTS:
-                if required:
-                    err = SkillError(f"拉取 {label} 失败: HTTP {resp.status_code}"
-                                     + ("" if loc else "（重定向缺少 Location）"))
-                    err.status_code = resp.status_code
-                    raise err
-                raise _RefMissing(label)
-            target = urljoin(url, loc)
-            tp = urlparse(target)
-            if tp.scheme.lower() not in ("http", "https"):
-                raise SkillError("重定向目标协议不允许")
-            _reject_internal_host(tp.hostname)
-            # 按请求覆盖不突变共享 client（复审 N-1）：httpx 合并语义下只能以空串覆盖 client 默认头，
-            # 该跳不带真实 token（F-6），其余同源调用仍取 client 默认（token 完整）
-            hop_hdrs = dict(_hdrs) if _hdrs is not None else {}
-            if tp.hostname != urlparse(url).hostname:  # 跨主机落点不带凭证（复审 F-6）
-                hop_hdrs["authorization"] = ""
-            return await _get_limited(client, target, label, required=required,
-                                      max_bytes=max_bytes, _hops=_hops + 1,
-                                      _hdrs=hop_hdrs)
-        if resp.status_code != 200:
-            if required:
-                err = SkillError(f"拉取 {label} 失败: HTTP {resp.status_code}")
-                err.status_code = resp.status_code
-                raise err
-            raise _RefMissing(label)
-        declared = resp.headers.get("content-length", "")
-        if declared.isdigit() and int(declared) > max_bytes:
-            raise _oversize_error(f"文件超过大小上限: {label}")
-        chunks: list[bytes] = []
-        total = 0
-        async for chunk in resp.aiter_bytes():
-            total += len(chunk)
-            if total > max_bytes:
-                raise _oversize_error(f"文件超过大小上限: {label}")
-            chunks.append(chunk)
-        return b"".join(chunks)
+                       _hdrs: dict | None = None) -> bytes:
+    try:
+        return await guard.fetch_limited(client, url, label, required=required,
+                                         max_bytes=max_bytes, headers=_hdrs)
+    except guard.GuardError as e:
+        err = SkillError(str(e))
+        err.status_code = e.status_code
+        err.oversize = e.oversize
+        raise err from e
+    except guard.RefMissing as e:
+        raise _RefMissing(label) from e
 
 
 def _gh_client(transport=None) -> httpx.AsyncClient:
