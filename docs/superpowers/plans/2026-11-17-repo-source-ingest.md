@@ -34,6 +34,7 @@
 ## 2. Global Constraints（每个 task 都隐含遵守）
 
 - 后端测试命令：`.venv/Scripts/python.exe -m pytest tests/<file> -q`（`pytest.ini` 已设 `asyncio_mode=auto`、`testpaths=tests`；口径见 `docs/developer-guide.md:126,149`）。**定向跑，不要顺手全量**：全量 pytest 会 down 掉宿主上正在跑的 dev 预览栈，且必须串行（共享 `zerocode_test` 库并发 TRUNCATE 会死锁）。
+- 模块级 `pytestmark = pytest.mark.asyncio` 的口径（2026-11-17 裁定，先前派单口头传过但没落文）：`asyncio_mode=auto` 下加不加都能跑。**含同步用例的文件不要加**——每个纯同步用例会多刷一条 PytestWarning（`tests/test_source_guard.py`、`tests/test_source_ingest.py`、`tests/test_source_hosting.py`、`tests/test_source_materialize.py` 依此，注释就地写明）。**全异步的文件跟随同目录既有写法**——`tests/test_apps_api.py:24` 带着这行，同域的 `tests/test_apps_source_api.py` 保持一致，不为零收益制造分裂。
 - 前端测试命令：`cd frontend && npx vitest run <file>`；全量加 `--maxWorkers=4`（`docs/developer-guide.md:149`）。
 - **不改平台表结构、不加迁移**。`app_project.origin` 是 `VARCHAR(60)`（`changelog/V20260917_01_init.sql`），只放短标记 `repo:gitee`，URL 全文留在快照 manifest 里。
 - 产物写盘一律 UTF-8 + `newline=""`（对齐 `app/deploy/scaffold.py:44`）；`nginx.conf` 类配置文件换行必须 LF。
@@ -1756,6 +1757,19 @@ async def test_subpath_narrows_the_snapshot(client):
     assert {f["path"] for f in m["files"]} == {"docs/a.md"}
 
 
+async def test_explicit_empty_subpath_means_repo_root_not_scan_all(client):
+    """三态不许在 HTTP 层被折叠（Task 3 在 ingest.py 里把这条写成契约）：
+    `subpath=""` = 就要仓库根，缺省 = 全域扫描，URL 自带 /tree/<ref>/<subpath> = 钻那个目录。
+    仓库根形态与全域恰好同产物，所以这里断言的是「参数原样传下去、没被 `or None` 折成缺省」。"""
+    client.app.state.source_http_transport = _transport(TREE, FILES)
+    r = await client.post("/api/apps", json=_body(source={"url": URL, "subpath": ""}))
+    assert r.status_code == 201, r.text
+    import json
+    m = json.loads((APP_DIR / "frontend/public/source/manifest.json").read_text(encoding="utf-8"))
+    assert m["subpath"] is None                     # 仓库根归一成 None（快照不是一条子目录）
+    assert {f["path"] for f in m["files"]} == {"README.md", "docs/a.md"}
+
+
 async def test_request_without_source_field_still_creates_normally(client):
     r = await client.post("/api/apps", json={"name": "无快照", "slug": SLUG,
                                              "scale": "small", "stack": "static"})
@@ -1817,7 +1831,7 @@ async def create_app(request: Request, body: AppIn):
     if raw_url:
         try:
             source = await source_ingest.fetch_repo_snapshot(
-                raw_url, subpath=(body.source.subpath or None),
+                raw_url, subpath=body.source.subpath,
                 transport=getattr(request.app.state, "source_http_transport", None))
         except source_ingest.SourceError as e:
             raise HTTPException(400, str(e))
@@ -1835,6 +1849,29 @@ async def create_app(request: Request, body: AppIn):
 
 Run: `.venv/Scripts/python.exe -m pytest tests/test_apps_source_api.py -q`
 Expected: PASS。`test_empty_source_url_is_ignored` 若红，是 Step 3 的 `raw_url` strip 判定写在了 `subpath` 之后；`test_rate_limited_gitee_is_400_and_no_app_created` 若红，是 `SourceError` 没被 `except` 接住而是冒成了 500。
+
+- [ ] **Step 4b: 把三态契约钉在它的归属层（`tests/test_source_ingest.py`）**
+
+Task 3 把三态写成契约注释（`app/source/ingest.py:136-139`：显式 `subpath=""` 是「就要仓库根」，URL 里的 `/tree/<ref>/<subpath>` 是「钻这个目录」，两者都没有才是全域，显式参数优先），但**一条测试都没落**——所以 Step 3 那句 `or None` 折叠能一路绿灯通过前几轮评审。补下面这一对，加在 `test_subpath_narrows_snapshot_scope` 之后；两条只差一个参数，产物却必须不同，这才叫把两态分开：
+
+```python
+async def test_explicit_empty_subpath_overrides_url_carried_scope():
+    """显式 "" = 就要仓库根，必须盖掉 URL 带进来的 /tree/master/docs。"""
+    out = await ingest.fetch_repo_snapshot(f"{URL}/tree/master/docs", subpath="",
+                                           transport=_transport(TREE, FILES))
+    assert out["manifest"]["subpath"] is None
+    assert set(out["files"]) == {"README.md", "docs/user-manual.md"}
+
+
+async def test_absent_subpath_falls_back_to_url_carried_scope():
+    """不传 subpath 时才用 URL 里的目录——与上一条只差 `subpath=""`，产物必须不同。"""
+    out = await ingest.fetch_repo_snapshot(f"{URL}/tree/master/docs",
+                                           transport=_transport(TREE, FILES))
+    assert out["manifest"]["subpath"] == "docs"
+    assert set(out["files"]) == {"docs/user-manual.md"}
+```
+
+这两条与 Step 1 的 API 级 `test_explicit_empty_subpath_means_repo_root_not_scan_all` 一起构成闸门：前者钉语义，后者钉「HTTP 层不折叠」。任何一处退回 `or None`，至少一条会红。
 
 - [ ] **Step 5: 跑建应用与技能回归**
 
