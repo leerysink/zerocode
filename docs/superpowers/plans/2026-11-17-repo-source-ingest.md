@@ -2402,11 +2402,23 @@ git commit -m "docs(source): 记录 Gitee 仓库快照的端到端验收结果"
 ```python
 async def test_whitespace_only_subpath_is_repo_root_not_a_literal_directory():
     """只空白的 subpath 是「用户把框擦干净了」，不是「找一个名叫三个空格的目录」。
-    原样当目录用会静默零命中，201 建出一个没有正文的站点。"""
-    out = await ingest.fetch_repo_snapshot(URL, subpath="   ",
+    原样当目录用会静默零命中，201 建出一个没有正文的站点。
+    必须用**带目录的 URL** 才分得开「仓库根 / 沿用 URL 目录 / 全域」三种读法：
+    干净 URL 上三者逐字节同产物，那条用例等于没钉（工单初版就犯了这个错）。"""
+    out = await ingest.fetch_repo_snapshot(f"{URL}/tree/master/docs", subpath="   ",
                                            transport=_transport(TREE, FILES))
     assert out["manifest"]["subpath"] is None
     assert set(out["files"]) == {"README.md", "docs/user-manual.md"}
+
+
+async def test_unscoped_repo_with_no_text_at_all_still_succeeds_with_zero_docs():
+    """硬约束的另一半：只有「显式范围零命中」才报错，全域零正文不许变成 400。
+    纯二进制仓库是真实存在的东西，把它判成失败比判成空站更糟。"""
+    tree = [_blob("img/a.png"), _blob("frontend/package-lock.json")]
+    out = await ingest.fetch_repo_snapshot(URL, transport=_transport(tree, {}))
+    assert out["manifest"]["counts"]["snapshotted"] == 0
+    assert out["manifest"]["subpath"] is None
+    assert out["files"] == {}
 
 
 async def test_subpath_that_matches_nothing_is_an_error_not_an_empty_site():
@@ -2415,6 +2427,16 @@ async def test_subpath_that_matches_nothing_is_an_error_not_an_empty_site():
     with pytest.raises(ingest.SourceError) as e:
         await ingest.fetch_repo_snapshot(URL, subpath="doc",
                                         transport=_transport(TREE, FILES))
+    assert "没有可摄入的文本" in str(e.value)
+
+
+async def test_scoped_dir_whose_only_text_is_oversize_aborts_with_the_size_hint():
+    """范围内只有超限正文时也走同一条零命中报错：行为对（建一个空站没意义），
+    但这条用例钉的是「别把它误判成 not-found 后静默降级」。"""
+    tree = [_blob("docs/big.md", size=ingest.MAX_FILE_BYTES + 1)]
+    with pytest.raises(ingest.SourceError) as e:
+        await ingest.fetch_repo_snapshot(URL, subpath="docs",
+                                        transport=_transport(tree, {}))
     assert "没有可摄入的文本" in str(e.value)
 
 
@@ -2484,6 +2506,10 @@ Expected: 全绿、无 warning。**不得跑全量 pytest**（本票硬约束）
   而**范围外且合规**的条目两头都不记；因此 `listed ≠ snapshotted + skipped` 依旧成立，
   但理由不是「有些被拒的不计数」，而是「计数域不重合」。
   原写法「本次范围内被拒的 blob 条数」是错的（已复现：`subpath=docs` 时 lockfile 与 ignored-dir 都计入）。
+- CONTEXT 里 `unsafe-path` 的释义**必须写「前导 `/`」而不是「绝对路径」**：已实测
+  `is_eligible("C:/x.md") == (True, None)`——抓取侧压根不判绝对性，判绝对性是写盘侧 `_safe_rel` 独有的
+  （而那一条本身又是死支，真正拦盘符的是 `relative_to` 复核）。spec US-11 与 §4 D8 的存在意义就是提醒
+  两者判的不是一回事，CONTEXT 若写「绝对」就把这条非对称性抹平了，等于在术语层复现本票要修的错。
 - Task 9 的验收小节补一项：拿真实仓库试一次「拼错目录名」，确认 400 文案在 UI 上读得通。
 
 - [ ] **Step 6: 提交**
