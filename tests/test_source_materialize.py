@@ -28,13 +28,17 @@ def _fake_template(tmp_path: Path) -> Path:
 
 
 def _payload(**over):
+    # manifest 里的中文是真实形态，不是装饰：app/source/ingest.py:244-246 的 `files[].title`
+    # 取的是中文文档的首个标题，`skipped[].path` 取的是仓库里的中文路径，Task 6/9 直接读
+    # manifest.json 上这几个字。故这里必须按中文落盘（见 test_manifest_written_as_utf8_lf
+    # 的正向字节断言）——夹具若全是 ASCII，ensure_ascii 的取值就永远测不出差别。
     m = {"schema": "zc-source/1", "host": "gitee", "owner": "leerys", "repo": "zerocode",
          "ref": "master", "sourceUrl": "https://gitee.com/leerys/zerocode",
          "fetchedAt": "2026-11-17T09:12:00+00:00", "subpath": None, "truncated": False,
          "counts": {"listed": 4, "snapshotted": 2, "skipped": 2},
          "files": [{"path": "README.md", "bytes": 3, "title": "T", "dir": ""},
-                   {"path": "docs/a.md", "bytes": 3, "title": "A", "dir": "docs"}],
-         "skipped": [{"path": "x.png", "reason": "not-text"}]}
+                   {"path": "docs/a.md", "bytes": 3, "title": "部署指南", "dir": "docs"}],
+         "skipped": [{"path": "图片/图标.png", "reason": "not-text"}]}
     m.update(over)
     return {"manifest": m, "files": {"README.md": b"# T\n", "docs/a.md": b"# A\n"}}
 
@@ -51,7 +55,12 @@ def test_manifest_written_as_utf8_lf(tmp_path):
     raw = (tmp_path / "frontend/public/source/manifest.json").read_bytes()
     assert b"\r" not in raw, "换行必须是 LF"
     assert json.loads(raw.decode("utf-8"))["schema"] == "zc-source/1"
+    # 正向钉中文：先有「字节里真的有这三个汉字」，才有资格说「没有被转义」。
+    # 只否定 `\\u` 是空断言——纯 ASCII 载荷在 ensure_ascii=True/False 下字节完全一样。
+    assert "指南".encode("utf-8") in raw, "中文标题必须按 UTF-8 原样落盘"
+    assert "图片".encode("utf-8") in raw, "跳过清单里的中文路径同样不转义"
     assert "\\u" not in raw.decode("utf-8"), "中文不该被转义成 \\uXXXX"
+    assert json.loads(raw.decode("utf-8"))["files"][1]["title"] == "部署指南"
 
 
 def test_manifest_written_even_when_no_file_snapshotted(tmp_path):
@@ -66,10 +75,16 @@ def test_manifest_written_even_when_no_file_snapshotted(tmp_path):
 
 # 反斜杠与盘符形态只在 Windows 上有意义：NT 上 `files_dir / "C:/x.md"` 会整段替换成盘上的
 # 绝对路径（posixpath 既不看它是绝对的、也不觉得它越界），只有写盘前的 relative_to 拦得住。
-# 该形态在 POSIX 下只是个合法相对名，故按平台追加；越界断言看的是「什么都没建起来」。
+# 该形态在 POSIX 下只是个合法相对名（会老实落进 files/ 里），故按平台追加；跨平台都成立的
+# 包含性证明见 test_absolute_path_cannot_land_outside_snapshot_files_dir。
 _BAD_REMOTE_PATHS = ["../escape.md", "/abs.md", "a\\b.md"]
 if os.name == "nt":
     _BAD_REMOTE_PATHS.append("C:/escape.md")
+
+
+def _sandbox_entries(tmp_path: Path) -> list[str]:
+    """沙箱内被创建出来的每一条路径（含空目录）——「拒一个形态必须零副作用」的度量。"""
+    return sorted(p.relative_to(tmp_path).as_posix() for p in tmp_path.rglob("*"))
 
 
 @pytest.mark.parametrize("bad", _BAD_REMOTE_PATHS)
@@ -77,8 +92,33 @@ def test_unsafe_remote_path_is_rejected_not_written(tmp_path, bad):
     with pytest.raises(materialize.SnapshotError):
         materialize.write_snapshot(tmp_path, {"manifest": _payload()["manifest"],
                                               "files": {bad: b"x"}})
-    assert not (tmp_path / "frontend" / "public" / "source" / "files" / bad).exists()
+    # `files_dir / bad` 只在拼接结果仍留在沙箱内时才是可证的落点：绝对与盘符形态会被
+    # pathlib 整段替换成沙箱外的路径（Windows 上 `/abs.md` 拼出盘根 C:\abs.md，本来就写
+    # 不进去），那条断言在那两个形态上是空的，故只探沙箱内的形态；沙箱外的绝对形态由
+    # 下面那条包含性用例（逃逸点选在 tmp_path 之内）负责。
+    joined = (tmp_path / "frontend" / "public" / "source" / "files") / bad
+    if joined.is_relative_to(tmp_path):
+        assert not joined.exists()
+    assert _sandbox_entries(tmp_path) == [], "预检失败也要零副作用"
     assert not (tmp_path / "frontend" / "public" / "source").exists(), "预检失败也要零副作用"
+
+
+def test_absolute_path_cannot_land_outside_snapshot_files_dir(tmp_path):
+    """绝对形态的包含性证明，两个平台跑的是同一条用例、逃逸点刻意选在沙箱之内。
+
+    `tmp_path.as_posix()` 在 NT 上给出 `C:/.../outside.md`、在 POSIX 上给出
+    `/tmp/.../outside.md`：两种拼法都会把 `files_dir / 该串` 整段替换成 files/ 目录外的
+    绝对路径，而落点仍留在 tmp_path 里，于是「没有写到 files/ 之外」是沙箱内可证的。
+    分工：POSIX 上 `_safe_rel` 的 `startswith("/")` 第一层就拦下；NT 上该串既无前导斜杠
+    也无反斜杠、`posixpath.normpath` 与 `isabs` 都当它是相对名，**只有写盘前的
+    relative_to 复核拦得住**（`C:/escape.md` 同属这一层唯一能拦的形态）。
+    """
+    with pytest.raises(materialize.SnapshotError):
+        materialize.write_snapshot(tmp_path, {
+            "manifest": _payload()["manifest"],
+            "files": {f"{tmp_path.as_posix()}/outside.md": b"x"}})
+    assert not (tmp_path / "outside.md").exists(), "绝对形态逃逸到了快照 files/ 之外"
+    assert _sandbox_entries(tmp_path) == [], "拒一个形态必须零副作用"
 
 
 def test_path_traversal_cannot_escape_snapshot_dir(tmp_path):
@@ -86,6 +126,11 @@ def test_path_traversal_cannot_escape_snapshot_dir(tmp_path):
     with pytest.raises(materialize.SnapshotError):
         materialize.write_snapshot(tmp_path, {"manifest": _payload()["manifest"],
                                               "files": {"docs/../../escape.md": b"x"}})
+    # 光判抛错证明不了它没在别处落笔：`files_dir / "docs/../../escape.md"` 归一后落在
+    # 快照根目录（files 的上一级），那里必须没有文件，整个沙箱也必须为空。
+    assert not (tmp_path / "frontend" / "public" / "source" / "escape.md").exists()
+    assert not (tmp_path / "frontend" / "public" / "escape.md").exists()
+    assert _sandbox_entries(tmp_path) == [], "拒一个形态必须零副作用"
 
 
 def test_readme_gets_provenance_section_and_keeps_template_text(tmp_path):
@@ -98,6 +143,11 @@ def test_readme_gets_provenance_section_and_keeps_template_text(tmp_path):
     assert "https://gitee.com/leerys/zerocode" in text
     assert "frontend/public/source/" in text
     assert "manifest.json" in text
+    # read_text 走 universal newlines，会把 CRLF 抹平成 \n，所以 `newline=""` 这条写契约
+    # 只能在字节上钉：丢了它，Windows 上落盘的就是 CRLF，而上面四条断言照旧全绿。
+    readme_bytes = (tmp_path / "README.md").read_bytes()
+    assert b"\r" not in readme_bytes, "README 必须是纯 LF（write_text 要带 newline=\"\"）"
+    assert "仓库源码快照".encode("utf-8") in readme_bytes
 
 
 def test_provenance_without_readme_still_documents_snapshot(tmp_path):
@@ -106,6 +156,8 @@ def test_provenance_without_readme_still_documents_snapshot(tmp_path):
     text = (tmp_path / "README.md").read_text(encoding="utf-8")
     assert text.startswith("# 仓库源码快照")
     assert "frontend/public/source/manifest.json" in text
+    # 兜底分支是另一句 write_text，newline="" 得单独钉一次。
+    assert b"\r" not in (tmp_path / "README.md").read_bytes(), "兜底 README 同样必须纯 LF"
 
 
 def test_compose_with_source_renders_then_writes(tmp_path):
