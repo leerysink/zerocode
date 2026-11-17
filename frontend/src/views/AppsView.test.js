@@ -1243,6 +1243,23 @@ describe('AppsView 向导仓库地址接线', () => {
     expect('subpath' in payload.source).toBe(false)   // 空框=不表态，交给 URL 携带的目录
   })
 
+  it('填了子目录 → source 带 subpath 键（钉 form.sourceSubpath 的 v-model）', async () => {
+    // 其余三条向导用例都没往 inputs[1] 里打过字：把 v-model:value="form.sourceSubpath" 打错一个字母，
+    // 三条照样全绿而子目录永远发不出去。这一条专门补这个方向。
+    mocks.api.listApps.mockResolvedValue({ data: STORE_APPS })
+    mocks.api.createApp.mockResolvedValue({ data: { id: 1, slug: 'lailiao' } })
+    const wrapper = mount(AppsView, { global: { stubs: STORE_STUBS } })
+    await flushPromises()
+    const inputs = await openWizardToStep3(wrapper)
+    await inputs[0].setValue('https://gitee.com/o/r')
+    await inputs[1].setValue('docs/adr')
+    const create = wrapper.findAll('.stub-a-button').find((b) => b.text().includes('创建应用'))
+    await create.trigger('click')
+    await flushPromises()
+    const payload = mocks.api.createApp.mock.calls[0][0]
+    expect(payload.source).toStrictEqual({ url: 'https://gitee.com/o/r', subpath: 'docs/adr' })
+  })
+
   it('地址超长 → 拦住不发请求并报错', async () => {
     mocks.api.listApps.mockResolvedValue({ data: STORE_APPS })
     const wrapper = mount(AppsView, { global: { stubs: STORE_STUBS } })
