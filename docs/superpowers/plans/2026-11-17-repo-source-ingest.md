@@ -461,12 +461,22 @@ def test_unsupported_host_returns_none():
 def test_skill_md_direct_link_is_not_a_repo():
     assert hosting.parse_repo_url(
         "https://gitee.com/leerys/x/raw/master/SKILL.md") is None
+    # 文件页形态（/blob/）同样是指向单个文件，不是仓库
+    assert hosting.parse_repo_url(
+        "https://gitee.com/leerys/x/blob/master/SKILL.md") is None
+
+
+def test_skill_md_under_tree_dir_is_still_a_repo():
+    """`/tree/<ref>/<path>` 指的是目录，末段叫 SKILL.md 也仍是仓库地址：
+    浏览器里复制目录链接容易带上这一层，把它判成「不是仓库」会把真仓库拒在门外。"""
+    ref = hosting.parse_repo_url("https://gitee.com/o/r/tree/master/skills/foo/SKILL.md")
+    assert (ref.ref, ref.subpath) == ("master", "skills/foo/SKILL.md")
 
 
 @pytest.mark.parametrize("bad", [
     "https://gitee.com/onlyowner",
     "https://gitee.com/leerys/zerocode/branch/master",
-    "https://gitee.com/leerys/zerocode/tree/onlyref",
+    "https://gitee.com/leerys/zerocode/tree",
 ])
 def test_malformed_repo_url_raises(bad):
     with pytest.raises(hosting.HostingError):
@@ -557,9 +567,12 @@ def parse_repo_url(url: str) -> RepoRef | None:
     if parsed.hostname not in _GITEE_HOSTS:
         return None
     segs = [s for s in parsed.path.split("/") if s]
-    # 指向 SKILL.md 的直链不是仓库：交给技能安装的直链通道（同 installer.is_skill_md_url 的口径），
-    # 否则 /owner/repo/raw/master/SKILL.md 会被下面的 tree 形态判定当成坏 URL 报错。
-    if segs and segs[-1].upper() == "SKILL.MD":
+    # 只有「文件直链」形态才让路给技能直链通道：`/raw/` 与 `/blob/` 指向单个文件，
+    # 末段是 SKILL.md 时判成非仓库（口径同 installer.is_skill_md_url）。
+    # `/tree/<ref>/<path>` 是目录形态，末段叫 SKILL.md 也仍然是仓库地址——浏览器复制目录链接
+    # 常常带到最后一段，把它判成「不是仓库」会把真仓库拒在门外（终审 Important 的裁定）。
+    if (len(segs) >= 5 and segs[2] in ("raw", "blob")
+            and segs[-1].upper() == "SKILL.MD"):
         return None
     if len(segs) < 2:
         raise HostingError("Gitee 仓库地址至少要有 owner/repo")
@@ -597,7 +610,8 @@ def default_branch_of(repo_json: dict) -> str:
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `.venv/Scripts/python.exe -m pytest tests/test_source_hosting.py -q`
-Expected: PASS（12 项）。若 `test_skill_md_direct_link_is_not_a_repo` 红了，说明 SKILL.md 白名单分支没覆盖 `raw/` 前缀形态——按 `parse_repo_url` 只认「仓库根」和「/tree/」两种形态的裁定收紧判定，不要放宽测试。
+Expected: PASS（14 项 = 11 个单例 + `test_malformed_repo_url_raises` 的 3 个参数化用例）。
+`test_skill_md_direct_link_is_not_a_repo` 与 `test_skill_md_under_tree_dir_is_still_a_repo` 是一对方向相反的闸：前者要求 `/raw/`、`/blob/` 两种文件形态让路给技能直链通道，后者要求 `/tree/<ref>/…/SKILL.md` 这种目录形态**仍然**判成仓库——两头都不许靠放宽测试解决。`test_malformed_repo_url_raises` 的三项必须是真坏形态（缺 repo 段、`/branch/`、裸 `/tree`）；`/tree/<ref>` 单项是合法形态，不在这一列（Task 3 的 `.../tree/dev` 与 `.../tree/nope` 用例依赖它解析成功）。
 
 - [ ] **Step 5: 提交**
 
