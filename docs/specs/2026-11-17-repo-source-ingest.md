@@ -25,7 +25,7 @@
 | 4 | 生成站点读不到这份内容 | §2.2 的落点 `frontend/public/source/`，Vite 原样直出 |
 
 匿名 API 配额实测 60 次/小时（计划 §1），这决定了 §2.2 的抓取形状：**一次摄入的 API 调用数不随文件数
-增长**（至多两次），正文一律走 raw 直链，不吃配额。
+增长**（默认两次，含斜杠分支的回退会把树请求重发一次，上限三次），正文一律走 raw 直链，不吃配额。
 
 ## 2. 方案概述
 
@@ -55,8 +55,12 @@
 2. **站点侧按 manifest 逐文件 fetch**：快照里的 `manifest.json` 带 `files[]`（路径、字节数、首个
    标题、所在目录），生成的页面据此渲染目录树，点击时 fetch `/source/files/<仓库原路径>` 取正文。
 
-正文走 raw 直链（`hosting.raw_file_url`），因此一次摄入的 **API 调用数与文件数无关，至多两次**：
+正文走 raw 直链（`hosting.raw_file_url`），因此一次摄入的 **API 调用数与文件数无关**：默认两次 ——
 仓库元数据取默认分支 + 递归全树；URL 里已带 `/tree/<ref>` 时分支不必再问，只剩一次树调用。
+唯一会多出来的是**含斜杠分支的那次回退**（US-09）：第一次树调用 404 且本次带着生效子目录时，
+`fetch_repo_snapshot` 把「分支/子目录」并成一个 ref、**把树请求重发一次**，所以「仓库根 URL +
+显式 `subpath` 参数 + 默认分支的树 404」这条组合最多三次 API 调用。重发次数是固定的（树调用最多两次），
+与文件数、目录深度、仓库大小都无关 —— 「不随文件数增长」这条配额口径不因它而变。
 
 不是钻取的东西：运行时代理 Gitee、给平台 Agent 的任意 URL 抓取工具、把仓库当数据源实时同步。
 快照是**构建期**产物，站点读的是自己工作区里的静态文件。
@@ -123,8 +127,17 @@
   `POST /api/apps` 返回 **400 + 一句中文**（文案见 §5.4），并且**不创建应用、不分配端口、不建目录、
   不发一个 raw 请求**：抓取排在建应用之前，零副作用是顺序给的保证，不靠回滚兜。
 - **US-11** 快照落盘阶段失败（远端路径形态非法）→ 仍是一次 400，且 `create_app_project` 的既有回滚
-  把已铺的模板树整个删掉，不留半棵树。这条路径今天不可达（同一条形态判在抓取阶段就先跑过一遍），
-  留着是接缝不校验载荷形状的兜底（§8）。
+  把已铺的模板树整个删掉，不留半棵树。这一支今天没有入口，但**别读成「抓取侧已经判过同一条」**（§4 D8）：
+  `ingest.is_eligible` 与 `materialize._safe_rel` 只有前两段判据逐字相同（空串 / 前导 `/` / 反斜杠，
+  以及归一后的 `..` 前缀与 `.`），落盘侧多一个 `posixpath.isabs(归一后)`；而真正拦住 Windows 盘符形态
+  （`C:/x.md`）的是 `write_snapshot` 写盘前的 `relative_to` 复核 —— 抓取侧没这道，`is_eligible` 对盘符
+  是**放行**的（posix 语义既看不出它绝对、也看不出它越界）。今天走不到，只是因为带这种形态的 blob 在
+  raw 那一步换不到正文（`hosting.raw_file_url` 里的 `quote(path)` 把冒号写成 `C%3A`，远端 404 →
+  降级成 `not-found`，进不了载荷），所以它是**侥幸不可达**（取决于远端真的不回内容）、不是被上游挡死。
+  留着它兜的正是「接缝不校验载荷形状」——载荷的键直接来自远端树，写盘侧必须自己判（§5.4 末行、§6）。
+  它不靠真实仓库也能测：`tests/test_source_materialize.py` 的
+  `test_unsafe_remote_path_is_rejected_not_written` 按平台追加盘符形态，
+  `test_absolute_path_cannot_land_outside_snapshot_files_dir` 是跨平台的包含性证明。
 
 ### 发布后的站点
 
@@ -152,6 +165,9 @@
 - **D8** 远端路径在**落盘侧二次归一**（`materialize._safe_rel`）：抓取侧判的是「能不能拼进 URL」，
   落盘侧判的是「能不能拼进 `Path`」——Windows 上 `Path(dir) / "C:/x.md"` 会整段替换成绝对路径，
   只有写盘前的 `relative_to` 拦得住。两道闸口径不同，不是重复。
+  补一句免得有人去数差集：`_safe_rel` 比 `is_eligible` 多出的那个 `posixpath.isabs` 分支今天判不到
+  盘符形态（posix 的 `isabs` 只认前导 `/`，而那种串在它上面一行就已经被拒），落盘侧真正干活的仍是
+  `write_snapshot` 那道 `relative_to` 复核（US-11）。
 
 ## 5. 接口契约
 
@@ -190,6 +206,14 @@
 `manifest.subpath` 里存的还是那串空白。前端 `sourcePayload` 先 trim 再判空，
 因此这个形态只能由直接打 API 的客户端造出来。
 
+**跟进 · `FIX-SUBPATH-BLANK`｜当前实现如此，非契约意图**：上面那段描述的是今天代码的行为，不是设计要的
+行为。`ingest.fetch_repo_snapshot` 对 `subpath` 只做 `.strip("/")`、不做空白 strip，`hosting.unsafe_path_segment`
+又只认点段与反斜杠，所以「只有空白的 `subpath`」和「打错的目录名」都过了闸，结果是
+**静默建成一个零篇正文的应用**（201，不是 400，`counts.snapshotted` 为 0）。控制器已就此另开代码修复票；
+修完落地后回写本段与 `CONTEXT.md` 的「子目录（`subpath`）三态」。在此之前不要把它当契约引用、
+不要照它补断言当前行为的测试，也不要反过来把上段删掉——上段仍是今天的既成事实。
+全文搜 `FIX-SUBPATH-BLANK` 即可定位本条的所有出现处。
+
 ### 5.3 落盘产物与读路径
 
 ```
@@ -216,13 +240,13 @@ README 缺文件时兜底写成一份只含溯源段的 README，不静默丢出
 | 仓库无默认分支 | `hosting.default_branch_of` | 「仓库没有默认分支，请用 /tree/<ref> 指定分支」 |
 | 远端 401 | `ingest._remote_error` | 「仓库不可读（私有或需要授权），本能力只接公开仓库」 |
 | 远端 403 | `ingest._remote_error` | 「Gitee API 配额已用尽或访问被拒（匿名 60 次/小时），请稍后重试」 |
-| 树 404（含斜杠分支回退后仍 404） | `ingest.fetch_repo_snapshot` | 「获取仓库文件树失败：分支或路径不存在（HTTP 404）：{ref}」 |
+| 树 404（含斜杠分支回退后仍 404） | `ingest.fetch_repo_snapshot` | 「获取仓库文件树失败：分支或路径不存在（HTTP 404）：`<最后一次请求的那个 ref>`」——回退跑过时这里就是「分支/子目录」合并串，不重插 `subpath`（US-09） |
 | 树响应超 `TREE_MAX_BYTES` | `ingest._fetch_tree` | 「仓库文件树响应超过 8MB，请用 /tree/<ref>/<subpath> 或 subpath 参数收窄范围」 |
 | 树自报 `truncated` | `ingest.fetch_repo_snapshot` | 「仓库文件树被截断（truncated），请…收窄范围」 |
 | 声明体积预估超预算 / 下载中累计超预算 | 同上 | 同一个「文本总大小超过上限」，括号里分标「按文件树声明预估」/「下载中按实际字节累计」 |
 | 候选文件数超 `FILE_COUNT_MAX` | 同上 | 「文件数超过上限: {N} > 400」 |
 | 网络层异常 | `ingest.fetch_repo_snapshot` | 「远端请求失败: {异常类型名}」 |
-| 落盘形态非法（今天不可达） | `materialize._safe_rel` | 由 `create_app_project` 包成「创建应用失败: …」，仍 400 并回滚 |
+| 落盘形态非法（今天无已知入口；不可达的理由见 US-11，不是「抓取侧判过同一条」） | `materialize._safe_rel` 的越界判 + `write_snapshot` 写盘前的 `relative_to` 复核 | 「快照路径形态非法: …」/「快照路径越界: …」，由 `create_app_project` 包成「创建应用失败: …」，仍 400 并回滚 |
 
 ## 6. 边界与安全
 
@@ -254,8 +278,10 @@ README 缺文件时兜底写成一份只含溯源段的 README，不静默丢出
 **不出网的部分一律前置**：URL 预检、host 支持判定、ref/subpath 形态闸、树元数据的声明体积预估都排在
 第一个字节下载之前，所以「失败零副作用」是结构保证，不是 `try/finally` 兜出来的。
 
-**不可信输入的两次归一**：远端树里的路径与默认分支名都是远端给的，`unsafe_path_segment` 在拼 URL 之前
-判、`_safe_rel` 在写盘之前再判（§4 D8）。`fetchedAt` 用 UTC，避免宿主机时区进契约。
+**不可信输入的分层归一**：默认分支名（远端给的）与 URL 里的 ref/子路径（用户粘的）都在拼 URL 之前过
+`hosting.unsafe_path_segment`；递归树里的 blob 路径则由 `ingest.is_eligible` 判，它比落盘侧少一个
+`posixpath.isabs` 分支、也看不见 `Path` 拼接后的真实落点，所以写盘前还要再过 `materialize._safe_rel`
+与 `write_snapshot` 的 `relative_to` 复核（§4 D8、US-11）。`fetchedAt` 用 UTC，避免宿主机时区进契约。
 
 **已知代价**：一次请求内最多 `FILE_COUNT_MAX` 次**串行** raw 下载（8 MB 预算封顶）。真实仓库的耗时是
 §9 的验收项，不在本文预先承诺数字；若实测明显偏慢，再议是否改成「202 受理 + 后台执行」，
@@ -277,7 +303,8 @@ README 缺文件时兜底写成一份只含溯源段的 README，不静默丢出
   声明体积预估排在单文件剔除之前、`counts` 三数关系、`truncated` 恒 `false`、单文件级降级
   （`not-found`/`server-error`/`too-large`）、URL 已带 ref 时不再问默认分支（配额那条）。
 - `tests/test_source_materialize.py`：落点常量、manifest 的 UTF-8 + LF 字节（中文夹具 + 正向字节断言，
-  专门用来把 `ensure_ascii=False` 钉住）、越界/绝对/反斜杠路径在预检阶段被拒且零写入、
+  专门用来把 `ensure_ascii=False` 钉住）、越界/绝对/反斜杠路径在预检阶段被拒且零写入（盘符形态按平台
+  追加，跨平台那条是 `test_absolute_path_cannot_land_outside_snapshot_files_dir`，US-11）、
   README 追加不覆盖、快照正文里的 `{{...}}` 不触发渲染自检。
 - `tests/test_source_seam.py`：`create_app_project(source=…)` 与商店 `materialize` 正交组合、
   快照失败回滚后不留目录、不带 `source` 时与今天逐字节一致。

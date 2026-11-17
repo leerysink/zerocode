@@ -877,10 +877,16 @@ prod 栈未运行导致实时指标缺失时的读数口径：CPU 环退成灰�
 - **子目录（`subpath`）三态**：显式 `""` = 「就要仓库根」（压过 URL 携带的目录）、键缺席 =
   「沿用地址里 `/tree/<ref>/<目录>` 带的目录」、非空 = 「钻这个目录」。三态互不等价，HTTP 层不许折叠；
   向导只表达得出后两态（输入框初值是空串，把它当「显式仓库根」发出去会违背用户刚粘的 URL）。
+  另有 **`FIX-SUBPATH-BLANK`｜当前实现如此，非契约意图**：只有空白字符的 `subpath` 今天既不等价「仓库根」，
+  也筛不到任何真实目录的正文，而是按字面当目录名去筛——筛出零篇正文并静默建成应用；那是待修的既成事实，
+  不是第四态，详见规格 §5.2 的同名标记。
 - **载荷契约 `zc-source/1`**：`manifest.json` 的 `schema` 取值，与 `app.json` 的 `zc-app/1` 同族命名。
 
 `manifest.counts` 的三个数**不构成相加关系**：`listed` 是递归树返回的全部条目（含目录段与本次范围外的
-文件），`snapshotted` 是进了快照的正文数，`skipped` 是被白名单/形态/体积规则拒掉的 blob 数，
+文件），`snapshotted` 是进了快照的正文数，`skipped` 是**本次范围内被拒的 blob 条数**——既含筛选期被白名单、
+忽略目录、lockfile、路径形态、声明体积这些规则拒掉的那些（`not-text`、`ignored-dir`、`lockfile`、
+`unsafe-path`、`too-large`），也含下载期降级的记录（`not-found`＝raw 返回 404/410、`server-error`＝raw
+返回 5xx、实际字节超限的 `too-large`），清单字段 `manifest.skipped[]` 只列前 200 条而这个数仍是全量，
 被 `subpath` 挡在范围外的文件既不算收录也不算跳过。README 的溯源段与本票所有文档都只并列三个数。
 
 与「技能（skill）」一节里的 `github` 来源（扫仓库找 `SKILL.md`）是**两条通道**：那条仍是 GitHub-only，
