@@ -2101,7 +2101,8 @@ export const createApp = (data) => http.post('/apps', data) // {name, slug, scal
     expect(payload.source).toStrictEqual({ url: 'https://gitee.com/o/r', subpath: 'docs/adr' })
   })
 
-  it('地址超长 → 拦住不发请求并报错', async () => {    mocks.api.listApps.mockResolvedValue({ data: STORE_APPS })
+  it('地址超长 → 拦住不发请求并报错', async () => {
+    mocks.api.listApps.mockResolvedValue({ data: STORE_APPS })
     const wrapper = mount(AppsView, { global: { stubs: STORE_STUBS } })
     await flushPromises()
     const inputs = await openWizardToStep3(wrapper)
