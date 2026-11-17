@@ -52,8 +52,11 @@
 1. **服务端一次递归全树**：`GET /api/v5/repos/{owner}/{repo}/git/trees/{ref}?recursive=1`
    （`hosting.api_tree_url`）一次调用拿到整个仓库的路径清单，这就是「往下钻」的入口 ——
    平台**不逐层点目录**、不递归发多次树请求。
-2. **站点侧按 manifest 逐文件 fetch**：快照里的 `manifest.json` 带 `files[]`（路径、字节数、首个
-   标题、所在目录），生成的页面据此渲染目录树，点击时 fetch `/source/files/<仓库原路径>` 取正文。
+2. **站点侧按 manifest 逐文件 fetch**：快照里的 `manifest.json` 带 `files[]`（路径、**fetch 目标
+   `url`**、字节数、首个标题、所在目录），生成的页面据此渲染目录树，点击时 fetch
+   **`files[].url`**（形如 `/source/files/<百分号编码路径>`）取正文。`files[].path` 是仓库原路径，
+   只作展示：直接拿它拼 fetch 时，`#` 会掉进 URL 片段（静默 404）、`?` 变成查询串、
+   字面的 `%XX` 会被再解一次码而打到**另一篇**正文（终审 F4）。
 
 正文走 raw 直链（`hosting.raw_file_url`），因此一次摄入的 **API 调用数与文件数无关**：默认两次 ——
 仓库元数据取默认分支 + 递归全树；URL 里已带 `/tree/<ref>` 时分支不必再问，只剩一次树调用。
@@ -75,12 +78,12 @@
 | `schema` | 契约名 | 固定 `zc-source/1`（与 `app.json` 的 `zc-app/1` 同族命名） |
 | `host` / `owner` / `repo` | 仓库坐标 | `host` 恒为 `gitee`；`app_project.origin` 由它拼成 `repo:gitee` |
 | `ref` | 实际抓取的 ref | 用户没点分支时取 `default_branch`；含斜杠分支名的 404 回退命中后，这里是「分支/子目录」合并串 |
-| `sourceUrl` | 用户粘的原始 URL 全文 | URL 只留在 manifest，不进数据库列 |
+| `sourceUrl` | 用户粘的原始 URL 全文 | URL 只留在 manifest，不进数据库列。它**按构造不可能带凭证**：`guard.validate_http_url` 在第一个请求之前拒掉内嵌 `用户:令牌` 的 URL（终审 F1），理由见 §5.4 首两行 |
 | `fetchedAt` | 抓取时刻 | UTC ISO-8601，秒级精度（微秒归零） |
 | `subpath` | 生效的子目录，无则 `null` | 子目录被并进 `ref` 时同样归 `null`，避免同一个目录在两个字段里各说一遍 |
 | `truncated` | **恒为 `false`** | 树自报截断时当场抛错中止（§5.4），不存在「截断但仍建成了应用」这种部分成功 |
 | `counts` | `listed` / `snapshotted` / `skipped` 三个数 | 见下方警示 |
-| `files[]` | `path` / `bytes` / `title` / `dir`，按 `path` 排序 | `title` 是正文第一个 ATX 标题（跳过代码围栏内的伪标题），没有则 `null` |
+| `files[]` | `path` / **`url`** / `bytes` / `title` / `dir`，按 `path` 排序 | **`path` 是展示字段**（仓库原路径，原样不改）；**`url` 是机器字段**，页面 fetch 的目标，形如 `/source/files/<百分号编码路径>`，由 `materialize.snapshot_file_url` 按写盘侧同一个 `normpath` 归一后**逐段** `quote` 得到（终审 F4：`#`/`?`/字面 `%XX` 不编码就会 404 或打到别的正文上）。`title` 是正文第一个 ATX 标题（跳过代码围栏内的伪标题），没有则 `null` |
 | `skipped[]` | `{path, reason}`，按 `path` 排序 | 只写前 200 条（`fetch_repo_snapshot` 末尾的字面量截断，无命名常量）；`counts.skipped` 仍是**全量**条数 |
 
 **`counts` 的三个数不构成相加关系**，理由要说准：**计数域不重合**，不是「有些被拒的不计数」。
@@ -132,10 +135,13 @@ blob 时才碰巧相等），把它当恒等式读就是给一条不存在的不
 
 ### 失败与零副作用
 
-- **US-10** 抓取失败（配额用尽、私有仓、分支或路径不存在、非支持站点、超预算、URL 指向内网、
+- **US-10** 抓取失败（配额用尽、私有仓、分支或路径不存在、非支持站点、超预算、**超过时间预算**、
+  URL 指向内网、**URL 解析不出形态**、**URL 里内嵌账号或令牌**、
   显式 `subpath` 零命中）→
   `POST /api/apps` 返回 **400 + 一句中文**（文案见 §5.4），并且**不创建应用、不分配端口、不建目录、
   不发一个 raw 请求**：抓取排在建应用之前，零副作用是顺序给的保证，不靠回滚兜。
+  「只能以 400 出去」是**全函数**意义上的：守卫内部把 `urlparse`/`urljoin` 的裸 `ValueError`
+  也翻成 `GuardError`（终审 F2），所以 `app/api/apps.py` 那一句 `except SourceError` 之外没有出口。
 - **US-11** 快照落盘阶段失败（远端路径形态非法）→ 仍是一次 400，且 `create_app_project` 的既有回滚
   把已铺的模板树整个删掉，不留半棵树。这一支今天没有入口，但**别读成「抓取侧已经判过同一条」**（§4 D8）：
   `ingest.is_eligible` 与 `materialize._safe_rel` 只有前两段判据逐字相同（空串 / 前导 `/` / 反斜杠，
@@ -151,9 +157,9 @@ blob 时才碰巧相等），把它当恒等式读就是给一条不存在的不
 
 ### 发布后的站点
 
-- **US-12** 站点里 `fetch('/source/manifest.json')` 与 `fetch('/source/files/<路径>')` 在 dev 预览与
+- **US-12** 站点里 `fetch('/source/manifest.json')` 与 `fetch(<files[].url>)` 在 dev 预览与
   发布后的正式地址都取得到 —— 靠 Vite 把 `public/` 原样拷进 `dist`，不改 `vite.config`、不改
-  `nginx.conf`、不给静态栈加 router。
+  `nginx.conf`、不给静态栈加 router。读路径用的是编码后的 `url`（§2.2 第 2 级），不是 `path`。
 - **US-13** AI 用既有工具读快照做页面：`read_file`/`list_dir`/`search` 就够（本票一个 agent 工具都不加），
   单文件上限 200 KB 正是为了让快照里每一篇都能被 `read_file` 一次读完。
 - **US-14** 页面文案不得声称「正在读取 Gitee」——读的是构建期快照，仓库更新要重建应用（§8）。
@@ -167,7 +173,12 @@ blob 时才碰巧相等），把它当恒等式读就是给一条不存在的不
 - **D4** SSRF 判据下沉为共享模块 `app/source/guard.py`，技能通道改薄包装、文案与语义逐字不变；
   两条通道各自保留自己的预算数值（技能 1 MB / 10 MB / 600，快照 200 KB / 8 MB / 400），
   `guard.fetch_limited` 的 `max_bytes` 由调用方传入。
-- **D5** 只接公开 Gitee 仓库，匿名抓取，不带 token；`gitee.com` 与 `www.gitee.com` 都认。
+- **D5** 只接公开 Gitee 仓库，匿名抓取，**不带 token**；`gitee.com` 与 `www.gitee.com` 都认。
+  「不带」是强制的而不是承诺：URL 里内嵌 `用户:令牌` 的写法由 `guard.validate_http_url` 在任何请求
+  之前拒收（终审 F1）。机理是 `urlparse().hostname` 按定义不含 userinfo，SSRF 判据对它盲，而所有
+  端点又按硬编码 host 重拼、从不带鉴权头 —— 凭证一个请求都不生效，却会被原样冻进
+  `manifest.sourceUrl` 与 README 的出处行，而 `manifest.json` 正是发布后公开可读的那个文件。
+  技能通道共用同一道闸，同一条 URL 现在同样被 `SkillError` → 400 拒掉（§5.4、ADR-0051 决策 4）。
 - **D6** 顺序不可调：`base_render → write_snapshot → append_readme_provenance`。快照写在渲染**之前**
   会被 scaffold 的占位符残留自检打成渲染残留（远端正文里带 `{{APP_NAME}}` 是常事），一次粘贴把创建弄成 500。
 - **D7** `origin` 只写短标记 `repo:gitee`（列是 `VARCHAR(60)`），URL 全文留在 manifest —— 本票不改表结构、
@@ -195,7 +206,9 @@ blob 时才碰巧相等），把它当恒等式读就是给一条不存在的不
 
 - `url`（必填，`str`）：上限 1000 字符（`guard.MAX_URL_LEN`，与 `user_skill.source_url` 列宽同源；
   前端 `appSource.MAX_SOURCE_URL` 同值，超长在前端先拦一次）。`source` 对象缺 `url` 由 schema 层
-  直接 422，一次请求都不发。
+  直接 422，一次请求都不发。**不允许内嵌账号或令牌**（`用户:令牌@主机` 那种写法）：匿名能力用不上它，
+  而它会随 `manifest.sourceUrl` 出现在公开站点上（§6 F1）。形态解析不出（未闭合的 IPv6 等）
+  同样是 400，不是 500（§6 F2）。
 - `subpath`（可选，`str | None`）：上限 500 字符（`ingest._SUBPATH_MAX`）。**归一后的生效子目录**
   （参数或 URL 携带，取先到的那个）也受这条上限约束 —— 只卡参数会漏掉 `/tree/<ref>/<超长子路径>`。
 - 成功：`201` + 与不填 `source` 时同形状的应用对象（响应里**不**新增 `source` 字段）。
@@ -239,6 +252,11 @@ blob 时才碰巧相等），把它当恒等式读就是给一条不存在的不
 <workspace>/README.md                                追加「## 仓库源码快照（<sourceUrl>）」一段
 ```
 
+`files/` 下面那个名字是**落盘名**（`_safe_rel` 归一后的仓库路径，中文与空格原样），而页面要用的
+是 `manifest.files[].url` —— 同一个名字的百分号编码形态冠以公开前缀 `/source/files/`
+（`materialize.snapshot_file_url`，与写侧共用同一次 `normpath`）。README 的出处段明确写的是
+**fetch `files[].url`（机器字段），展示才用 `files[].path`**（终审 F4）。
+
 路径常量单一真源：`materialize.SOURCE_ROOT_PARTS` / `MANIFEST_REL` / `FILES_REL_PREFIX`，
 测试的读侧也钉在常量上（`tests/test_apps_source_api.py` 取 `MANIFEST_REL` 与 `FILES_REL_PREFIX`；
 `tests/test_source_seam.py` 里仍留着一处硬编码的快照正文路径，是已登记的瑕疵，不是另一条契约）。
@@ -249,6 +267,8 @@ README 缺文件时兜底写成一份只含溯源段的 README，不静默丢出
 | 情形 | 判定位置 | 400 文案要点 |
 |---|---|---|
 | URL 非 http/https、超 1000 字符 | `guard.validate_http_url` | 「仅支持 http/https 直链」/「URL 超过 1000 字符上限」 |
+| **URL 解析不出形态**（未闭合的 IPv6 字面量等，`urlparse`/`urljoin` 抛裸 `ValueError`） | `guard.validate_http_url`（`fetch_limited` 的重定向落点同） | 「URL 形态非法：这个地址解析不出主机名（方括号或主机部分不完整？）」——**终审 F2**：收口在守卫内部，否则它排在 `ingest` 的大 try 之前，端点只能回 500 |
+| **URL 内嵌账号或访问令牌** | `guard.validate_http_url`（`parsed.username`/`password` 非空即拒） | 「URL 里不允许携带账号或访问令牌（在主机名前面写用户名的那种写法）：本能力只匿名读取公开仓库，凭证不会生效，却会随快照泄漏到公开站点」——**终审 F1（安全）**；文案**不回显 URL**（detail 进响应体与访问日志） |
 | URL 主机是内网/保留地址、`localhost`、IP 混淆写法 | `guard.reject_internal_host` | 「不允许指向内网/保留地址」等 |
 | 重定向落点越界或协议不允许 | `guard.fetch_limited` | 「重定向目标协议不允许」/内网文案 |
 | 主机不是 Gitee | `hosting.parse_repo_url` 返 `None` | 「只支持公开托管仓库，当前接入：gitee.com」 |
@@ -262,6 +282,7 @@ README 缺文件时兜底写成一份只含溯源段的 README，不静默丢出
 | 树自报 `truncated` | `ingest.fetch_repo_snapshot` | 「仓库文件树被截断（truncated），请…收窄范围」 |
 | 声明体积预估超预算 / 下载中累计超预算 | 同上 | 同一个「文本总大小超过上限」，括号里分标「按文件树声明预估」/「下载中按实际字节累计」 |
 | 候选文件数超 `FILE_COUNT_MAX` | 同上 | 「文件数超过上限: {N} > 400」 |
+| **一次摄入超过墙钟预算** | `ingest._check_time_budget`（排在每个出网步骤之前） | 「快照抓取超过 120 秒的时间预算，已中止（仓库过大或响应过慢？请用 /tree/<ref>/<subpath> 或 subpath 参数收窄范围）」——**终审 F5**，见 §6 的时间预算 |
 | 显式 `subpath` 归一后非空、范围里挑不出一篇正文（打错的目录名） | 同上（`picked` 为空且 `scoped` 非空） | 「该目录下没有可摄入的文本：subpath=…（范围里有文本正文吗？）」——全域零正文**不**走这条，仍是合法空快照（§5.2） |
 | 网络层异常 | `ingest.fetch_repo_snapshot` | 「远端请求失败: {异常类型名}」 |
 | 落盘形态非法（今天无已知入口；不可达的理由见 US-11，不是「抓取侧判过同一条」） | `materialize._safe_rel` 的越界判 + `write_snapshot` 写盘前的 `relative_to` 复核 | 「快照路径形态非法: …」/「快照路径越界: …」，由 `create_app_project` 包成「创建应用失败: …」，仍 400 并回滚 |
@@ -273,8 +294,21 @@ README 缺文件时兜底写成一份只含溯源段的 README，不静默丢出
 （防 rebinding）——这条边界沿用技能通道既定裁定（`2026-09-26-user-skills.md` §5 安全预检），
 单机部署假定下成立；要收紧必须先另立 ADR，不许在守卫里顺手加解析。
 
-**预算**（标 `guard.*` 的两行在 `app/source/guard.py` 顶部，其余命名常量都在 `app/source/ingest.py` 顶部；
-最后两行是函数体内的字面量，**没有命名常量**）：
+判据里还有两条**跨任务才看得见**的收口（终审 F1/F2，都修在共用守卫上，所以两条通道一起受益）：
+
+- **URL 里不许内嵌凭证**：`username`/`password` 任一非空即 `GuardError`。SSRF 判据读的是
+  `urlparse().hostname`，按定义不含 userinfo；端点又全部按硬编码 host 重拼、从不带鉴权头，
+  于是那条凭证**不生效但会泄漏** —— 它落在 `manifest.sourceUrl`（→ 公开站点）与 README 出处行上。
+  错误文案不回显 URL。**行为变化**：同一形态在技能通道过去被接受（并静默按公开视图抓取），
+  现在由 `installer._validate_http_url` 翻成 `SkillError` → 400，文案就是这一句。
+- **守卫只往外抛领域错误**：`urlparse`/`urljoin` 对未闭合 IPv6 之类形态抛的裸 `ValueError` 在守卫
+  内部一律翻成 `GuardError`。调用方（`apps.py` 的 `except SourceError`、`skills.py` 的
+  `except SkillError`）只翻译领域错误，漏一条裸异常出去就是一次 500 —— 所以「`GuardError` 绝不逃出
+  包装层」是两条通道共同的铁律，写在 `guard.py` 与 `installer.py` 顶部。
+
+**预算**（标 `guard.*` 的两行在 `app/source/guard.py` 顶部，其余命名常量（含
+`WALL_CLOCK_BUDGET_SECONDS`）都在 `app/source/ingest.py` 顶部；表中标注「字面量」的那两行是函数体内的
+裸数字，**没有命名常量**）：
 
 | 常量 | 值 | 作用 |
 |---|---|---|
@@ -288,7 +322,12 @@ README 缺文件时兜底写成一份只含溯源段的 README，不静默丢出
 | `guard.MAX_URL_LEN` | `1000` | URL 长度上限（两通道同源） |
 | `guard.MAX_REDIRECTS` | `5` | 手动跟随的重定向跳数上限 |
 | `manifest.skipped` 截断 | `200` 条 | 写在 `fetch_repo_snapshot` 末尾的字面量，**无命名常量** |
-| 单次 HTTP 超时 | `20.0` 秒 | 写在 `ingest._client` 的字面量，**无命名常量** |
+| 单次 HTTP 超时 | `20.0` 秒 | 写在 `ingest._client` 的字面量，**无命名常量**；这是 httpx 的**每段读**超时，不是每次请求的时限 |
+| **`WALL_CLOCK_BUDGET_SECONDS`** | **`120.0` 秒** | **一次摄入的聚合墙钟预算**（终审 F5）。字节与条数封不住时间：慢滴响应能把 20 秒读超时无限次续期，而创建请求是同步等的（向导没有 axios 超时）。闸排在**每个出网步骤之前**（默认分支调用、每次树调用、每篇正文下载），超线即 `SourceError` → 400，文案点名上限并建议 `subpath` 收窄；抛在建应用之前，所以不变量 (e)「失败零副作用」不受影响。单个响应**内部**的慢滴仍由那条 20 秒读超时兜，两道各管一段 |
+
+**时间预算的数是怎么定的**：`FILE_COUNT_MAX`（400）次串行 raw 下载 + 至多三次 API 调用，在正常
+延迟下远在 120 秒以内；120 秒同时也在网关与浏览器可等待的范围之内，超过它说明这次输入不该在
+一次创建请求里同步跑完。实测偏差回 §9 的耗时验收项复核，改数就改这一处常量与本表。
 
 **跳过目录**：路径任一段（含文件名本身）命中 `app/workspace_ignore.IGNORE_DIRS`
 （`.git`、`node_modules`、`__pycache__`、`dist`、`.venv`、`build`）即不收 —— 与文件树/检索工具同一张名单。
@@ -301,9 +340,11 @@ README 缺文件时兜底写成一份只含溯源段的 README，不静默丢出
 `posixpath.isabs` 分支、也看不见 `Path` 拼接后的真实落点，所以写盘前还要再过 `materialize._safe_rel`
 与 `write_snapshot` 的 `relative_to` 复核（§4 D8、US-11）。`fetchedAt` 用 UTC，避免宿主机时区进契约。
 
-**已知代价**：一次请求内最多 `FILE_COUNT_MAX` 次**串行** raw 下载（8 MB 预算封顶）。真实仓库的耗时是
-§9 的验收项，不在本文预先承诺数字；若实测明显偏慢，再议是否改成「202 受理 + 后台执行」，
-那是一次独立的架构决策（ADR-0051 后果）。
+**已知代价**：一次请求内最多 `FILE_COUNT_MAX` 次**串行** raw 下载（8 MB 预算封顶），
+并且现在**预先承诺一个时间上限**：整次摄入的聚合墙钟预算 `WALL_CLOCK_BUDGET_SECONDS = 120` 秒
+（终审 F5 —— 条数与字节封不住时间，而 `timeout=20.0` 只是每段读超时）。超线即 400，不产出应用。
+真实仓库的实测耗时仍是 §9 的验收项；若实测明显偏慢或 120 秒这道闸真的会误伤合法输入，
+再议是否改成「202 受理 + 后台执行」，那是一次独立的架构决策（ADR-0051 后果）。
 
 ## 7. 测试决策
 
@@ -314,7 +355,9 @@ README 缺文件时兜底写成一份只含溯源段的 README，不静默丢出
 - `tests/test_source_guard.py`：SSRF 判定（`localhost` / `a.localhost` / `10.0.0.5` /
   `169.254.169.254` 与 `127.0.1` / `2130706433` / `0x7f000001` 这些混淆写法）、URL 长度上限、
   流式限量的两条出口（声明 `content-length` 与实际字节）、逐跳重定向预检、跨主机落点摘凭证、
-  「守卫与 installer 的包装对同一批输入判定一致」。
+  「守卫与 installer 的包装对同一批输入判定一致」、
+  **内嵌凭证的 URL 一律拒且文案不回显凭证**（F1，含 `installer` 侧同一结论）、
+  **未闭合 IPv6 之类的坏形态翻成 `GuardError` 而不是裸 `ValueError`**（F2，落点 Location 同口径）。
 - `tests/test_source_hosting.py`：`parse_repo_url` 的接受/拒绝形态（仓库根、`/tree/<ref>`、
   `/tree/<ref>/<subpath>`、`.git` 后缀、SKILL.md 直链让路）与端点拼串，含形态闸的每个坏段。
 - `tests/test_source_ingest.py`：预算与白名单、`subpath` 三态优先级（含「只有空白的值归仓库根」——
@@ -323,15 +366,26 @@ README 缺文件时兜底写成一份只含溯源段的 README，不静默丢出
   **全域**零正文仍是合法空快照（报错闸只认「用户点名了目录」，纯二进制仓库不许被打成 400）、
   含内部点段的树路径按 `unsafe-path` 拒收、含斜杠分支的 404 回退、
   声明体积预估排在单文件剔除之前、`counts` 三数关系、`truncated` 恒 `false`、单文件级降级
-  （`not-found`/`server-error`/`too-large`）、URL 已带 ref 时不再问默认分支（配额那条）。
+  （`not-found`/`server-error`/`too-large`）、URL 已带 ref 时不再问默认分支（配额那条）、
+  **带凭证的 URL 在零请求之前被拒且错误文本不含凭证**（F1）、
+  **`files[].url` 是 `#`/`%`/`?`/空格都编好码的 fetch 目标**（F4）、
+  **墙钟预算超线即停止后续下载并 400**（F5，走 `_monotonic` 这层可替换接缝，不做真 sleep）。
 - `tests/test_source_materialize.py`：落点常量、manifest 的 UTF-8 + LF 字节（中文夹具 + 正向字节断言，
   专门用来把 `ensure_ascii=False` 钉住）、越界/绝对/反斜杠路径在预检阶段被拒且零写入（盘符形态按平台
   追加，跨平台那条是 `test_absolute_path_cannot_land_outside_snapshot_files_dir`，US-11）、
-  README 追加不覆盖、快照正文里的 `{{...}}` 不触发渲染自检。
+  README 追加不覆盖、快照正文里的 `{{...}}` 不触发渲染自检、
+  **`snapshot_file_url` 的逐段编码与写盘名同源**（`url` 解码后就是盘上那个文件，F4）、
+  **README 出处段指向 `files[].url` 而不是 `path`**（F4）。
 - `tests/test_source_seam.py`：`create_app_project(source=…)` 与商店 `materialize` 正交组合、
-  快照失败回滚后不留目录、不带 `source` 时与今天逐字节一致。
+  快照失败回滚后不留目录、不带 `source` 时与今天逐字节一致。「坏快照回滚」那条**用 `match=`
+  限定到快照失败的文本**（终审 F3）：同一个 `try` 里还有第二条不相干的 `DeployError`
+  （`数据库供给结果不完整`，status=500，同样回滚），不限定文本的用例可以在它身上假绿，
+  而快照那一步压根没跑。
 - `tests/test_apps_source_api.py`：抓取先于建应用的零副作用、403/401/非 Gitee/内网 URL/预估超预算/
-  拼错目录名（零命中）这六条 400 路径、`source={}` 的 422、空白 url 不发请求、`subpath` 三态在 HTTP 层不折叠、
+  拼错目录名（零命中）/**内嵌凭证的 URL**（F1，断言的是「什么都没存下来」：无目录、无 manifest、
+  无 app 行、detail 里也不含凭证）/**未闭合 IPv6 的 URL**（F2，400 而不是 500）/
+  **超过时间预算**（F5，零请求且无 app 行）这九条 400 路径、`source={}` 的 422、空白 url 不发请求、
+  `subpath` 三态在 HTTP 层不折叠、`manifest.files[].url` 解码后正是盘上那个正文（F4 端点级）、
   `origin` 只在真摄入时写、响应不新增字段。
 - 前端：`frontend/src/utils/appSource.test.js`（判定那一组）+ `AppsView.test.js` 里
   「AppsView 向导仓库地址接线」那组（接线：真进载荷、带子目录、超长拦下、重置不带旧地址、
@@ -339,8 +393,13 @@ README 缺文件时兜底写成一份只含溯源段的 README，不静默丢出
 
 用例条数以各文件里的 `def test_` / `it(` 为准（参数化会展开出更多用例），本文不锁计数。
 
-变异测试用过的三处关键闸（去掉就必红的接线，不是纯函数覆盖）：HTTP 层的 `subpath` 原样转发、
-向导 `v-model:value="form.sourceSubpath"` 的绑定（打错名会静默不发子目录）、`ensure_ascii=False`。
+变异测试用过的关键闸（去掉就必红的接线，不是纯函数覆盖）：HTTP 层的 `subpath` 原样转发、
+向导 `v-model:value="form.sourceSubpath"` 的绑定（打错名会静默不发子目录）、`ensure_ascii=False`、
+守卫的**内嵌凭证拒收**（去掉后端点直接 201，把凭证烘进公开 manifest，F1）、
+守卫里 `urlparse` 的 **`ValueError` 收口**（去掉后端点抛裸 `ValueError`，F2）、
+`manifest.files[].url` 的**编码**（改成原串拼接后 F4 的三条用例全红，F4）、
+`fetch_repo_snapshot` **循环里的墙钟闸**（只留步骤前的那道 → 慢滴场景一路下满，F5）、
+`test_source_seam` 那条 `match=`（去掉限定文本后，探针场景里它替不相干的 500 假绿，F3）。
 
 ## 8. 明确不做
 
@@ -368,6 +427,8 @@ README 缺文件时兜底写成一份只含溯源段的 README，不静默丢出
 | 全域输入的 `counts` | `snapshotted > 0`，`listed ≥ snapshotted`，`truncated` 为 `false` | 待填 |
 | 收窄输入（`subpath` 或目录型 URL）的 `counts` | `files[].path` 全在该目录下，`manifest.subpath` 等于该目录 | 待填 |
 | 一次摄入的耗时 | 记录墙钟秒数并与 `FILE_COUNT_MAX` 对照，判断是否需要改成 202 后台任务；超出创建请求可用等待时间即判不通过并上报 | 待填 |
+| **时间预算不误伤真实仓库**（F5） | 全域与收窄两种输入都在 `WALL_CLOCK_BUDGET_SECONDS`（120 秒）内跑完并 201；同时记录实测墙钟秒数。若真实仓库撞线，**改的是这个数字并回写 §6 的口径**（附上实测依据），而不是拆掉这道闸 | 待填 |
+| **`files[].url` 在 dev 与 prod 都取得到**（F4） | 从落盘 manifest 里任取三篇（含一篇 `path` 带空格或 `#`/`%`/`?` 的；真实仓库没有就在测试仓造一个）按 `url` fetch，dev 预览与发布后的正式地址都 200 且正文对得上；顺带证明 `path` 原串拼出来的地址是 404 | 待填 |
 | 工作区落盘 | `frontend/public/source/manifest.json` 与 `files/` 在位、`README.md` 含溯源段、`app.json` 的 `stack` 正确 | 待填 |
 | dev 侧读路径 | `http://localhost:<DEV_PORT>/source/manifest.json` 与任一篇 `/source/files/<路径>` 均 200，正文是真内容 | 待填 |
 | prod 侧读路径 | 发布后经网关域名取同样两个地址均 200（验的是快照真随 `vite build` 进了镜像） | 待填 |
