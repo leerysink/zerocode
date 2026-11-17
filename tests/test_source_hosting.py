@@ -79,6 +79,39 @@ def test_tree_with_slashed_ref_is_resolvable_by_caller():
     assert (ref.ref, ref.subpath) == ("master", "dev/x")
 
 
+@pytest.mark.parametrize("bad", [
+    "https://gitee.com/o/r/tree/..",
+    "https://gitee.com/o/r/tree/master/../../otherowner/otherrepo",
+    "https://gitee.com/o/r/tree/master/docs/../..",
+    "https://gitee.com/o/r/tree/./x",
+    "https://gitee.com/o/r/tree/master/a\\b",
+    "https://gitee.com/../r",
+    "https://gitee.com/o/..",
+])
+def test_dot_segment_or_backslash_in_url_raises(bad):
+    """点段/反斜杠在解析层就拒，不放行到端点拼接：`api_tree_url(ref, "..")` 拼出的
+    `…/repos/o/r/git/trees/..?recursive=1` 会被点段归一吃掉 `/git/trees/` 那一截，
+    一条用户粘的 URL 就能打到同域任意 API 路径，脏形态还会冻进 ref/subpath。
+    静默放行坏形态正是本文件开头那条裁定要避免的事。"""
+    with pytest.raises(hosting.HostingError) as e:
+        hosting.parse_repo_url(bad)
+    assert "形态非法" in str(e.value)
+
+
+def test_unsafe_path_segment_predicate_is_pure_and_total():
+    """空值 = 「没有这一段」，不是「一段坏值」，放行；正常点号文件名不受牵连。"""
+    assert hosting.unsafe_path_segment(None) is None
+    assert hosting.unsafe_path_segment("") is None
+    assert hosting.unsafe_path_segment("master") is None
+    assert hosting.unsafe_path_segment("feature/docs") is None
+    assert hosting.unsafe_path_segment("v1.2.3") is None
+    assert hosting.unsafe_path_segment("docs/.github") is None
+    assert hosting.unsafe_path_segment("..") == ".."
+    assert hosting.unsafe_path_segment("a/../b") == ".."
+    assert hosting.unsafe_path_segment("a//b") == ""
+    assert hosting.unsafe_path_segment("a\\b") == "a\\b"
+
+
 def test_slashed_branch_survives_api_tree_url():
     """含斜杠的分支名原样留在 tree 端点里：Task 3 把 f"{branch}/{scoped}" 直接喂给
     api_tree_url，靠的就是 quote 不转义斜杠；此前没有任何测试钉住这条契约。"""

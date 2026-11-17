@@ -11,8 +11,10 @@
   `COPY . .`），镜像里塞几十 MB 噪声是给发布链添堵；
 - FILE_COUNT_MAX = 400：一次官网文档站够装几百篇，再多就是整仓 mirror，不是素材快照。
 
-不出网的部分一律前置：URL 预检、host 支持判定、树元数据的声明体积都在第一个字节下载之前，
-所以「失败零副作用」是结构保证，不是靠 try/finally 兜出来的。
+不出网的部分一律前置：URL 预检、host 支持判定、ref/subpath 的路径形态闸、树元数据的声明体积
+都在第一个字节下载之前，所以「失败零副作用」是结构保证，不是靠 try/finally 兜出来的。
+形态闸为什么也在这里：`..` 不是「路径怪一点」，而是会被服务端的点段归一改写成同域另一条 API
+路径，脏值还会冻进 manifest 的 ref/subpath 一路流到 README 的出处行。
 """
 from __future__ import annotations
 
@@ -78,9 +80,24 @@ def first_heading(text: str) -> str | None:
         if in_fence:
             continue
         m = _HEADING.match(line)
-        if m and len(m.group(0)) > len(m.group(1)) + 1:   # `#x` 不是标题，`# x` 才是
+        if m:
+            # 形态判定全在正则里：`#{1,6}\s+` 已经要求井号后跟空白，`#x` 根本匹配不上。
+            # 原先这里还跟着一个「整串比 group(1) 长 1 以上」的长度比较，匹配成功就恒为真，
+            # 而且注释给的理由（挡 `#x`）也是错的 —— 死条件删掉，别再教错原因。
             return m.group(1)
     return None
+
+
+def _require_safe_shape(value: str | None, label: str) -> None:
+    """路径形态闸：`.`/`..`/空段/反斜杠一律拒，判据与 parse_repo_url 用的是同一条。
+
+    为什么必须在拼 URL 之前：`quote(x, safe='/')` 原样放行斜杠，于是 `git/trees/..` 经服务端
+    点段归一会把 `/git/trees/` 吃掉一截，一条用户粘的 URL 就能打到同域任意 API 路径；这些脏值
+    还会被冻进 manifest 的 ref/subpath，Task 4 直接把它写进 README 的出处行。
+    """
+    bad = hosting.unsafe_path_segment(value)
+    if bad is not None:
+        raise SourceError(f"{label}{hosting.UNSAFE_SHAPE_HINT}（问题段 {bad!r}：{value!r}）")
 
 
 def _client(transport=None) -> httpx.AsyncClient:
@@ -120,22 +137,46 @@ async def fetch_repo_snapshot(url: str, *, subpath: str | None = None,
     # 显式 subpath="" 是「就要仓库根」，URL 里的 /tree/<ref>/<subpath> 是「钻这个目录」，
     # 两者都没有才是全域；显式参数优先于 URL 带的路径。
     scoped = (subpath if subpath is not None else (ref.subpath or "")).strip("/")
+    # 上限对两个来源一视同仁：原来只卡 subpath 参数，URL 里带的 /tree/<ref>/<subpath> 走的是
+    # 同一份拼接却不受限，归一到 scoped 之后再判才封得住。
+    if len(scoped) > _SUBPATH_MAX:
+        raise SourceError(f"subpath 超过 {_SUBPATH_MAX} 字符上限：{len(scoped)} 字符")
+    # 形态闸排在拼第一个 URL 之前。ref.ref / ref.subpath 由 parse_repo_url 判（那里拒的是「这条
+    # URL 本身不是合法仓库形态」，两条通道都受益），这里补上解析层看不到的一半：显式 subpath 参数
+    # 归并出来的 scoped，加上后面远端 JSON 给的默认分支与合并候选。
+    _require_safe_shape(scoped, "子路径")
     client = _client(transport)
     try:
         branch = ref.ref or hosting.default_branch_of(
             await _get_json(client, hosting.api_repo_url(ref), "仓库信息"))
+        _require_safe_shape(branch, "分支")   # default_branch 是远端返回的，一样不许带点段
         tree_json = await _fetch_tree(client, ref, branch)
         if tree_json is None:
             # 含斜杠分支名（feature/x）在 URL 里天然歧义：404 时把已判定的子目录并进 ref 再试一次。
             # 显式 subpath 参数走同一条回退——候选二次提交时它也带着 subpath（照抄 installer 的裁定）。
             if scoped:
-                branch = f"{branch}/{scoped}"
+                base_branch = branch
+                merged = f"{branch}/{scoped}"
+                # scoped 与 branch 各自在上面都过了闸，这是拼 URL 前的最后一道回手闸：
+                # 判的是「真正要进 /git/trees/ 和 /raw/ 的那个值」本身，日后这里若换了来源，
+                # 漏判也不会逃出去（同 RefMissing 那条兜底的口径，注释里说清是回手闸而不是活闸）。
+                _require_safe_shape(merged, "分支与子路径的合并结果")
+                # 合并只许追加、不许替换：候选必须以原分支开头，否则 manifest["ref"] 就不再是用户
+                # 点名的那个分支（Task 4 的出处行把它当事实引用）。今天这一条由上一行的拼接保证，
+                # 留在这里是把契约钉住，真正干活的是上面那道形态判。
+                if not merged.startswith(f"{base_branch}/"):
+                    raise SourceError(
+                        f"分支与子路径合并结果异常：{merged!r} 不以 {base_branch!r} 为前缀")
+                branch = merged
                 tree_json = await _fetch_tree(client, ref, branch)
-                if tree_json is not None:
-                    scoped = ""
+                # 子路径已经并进 ref：命中与否都不再单独提它，否则 404 文案重复拼一遍、
+                # 命中时又会把同一个目录当 subpath 二次过滤。
+                scoped = ""
             if tree_json is None:
-                raise SourceError(f"获取仓库文件树失败：分支或路径不存在（HTTP 404）：{branch}"
-                                  f"{'/' + subpath if subpath else ''}")
+                # branch 就是最后一次请求的那个 ref（合并过就自带子路径），所以文案只报它：
+                # 插回 subpath 参数的话，URL 带进来的 /tree/<ref>/<subpath> 会整段从用户看得见
+                # 的文本里消失（终审 Minor 1）。
+                raise SourceError(f"获取仓库文件树失败：分支或路径不存在（HTTP 404）：{branch}")
         entries = [e for e in (tree_json.get("tree") or []) if isinstance(e, dict)]
         if tree_json.get("truncated"):
             raise SourceError("仓库文件树被截断（truncated），请用 /tree/<ref>/<subpath> 或 subpath 参数收窄范围")
@@ -161,8 +202,10 @@ async def fetch_repo_snapshot(url: str, *, subpath: str | None = None,
         # 不值得为它发几百次请求再逐文件挑掉——当场收工，一个字节都不下载。
         declared_total = sum(size for _, size in candidates)
         if declared_total > TOTAL_MAX_BYTES:
+            # 文案带阶段：这条是「按树里声明的 size 预估」撞的，和下载中按实际字节撞的那条
+            # 是同一种超预算、不同阶段，支持侧只看文案就要分得清是哪种。
             raise SourceError(
-                f"文本总大小超过上限: {declared_total} > {TOTAL_MAX_BYTES} 字节")
+                f"文本总大小超过上限（按文件树声明预估）: {declared_total} > {TOTAL_MAX_BYTES} 字节")
         picked = []
         for path, declared in candidates:
             if declared > MAX_FILE_BYTES:
@@ -195,7 +238,8 @@ async def fetch_repo_snapshot(url: str, *, subpath: str | None = None,
                 raise _remote_error(e) from e   # 安全类拒绝与配额/权限原样上报，别用「跳过」掩盖配置错误
             running += len(data)
             if running > TOTAL_MAX_BYTES:
-                raise SourceError(f"文本总大小超过上限: {running} > {TOTAL_MAX_BYTES} 字节")
+                raise SourceError(
+                    f"文本总大小超过上限（下载中按实际字节累计）: {running} > {TOTAL_MAX_BYTES} 字节")
             files[path] = data
             text = data.decode("utf-8", "replace")
             titles.append({"path": path, "bytes": len(data),
@@ -208,6 +252,8 @@ async def fetch_repo_snapshot(url: str, *, subpath: str | None = None,
                 "fetchedAt": datetime.datetime.now(datetime.timezone.utc)
                     .replace(microsecond=0).isoformat(),
                 "subpath": scoped or None,
+                # 恒为 False：树自报 truncated 在上面就已经抛错中止，能走到这里的都是没截断的树。
+                # 字段是 brief 冻结的载荷契约（Task 4 按字段名落盘），别把它当成信息读、也别删。
                 "truncated": bool(tree_json.get("truncated")),
                 "counts": {"listed": len(entries), "snapshotted": len(files),
                            "skipped": len(skipped)},
