@@ -112,7 +112,12 @@ async def test_snapshot_failure_rolls_back_and_writes_nothing(test_engine):
     sf = make_session_factory(test_engine)
     bad = _payload()
     bad["files"]["../../etc/x.md"] = b"boom"
-    with pytest.raises(DeployError):
+    # `match=` 是必须的，不是装饰（终审 F3）：`create_app_project` 的同一个 try 里今天还有
+    # **第二条毫不相干的** DeployError（`数据库供给结果不完整`，status=500，同样回滚）。
+    # 只判 `pytest.raises(DeployError)` 的用例可以在那一条上变绿 —— 快照这一步压根没跑，
+    # 「坏快照被回滚」这件事就成了一句没有断言的绿。故把匹配钉在快照失败的文本上：
+    # 外层包装（创建应用失败: …）+ 真因（快照路径越界）两段都要出现才算数。
+    with pytest.raises(DeployError, match=r"创建应用失败: 快照路径越界"):
         await app_service.create_app_project(
             sf, name="坏快照", slug=SLUG, scale="small", stack="static", source=bad)
     assert not APP_DIR.exists(), "失败后留下了半个工作区"
