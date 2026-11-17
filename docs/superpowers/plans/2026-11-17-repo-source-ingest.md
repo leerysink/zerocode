@@ -1758,16 +1758,26 @@ async def test_subpath_narrows_the_snapshot(client):
 
 
 async def test_explicit_empty_subpath_means_repo_root_not_scan_all(client):
-    """三态不许在 HTTP 层被折叠（Task 3 在 ingest.py 里把这条写成契约）：
-    `subpath=""` = 就要仓库根，缺省 = 全域扫描，URL 自带 /tree/<ref>/<subpath> = 钻那个目录。
-    仓库根形态与全域恰好同产物，所以这里断言的是「参数原样传下去、没被 `or None` 折成缺省」。"""
+    """三态不许在 HTTP 层被折叠（Task 3 在 ingest.py:136-139 把这条写成契约）：
+    显式 `subpath=""` = 就要仓库根，URL 自带 /tree/<ref>/<subpath> = 钻那个目录，缺省 = 回退到 URL。
+    关键：不带目录的 URL 上 `""` 与 None 可证等价（ingest.py:139 归一后都是空 scoped），
+    所以只发「干净 URL + ""」这条请求**即使有 `or None` 折叠也照样绿**——必须再发一条
+    URL 携带目录的请求，两种意图才会分流。下面两段都留着：前一段当回归护栏，后一段才是闸。"""
     client.app.state.source_http_transport = _transport(TREE, FILES)
     r = await client.post("/api/apps", json=_body(source={"url": URL, "subpath": ""}))
     assert r.status_code == 201, r.text
     import json
-    m = json.loads((APP_DIR / "frontend/public/source/manifest.json").read_text(encoding="utf-8"))
+    m = json.loads((APP_DIR / materialize.MANIFEST_REL).read_text(encoding="utf-8"))
     assert m["subpath"] is None                     # 仓库根归一成 None（快照不是一条子目录）
     assert {f["path"] for f in m["files"]} == {"README.md", "docs/a.md"}
+
+    client.app.state.source_http_transport = _transport(TREE, FILES)
+    r2 = await client.post("/api/apps", json=_body(
+        source={"url": f"{URL}/tree/master/docs", "subpath": ""}))
+    assert r2.status_code == 201, r2.text
+    m2 = json.loads((APP_DIR / materialize.MANIFEST_REL).read_text(encoding="utf-8"))
+    assert m2["subpath"] is None                    # 折叠成 None 就会退回用 URL 的 docs → 这条红
+    assert {f["path"] for f in m2["files"]} == {"README.md", "docs/a.md"}
 
 
 async def test_request_without_source_field_still_creates_normally(client):
