@@ -13,7 +13,9 @@
 API 路径，还会被冻进 RepoRef 一路流到落盘侧。这里纯字符串判定，不出网、不依赖守卫。
 
 刻意不做的事（详见 ADR-0051）：不接 GitHub/GitLab（形态相近但配额与鉴权语义不同，
-等真需要时另票）、不带 token（私有仓不在本票范围）、不解析 blob 网页形态
+等真需要时另票）、不带 token（私有仓不在本票范围；URL 里内嵌 `user:token@` 的形态由
+`guard.validate_http_url` 在解析之前拒收——本模块的端点全部按硬编码 host 重拼，凭证既不生效
+又会随 manifest 泄漏，终审 F1）、不解析 blob 网页形态
 （`/-/blob/` 与 `/blob/` 返回 HTML，正文一律走 raw）。
 """
 from __future__ import annotations
@@ -77,7 +79,12 @@ def parse_repo_url(url: str) -> RepoRef | None:
         return None
     segs = [s for s in parsed.path.split("/") if s]
     # 只有「文件直链」形态才让路给技能直链通道：`/raw/` 与 `/blob/` 指向单个文件，
-    # 末段是 SKILL.md 时判成非仓库（口径同 installer.is_skill_md_url）。
+    # 末段是 SKILL.md 时判成非仓库。
+    # **别把它读成 `installer.is_skill_md_url` 的等价判据**（这里曾写过「口径同」，是假的）：
+    # 那条是纯 basename 判定，任意 URL 只要末段是 SKILL.md 就为真；本条**额外**要求
+    # `segs[2] in ("raw","blob")` 且段数 ≥5 的文件直链形态，因为 `/tree/<ref>/<path>` 是目录形态，
+    # 末段叫 SKILL.md 也仍然是仓库地址——浏览器复制目录链接常常带上这一层，
+    # 判成「不是仓库」会把真仓库拒在门外（终审 Important 的裁定）。两条各自被测试钉住，改一条别顺手改另一条。
     # `/tree/<ref>/<path>` 是目录形态，末段叫 SKILL.md 也仍然是仓库地址——浏览器复制目录链接
     # 常常带到最后一段，把它判成「不是仓库」会把真仓库拒在门外（终审 Important 的裁定）。
     if (len(segs) >= 5 and segs[2] in ("raw", "blob")

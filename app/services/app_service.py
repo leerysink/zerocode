@@ -15,8 +15,10 @@ from app.deploy.nics import app_url
 from app.deploy.ports import allocate_pair
 from app.deploy.settings import REPO_ROOT, deploy_cfg, preview_url, resolve_apps_root
 from app.deploy.slugs import validate_slug
-# 快照铺源排在 app.deploy 之后导入：app/source/materialize.py 只依赖 app.deploy.scaffold，
-# 不回流本模块，故这条 import 不成环。
+# 快照铺源排在 app.deploy 之后导入只是行文顺序，不是依赖要求：app/source/materialize.py
+# 只 import 标准库（json/posixpath/pathlib/typing/urllib.parse），既不 import app.deploy.scaffold
+# 也不回流本模块，所以这条 import 无论如何都不成环。（旧注释写成「它只依赖 app.deploy.scaffold」
+# 是假的 —— 别照它去找一条不存在的依赖，更别因为「怕成环」而把这条 import 挪进函数体。）
 from app.source import materialize as source_materialize
 
 SCALES = ("small", "large")
@@ -154,7 +156,10 @@ async def create_app_project(session_factory, *, name: str, slug: str, scale: st
 
     `materialize(root_path, mapping)`：铺源钩子。默认走栈模板渲染；商店安装传自己的闭包
     （从包 copy 源码 + 锚点 sqlchange），从而复用本函数的端口分配、app.json、原子回滚。
-    `origin`：安装来源标记（`store:<release_id>`），自建应用为 NULL。
+    `origin`：安装来源标记，`VARCHAR(60)` 的短标记，自建应用为 NULL。今天有两个取值：
+    商店安装 `store:<release_id>`、仓库快照摄入 `repo:<host>`（`app/api/apps.py::create_app`
+    按 manifest 的 host 拼出，当前恒为 `repo:gitee`）；仓库 URL 全文不进这一列，留在快照的
+    `manifest.json` 里（规格 §5.1、D7）。
     `owner_user_id`：归属用户（登录后的 actor id），新建行落此列（Ticket 003 扩展态）。
 
     `source`：仓库快照载荷（app/source/ingest.py 的返回）。给出时**先**按 materialize（或栈模板）

@@ -127,6 +127,9 @@ async def create_app(request: Request, body: AppIn):
                 raw_url, subpath=body.source.subpath,
                 transport=getattr(request.app.state, "source_http_transport", None))
         except source_ingest.SourceError as e:
+            # 这条映射是全函数：`fetch_repo_snapshot` 把守卫的 GuardError（含 urlparse 的坏形态，
+            # 见 app/source/guard.py 顶部那条铁律）、HostingError、RefMissing、httpx.HTTPError 全部
+            # 收进 SourceError，所以任何一次抓取失败都只能以 400 出去 —— 规格 US-10 / §5.4。
             raise HTTPException(400, str(e))
         origin = f"repo:{source['manifest']['host']}"   # VARCHAR(60)：只放短标记，URL 全文在 manifest 里
     try:

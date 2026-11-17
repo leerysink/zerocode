@@ -30,7 +30,9 @@ _LINK = re.compile(r"\]\(([^)\s]+)")
 _NAME_MAX = NAME_MAX   # 单一真源：library.NAME_MAX（AI 生成通道在落库前也用它守卫）
 _REF_ATTEMPTS_MAX = 200  # 直链引用尝试数硬上限：链接条数不得线性放大请求数（复审 M-2）
 
-# 判据已下沉到 app/source/guard.py（与仓库快照摄入通道共用），这里只保留翻译层
+# 判据已下沉到 app/source/guard.py（与仓库快照摄入通道共用），这里只保留翻译层。
+# 翻译层的铁律：`guard.GuardError` 一律就地翻成 `SkillError`，绝不外泄 —— 端点只认
+# `except SkillError → 400`，漏一条 GuardError 出去就是一次 500（同 app/source/guard.py 顶部）。
 _RefMissing = guard.RefMissing
 
 
@@ -104,6 +106,8 @@ def _oversize_error(msg: str) -> SkillError:
 async def _get_limited(client: httpx.AsyncClient, url: str, label: str, *,
                        required: bool, max_bytes: int = MAX_FILE_BYTES,
                        _hdrs: dict | None = None) -> bytes:
+    # 又一层 GuardError→SkillError 的翻译点：`guard.fetch_limited` 抛出的 GuardError 必须在这里
+    # 落进领域错误，标记（status_code/oversize）逐条带走，不许原样逃到端点（见文件顶部那条铁律）。
     try:
         return await guard.fetch_limited(client, url, label, required=required,
                                          max_bytes=max_bytes, headers=_hdrs)

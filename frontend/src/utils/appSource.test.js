@@ -21,8 +21,11 @@ describe('sourcePayload', () => {
 
   it('子目录空串不落字段（后端把空串读成「仓库根」是有意的，缺省才是「全域扫描」）', () => {
     expect(sourcePayload('https://gitee.com/o/r', '')).toStrictEqual({ url: 'https://gitee.com/o/r' })
-    // 全空白的子目录同空串：不能让 .trim() 一漏就把 '   ' 当正文发下去
-    // （后端 ingest.py 的形态闸门会把它判成不安全段，用户收到一句看不懂的 400）
+    // 全空白的子目录同空串：不能让 .trim() 一漏就把 '   ' 当成「显式表态」发出去。
+    // 理由不是「后端形态闸会回一句看不懂的 400」（Task 10 之后抓取侧先整体 strip 空白，
+    // '   ' 归一成仓库根，那道闸根本不触发），而是 US-08：发出 subpath 键 = 用户显式说
+    // 「就要仓库根」，它会压过 URL 里带的 /tree/<ref>/<目录>，与刚粘地址的人的意图正相反。
+    // 空白框是「没表态」，所以键必须缺席。
     expect(sourcePayload('https://gitee.com/o/r', '   '))
       .toStrictEqual({ url: 'https://gitee.com/o/r' })
     expect(sourcePayload('https://gitee.com/o/r', '  docs/adr ')).toStrictEqual({
