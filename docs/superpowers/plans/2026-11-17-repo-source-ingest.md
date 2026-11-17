@@ -2395,7 +2395,7 @@ git commit -m "docs(source): 记录 Gitee 仓库快照的端到端验收结果"
    而 manifest.files[].path 仍存原串 → 站点按 manifest 去 fetch 会打到一个不存在的位置
 ```
 
-- [ ] **Step 1: 先写会红的用例（三条）**
+- [ ] **Step 1: 先写用例（五条：三条现在会红，两条在修好的代码上本就是绿的——它们钉的是「别改坏」）**
 
 `tests/test_source_ingest.py` 追加：
 
@@ -2464,7 +2464,7 @@ async def test_unmatched_subpath_is_400_and_creates_no_app(client):
 - [ ] **Step 2: 跑测试确认三条都红**
 
 Run: `PYTHONIOENCODING=utf-8 D:/project/zerocode/.venv/Scripts/python.exe -m pytest tests/test_source_ingest.py tests/test_apps_source_api.py -q`
-Expected: 三条新用例红（前两条现在静默 201/零命中；第三条 manifest 存原串），既有用例不许变红。
+Expected: 五条新用例里三条红（空白 subpath 当字面目录用、拼错目录静默零命中、点段 manifest 存原串），另两条在修好的代码上绿是**设计如此**——「全域零正文不算失败」与「范围内只剩超限正文也要报错」钉的是既有正确行为不许被后面改动破坏，不是修 bug。既有用例不许变红。
 
 - [ ] **Step 3: 实现三处收口**
 
@@ -2479,14 +2479,20 @@ Expected: 三条新用例红（前两条现在静默 201/零命中；第三条 m
 ```
 
 ```python
-# ③ is_eligible：点段一律拒，不静默归一后双存
+# ③ is_eligible：点段一律拒，不静默归一后双存。
+#    必须读**原始** path 的段，不能读归一后的 —— posixpath.normpath 已经把 "." 与 ".." 吃掉了，
+#    在归一结果上找点段是个永不成立的判据（工单初版就写了这一版，实现者发现后改了过来）。
     norm = posixpath.normpath(path)
     if norm.startswith("..") or norm == "." or posixpath.isabs(norm):
         return False, "unsafe-path"
-    segments = norm.split("/")
-    if any(seg in (".", "..") for seg in segments):     # 内部点段：落盘会归一，manifest 不会
+    if any(seg in (".", "..") for seg in path.split("/")):   # 原始段：落盘会归一，manifest 不会
         return False, "unsafe-path"
 ```
+
+不要往 `is_eligible` 里加 `posixpath.isabs(norm)`：前导 `/` 在上一行就被拒了，posix 的归一也从不把相对串变成绝对串，
+那条分支恒假；更关键的是 spec §4 D8 与 US-11 靠「写盘侧比抓取侧多一条绝对性判据」这条**不对称**立论，
+加上它就把文档的论据自己拆掉了（盘符形态 `C:/x.md` 真正被拦住的是 `write_snapshot` 的 `relative_to` 包含性复核，
+不是 `isabs`）。
 
 三处都要在代码注释里写明**为什么这样裁**：① 空白是「擦干净框」的 UI 残留，不是目录名；
 ② 静默零正文的站点是把失败藏起来，报错才是可执行的反馈；③ 归一后双存会让 manifest 与磁盘各说各话，
