@@ -151,11 +151,23 @@ async def test_absent_subpath_falls_back_to_url_carried_scope():
 
 async def test_whitespace_only_subpath_is_repo_root_not_a_literal_directory():
     """只空白的 subpath 是「用户把框擦干净了」，不是「找一个名叫三个空格的目录」。
-    原样当目录用会静默零命中，201 建出一个没有正文的站点。"""
-    out = await ingest.fetch_repo_snapshot(URL, subpath="   ",
+    原样当目录用会静默零命中，201 建出一个没有正文的站点。
+    必须用**带目录的 URL** 才分得开「仓库根 / 沿用 URL 目录 / 全域」三种读法：
+    干净 URL 上三者逐字节同产物，那条用例等于没钉（工单初版就犯了这个错）。"""
+    out = await ingest.fetch_repo_snapshot(f"{URL}/tree/master/docs", subpath="   ",
                                            transport=_transport(TREE, FILES))
     assert out["manifest"]["subpath"] is None
     assert set(out["files"]) == {"README.md", "docs/user-manual.md"}
+
+
+async def test_unscoped_repo_with_no_text_at_all_still_succeeds_with_zero_docs():
+    """硬约束的另一半：只有「显式范围零命中」才报错，全域零正文不许变成 400。
+    纯二进制仓库是真实存在的东西，把它判成失败比判成空站更糟。"""
+    tree = [_blob("img/a.png"), _blob("frontend/package-lock.json")]
+    out = await ingest.fetch_repo_snapshot(URL, transport=_transport(tree, {}))
+    assert out["manifest"]["counts"]["snapshotted"] == 0
+    assert out["manifest"]["subpath"] is None
+    assert out["files"] == {}
 
 
 async def test_subpath_that_matches_nothing_is_an_error_not_an_empty_site():
@@ -164,6 +176,16 @@ async def test_subpath_that_matches_nothing_is_an_error_not_an_empty_site():
     with pytest.raises(ingest.SourceError) as e:
         await ingest.fetch_repo_snapshot(URL, subpath="doc",
                                          transport=_transport(TREE, FILES))
+    assert "没有可摄入的文本" in str(e.value)
+
+
+async def test_scoped_dir_whose_only_text_is_oversize_aborts_with_the_size_hint():
+    """范围内只有超限正文时也走同一条零命中报错：行为对（建一个空站没意义），
+    但这条用例钉的是「别把它误判成 not-found 后静默降级」。"""
+    tree = [_blob("docs/big.md", size=ingest.MAX_FILE_BYTES + 1)]
+    with pytest.raises(ingest.SourceError) as e:
+        await ingest.fetch_repo_snapshot(URL, subpath="docs",
+                                         transport=_transport(tree, {}))
     assert "没有可摄入的文本" in str(e.value)
 
 

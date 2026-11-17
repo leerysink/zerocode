@@ -177,7 +177,10 @@ blob 时才碰巧相等），把它当恒等式读就是给一条不存在的不
   只有写盘前的 `relative_to` 拦得住。两道闸口径不同，不是重复。
   补一句免得有人去数差集：`_safe_rel` 比 `is_eligible` 多出的那个 `posixpath.isabs` 分支今天判不到
   盘符形态（posix 的 `isabs` 只认前导 `/`，而那种串在它上面一行就已经被拒），落盘侧真正干活的仍是
-  `write_snapshot` 那道 `relative_to` 复核（US-11）。
+  `write_snapshot` 那道 `relative_to` 复核（US-11）。差集不是单向的：Task 10 之后 `is_eligible` 多出一条
+  `_safe_rel` 没有的判据（内部点段即拒），所以 `docs/../x.md` 若真到了落盘侧会被归一成 `x.md` 收下并
+  按归一名写盘（实测 `_safe_rel("docs/../oops.md") == "oops.md"`），拒在抓取侧就是为了不让 manifest
+  存原串、盘上落归一名这种自相矛盾的载荷出现（§2.3）——两条闸的判据集合互有长短，别当谁是另一者的子集。
 
 ## 5. 接口契约
 
@@ -314,8 +317,11 @@ README 缺文件时兜底写成一份只含溯源段的 README，不静默丢出
   「守卫与 installer 的包装对同一批输入判定一致」。
 - `tests/test_source_hosting.py`：`parse_repo_url` 的接受/拒绝形态（仓库根、`/tree/<ref>`、
   `/tree/<ref>/<subpath>`、`.git` 后缀、SKILL.md 直链让路）与端点拼串，含形态闸的每个坏段。
-- `tests/test_source_ingest.py`：预算与白名单、`subpath` 三态优先级（含「只有空白的值归仓库根」）、
-  显式范围零命中报错（不产出空站点）、含内部点段的树路径按 `unsafe-path` 拒收、含斜杠分支的 404 回退、
+- `tests/test_source_ingest.py`：预算与白名单、`subpath` 三态优先级（含「只有空白的值归仓库根」——
+  那条用例刻意用**带目录的 URL** 打，干净 URL 上「仓库根 / 沿用 URL 目录 / 全域」三种读法逐字节同产物，
+  等于没钉）、显式范围零命中报错（不产出空站点；范围内只有超限正文的那一支也走同一条）、
+  **全域**零正文仍是合法空快照（报错闸只认「用户点名了目录」，纯二进制仓库不许被打成 400）、
+  含内部点段的树路径按 `unsafe-path` 拒收、含斜杠分支的 404 回退、
   声明体积预估排在单文件剔除之前、`counts` 三数关系、`truncated` 恒 `false`、单文件级降级
   （`not-found`/`server-error`/`too-large`）、URL 已带 ref 时不再问默认分支（配额那条）。
 - `tests/test_source_materialize.py`：落点常量、manifest 的 UTF-8 + LF 字节（中文夹具 + 正向字节断言，
