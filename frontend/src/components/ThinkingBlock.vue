@@ -23,7 +23,6 @@ watch(() => props.streaming, (v) => { if (v) open.value = true })
 <style scoped>
 .zc-think {
   width: 100%;
-  max-width: 640px;
   margin-bottom: 8px;
   border: 1px dashed var(--zc-border);
   border-radius: 8px;
