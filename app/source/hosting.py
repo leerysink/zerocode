@@ -85,8 +85,6 @@ def parse_repo_url(url: str) -> RepoRef | None:
     # `segs[2] in ("raw","blob")` 且段数 ≥5 的文件直链形态，因为 `/tree/<ref>/<path>` 是目录形态，
     # 末段叫 SKILL.md 也仍然是仓库地址——浏览器复制目录链接常常带上这一层，
     # 判成「不是仓库」会把真仓库拒在门外（终审 Important 的裁定）。两条各自被测试钉住，改一条别顺手改另一条。
-    # `/tree/<ref>/<path>` 是目录形态，末段叫 SKILL.md 也仍然是仓库地址——浏览器复制目录链接
-    # 常常带到最后一段，把它判成「不是仓库」会把真仓库拒在门外（终审 Important 的裁定）。
     if (len(segs) >= 5 and segs[2] in ("raw", "blob")
             and segs[-1].upper() == "SKILL.MD"):
         return None
