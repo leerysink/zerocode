@@ -57,8 +57,9 @@ ADR-0052 取代那一条。
   再追 `<memories>`（以 `brief` 为查询调 `memory_service.recall_memories`，cfg 透传）与
   决策索引（`clarify.render_decisions(collect_decisions(root))`）。
   **不注入** `<context_summary>`、`<current_todos>`，**不含**主会话聊天历史。
-- **循环**：轮数上限 `subrun.max_rounds`（夹取 1..50，默认 10；刻意不沿用「<=0 不限」约定——
-  子 run 的意义之一就是成本封顶）。每轮 LLM 流经 `_wait_or_cancel(..., ctx.cancel)` 与停止竞速；
+- **循环**：轮数上限 `subrun.max_rounds`（夹取 0..50，默认 10；`<=0` 表示不限，与主循环
+  `agent.max_tool_rounds` 及全项目「<=0 不限制」约定同口径）。每轮 LLM 流经
+  `_wait_or_cancel(..., ctx.cancel)` 与停止竞速；
   模型实例经 `runner._llm_for(cfg)` 取得（可调用工厂时每子 run 独立实例，测试注入依赖这条）。
 - **每轮行为**（与主循环同形，但更薄）：
   - 有工具调用：assistant 行落库（`content` + `tool_args`，脱敏同主 run 三出口口径）→
@@ -145,7 +146,7 @@ ADR-0052 取代那一条。
 - 账户级键（`config_service.USER_PREFIXES` 追加 `"subrun."`，与 `memory./clarify.` 同族——
   限制的是「我自己烧的钱」）：
   - `subrun.max_tasks` 默认 5，夹取 1..8；
-  - `subrun.max_rounds` 默认 10，夹取 1..50。
+  - `subrun.max_rounds` 默认 10，夹取 0..50（`<=0` 不限）。
   - 默认值写在代码（executor 读取处）与前端表单默认值两处，不新增 changelog 种行、
     不新增数据库迁移（与 `agent.preview_*` 同一先例）。
 - 前端：`stores/config.js` 的 `FIELD_TO_KEY`/表单默认值追加两键；`SettingsView.vue` 在
@@ -194,7 +195,8 @@ ADR-0052 取代那一条。
   压缩摘要不覆盖它们。
 - **US-13 停止**：委派执行中点停止，全部子 run 与主 run 一同收口；委派结果行为 cancelled，
   未收口的子 run 显示已中断。
-- **US-14 轮数预算**：子 run 达到 `subrun.max_rounds` 即以 error 回执收口，其余子 run 不受影响。
+- **US-14 轮数预算**：子 run 达到 `subrun.max_rounds` 即以 error 回执收口，其余子 run 不受影响；
+  配置为 0 时不限轮数（成本封顶改用默认 10 兜底）。
 - **US-15 并发落库**：多个子 run 并发写同一会话，`seq` 连续且唯一，无唯一索引冲突。
 - **US-16 配置**：`subrun.max_tasks` / `subrun.max_rounds` 在设置页可改、按账号生效、
   越界夹取；库里无该键时用代码默认值。

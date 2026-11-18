@@ -221,6 +221,26 @@ async def test_round_budget_exhaustion_is_an_error_receipt(test_engine, tmp_path
 
 
 @pytest.mark.asyncio
+async def test_zero_max_rounds_means_unlimited(test_engine, tmp_path):
+    """subrun.max_rounds=0 → 不限轮数（与主循环同口径）：越过有限值时期满即中止的轮数照样跑完。"""
+    rounds_needed = 12  # 大于 DEFAULT_MAX_ROUNDS(10)，有限值下必被中止
+    llm = RoutedLLM(
+        main_turns=[done(None, [tool_call("d1", "delegate", tasks=[
+            {"title": "调研 A", "brief": "调研A：多轮"}]),
+        ]), done("收工")],
+        sub_turns={"调研A": [
+            done(None, [tool_call(f"s{i}", "list_dir", path="")])
+            for i in range(rounds_needed)] + [done("查完了")]})
+    sid, status, rec, runner, sf = await run_agent(test_engine, tmp_path, llm,
+                                                   **{"subrun.max_rounds": 0})
+    assert status == "idle"
+    tr = next(e for e in rec.events if e["type"] == "tool_result" and e["name"] == "delegate")
+    sub = tr["result"]["subruns"][0]
+    assert sub["status"] == "completed" and sub["result"] == "查完了"
+    assert sub["rounds_used"] == rounds_needed + 1
+
+
+@pytest.mark.asyncio
 async def test_empty_reply_nudge_then_success_or_error(test_engine, tmp_path):
     """空回复沿用主循环的补催口径（同常量 _EMPTY_REPLY_RETRIES=2）：
     补催后给出文字 → completed；超过上限仍空 → error 回执，不伪造总结行。"""
@@ -408,14 +428,15 @@ def test_int_cfg_clamps_to_hard_bounds_and_code_defaults():
     越界只会被夹取，绝不放大成一次超支（下游还有整批拒绝兜底）。"""
     from app.agent import subrun as _sub
     d_tasks = (_sub.DEFAULT_MAX_TASKS, 1, _sub.MAX_TASKS_CAP)
-    d_rounds = (_sub.DEFAULT_MAX_ROUNDS, 1, _sub.MAX_ROUNDS_CAP)
+    d_rounds = (_sub.DEFAULT_MAX_ROUNDS, 0, _sub.MAX_ROUNDS_CAP)
     assert _sub.DEFAULT_MAX_TASKS == 5 and _sub.DEFAULT_MAX_ROUNDS == 10
     assert _sub._int_cfg({}, "subrun.max_tasks", *d_tasks) == 5
     assert _sub._int_cfg({}, "subrun.max_rounds", *d_rounds) == 10
     assert _sub._int_cfg({"subrun.max_tasks": 99}, "subrun.max_tasks", *d_tasks) == 8
     assert _sub._int_cfg({"subrun.max_tasks": 0}, "subrun.max_tasks", *d_tasks) == 1
     assert _sub._int_cfg({"subrun.max_rounds": 999}, "subrun.max_rounds", *d_rounds) == 50
-    assert _sub._int_cfg({"subrun.max_rounds": -3}, "subrun.max_rounds", *d_rounds) == 1
+    assert _sub._int_cfg({"subrun.max_rounds": -3}, "subrun.max_rounds", *d_rounds) == 0
+    assert _sub._int_cfg({"subrun.max_rounds": 0}, "subrun.max_rounds", *d_rounds) == 0
     assert _sub._int_cfg({"subrun.max_rounds": "abc"}, "subrun.max_rounds", *d_rounds) == 10
     assert _sub._int_cfg({"subrun.max_rounds": None}, "subrun.max_rounds", *d_rounds) == 10
 

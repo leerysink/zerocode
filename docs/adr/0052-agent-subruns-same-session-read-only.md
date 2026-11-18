@@ -35,8 +35,8 @@
 3. **委派形状**：一个 `delegate` 工具收一批任务书（`tasks: [{title, brief}]`），内部并发跑到
    全部落定，合并为一个 `tool_result` 回主 run——现有「工具逐条串行执行」的循环完全不动，
    并行度封装在工具内部。禁递归（子 run 工具面不含 `delegate`）；失败隔离（一个子 run 出错只影响
-   自己那条回执，不取消其余）；上限可配：`subrun.max_tasks` 默认 5、`subrun.max_rounds` 默认 10，
-   均为账户级键；子 run 继承主 run 模型。上下文 = 主 agent 写的任务书 + 与主 run 同款的系统骨架
+   自己那条回执，不取消其余）；上限可配：`subrun.max_tasks` 默认 5、`subrun.max_rounds` 默认 10
+   （`<=0` 表示不限轮数，与主循环 `agent.max_tool_rounds` 同口径），均为账户级键；子 run 继承主 run 模型。上下文 = 主 agent 写的任务书 + 与主 run 同款的系统骨架
    （技能/记忆/决策索引照旧注入），**不含主会话聊天历史**——隔离彻底、成本可估。
 
 4. **过程逐事件实时下发并落库**，满足 ADR-0029「实时≡历史」：子 run 的 assistant/tool 行与主 run

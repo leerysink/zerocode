@@ -373,8 +373,8 @@ async function save() {
             <a-form-item label="单批委派子任务上限（个）" extra="账户级、只影响自己；一次 delegate 最多并行几个只读子 agent，1..8">
               <a-input-number v-model:value="store.form.subrunMaxTasks" :min="1" :max="8" style="width: 180px" />
             </a-form-item>
-            <a-form-item label="子任务轮数上限（轮）" extra="账户级、只影响自己；每个子 agent 最多跑几轮，1..50">
-              <a-input-number v-model:value="store.form.subrunMaxRounds" :min="1" :max="50" style="width: 180px" />
+            <a-form-item label="子任务轮数上限（轮）" extra="账户级、只影响自己；每个子 agent 最多跑几轮，0 表示不限制（有限值最大 50）">
+              <a-input-number v-model:value="store.form.subrunMaxRounds" :min="0" :max="50" style="width: 180px" />
             </a-form-item>
           </a-form>
         </a-card>

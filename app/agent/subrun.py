@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import datetime
+import itertools
 import json
 
 from app.agent import clarify as _cl
@@ -72,7 +73,7 @@ def _parse_tasks(args: dict, max_tasks: int) -> tuple[list[dict], str | None]:
 async def run_batch(runner, ctx, cfg: dict, args: dict, call_id: str | None = None) -> dict:
     """批量执行一次委派，返回经预算截断的合并回执（唯一出口与主 run 相同）。"""
     max_tasks = _int_cfg(cfg, "subrun.max_tasks", DEFAULT_MAX_TASKS, 1, MAX_TASKS_CAP)
-    max_rounds = _int_cfg(cfg, "subrun.max_rounds", DEFAULT_MAX_ROUNDS, 1, MAX_ROUNDS_CAP)
+    max_rounds = _int_cfg(cfg, "subrun.max_rounds", DEFAULT_MAX_ROUNDS, 0, MAX_ROUNDS_CAP)
     tasks, error = _parse_tasks(args, max_tasks)
     if error:
         return {"ok": False, "error": error}
@@ -180,7 +181,9 @@ async def _execute(runner, ctx, cfg, index: int, brief: str, max_rounds: int,
         app=ctx.app, cfg=cfg, cancel=ctx.cancel, deploy_hub=None, deploy_tasks={},
         run_state={}, model_cfg=ctx.model_cfg, llm=llm)
     empty_retries = 0
-    for round_no in range(max_rounds):
+    # <=0 = 不限轮数（与主循环 agent.max_tool_rounds 同口径）
+    rounds = itertools.count() if max_rounds <= 0 else range(max_rounds)
+    for round_no in rounds:
         stats["rounds"] = round_no + 1
         if ctx.cancel.is_set():
             raise asyncio.CancelledError()

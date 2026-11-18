@@ -84,7 +84,7 @@ export const useConfigStore = defineStore('config', {
       memoryMinSimilarity: -1, // -1..1，-1=一条不因阈值丢掉
       memoryMaxTokens: 600, // 1..20000
       subrunMaxTasks: 5, // 1..8，与 subrun.py 的 DEFAULT_MAX_TASKS 同值
-      subrunMaxRounds: 10, // 1..50，与 subrun.py 的 DEFAULT_MAX_ROUNDS 同值
+      subrunMaxRounds: 10, // 0..50，0=不限，与 subrun.py 的 DEFAULT_MAX_ROUNDS 同值
     },
     saving: false,
     loaded: false, // 是否已从后端拉到过配置（ensureLoaded 的去重依据）
