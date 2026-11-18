@@ -204,8 +204,9 @@ if (Test-Path $bundle -PathType Leaf) {
 foreach ($need in 'deploy.sh', 'deploy_lib.sh', 'README-deploy.md', '.env.example') {
     if (-not (Test-Path (Join-Path $bundle $need))) { Fail "包里没有 $need：$bundle（重跑 build-output.bat，别手往包里塞文件——它是生成目录）" }
 }
-# 皮与双击入口不进硬校验：老包本来就没有它们，缺了也只是少一个入口，而内核与判定层缺一都跑不动。
-foreach ($entry in 'deploy.ps1', 'deploy.bat') {
+# 皮、双击入口与证书脚本不进硬校验：老包本来就没有它们，缺了也只是少一个入口或少一条签发路径，
+# 而内核与判定层缺一都跑不动。
+foreach ($entry in 'deploy.ps1', 'deploy.bat', 'gen_ssl.sh') {
     if (-not (Test-Path (Join-Path $bundle $entry))) { Warn "包里缺 $entry（旧包？）：内核与判定层都在，可以继续，但下次重打包会补上" }
 }
 
@@ -236,7 +237,7 @@ Warn '推进只覆盖同名文件、不删多余的：上一版包留下的脚�
 
 # Linux 侧脚本从 Windows 过去常带 CRLF——内核自己会自检并给修法，这里先替它剥掉更省事。
 try {
-    $null = Wsl $Distro @('bash', '-c', "cd '$targetLinux' && for f in deploy.sh deploy_lib.sh apply-init.sh; do [ -f `$f ] && sed -i 's/\r`$//' `$f; done") -Capture
+    $null = Wsl $Distro @('bash', '-c', "cd '$targetLinux' && for f in deploy.sh deploy_lib.sh gen_ssl.sh apply-init.sh; do [ -f `$f ] && sed -i 's/\r`$//' `$f; done") -Capture
 } catch { Warn '剥 CRLF 这步没跑成（内核的自检会接手，症状出现时按它给的那条 sed 修）' }
 
 Warn 'Windows 侧建议不起中央网关：宿主 80/443 常被占，通配 DNS 也指不到这台机器（ADR-0035 后果条）。'

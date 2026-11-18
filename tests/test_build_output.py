@@ -38,6 +38,12 @@ zc_busy() { # 0=被占 1=空闲 2=无法判定
   ss -ltnH 2>/dev/null | awk -v pat=":${port}\\$" '$4 ~ pat { f = 1 } END { exit !f }'
 }
 """
+# 证书签发同样住在仓库里、由打包器原样搬运：它 source 的是同一份判定层。
+GEN_SSL_SH_STUB = r"""#!/usr/bin/env bash
+set -uo pipefail
+. "$(dirname "$0")/deploy_lib.sh" || exit 1
+cert_acme() { zc_acme_issue_cmd "$@"; }
+"""
 # 源故意不带 BOM、行尾故意 CRLF：打包器要把它改成「BOM + LF」，US-26 才是可判定的。
 DEPLOY_PS1_STUB = "#!/usr/bin/env pwsh\r\nWrite-Host '皮：只保证 WSL，然后调用同一份 deploy.sh'\r\n"
 # .bat 桩与 .ps1 桩的期望相反：打包器要把行尾翻成「CRLF」，且必须保持纯 ASCII（cmd.exe 的脾气）。
@@ -175,6 +181,7 @@ def fake_repo(tmp_path) -> Path:
     scripts.mkdir()
     (scripts / "deploy.sh").write_text(DEPLOY_SH_STUB, encoding="utf-8")
     (scripts / "deploy_lib.sh").write_text(DEPLOY_LIB_SH_STUB, encoding="utf-8")
+    (scripts / "gen_ssl.sh").write_text(GEN_SSL_SH_STUB, encoding="utf-8")
     (scripts / "deploy.ps1").write_text(DEPLOY_PS1_STUB, encoding="utf-8")
     # write_bytes 而不是 write_text：Windows 上 write_text 会把 "\n" 就地翻成 CRLF，
     # 那这支「源是 LF、出包必须是 CRLF」的验证就自证自明了。
@@ -210,7 +217,8 @@ def test_build_produces_every_artifact(fake_repo):
     s = _build(fake_repo)
     out = s["out"]
     for rel in ("init.sql", "docker-compose.yml", ".env.example", ".dockerignore",
-                "apply-init.sh", "deploy.sh", "deploy_lib.sh", "deploy.ps1", "deploy.bat",
+                "apply-init.sh", "deploy.sh", "deploy_lib.sh", "gen_ssl.sh",
+                "deploy.ps1", "deploy.bat",
                 "README-deploy.md",
                 "backend/Dockerfile", "backend/requirements.txt", "backend/app/main.py",
                 "browser/Dockerfile", "browser/requirements.txt", "browser/app.py",
@@ -255,27 +263,30 @@ def test_generated_text_files_use_lf(fake_repo):
         assert b"\r\n" not in raw, f"{rel} 含 CRLF 行尾"
 
 
-def test_deploy_script_ships_verbatim_from_repo(fake_repo):
-    """deploy.sh 的源住在仓库里，包只是搬运工：重打包不再冲掉服务器端排障改动。"""
-    (fake_repo / "scripts" / "deploy.sh").write_text("#!/usr/bin/env bash\necho 现场改的\n",
-                                                     encoding="utf-8")
+@pytest.mark.parametrize("name", ("deploy.sh", "deploy_lib.sh", "gen_ssl.sh"))
+def test_deploy_script_ships_verbatim_from_repo(fake_repo, name):
+    """三份 shell 脚本的源都住在仓库里，包只是搬运工：重打包不再冲掉服务器端排障改动。"""
+    (fake_repo / "scripts" / name).write_text("#!/usr/bin/env bash\necho 现场改的\n",
+                                              encoding="utf-8")
     out = _build(fake_repo)["out"]
-    assert (out / "deploy.sh").read_text(encoding="utf-8").endswith("echo 现场改的\n")
+    assert (out / name).read_text(encoding="utf-8").endswith("echo 现场改的\n")
 
 
-def test_deploy_script_strips_crlf(fake_repo):
+@pytest.mark.parametrize("name", ("deploy.sh", "deploy_lib.sh", "gen_ssl.sh"))
+def test_deploy_script_strips_crlf(fake_repo, name):
     """边界：源文件被编辑器存成 CRLF 也不能带进包——脚本自己在服务器上有条 CRLF 自检。"""
-    (fake_repo / "scripts" / "deploy.sh").write_bytes(b"#!/usr/bin/env bash\r\necho hi\r\n")
+    (fake_repo / "scripts" / name).write_bytes(b"#!/usr/bin/env bash\r\necho hi\r\n")
     out = _build(fake_repo)["out"]
-    assert b"\r" not in (out / "deploy.sh").read_bytes()
+    assert b"\r" not in (out / name).read_bytes()
 
 
-@pytest.mark.parametrize("name", ("deploy.sh", "deploy_lib.sh", "deploy.ps1", "deploy.bat"))
+@pytest.mark.parametrize("name", ("deploy.sh", "deploy_lib.sh", "gen_ssl.sh", "deploy.ps1", "deploy.bat"))
 def test_missing_any_deploy_script_blocks_packaging(fake_repo, name):
-    """四份脚本缺一不出包：内核要 source 判定层，皮与内核互为左右手，双击入口缺了等于把
-    不碰终端的人挡在门外——少一份就是让服务器（或部署者）跑到一半才发现。"""
+    """五份脚本缺一不出包：两支内核都要 source 判定层，皮与 deploy.sh 互为左右手，
+    gen_ssl.sh 是证书的唯一出口（deploy.sh 不签证书），双击入口缺了等于把不碰终端的人挡在
+    门外——少一份就是让服务器（或部署者）跑到一半才发现。"""
     (fake_repo / "scripts" / name).unlink()
-    with pytest.raises(bo.BuildError, match=name):
+    with pytest.raises(bo.BuildError, match=re.escape(name)):
         _build(fake_repo)
 
 
@@ -300,24 +311,54 @@ def test_powershell_skin_ships_as_bom_plus_lf(fake_repo):
     assert "deploy.sh" in raw.decode("utf-8-sig"), "皮里没有调用同一份 deploy.sh（那它就不是皮）"
 
 
-def test_repo_deploy_kernel_never_persists_dnspod_credentials():
+def test_repo_gen_ssl_never_persists_dnspod_credentials():
     """DNSPod API 凭据只许 export 给 acme.sh（它自己存 account.conf 供续期），
     一旦写进 .env / .deploy-answers 就是明文凭据落盘并被下轮部署回显。"""
-    kernel = (bo.REPO_ROOT / "scripts" / "deploy.sh").read_text(encoding="utf-8")
-    assert "read -rs DP_KEY" in kernel, "DP_Key 不再用不回显输入收"
+    gen = (bo.REPO_ROOT / "scripts" / "gen_ssl.sh").read_text(encoding="utf-8")
+    assert "read -rs DP_KEY" in gen, "DP_Key 不再用不回显输入收"
     for bad in ("put DP_Id", "put DP_Key", "put DP_ID", "put DP_KEY"):
-        assert bad not in kernel, f"凭据被写进运行参数：{bad}"
-    assert "export DP_Id=" in kernel and "DP_Key=" in kernel, "凭据没交给 acme.sh"
+        assert bad not in gen, f"凭据被写进运行参数：{bad}"
+    assert "export DP_Id=" in gen and "DP_Key=" in gen, "凭据没交给 acme.sh"
 
 
-def test_repo_deploy_kernel_wires_acme_commands_to_the_lib():
+def test_repo_gen_ssl_wires_acme_commands_to_the_lib():
     """网关真证书的拼装只在判定层（有桩测）；执行层不得自己拼 --issue/--install-cert，
     否则命令与桩测覆盖的两份文本会各自漂移。"""
+    gen = (bo.REPO_ROOT / "scripts" / "gen_ssl.sh").read_text(encoding="utf-8")
+    assert "zc_acme_issue_cmd" in gen, "签发没走 zc_acme_issue_cmd"
+    assert "zc_acme_install_cmd" in gen, "安装没走 zc_acme_install_cmd"
+    assert "zc_gateway_reloadcmd" in gen, "续期后的重启命令没走 zc_gateway_reloadcmd"
+    assert "--issue --server letsencrypt" not in gen, "执行层里又自己拼了一份签发命令"
+    assert "--install-cert" not in gen, "执行层里又自己拼了一份安装命令"
+
+
+def test_repo_gen_ssl_gates_the_gateway_domain_charset():
+    """域名会被拼进 `docker run … sh -c "… '<域名>'"` 的单引号里，由 root 执行。
+    deploy.sh 那侧的闸门挡的是写进 .env 的值，这道挡的是现场直接跑 gen_ssl.sh 的人。"""
+    gen = (bo.REPO_ROOT / "scripts" / "gen_ssl.sh").read_text(encoding="utf-8")
+    assert 'case "$DOMAIN" in' in gen, "gen_ssl.sh 没做域名字符集校验"
+    assert "*[!A-Za-z0-9._-]*)" in gen, "gen_ssl.sh 的域名闸门没在越界时直接失败"
+
+
+def test_repo_gen_ssl_gates_every_lib_function_it_calls():
+    """与内核同一道版本闸门：gen_ssl.sh 用的是同一份判定层，包里 lib 比脚本旧时要在动手前停下。"""
+    gen = (bo.REPO_ROOT / "scripts" / "gen_ssl.sh").read_text(encoding="utf-8")
+    lib = (bo.REPO_ROOT / "scripts" / "deploy_lib.sh").read_text(encoding="utf-8")
+    assert '. "$LIB"' in gen, "gen_ssl.sh 没 source 判定层：两份脚本会各自漂移"
+    gate = gen[gen.index("for want in"):gen.index("declare -F")]
+    named = [f for f in re.findall(r"^(zc_[a-z_]+)\(\)", lib, re.M) if f in gen]
+    missing = [f for f in named if f not in gate]
+    assert not missing, f"gen_ssl.sh 用到这些判定函数却没进版本闸门名单：{missing}"
+
+
+def test_repo_deploy_kernel_keeps_certificates_out_of_the_upgrade_path():
+    """回归钉：deploy.sh 不签证书。签发要联网、要 DNSPod 凭据、会被 Let's Encrypt 限流，
+    让它们决定一次平台升级就是给「升级失败」添新来源；第 9 步只认现场证书，缺就跳过起网关。"""
     kernel = (bo.REPO_ROOT / "scripts" / "deploy.sh").read_text(encoding="utf-8")
-    assert "zc_acme_issue_cmd" in kernel, "执行层没调 zc_acme_issue_cmd"
-    assert "zc_acme_install_cmd" in kernel, "执行层没调 zc_acme_install_cmd"
-    assert "--issue --server letsencrypt" not in kernel, "内核里又自己拼了一份签发命令"
-    assert "--install-cert" not in kernel, "内核里又自己拼了一份安装命令"
+    for gone in ("DP_Id", "DP_Key", "zc_acme_", "zc_gateway_reloadcmd", "cert_acme",
+                 "cert_selfsign", "get.acme.sh", "make-cert.sh:/mk.sh"):
+        assert gone not in kernel, f"内核里又长出了证书签发动作：{gone}"
+    assert "gen_ssl.sh" in kernel, "内核不再把缺证书指向 gen_ssl.sh：部署者拿不到出路"
 
 
 def test_repo_deploy_kernel_delegates_predicates_to_the_lib():
@@ -510,6 +551,8 @@ def test_repo_upgrade_copy_list_matches_the_merge_plan_text():
     assert copied == listed, (f"内核 cp 的与计划表列的不一致：只在内核 {sorted(copied - listed)}，"
                               f"只在计划表 {sorted(listed - copied)}")
     assert "deploy.bat" in copied, "双击入口没进升级搬运名单：升级后部署根里还是旧入口（或没有）"
+    assert "gen_ssl.sh" in copied, "证书脚本没进升级搬运名单：升级后部署根里根本没有 gen_ssl.sh，" \
+                                   "而内核第 9 步已经把缺证书的人指到那里去了"
 
 
 def test_windows_forwarder_ships_crlf_and_ascii_only(fake_repo):

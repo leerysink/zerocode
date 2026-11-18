@@ -189,7 +189,7 @@ EOF
   rsync -a --delete  backend/  →  ${root}/backend/
   rsync -a --delete  browser/  →  ${root}/browser/
   rsync -a --delete  frontend/ →  ${root}/frontend/
-  只覆盖不删的顶层生成物：docker-compose.yml  init.sql  apply-init.sh  deploy.sh  deploy_lib.sh  deploy.ps1  deploy.bat  .env.example  README-deploy.md  .dockerignore
+  只覆盖不删的顶层生成物：docker-compose.yml  init.sql  apply-init.sh  deploy.sh  deploy_lib.sh  gen_ssl.sh  deploy.ps1  deploy.bat  .env.example  README-deploy.md  .dockerignore
   网关侧只覆盖 gateway/ 下的配置与脚本；容器重建与否现场问
 不会动：八项现场产物，一项都不进上面的清单（术语见 CONTEXT.md「现场产物」）
   ${root}/.env            —— 本脚本只往里合并被问到的键，且动笔前先备份
@@ -197,7 +197,7 @@ EOF
   ${root}/apps/           —— 服务器上新建的应用工程（root_path 指向它）
   ${root}/data/           —— 运行期落盘的技能库、截图
   ${root}/store/          —— 商店包
-  ${root}/gateway/certs/  —— TLS 证书与私钥，只在服务器现场生成
+  ${root}/gateway/certs/  —— TLS 证书与私钥，只在服务器现场生成（gen_ssl.sh 签，本脚本不碰）
   ${root}/gateway/routes/ —— 运行期路由表
   ${root}/gateway/.env    —— 网关侧域名覆盖
   pgdata 卷               —— 平台库与全部应用分库

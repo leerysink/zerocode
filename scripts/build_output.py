@@ -1305,7 +1305,8 @@ def readme_md(presets, deploy_root: str, generated_at: str, dist_stamp: str,
 > 下次打包会整目录重建。要改就改仓库里的 `changelog/`、`app/`、`frontend/`、`gateway/`、
 > `scripts/deploy.sh`（交互内核）、`scripts/deploy_lib.sh`（被内核 source 的判定层，桩测全打在它身上）、
 > `scripts/deploy.ps1`（Windows 侧的 WSL2 皮）、`scripts/deploy.bat`（双击皮用的入口，只转发不判定），
-> 或者改打包脚本——包里的这四份只是拷贝。
+> `scripts/gen_ssl.sh`（网关证书签发——`deploy.sh` 不签证书），
+> 或者改打包脚本——包里的这五份只是拷贝。
 > `gateway/certs/`（TLS 私钥）与 `gateway/routes/routes.json`（运行期路由）是
 > 服务器现场产物，不在包内。
 
@@ -1344,9 +1345,10 @@ def readme_md(presets, deploy_root: str, generated_at: str, dist_stamp: str,
   时，网关可以先不起（第 4 步回答 n 即可，Windows 侧的建议默认值就是 n）。
 - 平台库账号需具备建库建角色权限（镜像默认的 `zerocode` 就是超级用户）。
 - 口令请只用字母、数字与 `- _`：它会被原样拼进 asyncpg 连接串，含 `@ : / # % & ?` 会把它截断。
-- TLS 证书**不在包里**（私钥绝不进包）：选了起网关，第 4 步默认走 acme.sh + DNSPod DNS-01
-  签 Let's Encrypt 泛域名真证书（现场收 DP_Id/DP_Key，不回显、不落 .env）；也可选自签，
-  或签发失败时自动回退自签。手工换证书的命令见 §2 末尾「网关」小节。
+- TLS 证书**不在包里**（私钥绝不进包），也**不由 `deploy.sh` 签发**：证书走包根里的 `bash gen_ssl.sh`
+  （acme.sh + DNSPod DNS-01 真证书，或内网自签，两条路径都在那支里；现场收 `DP_Id`/`DP_Key`，
+  不回显、不落 `.env`）。`deploy.sh` 第 9 步只看 `gateway/certs/` 里有没有现成证书——没有就跳过
+  起网关并指回这里。手工签发与换证书的操作见 §2 末尾「网关」小节。
 
 ## 2. 首次部署：一条命令
 
@@ -1386,7 +1388,7 @@ docker daemon 起不来）、保证发行版 `/etc/wsl.conf` 里 `[boot] systemd
 | 6 落盘 | 不问：合并 `.env`、铺包或按升级合并、把答案写进 `.deploy-answers` | 升级模式只镜像 `backend/`、`browser/`、`frontend/` 三棵，八项现场产物一个不碰（§4） |
 | 7 起平台栈 | 不问 | 先核 compose 里声明了 `browser` 服务，再预热 `docker pull` 基础镜像——拉不动就当场停，不等 build 卡二十分钟；起栈一律 `up -d --build`：平台代码与前端 dist 都烘在镜像里，只 `up -d` 会静默停在旧镜像 |
 | 8 重放与自检 | 不问：`bash apply-init.sh`，然后从后端容器实探探针与 sidecar | `compose 里有 browser 服务` 不等于 `Chromium 起得来`，自检探的是 `$ZEROCODE_BROWSER_URL/healthz` |
-| 9 中央网关 | 升级时问「要按新的 `gateway/docker-compose.yml` 重建吗」 | 第 4 步选 acme（默认，DNSPod DNS-01 真证书）或自签；现场已有证书则先问是否重签；`gateway/certs/`、`gateway/routes/`、`gateway/.env` 是现场产物，不覆盖也不删 |
+| 9 中央网关 | 升级时问「要按新的 `gateway/docker-compose.yml` 重建吗」 | **不签证书**：`gateway/certs/` 里已有 `gateway.crt` 与 `gateway.key` 就起网关，缺就跳过起网关并指路 `bash gen_ssl.sh`（缺证书的 openresty 是半死状态，比不起难查）；`gateway/certs/`、`gateway/routes/`、`gateway/.env` 是现场产物，不覆盖也不删 |
 
 `.env` 由脚本从包里的 `.env.example` 起步生成、再合并本次答案，既有键与注释一律保留——**不要**
 手工 `cp .env.example .env`，那等于把服务器现场填的配置顶掉（第 3 步的删库闸门也救不了你，
@@ -1423,16 +1425,26 @@ sidecar 未启动或崩溃时，`preview_page` 会返回「浏览器检查服务
 
 包的 `gateway/` 下是一个**独立的 OpenResty compose 项目**：终止 TLS，并按
 `https://<slug>.<域名>` 反代到应用的 prod 宿主端口。第 4 步回答「起」就会把它带上，
-下面是它单独成立时的手工路径（以及换证书时的操作）。
+但 **`deploy.sh` 不签证书**——签发住在包根里的 `gen_ssl.sh`：acme 要联网、要 DNSPod API 凭据、
+还会被 Let's Encrypt 限流，让这些决定一次平台升级不值当。`deploy.sh` 第 9 步只认
+`gateway/certs/` 里现成的证书，缺就跳过起网关并指回这里。
 
-先签证书，输出必须是 `gateway/certs/gateway.crt` 与 `gateway/certs/gateway.key`（文件名与
-域名无关，换域名/换 CA 都不用改 nginx 配置）：
+首次签发、换证书或换域名都跑这一条（在包目录里跑、在部署根里跑都行）：
 
-- **生产（推荐，第 4 步默认 `acme`）**：deploy.sh 现场收 DNSPod 的 `DP_Id`/`DP_Key`，
-  装 acme.sh 走 DNS-01 同时申请 `-d '<域名>' -d '*.<域名>'`，再用 `--install-cert` 写到
-  上面这对文件名；`--reloadcmd` 会让每月续期后自动重启网关。凭据不进 .env / 应答文件，
-  只由 acme.sh 存进自己的 `account.conf`（续期需要）。也可预先 `export DP_Id=… DP_Key=…`。
-- **内网/本机自签**：第 4 步选 `selfsign`（或 acme 签发失败时自动回退）。自签 CA 需要
+```bash
+cd <部署根>
+bash gen_ssl.sh          # 问域名（默认取 .env 的 ZEROCODE_GATEWAY_DOMAIN）与证书来源
+```
+
+输出必须是 `gateway/certs/gateway.crt` 与 `gateway/certs/gateway.key`（文件名与域名无关，
+换域名/换 CA 都不用改 nginx 配置）：
+
+- **生产（默认 `acme`）**：gen_ssl.sh 现场收 DNSPod 的 `DP_Id`/`DP_Key`，装 acme.sh 走 DNS-01
+  同时申请 `-d '<域名>' -d '*.<域名>'`，再用 `--install-cert` 写到上面这对文件名；`--reloadcmd`
+  会让每月续期后自动重启网关。凭据不进 .env / 应答文件，只由 acme.sh 存进自己的
+  `account.conf`（续期需要）。也可预先 `export DP_Id=… DP_Key=…`——环境变量里的旧凭据会被
+  直接沿用，换账号前先 `unset DP_Id DP_Key`。
+- **内网/本机自签**：选 `selfsign`（acme 失败时它会问一句要不要回退自签）。自签 CA 需要
   客户端手动信任，手工等价命令：
   ```bash
   docker run --rm -v "$PWD/gateway/certs:/out" -v "$PWD/gateway/make-cert.sh:/mk.sh" \\
@@ -1440,7 +1452,8 @@ sidecar 未启动或崩溃时，`preview_page` 会返回「浏览器检查服务
   # 然后把 gateway/certs/ca.crt 导入客户端「受信任的根证书颁发机构」
   ```
 
-证书就位后启动网关：
+`gen_ssl.sh` 签完顺手让新证书生效：网关已在跑就 `restart`，没跑就 `up -d`——证书目录是 `:ro`
+挂载，只换文件不重启的话，容器里的 nginx 读到的还是旧证书。手工路径与它等价：
 
 ```bash
 cd <部署根>
@@ -1513,8 +1526,8 @@ bash deploy.sh          # 第 1 问选 upgrade
 - 只**镜像**三棵目录：`backend/`、`browser/`、`frontend/`——这三棵里没有服务器现场产生的东西，
   所以带 `--delete`；全场只有这三棵带 `--delete`。
 - 顶层生成物与 `gateway/` 的配置/脚本按文件名**覆盖**，不删别的：`docker-compose.yml`、`init.sql`、
-  `apply-init.sh`、`deploy.sh`、`deploy_lib.sh`、`deploy.ps1`、`deploy.bat`、`.env.example`、
-  `README-deploy.md`、`.dockerignore`，以及
+  `apply-init.sh`、`deploy.sh`、`deploy_lib.sh`、`gen_ssl.sh`、`deploy.ps1`、`deploy.bat`、
+  `.env.example`、`README-deploy.md`、`.dockerignore`，以及
   `gateway/nginx.conf`、`gateway/docker-compose.yml`、`gateway/make-cert.sh`、
   `gateway/make-cert.ps1`、`gateway/404.html`、`gateway/lua/router.lua`、`gateway/.env.example`。
 - 八项现场产物一个不碰（下表）。
@@ -1570,8 +1583,9 @@ bash deploy.sh          # 第 1 问选 upgrade
   它没有 docker.sock、没有平台库凭据、根文件系统只读。页面文本、控制台与失败请求在进模型前
   会做凭据遮断，但**截图是像素，无法可靠遮断**——演示机仍只应开给可信工作区。
 - **网关是独立 compose 项目**：平台起栈只管平台，网关要 `-f gateway/docker-compose.yml`
-  单独启停（第 9 步会做，升级时是否重建会问你）；它占用宿主 80/443，且证书/私钥只在服务器
-  现场生成（`gateway/certs/` 不进包）。acme.sh 续期后要重启（或 reload）网关让 nginx 读到新证书。
+  单独启停（第 9 步只做启停，升级时是否重建会问你；证书不在那里签）；签发走包根的 `gen_ssl.sh`（见 §2 末尾「网关」小节）。
+  它占用宿主 80/443，且证书/私钥只在服务器现场生成（`gateway/certs/` 不进包）。
+  acme.sh 续期后要重启（或 reload）网关让 nginx 读到新证书。
 - **部署根可以现场输入，但换根有代价**：镜像 `WORKDIR` 与 `ZEROCODE_GATEWAY_ROUTES` 在构建期定值，
   换根后必须重建镜像（起栈本就带 `--build`，见第 7 步）；机器上已经跑过应用时还要人工核对
   `apps/` 里既有工程与库里的 `root_path` 一致。
@@ -1603,11 +1617,12 @@ bash deploy.sh          # 第 1 问选 upgrade
 | `preview_page` 能开页面但截图为空 / 视觉诊断为「未启用」 | 图像缺失是截图落盘失败（看后端日志与 `<部署根>/data/browser_shots/` 权限）；「未启用」表示当前会话模型没有声明视觉能力，属正常降级 |
 | Agent 反复说「浏览器服务已满」/「浏览器会话已结束」 | 前者是活会话上限 `ZEROCODE_BROWSER_MAX_SESSIONS`（默认 2）用尽：超限的新会话被直接拒绝而不是排队，先 `docker compose logs browser` 看还留着几个没关的 context，别一上来调大——容器只有 `mem_limit: 1g`。后者多半是 `ZEROCODE_BROWSER_SESSION_TTL_SECONDS`（默认 120）到点回收，或 sidecar 中途重启过（内存里的会话全丢，重启容器不会「接回」它们）；两种都是正常降级出口，Agent 会重新 `browser_open`，用户数据不受影响 |
 | 应用域名 502 Bad Gateway | 先看 `docker compose -f gateway/docker-compose.yml logs gateway`：出现 `host.docker.internal could not be resolved` 就是上游地址在 Linux 上解析不了（nginx 不读 `/etc/hosts`），把 `gateway/.env` 的 `ZEROCODE_GATEWAY_UPSTREAM` 设成宿主 docker0 网关（默认 `172.17.0.1`）后重建网关；若日志是 `connection refused`，核对应用 prod 栈与 `routes.json` 的端口是否一致 |
-| 网关容器起不来 / 反复重启 | `docker compose -f gateway/docker-compose.yml logs gateway`：多为 `gateway/certs/gateway.crt|key` 缺失，或 80/443 被占用 |
+| 网关容器起不来 / 反复重启 | `docker compose -f gateway/docker-compose.yml logs gateway`：多为 `gateway/certs/gateway.crt|key` 缺失（跑 `bash gen_ssl.sh` 签），或 80/443 被占用 |
+| 第 9 步只提示「缺证书，本次不起网关」 | 这是预期行为：`deploy.sh` 不签证书。`cd <部署根> && bash gen_ssl.sh`（acme 真证书或内网自签，签完顺手起网关）；已经手工把证书放进 `gateway/certs/` 就直接重跑 |
 | 发布成功但域名仍是 404 | 检查 `<部署根>/gateway/routes/routes.json` 里有没有该 slug；没有就看 backend 日志里 `gateway routes.json 刷新失败` 一行（该失败只告警、不阻断发布） |
 | 端口被占用 | 第 5 步会点名占用者并给出处置：是**容器**就问你要不要 stop（只 stop 不删，`docker start <名字>` 可恢复，老 `--takeover` 的去处）；是**宿主进程**只报 PID，要你确认它不是别的服务后自己 kill。stop 完端口仍被占说明占用者不止一个，按它打印的 PID 手工腾。不建议改 `PLATFORM_PORT`：它是对外的控制台地址，还要与云安全组放行的一致；应用端口在控制台改不了，需重打包 |
 | 想连库一起重做（换口令 / 清数据） | 选**新增**：第 3 步发现已有 `pgdata` 卷时会要求逐字输入 `yes` 才删（老 `--fresh-db` 的去处）。升级模式不问也不删卷——只改 `.env` 里的口令是**无效**的，卷里仍是旧口令 |
-| `deploy.sh` 说「缺 xx——这份 lib 比 deploy.sh 旧」 | 只传了内核没传判定层（或反之）。三份脚本必须整套上传：包里那份是仓库 `scripts/` 的拷贝，别手改 |
+| `deploy.sh` / `gen_ssl.sh` 说「缺 xx——这份 lib 比 … 旧」 | 只传了内核没传判定层（或反之）。五份脚本必须整套上传：包里那份是仓库 `scripts/` 的拷贝，别手改 |
 | Windows 侧：发行版里 docker daemon 起不来 | `/etc/wsl.conf` 缺 `[boot] systemd=true`。跑 `deploy.ps1` 会代劳追加，但改完要**你手工**执行 `wsl --shutdown` 再重跑（脚本不自动重启机器，D-10） |
 | Windows 侧：部署根填了 `D:\\...` | 皮把包推进 **WSL 发行版内部**，部署根要 Linux 绝对路径（如 `/opt/zerocode`）。想从 Windows 资源管理器看那些文件，用 `\\\\wsl.localhost\\<发行版>\\opt\\zerocode` |
 
@@ -1788,13 +1803,13 @@ def copy_gateway(repo_root: Path, dst: Path, gateway_domain: str) -> int:
 
 
 def copy_deploy_scripts(repo_root: Path, out: Path) -> None:
-    """把仓库里的四份部署脚本搬进包根：deploy.sh（内核）、deploy_lib.sh（判定层）、
-    deploy.ps1（WSL 皮）、deploy.bat（Windows 侧双击入口）。
+    """把仓库里的五份部署脚本搬进包根：deploy.sh（内核）、deploy_lib.sh（判定层）、
+    gen_ssl.sh（网关证书签发）、deploy.ps1（WSL 皮）、deploy.bat（Windows 侧双击入口）。
 
     它们与 apply-init.sh 相反：那个是生成物，这几份是交付物的**源**——要在服务器上手改排障，
     所以住在仓库里（`scripts/`），包只是搬运工。缺任一文件不出包，理由同网关配置：
-    deploy.sh 会 source deploy_lib.sh，缺一份就是让服务器上跑到一半才炸；皮与内核缺一份，
-    另一份就是废纸。
+    deploy.sh 与 gen_ssl.sh 都 source deploy_lib.sh，缺一份就是让服务器上跑到一半才炸；
+    皮与内核缺一份，另一份就是废纸。
 
     行尾与编码按扩展名分道，三类各有各的理由（US-26 / US-27）：
     - `.sh` 剥 `\\r`：内核自带一条 CRLF 自检，带着 \\r 出包等于把失败推迟到服务器上才炸。
@@ -1804,7 +1819,7 @@ def copy_deploy_scripts(repo_root: Path, out: Path) -> None:
       下读带多字节字符的批处理会丢字节同步、把 echo 文本当成命令执行（build-output.bat 同条
       NOTE）。所以这里不放宽成 UTF-8，而是非 ASCII 直接不出包——中文提示交给 deploy.ps1。
     """
-    for name in ("deploy.sh", "deploy_lib.sh", "deploy.ps1", "deploy.bat"):
+    for name in ("deploy.sh", "deploy_lib.sh", "gen_ssl.sh", "deploy.ps1", "deploy.bat"):
         src = repo_root / "scripts" / name
         if not src.is_file():
             raise BuildError(f"缺部署脚本 {src}：{name} 已纳入交付包，缺文件不出包")
