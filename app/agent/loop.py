@@ -669,8 +669,11 @@ class AgentRunner:
                     await add_message(self.sf, session_id, "tool", tool_call_id=exec_tc.get("id"),
                                       tool_name=name, tool_result=sanitized_result)
                     await self.send({"type": "tool_result", "name": name, "result": sanitized_result})
+                    # default=str 是最后一道兜底：工具漏回一个 Decimal/datetime 时，宁可模型
+                    # 读到字符串形态，也不能在这里抛 TypeError——那会让整轮中止、结果丢失，
+                    # 而前端只留一条「重试」，点一次再炸一次。
                     messages.append({"role": "tool", "tool_call_id": exec_tc.get("id"),
-                                     "content": json.dumps(result, ensure_ascii=False)})
+                                     "content": json.dumps(result, ensure_ascii=False, default=str)})
                 continue
             if not (final.get("content") or "").strip():
                 # 空回复不能当「正常答完」：这一分支原本会落一条 content=NULL 的 assistant 行、

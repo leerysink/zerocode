@@ -19,8 +19,8 @@ async def add_message(session_factory, session_id: int, role: str, content=None,
             {"sid": session_id, "role": role, "content": content, "context_content": context_content,
              "reasoning": reasoning,
              "tcid": tool_call_id, "tname": tool_name,
-             "targs": json.dumps(tool_args, ensure_ascii=False) if tool_args is not None else None,
-             "tresult": json.dumps(tool_result, ensure_ascii=False) if tool_result is not None else None}
+             "targs": json.dumps(tool_args, ensure_ascii=False, default=str) if tool_args is not None else None,
+             "tresult": json.dumps(tool_result, ensure_ascii=False, default=str) if tool_result is not None else None}
         )).mappings().first()
         attachments = []
         if attachment_ids:

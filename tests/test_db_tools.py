@@ -409,6 +409,24 @@ async def test_rows_assertion_normalizes_db_value_types(wired):
     assert r["ok"] is True and r["passed"] is True
 
 
+async def test_rows_assertion_diff_is_json_serializable(wired):
+    """不符时的差异摘要回的是**原始行**值：Decimal/datetime 必须过归一再进结果。
+    否则 tool_result 的 JSON 出口抛 TypeError，整轮中止、查询结果丢失，前端只剩一条
+    点了再炸的「重试」（2026-11-17 线上实撞）。"""
+    import datetime as dt
+    import json
+    from decimal import Decimal
+    wired.results.append(FakeResult(["id", "qty", "ts"],
+                                    [(1, Decimal("3.5"), dt.datetime(2026, 11, 17, 9, 0))]))
+    r = await db_tools.run_db_tool(
+        Ctx(app=APP), "db_query",
+        {"sql": "select id, qty, ts from t",
+         "expect": {"type": "rows", "value": [{"id": 1, "qty": 4, "ts": "2026-11-17T10:00:00"}]}})
+    assert r["ok"] is True and r["passed"] is False
+    assert {d["column"]: d["actual"] for d in r["diff"]} == {"qty": "3.5", "ts": "2026-11-17T09:00:00"}
+    json.dumps(r, ensure_ascii=False)  # 落库与回注模型用的就是这个出口，不许再抛
+
+
 async def test_rows_expect_over_limit_refused_before_db(wired):
     """US-10：期望行数超断言上限（默认 200）在连库前拒，并指路 count/scalar。"""
     huge = [{"id": n} for n in range(201)]

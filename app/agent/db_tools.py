@@ -182,8 +182,11 @@ def compare_expect(etype: str, outcome: dict, expected):
                 continue
             for col in sorted(set(an) | set(bn)):
                 if an.get(col) != bn.get(col):
+                    # actual 取自未归一的原始行，必须过 _jsonable：Decimal/datetime 直接进
+                    # 结果会在 tool_result 的 JSON 出口炸掉整轮（diff 的 expected 来自工具
+                    # 入参，本就是 JSON 原生值，不用再转一道）。
                     diffs.append({"row": i, "column": col,
-                                  "expected": bo.get(col), "actual": ao.get(col)})
+                                  "expected": bo.get(col), "actual": _jsonable(ao.get(col))})
             if len(diffs) >= ROWS_DIFF_MAX:
                 break
         return {"passed": not diffs, "diff": diffs[:ROWS_DIFF_MAX]}
