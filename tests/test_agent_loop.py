@@ -298,6 +298,83 @@ async def test_cancel_midround_pairs_undispatched_calls(test_engine, tmp_path):
     types = [e["type"] for e in evs]
     assert types.count("tool_call") == 2 and types.count("tool_result") == 2
 
+class _StalledLLM:
+    """模型流一个事件都不吐：复现「等首字/上游卡住」时用户点停止。"""
+
+    def __init__(self):
+        self.entered = asyncio.Event()
+
+    async def chat_stream(self, messages, tools):
+        self.entered.set()
+        await asyncio.Event().wait()
+        yield  # pragma: no cover
+
+@pytest.mark.asyncio
+async def test_cancel_interrupts_stalled_model_stream(test_engine, tmp_path):
+    """模型流卡住时点停止，run 必须当场收口，不能等上游下一个事件。
+
+    实撞：停止后左侧会话角标一直转圈、再点会话标题又显示「运行中」。根因是 runner
+    只在**收到下一个流事件**时才采样 cancel：上游迟迟不吐 token 时 run 还挂在 await 上，
+    hub.running 不被清理，live-status 继续报 running，重连补发的 status(running)
+    又把刚停的任务立回「运行中」。
+    """
+    sid = await mk_session(test_engine, tmp_path)
+    sf = make_session_factory(test_engine)
+    cancel = asyncio.Event()
+    llm = _StalledLLM()
+    runner = AgentRunner(sf, llm, cfg_provider(), Recorder(),
+                         lambda *a, **k: asyncio.sleep(0, None), lambda *a, **k: True)
+    task = asyncio.create_task(runner.run(sid, "开始", cancel))
+    await asyncio.wait_for(llm.entered.wait(), 5.0)   # 确认 run 已挂到流上
+    cancel.set()
+    status = await asyncio.wait_for(task, 1.5)
+    assert status == "idle"
+    assert runner.last_outcome == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_cancel_interrupts_inflight_tool(test_engine, tmp_path, monkeypatch):
+    """停止落在一次长工具里（如 run_check 容器自检，上限 900s）时，不能等它跑完。
+
+    在途调用被中断也要补一条配对的 tool 行：assistant 行带着 N 个 tool_calls，
+    少一行就是刷新后回注模型的孤儿（OpenAI 兼容 API 400），前端也会留一张死卡。
+    """
+    import app.agent.loop as loop_mod
+    started, aborted = asyncio.Event(), asyncio.Event()
+
+    async def slow_tool(ctx, name, args, *, confirmed=False):
+        started.set()
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            aborted.set()
+            raise
+        return {"ok": True}
+
+    monkeypatch.setattr(loop_mod, "execute_tool", slow_tool)
+    sid = await mk_session(test_engine, tmp_path)
+    sf = make_session_factory(test_engine)
+    cancel = asyncio.Event()
+    rec = Recorder()
+    turns = [done(None, [tool_call("c1", "read_file", path="a.txt")]), done("不该到达")]
+    runner = AgentRunner(sf, ScriptedLLM(turns), cfg_provider(), rec,
+                         lambda *a, **k: asyncio.sleep(0, None), lambda *a, **k: True)
+    task = asyncio.create_task(runner.run(sid, "开始", cancel))
+    await asyncio.wait_for(started.wait(), 1.0)
+    cancel.set()
+    status = await asyncio.wait_for(task, 1.5)
+    assert status == "idle"
+    assert runner.last_outcome == "cancelled"
+    assert aborted.is_set()            # 在途工具本身也被取消，不能留在后台继续跑
+    async with sf() as s:
+        rows = (await s.execute(sql(
+            "SELECT tool_call_id, tool_name, tool_result FROM message "
+            "WHERE session_id=:i AND role='tool' ORDER BY seq"), {"i": sid})).mappings().all()
+    assert [dict(r) for r in rows] == [
+        {"tool_call_id": "c1", "tool_name": "read_file", "tool_result": {"cancelled": True}}]
+    types = [e["type"] for e in rec.events]
+    assert types.count("tool_call") == 1 and types.count("tool_result") == 1
+
 @pytest.mark.asyncio
 async def test_history_trim_keeps_tool_pairs(test_engine, tmp_path):
     # 窗口边界落在 assistant(tool_calls)/tool 之间会拆散消息对：请求带孤儿 tool 消息

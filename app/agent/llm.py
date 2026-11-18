@@ -1,3 +1,4 @@
+import contextlib
 import json
 from typing import AsyncIterator
 from openai import AsyncOpenAI
@@ -43,32 +44,37 @@ class OpenAICompatLLM:
         stream = await self.client.chat.completions.create(
             model=self.model, messages=messages, tools=tools, stream=True)
         finish_reason = None
-        async for chunk in stream:
-            if not chunk.choices:
-                continue
-            choice = chunk.choices[0]
-            # 结束原因只出现在流末尾的 chunk 上，且该 chunk 可能没有 delta：
-            # loop 要靠它区分「模型答完了」与「被长度/内容审查截断」，不能丢
-            if getattr(choice, "finish_reason", None):
-                finish_reason = choice.finish_reason
-            delta = choice.delta
-            rc = _reasoning_of(delta)
-            if rc:
-                reasoning_parts.append(rc)
-                yield {"type": "reasoning_delta", "content": rc}
-            if delta and delta.content:
-                content_parts.append(delta.content)
-                yield {"type": "content_delta", "content": delta.content}
-            if delta and delta.tool_calls:
-                for tc in delta.tool_calls:
-                    # Ark 等严格端点强制要求 tool_calls[].type="function"（缺失 400）
-                    slot = tool_calls.setdefault(tc.index, {"type": "function", "id": "", "function": {"name": "", "arguments": ""}})
-                    if tc.id:
-                        slot["id"] = tc.id
-                    if tc.function and tc.function.name:
-                        slot["function"]["name"] = tc.function.name
-                    if tc.function and tc.function.arguments:
-                        slot["function"]["arguments"] += tc.function.arguments
+        try:
+            async for chunk in stream:
+                if not chunk.choices:
+                    continue
+                choice = chunk.choices[0]
+                # 结束原因只出现在流末尾的 chunk 上，且该 chunk 可能没有 delta：
+                # loop 要靠它区分「模型答完了」与「被长度/内容审查截断」，不能丢
+                if getattr(choice, "finish_reason", None):
+                    finish_reason = choice.finish_reason
+                delta = choice.delta
+                rc = _reasoning_of(delta)
+                if rc:
+                    reasoning_parts.append(rc)
+                    yield {"type": "reasoning_delta", "content": rc}
+                if delta and delta.content:
+                    content_parts.append(delta.content)
+                    yield {"type": "content_delta", "content": delta.content}
+                if delta and delta.tool_calls:
+                    for tc in delta.tool_calls:
+                        # Ark 等严格端点强制要求 tool_calls[].type="function"（缺失 400）
+                        slot = tool_calls.setdefault(tc.index, {"type": "function", "id": "", "function": {"name": "", "arguments": ""}})
+                        if tc.id:
+                            slot["id"] = tc.id
+                        if tc.function and tc.function.name:
+                            slot["function"]["name"] = tc.function.name
+                        if tc.function and tc.function.arguments:
+                            slot["function"]["arguments"] += tc.function.arguments
+        finally:
+            # 用户点停止时 loop 会取消在途 __anext__：不关掉底层流，httpx 连接会悬到 GC
+            with contextlib.suppress(Exception):
+                await stream.close()
         yield {"type": "done", "finish_reason": finish_reason, "message": {
             "role": "assistant",
             "content": "".join(content_parts) or None,

@@ -8,7 +8,7 @@
 message_done 是**轮次收口**，不是执行终态：每个工具轮在派发工具之前也会发一次（content 为空则不发），
 把本轮已流式输出的文字固化成一条消息，所以一次执行可以发多次。执行终态只由 status/error 判定。
 """
-import asyncio, datetime, inspect, itertools, json, time
+import asyncio, contextlib, datetime, inspect, itertools, json, time
 import logging
 from pathlib import Path
 from app.agent.preview_tools import (build_preview_prompt, confirm_summary, fetch_app,
@@ -546,8 +546,17 @@ class AgentRunner:
             llm = await self._llm_for(cfg)
             final = None
             finish_reason = None
-            async for ev in llm.chat_stream(messages, tools):
-                if cancel.is_set():
+            # 停止不能等「下一个流事件」才生效：上游迟迟不吐 token 时 async for 会一直挂着，
+            # 所以把 __anext__ 放进可被 cancel 竞速的任务里等（见 _wait_or_cancel）
+            stream = llm.chat_stream(messages, tools)
+            while True:
+                pending = asyncio.ensure_future(stream.__anext__())
+                try:
+                    ev = await _wait_or_cancel(pending, cancel)
+                except StopAsyncIteration:
+                    break
+                if ev is _CANCEL:
+                    await _abort_stream(stream, pending)
                     raise _Cancelled()
                 if ev["type"] == "reasoning_delta":
                     await self.send(ev)
@@ -625,7 +634,30 @@ class AgentRunner:
                         push_args = {}
                     await self.send({"type": "tool_call", "name": name, "args": push_args})
                     started = time.perf_counter()
-                    result = await self._dispatch(ctx, cfg, session_id, name, exec_args, cancel)
+                    # 在途工具同样要能被停止唤醒：run_check 上限 900s、部署类更久，
+                    # 只等它返回再采样 cancel 会让 hub.running 长时间不清（侧栏一直转圈、
+                    # 重连补发的 status(running) 又把任务立回来）
+                    dispatch = asyncio.ensure_future(
+                        self._dispatch(ctx, cfg, session_id, name, exec_args, cancel))
+                    result = await _wait_or_cancel(dispatch, cancel)
+                    if result is _CANCEL:
+                        # 这条调用已下发过 tool_call 事件：补一条 cancelled 结果并落库，
+                        # 配对才完整（ADR-0029：实时事件与刷新后的历史同形）
+                        dispatch.cancel()
+                        with contextlib.suppress(BaseException):
+                            await dispatch
+                        result = {"cancelled": True}
+                        await self._note_tool_metric(
+                            session_id, name, result,
+                            int((time.perf_counter() - started) * 1000), _round)
+                        sanitized_result = redact_tool_result(result)
+                        await add_message(self.sf, session_id, "tool",
+                                          tool_call_id=exec_tc.get("id"),
+                                          tool_name=name, tool_result=sanitized_result)
+                        await self.send({"type": "tool_result", "name": name,
+                                         "result": sanitized_result})
+                        await self._pair_undispatched(session_id, pairs[idx + 1:])
+                        raise _Cancelled()
                     await self._note_tool_metric(session_id, name, result,
                                                  int((time.perf_counter() - started) * 1000),
                                                  _round)
@@ -824,3 +856,42 @@ class AgentRunner:
 
 class _Cancelled(Exception):
     pass
+
+# 停止竞速的哨兵：cancel.wait() 先完成时由 _wait_or_cancel 返回它
+_CANCEL = object()
+
+async def _wait_or_cancel(task, cancel):
+    """等 task 完成；cancel 先置位则返回 _CANCEL（task 由调用方取消）。
+
+    停止不能只在「下一个流事件/工具返回后」采样：上游迟迟不吐 token、或工具跑了
+    十几分钟（run_check 上限 900s），run 会一直占着 hub.running —— 侧栏角标继续转圈，
+    重连补发的 status(running) 又把刚停的任务立回「运行中」。等待侧必须被唤醒。
+    """
+    if cancel.is_set():
+        return _CANCEL
+    stop = asyncio.ensure_future(cancel.wait())
+    try:
+        done, _ = await asyncio.wait({task, stop}, return_when=asyncio.FIRST_COMPLETED)
+    except BaseException:
+        # 外层（run）自己被取消/出错：先收掉子任务，别留一条继续动工作区的协程
+        task.cancel()
+        with contextlib.suppress(BaseException):
+            await task
+        raise
+    finally:
+        stop.cancel()
+        with contextlib.suppress(BaseException):
+            await stop
+    if task in done:
+        return task.result()
+    return _CANCEL
+
+async def _abort_stream(stream, pending):
+    """停止落在等流事件时：取消在途 __anext__ 并关掉生成器（释放上游连接）。"""
+    pending.cancel()
+    with contextlib.suppress(BaseException):
+        await pending
+    aclose = getattr(stream, "aclose", None)
+    if aclose is not None:
+        with contextlib.suppress(BaseException):
+            await aclose()
