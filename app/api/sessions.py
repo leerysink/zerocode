@@ -210,7 +210,8 @@ async def get_messages(request: Request, session_id: int):
     async with request.app.state.session_factory() as s:
         await _require_session(request, session_id, uid)
         rows = (await s.execute(text(
-            "SELECT id, seq, role, content, reasoning, tool_call_id, tool_name, tool_args, tool_result, created_at "
+            "SELECT id, seq, role, content, reasoning, tool_call_id, tool_name, tool_args, tool_result, "
+            "parent_tool_call_id, subrun_index, created_at "
             "FROM message WHERE session_id=:i ORDER BY seq"), {"i": session_id})).mappings().all()
         # 压缩留痕只活在 compaction 表，读取时投成 notice 行插回水位之后：
         # 往 message 表写一行固然更省事，但 rows_after/_history 都读那张表，

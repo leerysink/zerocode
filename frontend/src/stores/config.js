@@ -42,6 +42,9 @@ const FIELD_TO_KEY = {
   memoryTopK: 'memory.top_k',
   memoryMinSimilarity: 'memory.min_similarity',
   memoryMaxTokens: 'memory.max_tokens',
+  // ---- 子任务委派（subrun.*：账户级，封的是「我自己烧的钱」；夹取见 app/agent/subrun.py）----
+  subrunMaxTasks: 'subrun.max_tasks',
+  subrunMaxRounds: 'subrun.max_rounds',
 }
 
 export const useConfigStore = defineStore('config', {
@@ -80,6 +83,8 @@ export const useConfigStore = defineStore('config', {
       memoryTopK: 5, // 1..100
       memoryMinSimilarity: -1, // -1..1，-1=一条不因阈值丢掉
       memoryMaxTokens: 600, // 1..20000
+      subrunMaxTasks: 5, // 1..8，与 subrun.py 的 DEFAULT_MAX_TASKS 同值
+      subrunMaxRounds: 10, // 1..50，与 subrun.py 的 DEFAULT_MAX_ROUNDS 同值
     },
     saving: false,
     loaded: false, // 是否已从后端拉到过配置（ensureLoaded 的去重依据）

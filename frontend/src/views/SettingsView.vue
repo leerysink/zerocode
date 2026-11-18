@@ -343,7 +343,7 @@ async function save() {
           class="zc-agent-note"
           type="info"
           show-icon
-          message="除「记忆召回」按账户生效外，本页其余项都是平台级配置：保存后对所有账号的会话生效。数值框的上下限与后端夹取区间一致，超出的值后端会回落。"
+          message="除「记忆召回」与「子任务委派上限」按账户生效外，本页其余项都是平台级配置：保存后对所有账号的会话生效。数值框的上下限与后端夹取区间一致，超出的值后端会回落。"
         />
         <a-card title="上下文压缩" class="zc-card">
           <a-form layout="vertical">
@@ -369,6 +369,12 @@ async function save() {
             </a-form-item>
             <a-form-item label="预览日志行数" extra="返回给模型的最近日志行数，10..300">
               <a-input-number v-model:value="store.form.previewLogLines" :min="10" :max="300" style="width: 180px" />
+            </a-form-item>
+            <a-form-item label="单批委派子任务上限（个）" extra="账户级、只影响自己；一次 delegate 最多并行几个只读子 agent，1..8">
+              <a-input-number v-model:value="store.form.subrunMaxTasks" :min="1" :max="8" style="width: 180px" />
+            </a-form-item>
+            <a-form-item label="子任务轮数上限（轮）" extra="账户级、只影响自己；每个子 agent 最多跑几轮，1..50">
+              <a-input-number v-model:value="store.form.subrunMaxRounds" :min="1" :max="50" style="width: 180px" />
             </a-form-item>
           </a-form>
         </a-card>

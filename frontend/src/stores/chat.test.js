@@ -683,6 +683,222 @@ describe('openSession 装载顺序、切换瞬态与缓存', () => {
   })
 })
 
+// ---------- 委派卡（ADR-0052 / 规格 2026-11-18-agent-subruns）：subrun_* 归并 ----------
+// 契约：子 run 事件按 index 并入**同一条** delegate 调用记录（不另起消息行）；
+// 步骤 = 调用 + 结果折叠成一条（与主流程同一约定）；停止时没有 done 的行收口为 cancelled。
+describe('subrun_* 事件归并进 delegate 调用记录', () => {
+  const ARGS = { tasks: [
+    { title: '调研 A', brief: '看 A' },
+    { title: '调研 B', brief: '看 B' },
+  ] }
+  const RECEIPT = { ok: true, subruns: [
+    { index: 0, title: '调研 A', status: 'completed', result: 'A 完成', error: null, rounds_used: 2, tool_calls: 1 },
+    { index: 1, title: '调研 B', status: 'completed', result: 'B 完成', error: null, rounds_used: 2, tool_calls: 1 },
+  ] }
+
+  function delegateEvents() {
+    return [
+      { type: 'tool_call', name: 'delegate', args: ARGS },
+      { type: 'subrun_start', index: 1, title: '调研 B' },   // 乱序到达：index 1 先开始
+      { type: 'subrun_start', index: 0, title: '调研 A' },
+      { type: 'subrun_text', index: 0, content: '先读 A' },
+      { type: 'subrun_tool_call', index: 0, name: 'read_file', args: { path: 'a.txt' } },
+      { type: 'subrun_tool_result', index: 0, name: 'read_file', result: { ok: true } },
+      { type: 'subrun_text', index: 0, content: 'A 完成' },
+      { type: 'subrun_done', index: 0, status: 'completed' },
+      { type: 'subrun_tool_call', index: 1, name: 'search', args: { q: 'b' } },
+      { type: 'subrun_tool_result', index: 1, name: 'search', result: { hits: [] } },
+      { type: 'subrun_text', index: 1, content: 'B 完成' },
+      { type: 'subrun_done', index: 1, status: 'completed' },
+      { type: 'tool_result', name: 'delegate', result: RECEIPT },  // done 之后整批回执才回来
+    ]
+  }
+
+  it('批量完成：同一行内按 index 排序、步骤折叠、文本留痕、回执摘要', () => {
+    const s = mk()
+    for (const ev of delegateEvents()) applyEvent(s, ev)
+    expect(s.messages).toHaveLength(1)
+    expect(s.messages[0]).toEqual({
+      role: 'tool', name: 'delegate', args: ARGS, result: RECEIPT,
+      subruns: [
+        { index: 0, title: '调研 A', status: 'completed', result: 'A 完成',
+          texts: ['先读 A', 'A 完成'],
+          steps: [{ name: 'read_file', args: { path: 'a.txt' }, result: { ok: true } }] },
+        { index: 1, title: '调研 B', status: 'completed', result: 'B 完成',
+          texts: ['B 完成'],
+          steps: [{ name: 'search', args: { q: 'b' }, result: { hits: [] } }] },
+      ],
+    })
+  })
+
+  it('步骤结果先于调用到达（乱序）时不会被吞掉', () => {
+    const s = mk()
+    applyEvent(s, { type: 'tool_call', name: 'delegate', args: ARGS })
+    applyEvent(s, { type: 'subrun_start', index: 0, title: '调研 A' })
+    applyEvent(s, { type: 'subrun_tool_result', index: 0, name: 'search', result: { ok: true } })
+    applyEvent(s, { type: 'subrun_tool_call', index: 0, name: 'search', args: { q: 'x' } })
+    expect(s.messages[0].subruns[0].steps).toEqual([
+      { name: 'search', result: { ok: true } },
+      { name: 'search', args: { q: 'x' } },
+    ])
+  })
+
+  it('停止级联：没有 done 的行收口为已中断，进度清掉；先完成的保持完成', () => {
+    const s = mk()
+    applyEvent(s, { type: 'tool_call', name: 'delegate', args: ARGS })
+    applyEvent(s, { type: 'subrun_start', index: 0, title: '调研 A' })
+    applyEvent(s, { type: 'subrun_tool_call', index: 0, name: 'preview_status', args: {} })
+    applyEvent(s, { type: 'subrun_progress', index: 0, name: 'preview_status', line: '等待构建' })
+    applyEvent(s, { type: 'subrun_start', index: 1, title: '调研 B' })
+    applyEvent(s, { type: 'subrun_text', index: 1, content: 'B 已答完' })
+    applyEvent(s, { type: 'subrun_done', index: 1, status: 'completed' })
+    applyEvent(s, { type: 'tool_result', name: 'delegate', result: { cancelled: true } })
+    const subs = s.messages[0].subruns
+    expect(subs[0].status).toBe('cancelled')
+    expect('progress' in subs[0]).toBe(false)
+    expect(subs[0].steps).toEqual([{ name: 'preview_status', args: {} }])
+    // 停止时整批回执丢失：先完成的子任务回执摘要取最后一段文本
+    expect(subs[1]).toEqual({
+      index: 1, title: '调研 B', status: 'completed', result: 'B 已答完', texts: ['B 已答完'],
+    })
+  })
+
+  it('subrun_progress 写进对应子任务行，同工具的步骤结果到达即清', () => {
+    const s = mk()
+    applyEvent(s, { type: 'tool_call', name: 'delegate', args: ARGS })
+    applyEvent(s, { type: 'subrun_start', index: 0, title: '调研 A' })
+    applyEvent(s, { type: 'subrun_progress', index: 0, name: 'preview_status', line: '等构建' })
+    expect(s.messages[0].subruns[0].progress).toEqual({ name: 'preview_status', line: '等构建' })
+    applyEvent(s, { type: 'subrun_tool_result', index: 0, name: 'read_file', result: { ok: true } })
+    expect(s.messages[0].subruns[0].progress.line).toBe('等构建') // 别的工具不误清
+    applyEvent(s, { type: 'subrun_tool_result', index: 0, name: 'preview_status', result: { ok: true } })
+    expect('progress' in s.messages[0].subruns[0]).toBe(false)
+  })
+
+  it('没有打开的 delegate 调用记录时事件安全忽略（不凭空造行）', () => {
+    const s = mk()
+    expect(() => applyEvent(s, { type: 'subrun_start', index: 0, title: 'x' })).not.toThrow()
+    expect(s.messages).toHaveLength(0)
+  })
+
+  it('委派校验失败（零派发）只留错误回执，不补 subruns 键', () => {
+    const s = mk()
+    applyEvent(s, { type: 'tool_call', name: 'delegate', args: { tasks: [] } })
+    applyEvent(s, { type: 'tool_result', name: 'delegate', result: { ok: false, error: '至少 1 个任务' } })
+    expect(s.messages[0]).toEqual({
+      role: 'tool', name: 'delegate', args: { tasks: [] }, result: { ok: false, error: '至少 1 个任务' },
+    })
+    expect('subruns' in s.messages[0]).toBe(false)
+  })
+})
+
+// ---------- 中途刷新补卡（Ticket 004）：subrun_snapshot ----------
+// 批量执行中连入时 hub 补发当前批次的任务与每行状态；delegate 的 tool 行还没落库，
+// 历史里没有可贴的调用行，所以没有打开中的记录就**合成**一条（同 confirm_request）。
+// 步骤不进快照——已落库的行先于事件写库，连入时抓到的历史一定包含全部已发出的步骤。
+describe('subrun_snapshot 中途刷新补卡', () => {
+  const ARGS = { tasks: [{ title: '调研 A', brief: 'a' }, { title: '调研 B', brief: 'b' }] }
+
+  it('没有打开记录时合成 delegate 行，并从历史子 run 行还原步骤', () => {
+    const s = mk()
+    s.messages = [
+      {
+        role: 'assistant', content: '我来委派',
+        tool_args: { tool_calls: [{
+          id: 'cd', type: 'function',
+          function: { name: 'delegate', arguments: JSON.stringify(ARGS) },
+        }] },
+      },
+      {
+        role: 'assistant', content: '先读', parent_tool_call_id: 'cd', subrun_index: 0,
+        tool_args: { tool_calls: [{
+          id: 's0', type: 'function',
+          function: { name: 'read_file', arguments: '{"path":"a.txt"}' },
+        }] },
+      },
+      { role: 'tool', tool_call_id: 's0', tool_name: 'read_file',
+        tool_result: { ok: true }, parent_tool_call_id: 'cd', subrun_index: 0 },
+    ]
+    applyEvent(s, {
+      type: 'subrun_snapshot',
+      tasks: [{ title: '调研 A' }, { title: '调研 B' }],
+      subruns: [
+        { index: 0, title: '调研 A', status: 'running' },
+        { index: 1, title: '调研 B', status: 'completed' },
+      ],
+    })
+    const rec = s.messages.at(-1)
+    expect(rec).toMatchObject({ role: 'tool', name: 'delegate' })
+    expect(rec.subruns).toEqual([
+      { index: 0, title: '调研 A', status: 'running', texts: ['先读'],
+        steps: [{ name: 'read_file', args: { path: 'a.txt' }, result: { ok: true } }] },
+      { index: 1, title: '调研 B', status: 'completed' },
+    ])
+    // 后续事件继续归并到同一条合成记录
+    applyEvent(s, { type: 'subrun_tool_call', index: 0, name: 'search', args: { q: 'b' } })
+    expect(rec.subruns[0].steps.at(-1)).toEqual({ name: 'search', args: { q: 'b' } })
+  })
+
+  it('已有打开中的记录时只合并状态，不另起一行也不抹掉实时文本', () => {
+    const s = mk()
+    applyEvent(s, { type: 'tool_call', name: 'delegate', args: ARGS })
+    applyEvent(s, { type: 'subrun_start', index: 0, title: '调研 A' })
+    applyEvent(s, { type: 'subrun_text', index: 0, content: '进行中' })
+    applyEvent(s, {
+      type: 'subrun_snapshot',
+      tasks: [{ title: '调研 A' }, { title: '调研 B' }],
+      subruns: [
+        { index: 0, title: '调研 A', status: 'completed' },
+        { index: 1, title: '调研 B', status: 'running' },
+      ],
+    })
+    expect(s.messages).toHaveLength(1)
+    expect(s.messages[0].subruns.map((r) => r.status)).toEqual(['completed', 'running'])
+    expect(s.messages[0].subruns[0].texts).toEqual(['进行中'])
+  })
+
+  it('快照不会把已收口的行降回运行中', () => {
+    const s = mk()
+    applyEvent(s, { type: 'tool_call', name: 'delegate', args: ARGS })
+    applyEvent(s, { type: 'subrun_start', index: 0, title: '调研 A' })
+    applyEvent(s, { type: 'subrun_done', index: 0, status: 'completed' })
+    applyEvent(s, {
+      type: 'subrun_snapshot', tasks: [{ title: '调研 A' }],
+      subruns: [{ index: 0, title: '调研 A', status: 'running' }],
+    })
+    expect(s.messages[0].subruns[0].status).toBe('completed')
+  })
+
+  it('历史里已收口的旧批次子 run 行不会被并进当前快照', () => {
+    const s = mk()
+    s.messages = [
+      // 旧批次：已有 delegate tool 行（收口过），normalize 会自行重建
+      { role: 'tool', tool_call_id: 'old', tool_name: 'delegate', result: { ok: true, subruns: [] } },
+      {
+        role: 'assistant', content: '旧的', parent_tool_call_id: 'old', subrun_index: 0,
+        tool_args: { tool_calls: [{
+          id: 'so', type: 'function',
+          function: { name: 'search', arguments: '{"q":"old"}' },
+        }] },
+      },
+      // 当前批次：还没有 delegate tool 行
+      {
+        role: 'assistant', content: '新的', parent_tool_call_id: 'new', subrun_index: 0,
+        tool_args: { tool_calls: [{
+          id: 'sn', type: 'function',
+          function: { name: 'read_file', arguments: '{"path":"b.txt"}' },
+        }] },
+      },
+    ]
+    applyEvent(s, {
+      type: 'subrun_snapshot', tasks: [{ title: '调研 A' }],
+      subruns: [{ index: 0, title: '调研 A', status: 'running' }],
+    })
+    const rec = s.messages.at(-1)
+    expect(rec.subruns[0].steps).toEqual([{ name: 'read_file', args: { path: 'b.txt' } }])
+  })
+})
+
 // ---------- Ticket 010：撤销/退出收口 ----------
 describe('share_revoked（撤销/退出旁观）', () => {
   it('置位撤销标记并解锁执行态（连接随后由 4404 静默收掉）', () => {

@@ -5,6 +5,9 @@
 // / error / status / file_change / todo_sync / compacting / compaction_done / notice(压缩 skip 终态)
 // / busy(执行中被拒的非终态提示) / steering_done(插话已在工具边界被模型看见)
 // / tool_progress(预览工具的临时进度，不落库不进气泡，收到结果/终态即清)
+// / subrun_start/text/tool_call/tool_result/progress/done(委派卡的子 run 事件，按 index
+//   归并进 delegate 调用记录；没有 done 的行在委派结果 cancelled 时收口成已中断)
+// / subrun_snapshot(批量委派执行中连入的补发：合成/合并委派卡的当前批次状态，步骤从历史行还原)
 // / session_title(首条消息自动命名，就地更新侧栏标题)
 // / interaction_expired(后端已无这次确认/回答的挂起点：把待答卡收口成已中断并解锁输入)；
 // / share_revoked(共享被撤销/自行退出：服务端随后以 4404 关闭旁观连接，视图提示并回应用页)；
@@ -21,7 +24,7 @@ import {
   fetchAttachmentBlob, uploadAttachment, wsUrl,
 } from '../api'
 import { newClientMsgId } from '../utils/imageAttachments'
-import { findOpenToolCall, DECLINE_ANSWER, NOTICE_TEXT } from './messageModel'
+import { findOpenToolCall, DECLINE_ANSWER, NOTICE_TEXT, subrunStepsFromRows } from './messageModel'
 
 // 「执行中被拦下」的三条文案：单点定义，本地拦截与后端 busy 回包共用同一口径
 const BUSY_HINT = '会话正在执行中：点右侧「停止」结束当前执行后即可继续发言'
@@ -50,6 +53,49 @@ function settleCompactMarker(store, text, kind) {
   const i = findCompactMarker(store)
   if (i >= 0) store.messages.splice(i, 1, rec)
   else store.messages.push(rec)
+}
+
+// ---------- 委派卡（ADR-0052 / 规格 2026-11-18-agent-subruns）：subrun_* 事件归并 ----------
+// 子 run 事件不带 call_id：同一时刻至多一次 delegate 在跑（工具串行派发），按「还没结果的
+// delegate 调用记录」定位即可。子任务行按 index 升序插入——历史重建按 index 排序，到达序
+// 若因并行而交错，实时与刷新后的记录就会叉开（ADR-0029 同构）。
+function subrunOf(open, index) {
+  if (!Number.isInteger(index)) return null
+  if (!Array.isArray(open.subruns)) open.subruns = []
+  const hit = open.subruns.find((r) => r.index === index)
+  if (hit) return hit
+  const row = { index, status: 'running' }
+  const at = open.subruns.findIndex((r) => r.index > index)
+  if (at < 0) open.subruns.push(row)
+  else open.subruns.splice(at, 0, row)
+  return row
+}
+
+function openSubrun(store, index) {
+  const open = findOpenToolCall(store.messages, 'delegate')
+  return open ? subrunOf(open, index) : null
+}
+
+// 合并回执行里的逐项回执：done 事件已经把状态写上去，这里补回执摘要与标题；
+// cancelled 的批次没有 subruns 条目——没 done 的行统一收口为已中断（与历史重建同一条规则）。
+function mergeDelegateReceipt(open, result) {
+  if (!result || typeof result !== 'object') return
+  for (const r of Array.isArray(result.subruns) ? result.subruns : []) {
+    const idx = Number(r?.index)
+    if (!Number.isInteger(idx)) continue
+    const row = subrunOf(open, idx)
+    row.status = r.status || 'error'
+    if (r.title && !row.title) row.title = r.title
+    if (r.error != null) row.error = r.error
+    if (r.result != null) row.result = r.result
+    delete row.progress
+  }
+  if (result.cancelled) {
+    for (const row of open.subruns || []) {
+      if (row.status === 'running') row.status = 'cancelled'
+      delete row.progress
+    }
+  }
 }
 
 // 本轮结束时要复位的执行态，单点定义：三个终态入口（error / status(idle|error) /
@@ -86,6 +132,7 @@ export function applyEvent(store, ev) {
         // 记录比历史行多两个键（标记不落库），同构断言就此叉开。
         delete open.awaitingConfirm
         delete open.confirmSummary
+        if (ev.name === 'delegate') mergeDelegateReceipt(open, ev.result)
       } else {
         store.messages.push({ role: 'tool', name: ev.name, result: ev.result })
       }
@@ -96,6 +143,87 @@ export function applyEvent(store, ev) {
     case 'tool_progress': // 预览工具的临时进度（不落库，刷新即消失；最终结论看 tool_result）
       store.toolProgress = { name: ev.name, line: ev.line }
       break
+    // ---- 委派卡：子 run 事件（ADR-0052）。都按 index 归并进打开的 delegate 记录 ----
+    case 'subrun_snapshot': {
+      // 批量执行中连入（刷新/重连/旁观）：回执行还没落库，历史里没有 delegate 调用行，
+      // 只靠事件流卡片会整段消失。没有打开中的记录就合成一条调用行（对齐 confirm_request
+      // 合成行做法）；已落库的步骤从历史子 run 行还原——快照只带状态，行一定先于事件落库。
+      let open = findOpenToolCall(store.messages, 'delegate')
+      if (!open) {
+        open = { role: 'tool', name: 'delegate', args: { tasks: ev.tasks || [] } }
+        store.messages.push(open)
+      }
+      const derived = subrunStepsFromRows(store.messages)
+      for (const s of ev.subruns || []) {
+        if (!Number.isInteger(s?.index)) continue
+        const row = subrunOf(open, s.index)
+        if (s.title && !row.title) row.title = s.title
+        // 快照与实时流有竞态：已收口（completed/error/cancelled）的行绝不被降回运行中。
+        // 实时文本/步骤也不被快照覆盖——快照只补缺口，不替换现场。
+        if (row.status === 'running') row.status = s.status || 'running'
+        if (s.error != null) row.error = s.error
+        const d = derived.get(s.index)
+        if (d) {
+          if (d.texts && !row.texts) row.texts = d.texts
+          if (d.steps && !row.steps) row.steps = d.steps
+          if (d.result !== undefined && row.result === undefined) row.result = d.result
+        }
+      }
+      break
+    }
+    case 'subrun_start': {
+      const row = openSubrun(store, ev.index)
+      if (row && ev.title) row.title = ev.title
+      break
+    }
+    case 'subrun_text': {
+      const row = openSubrun(store, ev.index)
+      if (row && ev.content) (row.texts || (row.texts = [])).push(ev.content)
+      break
+    }
+    case 'subrun_tool_call': {
+      const row = openSubrun(store, ev.index)
+      if (!row) break
+      const step = { name: ev.name }
+      if (ev.args !== undefined) step.args = ev.args
+      ;(row.steps || (row.steps = [])).push(step)
+      break
+    }
+    case 'subrun_tool_result': {
+      const row = openSubrun(store, ev.index)
+      if (!row) break
+      const steps = row.steps || (row.steps = [])
+      let step = null
+      for (let i = steps.length - 1; i >= 0; i--) {
+        if (steps[i].name === ev.name && steps[i].result === undefined) { step = steps[i]; break }
+      }
+      if (!step) { // 孤立结果（乱序/调用行缺失）：与主流程同一处理，另立一条只带结果的步骤
+        step = { name: ev.name }
+        steps.push(step)
+      }
+      step.result = ev.result
+      if (row.progress && row.progress.name === ev.name) delete row.progress
+      break
+    }
+    case 'subrun_progress': { // 子 run 里的预览进度：临时态，步骤结果/收口即清
+      const row = openSubrun(store, ev.index)
+      if (row) row.progress = { name: ev.name, line: ev.line }
+      break
+    }
+    case 'subrun_done': {
+      const row = openSubrun(store, ev.index)
+      if (!row) break
+      row.status = ev.status === 'completed' ? 'completed' : 'error'
+      if (ev.error != null) row.error = ev.error
+      // 停止时整批回执丢失：先完成的子 run 用最后一段文本当回执摘要。
+      // 历史重建「没有回执时取收尾文本行」是同一条规则的落库侧写法。
+      if (row.status === 'completed' && row.result === undefined
+          && Array.isArray(row.texts) && row.texts.length) {
+        row.result = row.texts[row.texts.length - 1]
+      }
+      delete row.progress
+      break
+    }
     case 'ask_user': {
       // 提问卡画在 ask_user 调用行上（ADR 0029）。实时流里 tool_call 已先把行建好，但行里是
       // 模型原始参数（可能被二次编码）；事件带的是后端规整后的题目，用它覆盖才能保证出卡。

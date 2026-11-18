@@ -81,6 +81,29 @@ describe('config store 预览重启次数与提问提醒', () => {
   })
 })
 
+describe('config store 子任务委派上限', () => {
+  it('默认值与后端执行器代码默认同口径：单批 5 个子任务、每个 10 轮', () => {
+    expect(useConfigStore().form).toMatchObject({
+      subrunMaxTasks: 5, subrunMaxRounds: 10,
+    })
+  })
+
+  it('loadConfig / save 读写 subrun.max_*（账户级键）', async () => {
+    getConfig.mockResolvedValue({ data: {
+      'subrun.max_tasks': 8, 'subrun.max_rounds': 50 } })
+    const store = useConfigStore()
+    await store.loadConfig()
+    expect(store.form.subrunMaxTasks).toBe(8)
+    expect(store.form.subrunMaxRounds).toBe(50)
+
+    store.form.subrunMaxTasks = 2
+    store.form.subrunMaxRounds = 20
+    await store.save()
+    expect(putConfig).toHaveBeenCalledWith(expect.objectContaining({
+      'subrun.max_tasks': 2, 'subrun.max_rounds': 20 }))
+  })
+})
+
 describe('config store 运行参数与记忆召回', () => {
   it('默认值逐项对齐后端代码默认：抄错等于用一次保存改掉默认值', () => {
     expect(useConfigStore().form).toMatchObject({

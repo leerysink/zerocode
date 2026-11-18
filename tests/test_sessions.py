@@ -30,6 +30,21 @@ async def test_message_seq_increments(client):
     assert [m["role"] for m in msgs] == ["user", "assistant"]
 
 @pytest.mark.asyncio
+async def test_messages_carry_subrun_attribution(client):
+    """历史读取必须带上归属列（ADR-0052）：drop 掉两列，前端就分不出子 run 行——
+    委派卡的步骤会丢失，子 run 的中间产物还会串进顶部消息流。"""
+    ws = await _mk_ws(client)
+    s = (await client.post("/api/sessions", json={"workspace_id": ws["id"]})).json()
+    sf = client.app.state.session_factory
+    await add_message(sf, s["id"], "user", content="主问题")
+    await add_message(sf, s["id"], "assistant", content="子结论",
+                      parent_tool_call_id="d1", subrun_index=1)
+    msgs = (await client.get(f"/api/sessions/{s['id']}/messages")).json()
+    assert [(m["parent_tool_call_id"], m["subrun_index"]) for m in msgs] == [
+        (None, None), ("d1", 1)]
+
+
+@pytest.mark.asyncio
 async def test_messages_project_compaction_markers(client):
     # 压缩留痕只活在 compaction 表：读取时投成 notice 行，插在「被摘到的最后一条消息」之后，
     # 刷新/切会话后照样看得见。故意不写 message 表——模型上下文因此不会掺进提示条。

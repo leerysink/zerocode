@@ -132,6 +132,34 @@ async def test_clarify配置按账号隔离不覆盖平台行(two_auth_clients):
     assert platform in ([], [False]), f"账户覆盖改写了平台默认行：{rows}"
 
 
+async def test_subrun配置按账号隔离_无键回落代码默认(two_auth_clients):
+    """Ticket 005（ADR-0052 / US-16）：subrun.* 进了 USER_PREFIXES——委派上限封的是
+    「我自己烧的钱」，A 调大不该让 B 也放大；库里无键时执行器按代码默认 5/10 回落，
+    不该因此出现任何平台级行（默认值只住代码与前端表单）。"""
+    alice, bob = two_auth_clients
+    uid_a = await _me(alice)
+    # 无键回落：用户视图里根本没有这两个键，执行器读 cfg.get 的缺省即代码默认
+    cfg_a0 = (await alice.get("/api/config")).json()
+    assert "subrun.max_tasks" not in cfg_a0 and "subrun.max_rounds" not in cfg_a0
+    r = await alice.put("/api/config", json={"subrun.max_tasks": 8,
+                                             "subrun.max_rounds": 20})
+    assert r.status_code == 200
+    cfg_a = (await alice.get("/api/config")).json()
+    assert cfg_a["subrun.max_tasks"] == 8 and cfg_a["subrun.max_rounds"] == 20
+    cfg_b = (await bob.get("/api/config")).json()
+    assert "subrun.max_tasks" not in cfg_b and "subrun.max_rounds" not in cfg_b, \
+        "alice 的委派上限漏给了 bob——他一次并发几个子 run 不该由别人决定"
+    # 同名键各写各的行：owner+key 结合键，不互相覆盖
+    assert (await bob.put("/api/config", json={"subrun.max_tasks": 2})).status_code == 200
+    assert (await alice.get("/api/config")).json()["subrun.max_tasks"] == 8
+    async with alice.app.state.session_factory() as s:
+        pairs = (await s.execute(text(
+            "SELECT owner_user_id, value FROM app_config WHERE key = 'subrun.max_tasks' "
+            "ORDER BY owner_user_id"))).fetchall()
+    assert [(o, v) for o, v in pairs] == [(uid_a, 8), (await _me(bob), 2)], \
+        "subrun.* 必须只落 owner 行：owner NULL 行不会被清库，会漏给后续所有账号"
+
+
 async def test_Agent会话按owner解析模型配置(two_auth_clients, tmp_path, test_engine):
     """行为关键链：各自的默认档案只服务各自的会话；直绑他人行也被回落，不串 key。"""
     alice, bob = two_auth_clients

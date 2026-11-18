@@ -1450,3 +1450,154 @@ def test_ws_revoke_closes_target_watcher_only(client):
     finally:
         stack.close()
         _drop_planted_app(client, aid)
+
+
+# ---------- 委派中途快照补发（Ticket 004 / ADR-0052 §2.4） ----------
+
+def _delegate_turn(call_id, titles):
+    return done(None, [{"id": call_id, "function": {
+        "name": "delegate",
+        "arguments": json.dumps({"tasks": [{"title": t, "brief": f"任务书：{t}"}
+                                           for t in titles]}, ensure_ascii=False)}}])
+
+
+class _RoutedLLM:
+    """主 run 走 main 脚本；子 run 按任务书标记路由，hang_marker 命中的永不收口。
+
+    子 run 的 messages[1] 是任务书、主 run 的 messages[1] 是首条用户消息，按标记分流；
+    ScriptedLLM 有状态（逐轮 pop），各路由各持一份实例，互不串台。
+    """
+
+    def __init__(self, main_turns, sub_turns=None, hang_marker=None):
+        self.main = ScriptedLLM(main_turns)
+        self.subs = {m: ScriptedLLM(turns) for m, turns in (sub_turns or {}).items()}
+        self.hang_marker = hang_marker
+
+    async def chat_stream(self, messages, tools):
+        brief = messages[1].get("content") if len(messages) > 1 else ""
+        if isinstance(brief, str) and self.hang_marker and self.hang_marker in brief:
+            await asyncio.Event().wait()  # 只在取消时被 _wait_or_cancel 收走
+            return
+        target = self.main
+        if isinstance(brief, str):
+            for marker, llm in self.subs.items():
+                if marker in brief:
+                    target = llm
+                    break
+        async for ev in target.chat_stream(messages, tools):
+            yield ev
+
+
+def _eventually(pred, timeout=3.0):
+    import time
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if pred():
+            return True
+        time.sleep(0.01)
+    return pred()
+
+
+def _read_frames_until_status(ws, timeout=15.0, limit=30):
+    """有界读取取消后的帧，直到出现终态 status。
+
+    TestClient 的 receive_json 没有超时：真收不到时旧写法会把失败挂成挂死（排查成本极高）。
+    这里把读循环放进守护线程，超时即带已收帧失败；读到任何 status 都停，不按 idle 死等——
+    收口成 error 时死等只会把失败伪装成挂死。
+    """
+    import threading
+    frames, box = [], {}
+
+    def _read():
+        try:
+            for _ in range(limit):
+                ev = ws.receive_json()
+                frames.append(ev)
+                if ev.get("type") == "status":
+                    break
+        except BaseException as e:  # noqa: BLE001  连接被服务端关闭等
+            box["error"] = repr(e)
+
+    t = threading.Thread(target=_read, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        pytest.fail(f"取消后 {timeout:g}s 内未收到终态 status："
+                    f"frames={frames} err={box.get('error')}")
+    return frames
+
+
+def test_ws_subrun_snapshot_replays_mid_batch(client):
+    """批量执行中刷新：连入补发 status(running) 后紧跟 subrun_snapshot，
+    任务标题与每行状态与刷新前一致；run 收口即清，重连不再出现幽灵卡。"""
+    client.app.state.llm_factory = lambda cfg: _RoutedLLM(
+        main_turns=[_delegate_turn("d1", ["调研甲", "调研乙"])], hang_marker="任务书")
+    sid = client.zc_sid
+    hub = client.app.state.hub
+    with client.websocket_connect(f"/ws/chat/{sid}") as ws:
+        ws.send_json({"type": "user_message", "content": "开始"})
+        starts = 0
+        for _ in range(30):
+            if ws.receive_json()["type"] == "subrun_start":
+                starts += 1
+                if starts == 2:
+                    break
+        else:
+            pytest.fail("两条 subrun_start 应已在流上")
+        with client.websocket_connect(f"/ws/chat/{sid}") as ws2:
+            assert ws2.receive_json() == {"type": "status", "status": "running"}
+            assert ws2.receive_json() == {
+                "type": "subrun_snapshot",
+                "tasks": [{"title": "调研甲"}, {"title": "调研乙"}],
+                "subruns": [
+                    {"index": 0, "title": "调研甲", "status": "running"},
+                    {"index": 1, "title": "调研乙", "status": "running"},
+                ],
+            }
+            ws2.send_json({"type": "cancel"})
+            frames = _read_frames_until_status(ws2)
+            assert frames[-1] == {"type": "status", "status": "idle"}, frames
+    # 收口即清：快照只活在 run 生命周期内（进程重启即丢，与 run 语义一致）
+    assert _eventually(lambda: sid not in hub.running)
+    assert hub.subruns.get(sid) is None
+    # 空闲后重连：首帧直接是正常对话，不再补发 status/subrun_snapshot
+    client.app.state.llm_factory = lambda cfg: ScriptedLLM([done("正常回复")])
+    with client.websocket_connect(f"/ws/chat/{sid}") as ws3:
+        ws3.send_json({"type": "user_message", "content": "hi"})
+        assert ws3.receive_json()["type"] == "message_done"
+
+
+def test_ws_subrun_snapshot_only_current_batch(client):
+    """同一会话先后两次委派：快照只承载当前在跑的那批（旧批已收口，由历史行重建）。"""
+    client.app.state.llm_factory = lambda cfg: _RoutedLLM(
+        main_turns=[_delegate_turn("d1", ["第一批甲"]),
+                    _delegate_turn("d2", ["第二批丙"])],
+        sub_turns={"第一批": [done("甲完成")]},
+        hang_marker="第二批")
+    sid = client.zc_sid
+    hub = client.app.state.hub
+    with client.websocket_connect(f"/ws/chat/{sid}") as ws:
+        ws.send_json({"type": "user_message", "content": "开始"})
+        delegations = 0
+        second_started = False
+        for _ in range(60):
+            ev = ws.receive_json()
+            if ev["type"] == "tool_call" and ev["name"] == "delegate":
+                delegations += 1
+            elif delegations == 2 and ev["type"] == "subrun_start":
+                second_started = True
+                break
+        assert second_started, "第二次委派的子 run 应已开跑"
+        with client.websocket_connect(f"/ws/chat/{sid}") as ws2:
+            assert ws2.receive_json() == {"type": "status", "status": "running"}
+            snap = ws2.receive_json()
+            assert snap["type"] == "subrun_snapshot"
+            assert snap["tasks"] == [{"title": "第二批丙"}]
+            assert snap["subruns"] == [
+                {"index": 0, "title": "第二批丙", "status": "running"}]
+            assert "第一批" not in json.dumps(snap, ensure_ascii=False)
+            ws2.send_json({"type": "cancel"})
+            frames = _read_frames_until_status(ws2)
+            assert frames[-1] == {"type": "status", "status": "idle"}, frames
+    assert _eventually(lambda: sid not in hub.running)
+    assert hub.subruns.get(sid) is None

@@ -13,7 +13,9 @@ from app.agent import registry
 ROOT = Path(__file__).resolve().parents[1]
 BASE_NAMES = ["list_dir", "read_file", "search", "write_file", "edit_file",
               "delete_file", "move_file", "revert_change",
-              "ask_user", "todo_write", "memory_write"]
+              "ask_user", "todo_write", "memory_write", "delegate"]
+# 循环自处理、没有 handler 的工具（delegate 的实现在执行器，与 ask_user 同列）
+LOOP_OWNED = ("ask_user", "clarify_done", "delegate")
 APP_NAMES = ["preview_status", "preview_logs", "preview_restart",
              "db_query", "db_write", "preview_page",
              "browser_open", "browser_step", "browser_close",
@@ -65,14 +67,14 @@ def test_confirm_policy_is_registry_metadata():
 
 def test_every_executable_tool_resolves_a_handler():
     for spec in registry.SPECS:
-        if spec.name in ("ask_user", "clarify_done"):
+        if spec.name in LOOP_OWNED:
             assert spec.handler_ref is None
             continue
         assert callable(registry.resolve_handler(spec)), spec.name
 
 
 def test_loop_owned_tools_are_not_in_the_handler_face():
-    for name in ("ask_user", "clarify_done"):
+    for name in LOOP_OWNED:
         assert registry.spec_of(name).handler_ref is None
 
 

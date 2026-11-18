@@ -57,11 +57,122 @@ function put(rec, key, value) {
   rec[key] = value
 }
 
+// 子 run 行的归属键（ADR-0052）：一次委派的全部子 run 行都带 parent_tool_call_id（delegate
+// 调用的 id）与 subrun_index。子 run 行不进顶部消息流，按这两列归组后挂到 delegate 记录上。
+function parentCallOf(raw) {
+  return raw.parent_tool_call_id ?? raw.parentToolCallId ?? null
+}
+
+function collectSubrunGroups(list) {
+  const groups = new Map() // callId → Map(index → rows[]，保持 seq 顺序)
+  for (const raw of list || []) {
+    if (!raw || typeof raw !== 'object') continue
+    const pid = parentCallOf(raw)
+    if (pid == null) continue
+    const index = Number(raw.subrun_index ?? raw.subrunIndex ?? 0)
+    if (!Number.isInteger(index)) continue
+    if (!groups.has(pid)) groups.set(pid, new Map())
+    const byIndex = groups.get(pid)
+    if (!byIndex.has(index)) byIndex.set(index, [])
+    byIndex.get(index).push(raw)
+  }
+  return groups
+}
+
+// 子 run 行 → 委派卡里的子任务记录（形状与实时 reducer 逐字段相同，ADR-0029）：
+//   { index, title, status, error?, result?, texts?, steps? }
+// status 的来源只有两个：整批回执（正常完成）或「最后一条纯文本 assistant 行」（停止时
+// 回执丢了，已收尾的子 run 靠这行还原本完成态）；两者都没有就是被停止的行，记 cancelled。
+// receipts 里没有的已完成子 run 读不出错误态——停止前报错的子 run 刷新后会显示已中断：
+// 错误只活在实时事件里，落库的行不带状态列，这是不为子 run 加状态表的既有代价。
+function deriveSubruns(groups, args, result) {
+  const receipts = new Map()
+  for (const r of Array.isArray(result?.subruns) ? result.subruns : []) {
+    const idx = Number(r?.index)
+    if (Number.isInteger(idx)) receipts.set(idx, r)
+  }
+  const indices = new Set(receipts.keys())
+  if (groups) for (const k of groups.keys()) indices.add(k)
+  return [...indices]
+    .sort((a, b) => a - b)
+    .map((idx) => deriveSubrun(idx, groups?.get(idx) || [], receipts.get(idx), args, result))
+}
+
+function deriveSubrun(index, rows, receipt, args, result) {
+  const rec = { index }
+  const texts = []
+  const steps = []
+  const byId = new Map()
+  let finalText
+  for (const row of rows) {
+    if (row.role === 'assistant') {
+      if (typeof row.content === 'string' && row.content) texts.push(row.content)
+      const calls = callsOf(row)
+      for (const c of calls) {
+        const step = { name: c.name }
+        put(step, 'args', c.args)
+        steps.push(step)
+        if (c.id != null) byId.set(c.id, step)
+      }
+      // 纯文本行＝这个子 run 的收尾答案（执行器只在成功出口写无 tool_calls 的文本行）
+      if (!calls.length && typeof row.content === 'string' && row.content) finalText = row.content
+      continue
+    }
+    if (row.role === 'tool') {
+      const cid = row.tool_call_id ?? row.callId
+      let step = cid == null ? null : byId.get(cid)
+      if (!step) {
+        // 孤立结果（调用行被窗口裁掉等）：与实时 reducer 同一处理，另立一条只带结果的步骤
+        step = { name: row.tool_name ?? row.name ?? 'tool' }
+        steps.push(step)
+      }
+      put(step, 'result', row.tool_result ?? row.result)
+    }
+  }
+  put(rec, 'title', receipt?.title || args?.tasks?.[index]?.title)
+  if (receipt) {
+    rec.status = receipt.status || 'error'
+    put(rec, 'error', receipt.error)
+    put(rec, 'result', receipt.result)
+  } else if (finalText !== undefined) {
+    rec.status = 'completed'
+    put(rec, 'result', finalText)
+  } else {
+    rec.status = result?.cancelled ? 'cancelled' : 'error'
+  }
+  put(rec, 'texts', texts)
+  put(rec, 'steps', steps)
+  return rec
+}
+
+// 供快照合成（Ticket 004）：从已装入的历史行还原子 run 的文本/步骤留痕。
+// 只认「还没有 delegate tool 行」的父调用——已有 tool 行的批次是收口过的旧批次，
+// normalizeMessages 自己会完整重建，不能被并进当前快照。状态不取这里的推导值，
+// 由快照覆盖（快照来自 hub，是实时真相）。
+export function subrunStepsFromRows(list) {
+  const closed = new Set()
+  for (const raw of list || []) {
+    if (!raw || raw.role !== 'tool') continue
+    const cid = raw.tool_call_id ?? raw.callId
+    if (cid != null) closed.add(cid)
+  }
+  const out = new Map() // index → { texts?, steps?, result? }
+  for (const [pid, byIndex] of collectSubrunGroups(list)) {
+    if (closed.has(pid)) continue
+    for (const [idx, rows] of byIndex) {
+      out.set(idx, deriveSubrun(idx, rows, undefined, undefined, { cancelled: true }))
+    }
+  }
+  return out
+}
+
 export function normalizeMessages(list) {
+  const subrunGroups = collectSubrunGroups(list)
   const out = []
   let pending = [] // 尚未被 tool 行认领的调用参数（按 tool_call_id 配对）
   for (const raw of list || []) {
     if (!raw || typeof raw !== 'object') continue
+    if (parentCallOf(raw) != null) continue // 子 run 行并入 delegate 记录，不进顶部流
     if (raw.role === 'tool') {
       const callId = raw.callId ?? raw.tool_call_id
       const hit = callId == null ? null : pending.find((c) => c.id === callId)
@@ -83,6 +194,16 @@ export function normalizeMessages(list) {
       put(rec, 'diff_action', raw.diff_action)
       // 变更记录的行 id：渲染读的是归一化后的记录，这里漏传，聊天流里就没有跳转入口
       put(rec, 'diff_change_id', raw.diff_change_id)
+      if (rec.name === 'delegate') {
+        // 实时路径的子任务记录由 reducer 直接挂在调用记录上，原样放行；
+        // 历史路径从子 run 行重建（行已被上面的 collect 收走，不会出现在顶部流里）
+        if (Array.isArray(raw.subruns)) put(rec, 'subruns', raw.subruns)
+        else {
+          const derived = deriveSubruns(callId == null ? null : subrunGroups.get(callId),
+                                        rec.args, rec.result)
+          if (derived.length) put(rec, 'subruns', derived)
+        }
+      }
       out.push(rec)
       continue
     }

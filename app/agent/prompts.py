@@ -1,3 +1,18 @@
+def build_app_prompt_blocks(preview: str | None) -> str:
+    """应用级只读工具的 system 指引块，顺序固定：诊断 → 自检 → 数据库 → 预览。
+
+    主 run 与子 run 共用；浏览器两块（<browser>/<browser_session>）由主 run 在返回值后
+    自行追加——子 run 的工具面里没有浏览器工具，不给它们对应的教程。
+    惰性 import 与注册表 handler 引用同因：这些工具模块反向依赖 loop/llm 一侧，
+    顶层 import 会把 prompts 拖进环里。
+    """
+    from app.agent.check_tools import build_check_prompt
+    from app.agent.db_tools import build_db_prompt
+    from app.agent.diag_tools import build_diag_prompt
+    return (build_diag_prompt() + build_check_prompt() + build_db_prompt()
+            + (preview or ""))
+
+
 def build_system_prompt(root: str, date: str, app_contract: str | None = None,
                        skills: list[dict] | None = None, preview: str | None = None,
                        clarify: str | None = None) -> str:
@@ -31,7 +46,12 @@ def build_system_prompt(root: str, date: str, app_contract: str | None = None,
         "10. 用户消息可能直接附带图片（content part 中的 image_url 就是原图）。"
         "需要看图时直接依据消息里的图片回答，不要尝试用 read_file 去工作区找同名文件；"
         "图片附件不占用工作区路径。摘要或占位里只有文件名、没有 image_url 的图片不可查看："
-        "不要假装看过，也不要 read_file，需要时请用户重新发送。")
+        "不要假装看过，也不要 read_file，需要时请用户重新发送。\n"
+        "11. 委派子 agent（delegate）：≥2 个互不依赖的调研/检查/验证任务一次批量派出，"
+        "让它们并行干活；串行依赖、需要用户确认或写盘的活不要委派，自己按顺序做。"
+        "每项任务给 title（≤40 字短名）与 brief（完整任务书：目标/范围/验收），"
+        "子 agent 看不到本会话聊天历史，背景与约束必须写进任务书；它们只读，"
+        "不能提问、不能改文件。全部子任务落定后返回合并回执，失败逐个计入、不影响其余。")
     # 澄清段紧跟基础规则：它就是规则 4 的展开形态，隔太远会被当成另一件事。
     if clarify:
         text += clarify

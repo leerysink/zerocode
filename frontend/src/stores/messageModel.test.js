@@ -250,6 +250,155 @@ describe('ask_user 事件用规整题目覆盖调用行', () => {
   })
 })
 
+// ---------- 委派卡（ADR-0052 / 规格 2026-11-18-agent-subruns）：子 run 行归并 ----------
+// 子 run 行（parent_tool_call_id 非空）不进顶部消息流：按 subrun_index 归组，assistant 行的
+// tool_calls 与 tool 行按 tool_call_id 配成步骤，挂到按 callId 认领的 delegate 调用记录上。
+// 停止时整批回执丢失——已完成的行由「最后一条纯文本 assistant 行」还原，其余记已中断。
+describe('委派卡历史重建', () => {
+  const ARGS = { tasks: [
+    { title: '调研 A', brief: '看 A' },
+    { title: '调研 B', brief: '看 B' },
+  ] }
+  const RECEIPT = { ok: true, subruns: [
+    { index: 0, title: '调研 A', status: 'completed', result: 'A 完成', error: null, rounds_used: 2, tool_calls: 1 },
+    { index: 1, title: '调研 B', status: 'completed', result: 'B 完成', error: null, rounds_used: 2, tool_calls: 1 },
+  ] }
+
+  function historyRows() {
+    return [
+      { id: 1, seq: 1, role: 'user', content: '并行调研', created_at: 't1' },
+      {
+        id: 2, seq: 2, role: 'assistant', content: '我来委派', reasoning: null,
+        tool_args: { tool_calls: [{
+          id: 'cd', type: 'function',
+          function: { name: 'delegate', arguments: JSON.stringify(ARGS) },
+        }] },
+      },
+      // 子 run 0：中间文本 + 一次工具调用 + 收尾答案
+      {
+        id: 3, seq: 3, role: 'assistant', content: '先读 A', reasoning: null,
+        parent_tool_call_id: 'cd', subrun_index: 0,
+        tool_args: { tool_calls: [{
+          id: 's0', type: 'function',
+          function: { name: 'read_file', arguments: '{"path":"a.txt"}' },
+        }] },
+      },
+      { id: 4, seq: 4, role: 'tool', tool_call_id: 's0', tool_name: 'read_file',
+        tool_result: { ok: true }, parent_tool_call_id: 'cd', subrun_index: 0 },
+      { id: 5, seq: 5, role: 'assistant', content: 'A 完成', reasoning: null,
+        parent_tool_call_id: 'cd', subrun_index: 0 },
+      // 子 run 1：工具轮无文本，收尾答案
+      {
+        id: 6, seq: 6, role: 'assistant', content: null, reasoning: null,
+        parent_tool_call_id: 'cd', subrun_index: 1,
+        tool_args: { tool_calls: [{
+          id: 's1', type: 'function',
+          function: { name: 'search', arguments: '{"q":"b"}' },
+        }] },
+      },
+      { id: 7, seq: 7, role: 'tool', tool_call_id: 's1', tool_name: 'search',
+        tool_result: { hits: [] }, parent_tool_call_id: 'cd', subrun_index: 1 },
+      { id: 8, seq: 8, role: 'assistant', content: 'B 完成', reasoning: null,
+        parent_tool_call_id: 'cd', subrun_index: 1 },
+      // 回执行在整批落定后才写：seq 天然在子 run 行之后，按 tool_call_id 认领不受顺序影响
+      { id: 9, seq: 9, role: 'tool', tool_call_id: 'cd', tool_name: 'delegate', tool_result: RECEIPT },
+    ]
+  }
+
+  it('子 run 行不着顶：并入 delegate 记录、按 index 排序、步骤同体', () => {
+    const out = normalizeMessages(historyRows())
+    expect(out.map((m) => m.role)).toEqual(['user', 'assistant', 'tool'])
+    const d = out[2]
+    expect(d.name).toBe('delegate')
+    expect(d.args).toEqual(ARGS)
+    expect(d.result).toEqual(RECEIPT)
+    expect(d.subruns).toEqual([
+      { index: 0, title: '调研 A', status: 'completed', result: 'A 完成',
+        texts: ['先读 A', 'A 完成'],
+        steps: [{ name: 'read_file', args: { path: 'a.txt' }, result: { ok: true } }] },
+      { index: 1, title: '调研 B', status: 'completed', result: 'B 完成',
+        texts: ['B 完成'],
+        steps: [{ name: 'search', args: { q: 'b' }, result: { hits: [] } }] },
+    ])
+  })
+
+  function liveFromEvents() {
+    const s = { messages: [], streamingContent: '', streamingThinking: '', toolProgress: null }
+    s.messages.push({ role: 'user', content: '并行调研', attachments: [], client_msg_id: 'm1' })
+    for (const ev of [
+      { type: 'token', delta: '我来委派' },
+      { type: 'message_done', content: '我来委派' },
+      { type: 'tool_call', name: 'delegate', args: ARGS },
+      { type: 'subrun_start', index: 1, title: '调研 B' },
+      { type: 'subrun_start', index: 0, title: '调研 A' },
+      { type: 'subrun_text', index: 0, content: '先读 A' },
+      { type: 'subrun_tool_call', index: 0, name: 'read_file', args: { path: 'a.txt' } },
+      { type: 'subrun_tool_result', index: 0, name: 'read_file', result: { ok: true } },
+      { type: 'subrun_text', index: 0, content: 'A 完成' },
+      { type: 'subrun_done', index: 0, status: 'completed' },
+      { type: 'subrun_tool_call', index: 1, name: 'search', args: { q: 'b' } },
+      { type: 'subrun_tool_result', index: 1, name: 'search', result: { hits: [] } },
+      { type: 'subrun_text', index: 1, content: 'B 完成' },
+      { type: 'subrun_done', index: 1, status: 'completed' },
+      { type: 'tool_result', name: 'delegate', result: RECEIPT },
+    ]) applyEvent(s, ev)
+    return s.messages
+  }
+
+  it('实时 ≡ 历史（整批完成）：两条路径归一化后逐字段相等', () => {
+    expect(normalizeMessages(liveFromEvents())).toEqual(normalizeMessages(historyRows()))
+  })
+
+  it('实时 ≡ 历史（中途停止）：已完成的行还原回执摘要，其余行已中断', () => {
+    const cancelledReceipt = { cancelled: true }
+    const live = (() => {
+      const s = { messages: [], streamingContent: '', streamingThinking: '', toolProgress: null }
+      for (const ev of [
+        { type: 'token', delta: '我来委派' },
+        { type: 'message_done', content: '我来委派' },
+        { type: 'tool_call', name: 'delegate', args: ARGS },
+        { type: 'subrun_start', index: 0, title: '调研 A' },
+        { type: 'subrun_text', index: 0, content: '先读' },
+        { type: 'subrun_tool_call', index: 0, name: 'read_file', args: { path: 'a.txt' } },
+        { type: 'subrun_start', index: 1, title: '调研 B' },
+        { type: 'subrun_text', index: 1, content: 'B 已答完' },
+        { type: 'subrun_done', index: 1, status: 'completed' },
+        { type: 'tool_result', name: 'delegate', result: cancelledReceipt },
+      ]) applyEvent(s, ev)
+      return s.messages
+    })()
+    // 停止时的历史：没有整批回执，子 run 0 只有一条带工具调用的 assistant 行（工具行没写）
+    const history = [
+      {
+        id: 2, seq: 2, role: 'assistant', content: '我来委派', reasoning: null,
+        tool_args: { tool_calls: [{
+          id: 'cd', type: 'function',
+          function: { name: 'delegate', arguments: JSON.stringify(ARGS) },
+        }] },
+      },
+      {
+        id: 3, seq: 3, role: 'assistant', content: '先读', reasoning: null,
+        parent_tool_call_id: 'cd', subrun_index: 0,
+        tool_args: { tool_calls: [{
+          id: 's0', type: 'function',
+          function: { name: 'read_file', arguments: '{"path":"a.txt"}' },
+        }] },
+      },
+      { id: 4, seq: 4, role: 'assistant', content: 'B 已答完', reasoning: null,
+        parent_tool_call_id: 'cd', subrun_index: 1 },
+      { id: 9, seq: 9, role: 'tool', tool_call_id: 'cd', tool_name: 'delegate',
+        tool_result: cancelledReceipt },
+    ]
+    const hist = normalizeMessages(history)
+    expect(normalizeMessages(live)).toEqual(hist)
+    expect(hist[1].subruns).toEqual([
+      { index: 0, title: '调研 A', status: 'cancelled', texts: ['先读'],
+        steps: [{ name: 'read_file', args: { path: 'a.txt' } }] },
+      { index: 1, title: '调研 B', status: 'completed', result: 'B 已答完', texts: ['B 已答完'] },
+    ])
+  })
+})
+
 describe('压缩留痕的文案单点', () => {
   it('历史投影行只有 kind、没有正文时，按 kind 补出文案', () => {
     const [m] = normalizeMessages([{ id: null, seq: 2, role: 'notice', kind: 'compacted', content: null }])

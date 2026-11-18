@@ -12,6 +12,7 @@ import { normalizeMessages } from '../stores/messageModel'
 import { useChatPromptRail } from '../composables/useChatPromptRail'
 import MarkdownView from './MarkdownView.vue'
 import ToolCallBlock from './ToolCallBlock.vue'
+import DelegateCard from './DelegateCard.vue'
 import AskUserCard from './AskUserCard.vue'
 import ConfirmCard from './ConfirmCard.vue'
 import ThinkingBlock from './ThinkingBlock.vue'
@@ -244,6 +245,8 @@ onBeforeUnmount(cancelFill)
             <ConfirmCard v-else-if="confirmCardState(item.m)" :msg="item.m" :state="confirmCardState(item.m)"
                          :progress="liveProgress(item.m, item.i)" :watch-only="watchOnly" />
             <TodoCard v-else-if="item.m.name === 'todo_write' && item.m.args && item.m.args.todos" :todos="item.m.args.todos" />
+            <!-- 委派卡：delegate 一行里装一批子 run（ADR-0052），先于通用折叠块 -->
+            <DelegateCard v-else-if="item.m.name === 'delegate'" :msg="item.m" />
             <PageInspectCard v-else-if="isPageCard(item.m, item.i)" :msg="item.m" :progress="liveProgress(item.m, item.i)" />
             <BrowserFlowCard v-else-if="isBrowserCard(item.m, item.i)" :msg="item.m" :progress="liveProgress(item.m, item.i)" />
             <PreviewCard v-else-if="isPreviewCard(item.m, item.i)" :msg="item.m" :progress="liveProgress(item.m, item.i)" />

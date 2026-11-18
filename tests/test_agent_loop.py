@@ -76,6 +76,29 @@ async def test_plain_reply(test_engine, tmp_path):
     assert "你好" in row
 
 @pytest.mark.asyncio
+async def test_status_frame_survives_set_status_failure(test_engine, tmp_path):
+    """收口落库是旁路：UPDATE 失败不能吞掉 status 帧，也不能把正常完成的 run 记成 error。
+
+    实景：取消级联打断子 run 的 SQL 时 SQLAlchemy 判废连接，死连接偶尔回流池中，
+    紧随其后的收口 UPDATE 可能吃 InterfaceError。客户端必须仍收到终态帧——接收端
+    永远转圈的代价远大于一次状态行落库失败（DB 行由 watchdog 按 running 回收）。"""
+    sid = await mk_session(test_engine, tmp_path)
+    sf = make_session_factory(test_engine)
+    rec = Recorder()
+    runner = AgentRunner(sf, ScriptedLLM([done("好了")]), cfg_provider(), rec,
+                         lambda *a, **k: asyncio.sleep(0, None), lambda *a, **k: True)
+
+    async def _boom(session_id, status):
+        raise RuntimeError("connection is closed")
+
+    runner._set_status = _boom
+    status = await runner.run(sid, "开始", asyncio.Event())
+    assert status == "idle"
+    assert {"type": "status", "status": "idle"} in rec.events
+    assert runner.last_outcome == "completed"
+
+
+@pytest.mark.asyncio
 async def test_empty_reply_is_retried_instead_of_silently_finishing(test_engine, tmp_path):
     """模型空回复（无正文、无工具调用）不能当「答完」：先补催一轮，正常续上。
 

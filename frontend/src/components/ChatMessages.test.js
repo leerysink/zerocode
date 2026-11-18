@@ -11,6 +11,7 @@ vi.mock('../api', () => ({
 
 import ChatMessages from './ChatMessages.vue'
 import ToolCallBlock from './ToolCallBlock.vue'
+import DelegateCard from './DelegateCard.vue'
 import AskUserCard from './AskUserCard.vue'
 import BrowserFlowCard from './BrowserFlowCard.vue'
 import { applyEvent, useChatStore } from '../stores/chat'
@@ -117,6 +118,20 @@ describe('预览工具在消息流里的渲染', () => {
   it('非预览工具仍走 ToolCallBlock', () => {
     const w = mountMessages([{ role: 'tool', name: 'read_file', result: { ok: true } }])
     expect(w.find('.zc-preview').exists()).toBe(false)
+  })
+
+  it('delegate 调用渲染委派卡，不再落回通用折叠块', () => {
+    const w = mountMessages([{
+      role: 'tool', name: 'delegate',
+      args: { tasks: [{ title: '调研 A', brief: 'a' }] },
+      result: { ok: true, subruns: [
+        { index: 0, title: '调研 A', status: 'completed', result: '结论', error: null, rounds_used: 1, tool_calls: 0 },
+      ] },
+    }])
+    expect(w.findComponent(DelegateCard).exists()).toBe(true)
+    expect(w.findComponent(ToolCallBlock).exists()).toBe(false)
+    expect(w.text()).toContain('委派 1 个子任务')
+    expect(w.text()).toContain('结论')
   })
 
   // 历史行里 args 不在 tool 行上，而在前一条 assistant 行的 tool_args.tool_calls 里（JSON 字符串）。

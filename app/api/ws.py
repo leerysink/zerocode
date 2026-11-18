@@ -93,6 +93,9 @@ async def _watch_only(ws: WebSocket, session_id: int, hub, *,
     try:
         if session_id in hub.running and not hub.is_cancelling(session_id):
             await emit(session_id, {"type": "status", "status": "running"})
+            snap = hub.subrun_snapshot(session_id)
+            if snap:
+                await emit(session_id, snap)
         questions = hub.pending_asks.get(session_id)
         if questions is not None:
             await emit(session_id, {"type": "ask_user", "questions": questions})
@@ -165,6 +168,12 @@ async def ws_chat(ws: WebSocket, session_id: int):
     # 此刻补发等于把任务在界面上重新立成「运行中」，收口帧又只发往旧连接时就永远停在运行中。
     if session_id in hub.running and not hub.is_cancelling(session_id):
         await emit(session_id, {"type": "status", "status": "running"})
+        # 批量委派执行中刷新：delegate 的 tool 行还没落库，历史里没有可贴的调用行，
+        # 只靠事件流的话卡片整段消失。快照补出当前批次的任务与每行状态，
+        # 已落库步骤由前端从历史子 run 行还原（Ticket 004 / ADR-0052）。
+        snap = hub.subrun_snapshot(session_id)
+        if snap:
+            await emit(session_id, snap)
     # 挂起中的提问/确认在重连时补发：切走、刷新、另开标签页后卡片不消失，
     # ask/confirm future 不会永久挂起（否则会话卡死，用户既答不了也停不掉）。
     await hub.replay_pending(session_id)
@@ -350,6 +359,7 @@ async def ws_chat(ws: WebSocket, session_id: int):
                                 "finished_at": time.time(),
                             }
                         hub.run_vision.pop(session_id, None)
+                        hub.clear_subruns(session_id)  # 委派快照随 run 收口消失（Ticket 004）
                         hub.running.discard(session_id)
                         hub.cancel_events.pop(session_id, None)
 

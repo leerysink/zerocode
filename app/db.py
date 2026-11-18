@@ -7,7 +7,12 @@ from app import config as app_config
 CHANGELOG_DIR = Path(__file__).resolve().parents[1] / "changelog"  # app/db.py → 仓库根/changelog
 
 def make_engine(url: str | None = None) -> AsyncEngine:
-    return create_async_engine(url or app_config.database_url())
+    # pool_pre_ping：取消（停止级联下的子 run 尤甚）会在任意 await 点打断正在执行的 SQL，
+    # SQLAlchemy 以「取消后协议状态未知」为由判废该连接；并发收口时这条死连接偶尔会以
+    # 陈旧记录的身份回到池里，下一次 checkout 直接吃 InterfaceError('connection is closed')
+    # ——表现为与本次操作毫不相干的 DB 调用随机炸掉。预检在 checkout 时用一次 SELECT 1
+    # 换掉死连接，把这类偶发挡在池边界。
+    return create_async_engine(url or app_config.database_url(), pool_pre_ping=True)
 
 def make_session_factory(engine: AsyncEngine) -> async_sessionmaker:
     return async_sessionmaker(engine, expire_on_commit=False)

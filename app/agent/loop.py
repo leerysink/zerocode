@@ -16,10 +16,8 @@ from app.agent.preview_tools import (build_preview_prompt, confirm_summary, fetc
 from app.agent.browser_tools import build_browser_prompt
 from app.agent.browser_session_tools import (build_browser_session_prompt, close_browser_session,
                                             redact_sensitive_step_args)
-from app.agent.db_tools import build_db_prompt, db_confirm_summary
-from app.agent.check_tools import build_check_prompt
-from app.agent.diag_tools import build_diag_prompt
-from app.agent.prompts import build_clarify_prompt, build_system_prompt
+from app.agent.db_tools import db_confirm_summary
+from app.agent.prompts import build_app_prompt_blocks, build_clarify_prompt, build_system_prompt
 from app.agent import clarify as _cl
 from app.agent import registry as _registry
 from app.agent.tools import ToolContext, ToolError, execute_tool
@@ -237,7 +235,13 @@ class AgentRunner:
             status = "error"
             outcome = "error"
         finally:
-            await self._set_status(session_id, status)
+            try:
+                await self._set_status(session_id, status)
+            except Exception:
+                # 状态落库是旁路：一条 UPDATE 失败不能吞掉下面的 status 帧——客户端靠它
+                # 停转圈，DB 行留给 watchdog 按 running 回收。异常本身要留痕，别静默。
+                logger.exception("run 收口状态落库失败 session=%s status=%s",
+                                 session_id, status)
             await self.send({"type": "status", "status": status})
             # 浏览器会话收口（规格 2026-11-02 US-21）：模型没调 browser_close 也要发 DELETE，
             # 否则 sidecar 会在 mem_limit 1g 里攒僵尸 context。放在状态帧之后、且内部全吞：
@@ -261,7 +265,8 @@ class AgentRunner:
             rows = (await s.execute(text(
                 "SELECT id, seq, role, COALESCE(context_content, content) AS content, "
                 "tool_call_id, tool_name, tool_args, tool_result "
-                "FROM message WHERE session_id=:i ORDER BY seq DESC LIMIT :win"),
+                "FROM message WHERE session_id=:i AND parent_tool_call_id IS NULL "
+                "ORDER BY seq DESC LIMIT :win"),
                 {"i": session_id, "win": window})).mappings().all()
         rows = list(reversed(rows))
         # 附件只回放最近两条带图用户消息：内联原图对 token/带宽都太重，更早的退化为
@@ -498,8 +503,9 @@ class AgentRunner:
             # 数据库指引与工具同生同灭（多应用 fail closed 时两者都不注入）。块顺序固定：
             # <app_diagnostics> → <app_checks> → <database> → <preview> → <browser> → <browser_session>；
             # system 尾部锚定 </browser_session>（见 test_agent_loop 的提示词顺序断言）。
-            preview_prompt = (build_diag_prompt() + build_check_prompt() + build_db_prompt()
-                              + (preview_prompt or "")
+            # 前四块由 prompts.build_app_prompt_blocks 产出（子 run 复用同一份），
+            # 浏览器两块只属主 run。
+            preview_prompt = (build_app_prompt_blocks(preview_prompt)
                               + build_browser_prompt() + build_browser_session_prompt())
         # 交互工具的挂载条件与 preview_page 完全一致（规格 §5.1）：只在解析出唯一应用时挂载，
         # 非应用工作区连「调了才发现不能用」的假工具都不给。
@@ -638,7 +644,8 @@ class AgentRunner:
                     # 只等它返回再采样 cancel 会让 hub.running 长时间不清（侧栏一直转圈、
                     # 重连补发的 status(running) 又把任务立回来）
                     dispatch = asyncio.ensure_future(
-                        self._dispatch(ctx, cfg, session_id, name, exec_args, cancel))
+                        self._dispatch(ctx, cfg, session_id, name, exec_args, cancel,
+                                       call_id=exec_tc.get("id")))
                     result = await _wait_or_cancel(dispatch, cancel)
                     if result is _CANCEL:
                         # 这条调用已下发过 tool_call 事件：补一条 cancelled 结果并落库，
@@ -753,7 +760,7 @@ class AgentRunner:
             return {"cancelled": True, "confirm": "cancelled"}
         return {"ok": False, "error": message, "confirm": "denied"}
 
-    async def _dispatch(self, ctx, cfg, session_id, name, args, cancel):
+    async def _dispatch(self, ctx, cfg, session_id, name, args, cancel, call_id=None):
         if name == "ask_user":
             timeout = cfg.get("agent.ask_timeout_seconds", 0)
             try:
@@ -790,6 +797,12 @@ class AgentRunner:
             if isinstance(assumptions, list) and assumptions:
                 result["assumptions"] = [str(a) for a in assumptions][:20]
             return result
+        if name == "delegate":
+            # 子 run 委派（ADR-0052）：与 ask_user 同列由循环特殊处理——执行器需要 runner 侧的
+            # 技能/记忆/应用上下文装配，走不了 execute_tool 的 handler 分派。惰性 import：
+            # subrun 模块顶层反向依赖本模块的取消/竞速工具，顶层互相 import 会成环。
+            from app.agent import subrun as _subrun
+            return await _subrun.run_batch(self, ctx, cfg, args, call_id=call_id)
         # 确认策略读注册表：加一个需要确认的工具不必再回来改这里的 if 链。
         spec = _registry.spec_of(name)
         confirm_policy = spec.confirm if spec is not None else _registry.CONFIRM_NONE

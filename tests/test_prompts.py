@@ -168,3 +168,16 @@ def test_clarify_prompt_orders_plan_before_implementation():
     assert "<clarify_mode>" in p
     assert p.index("先落计划再动代码") < p.index("允许在实现之后补")  # 先后本身要成立
     assert "共用第 8 步那一次征询" in p                              # 不为 ADR 再打断一轮
+
+
+def test_prompt_teaches_delegation():
+    """ADR-0052 / 规格 §2.6：基础规则里的「委派」小节——何时用、任务书三要素、
+    三条禁令（串行依赖/需确认/写盘）与「子 agent 看不到本会话聊天历史」这一硬事实。"""
+    p = build_system_prompt("/ws", "2026-09-17")
+    assert "delegate" in p
+    assert "≥2 个互不依赖" in p
+    for kw in ("任务书", "目标", "范围", "验收"):
+        assert kw in p
+    assert "串行依赖" in p and "确认" in p and "写盘" in p
+    assert "看不到本会话聊天历史" in p
+    assert "合并回执" in p

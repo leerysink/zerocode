@@ -39,7 +39,8 @@ async def rows_after(sf, session_id: int, after_seq: int) -> list[dict]:
             "  SELECT message_id, count(*) AS cnt, string_agg(filename, ', ' ORDER BY id) AS names "
             "  FROM message_attachment WHERE message_id IS NOT NULL GROUP BY message_id"
             ") a ON a.message_id = m.id "
-            "WHERE m.session_id=:i AND m.seq > :a ORDER BY m.seq"),
+            "WHERE m.session_id=:i AND m.seq > :a AND m.parent_tool_call_id IS NULL "
+            "ORDER BY m.seq"),
             {"i": session_id, "a": after_seq})).mappings().all()
     return [dict(r) for r in rows]
 

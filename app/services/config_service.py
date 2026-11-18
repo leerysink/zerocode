@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 # clarify.* 同理（ADR-0032）：澄清模式是「问不问我的活」，被拷问的人得能自己关掉。
 # 另立新前缀而不是把 agent.* 整体改成账户级——那条「普通用户改 agent.* 影响全平台」
 # 是既有裁定，本条不推翻它。
-USER_PREFIXES = ("llm.", "memory.", "clarify.")
+USER_PREFIXES = ("llm.", "memory.", "clarify.", "subrun.")
 
 
 def _is_user_key(k: str) -> bool:

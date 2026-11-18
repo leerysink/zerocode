@@ -39,6 +39,8 @@ DB_POLICY = ResultPolicy(max_chars=32_000, max_items=500, max_str_chars=8_000)
 BROWSER_POLICY = ResultPolicy(max_chars=32_000, max_items=300, max_str_chars=8_000)
 # 自检输出只留尾部几 KB 的报错，够模型定位 file:line，不把整段构建日志塞回上下文。
 CHECK_POLICY = ResultPolicy(max_chars=16_000, max_items=200, max_str_chars=16_000)
+# 委派的合并回执最多 8 条子任务回执、每条正文 12k 字符：整批一次回来，不能把主上下文淹掉。
+DELEGATE_POLICY = ResultPolicy(max_chars=48_000, max_items=8, max_str_chars=12_000)
 
 
 @dataclass(frozen=True)
@@ -135,6 +137,21 @@ _MEMORY_WRITE = _fn(
      "title": {"type": "string", "description": "可选短标题（不超过 200 字），便于检索"},
      "id": {"type": "string", "description": "update/delete 必填：create 返回的字符串 id"}},
     ["op"])
+
+_DELEGATE = _fn(
+    "delegate",
+    ("把互不依赖的调研/检查/验证任务一次派给多个只读子 agent 并行执行，全部落定后返回合并回执。"
+     "每项任务给 title（≤40 字短名）与 brief（完整任务书：目标/范围/验收）。"
+     "子 agent 看不到本会话聊天历史，背景必须写进 brief；它们只读，不能写文件、"
+     "不能提问或请求确认。串行依赖、需要用户确认或写盘的活不要委派，自己按顺序做。"
+     "一次最多 5 条（账户可配），超限请拆成多批；失败会逐个计入回执，不影响其余任务。"),
+    {"tasks": {"type": "array", "items": {"type": "object", "properties": {
+        "title": {"type": "string", "description": "任务短名（不超过 40 字），显示在委派卡上"},
+        "brief": {"type": "string",
+                  "description": "完整任务书：目标、范围、验收口径；建议不超过 500 字"}},
+        "required": ["title", "brief"]},
+        "description": "要并行执行的子任务列表（1..N，默认上限 5）"}},
+    ["tasks"])
 
 _CLARIFY_DONE = _fn(
     "clarify_done",
@@ -261,6 +278,9 @@ SPECS: tuple[ToolSpec, ...] = (
              handler_ref=("app.agent.tools", "_handle_todo_write"), result_policy=SMALL_POLICY),
     ToolSpec("memory_write", _MEMORY_WRITE, "memory",
              handler_ref=("app.agent.tools", "_handle_memory_write"), result_policy=SMALL_POLICY),
+    # 子 run 委派（ADR-0052）：与 ask_user 同列，由会话循环特殊处理（要拿 runner 侧装配），
+    # 不走 execute_tool 的 handler 分派；合并回执由执行器显式套 apply_budget。
+    ToolSpec("delegate", _DELEGATE, "chat", result_policy=DELEGATE_POLICY),
     ToolSpec("clarify_done", _CLARIFY_DONE, "clarify", scope=SCOPE_CLARIFY),
     ToolSpec("preview_status", _PREVIEW_STATUS, "preview", scope=SCOPE_APP,
              handler_ref=("app.agent.preview_tools", "run_preview_tool"),
@@ -332,6 +352,22 @@ def build_tools(*, app: bool = False, clarify: bool = False) -> list[dict]:
     if clarify:
         active.append(SCOPE_CLARIFY)
     return [spec.schema for scope in active for spec in SPECS if spec.scope == scope]
+
+
+# 子 run 只读白名单（ADR-0052）：按 SPECS 既有顺序过滤挂载。禁：写盘五件、ask_user、
+# clarify_done、todo_write、memory_write、db_write、preview_restart/preview_logs、
+# browser_* 走查，以及 delegate 自身（禁递归——树深恒 1 由工具面保证，不靠提示词）。
+SUBRUN_TOOL_NAMES = ("list_dir", "read_file", "search", "preview_status",
+                     "db_query", "preview_page", "release_preflight", "db_schema")
+
+
+def build_subrun_tools(*, app: bool = False) -> list[dict]:
+    """子 run 的挂载清单：白名单 ∩ 与主 run 相同的 app 判据。
+
+    非应用工作区只剩 fs 三件套（应用级四项与主 run 同生同灭）；顺序沿用 SPECS。
+    """
+    return [spec.schema for spec in SPECS
+            if spec.name in SUBRUN_TOOL_NAMES and (spec.scope != SCOPE_APP or app)]
 
 
 def resolve_handler(spec: ToolSpec) -> Callable | None:

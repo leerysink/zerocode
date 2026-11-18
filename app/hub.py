@@ -18,6 +18,11 @@
   补发（同一张卡的恢复，不是重复提问、重复确认）——两张卡都画在消息流的调用行上，而**待答**
   的那次调用还没有 tool 行（工具行要等结果回来才落库），刷新后历史里没有可贴标记的行，
   只能靠补发让前端合成一条；不补则卡片消失、future 永久挂起，会话卡死。
+- subruns：正在执行的委派批次快照（Ticket 004）。子 run 事件全部经 emit_event 下发，
+  这里顺路记下当前批次的任务与每行状态；WS 连入时补发 subrun_snapshot，刷新中不丢委派卡
+  （回执行没回来，历史里没有 delegate 调用行可贴）。run 收口由 ws.run_task 的 finally 清除：
+  进程重启即丢，与挂起点/运行态同一语义。同一会话先后两次委派时，新的 delegate tool_call
+  重置快照——快照永远只描述当前那一次。
 """
 import asyncio
 
@@ -39,6 +44,8 @@ class ChatHub:
         # 后续每个 run 都不再强制澄清。与挂起点同样是内存态——进程重启后失效（该会话
         # 回到「未解除」状态），这是既有代价，不为它加一层持久化。
         self.clarify_waived: dict[int, bool] = {}
+        # 正在执行的委派快照（Ticket 004）：session_id → {"tasks": [{"title"}], "state": {index: {...}}}
+        self.subruns: dict[int, dict] = {}
         self.emits: dict[int, callable] = {}  # session_id → 下行发送器: async (session_id, event) -> None
         # 只读旁观者（Ticket 008）：session_id → {emit, ...}。绝不动 emits，
         # 所有者的槽不被夺走；断连只摘自己那一份。
@@ -126,12 +133,61 @@ class ChatHub:
         """
         return list(self.running)
 
+    def _track_subrun(self, session_id, event):
+        """从流经的下行事件里维护委派快照（Ticket 004）：子 run 事件不带连接态，
+        hub 是唯一同时看得到「delegate tool_call + 全部 subrun_*」的地方。"""
+        t = event.get("type")
+        if t == "tool_call" and event.get("name") == "delegate":
+            args = event.get("args") if isinstance(event.get("args"), dict) else {}
+            raw = args.get("tasks") if isinstance(args.get("tasks"), list) else []
+            self.subruns[session_id] = {
+                "tasks": [{"title": str(x.get("title") or "")} for x in raw
+                          if isinstance(x, dict)],
+                "state": {},
+            }
+            return
+        cur = self.subruns.get(session_id)
+        if cur is None:
+            return
+        idx = event.get("index")
+        if not isinstance(idx, int) or isinstance(idx, bool):
+            return
+        if t == "subrun_start":
+            cur["state"][idx] = {"title": event.get("title") or "", "status": "running"}
+        elif t == "subrun_done":
+            st = cur["state"].setdefault(idx, {"title": "", "status": "running"})
+            st["status"] = "completed" if event.get("status") == "completed" else "error"
+            if event.get("error") is not None:
+                st["error"] = event["error"]
+
+    def subrun_snapshot(self, session_id):
+        """当前在跑那次委派的快照载荷；没有在跑的委派时返回 None。
+
+        只带状态与标题——已落库的步骤由前端从历史子 run 行还原（行先于事件落库，
+        连入前抓到的历史一定覆盖到已发出的事件）。"""
+        cur = self.subruns.get(session_id)
+        if not cur:
+            return None
+        subs = []
+        for idx in sorted(cur["state"]):
+            st = cur["state"][idx]
+            item = {"index": idx, "title": st.get("title") or "",
+                    "status": st.get("status") or "running"}
+            if st.get("error") is not None:
+                item["error"] = st["error"]
+            subs.append(item)
+        return {"type": "subrun_snapshot", "tasks": list(cur["tasks"]), "subruns": subs}
+
+    def clear_subruns(self, session_id):
+        self.subruns.pop(session_id, None)
+
     async def emit_event(self, session_id, event):
         """向指定会话的当前连接下发事件；该会话无连接（槽为空）时静默丢弃。
 
         旁观连接（Ticket 008）与 owner 槽各收一份，同一事件同一形状；旁观者发得慢
         不影响别人的事实语义——发送器自己吞掉断连异常（见 ws.py）。
         """
+        self._track_subrun(session_id, event)
         emit = self.emits.get(session_id)
         if emit:
             await emit(session_id, event)
