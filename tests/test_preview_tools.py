@@ -121,7 +121,7 @@ async def test_base_tools_unchanged_by_preview_feature():
         "delete_file", "move_file", "revert_change",
         "ask_user", "todo_write", "memory_write",
         "web_fetch", "web_download", "web_open", "web_step", "web_close",
-        "delegate"]
+        "delegate", "run_python"]
 # ---------- ctx 替身：preview_tools 只读字段，不 import ToolContext ----------
 
 class Ctx:
@@ -1165,10 +1165,12 @@ async def test_preview_context_fields_default_safely_and_are_not_shared(tmp_path
 
 
 async def test_no_command_execution_tool_exists(tmp_path):
-    """红线（ADR-0046 改写后）：工具面无通用命令执行能力，只允许平台写死的 preset。
+    """红线（ADR-0046 → ADR-0056 改写后）：工具面无通用命令执行能力，只允许平台写死的 preset
+    与隔离 Python 沙箱。
 
-    原先按「名字黑名单」钉，现在语义升级为「preset 白名单」：任何 schema 都不得出现
-    command/cmd/argv/shell/script 参数，唯一的执行类工具 run_check 只能选写死的 preset。
+    语义是「白名单」：任何 schema 都不得出现 command/cmd/argv/shell/script 参数；两个执行类
+    工具各自锁死——run_check 只能选写死的 preset，run_python 是 sanctioned 沙箱、只收 code
+    （触达面由容器围栏锁死，不是通用 shell）。
     """
     from app.agent import registry
     from app.agent.llm import PREVIEW_TOOL_NAMES, TOOLS
@@ -1178,10 +1180,13 @@ async def test_no_command_execution_tool_exists(tmp_path):
                      "delete_file", "move_file", "revert_change",
                      "ask_user", "todo_write", "memory_write",
                      "web_fetch", "web_download", "web_open", "web_step", "web_close",
-                     "delegate",
+                     "delegate", "run_python",
                      "preview_status", "preview_logs", "preview_restart"}
     for spec in registry.SPECS:
         props = spec.schema["function"]["parameters"].get("properties", {})
+        if spec.name == "run_python":
+            assert set(props) == {"code"}, "run_python 是 sanctioned 沙箱，只收 code"
+            continue
         assert not (set(props) & {"command", "cmd", "argv", "shell", "script"}), spec.name
     check = registry.spec_of("run_check").schema["function"]["parameters"]
     assert set(check["properties"]) == {"preset"}

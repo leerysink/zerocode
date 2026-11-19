@@ -12,7 +12,7 @@ def test_tools_schema():
                      "delete_file", "move_file", "revert_change",
                      "ask_user", "todo_write", "memory_write",
                      "web_fetch", "web_download", "web_open", "web_step", "web_close",
-                     "delegate"}
+                     "delegate", "run_python"}
     w = next(t for t in TOOLS if t["function"]["name"] == "write_file")
     assert set(w["function"]["parameters"]["required"]) == {"path", "content"}
 

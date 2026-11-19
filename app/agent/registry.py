@@ -297,6 +297,13 @@ _WEB_STEP = _fn(
     ["action", "target"])
 _WEB_CLOSE = _fn("web_close", "关闭当前公网浏览器会话，返回本次走查的收口报告")
 
+_RUN_PYTHON = _fn(
+    "run_python",
+    "在隔离一次性容器里执行 Python 脚本（工作区只读、写只进 scratch、离线无网络、无库凭据）；"
+    "回退出码与输出，文本产物经 write_file 落盘。数据处理/计算/验证用，改完跑一次不反复跑",
+    {"code": {"type": "string", "description": "要执行的 Python 源码"}},
+    ["code"])
+
 
 SPECS: tuple[ToolSpec, ...] = (
     ToolSpec("list_dir", _LIST_DIR, "fs", handler_ref=("app.agent.tools", "_handle_list_dir"),
@@ -342,6 +349,11 @@ SPECS: tuple[ToolSpec, ...] = (
     # 子 run 委派（ADR-0052）：与 ask_user 同列，由会话循环特殊处理（要拿 runner 侧装配），
     # 不走 execute_tool 的 handler 分派；合并回执由执行器显式套 apply_budget。
     ToolSpec("delegate", _DELEGATE, "chat", result_policy=DELEGATE_POLICY),
+    # Python 沙箱（ADR-0056）：红线改写后的第二个执行载体。基础面恒挂载（不依赖应用身份）；
+    # 确认沿 write_file 档；不收录子 run 只读白名单（执行能力，非只读语义）。
+    ToolSpec("run_python", _RUN_PYTHON, "python", scope=SCOPE_ALWAYS, confirm=CONFIRM_WRITE,
+             handler_ref=("app.agent.python_tools", "run_python_tool"),
+             pass_confirmed=True, result_policy=CHECK_POLICY),
     ToolSpec("clarify_done", _CLARIFY_DONE, "clarify", scope=SCOPE_CLARIFY),
     ToolSpec("preview_status", _PREVIEW_STATUS, "preview", scope=SCOPE_APP,
              handler_ref=("app.agent.preview_tools", "run_preview_tool"),

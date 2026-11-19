@@ -23,6 +23,7 @@ const COPY = {
   write_file: { pending: '写入确认', ok: '确认写入', no: '拒绝', done: '已批准写入', acked: '已受理' },
   edit_file: { pending: '修改确认', ok: '确认写入', no: '拒绝', done: '已批准修改', acked: '已受理' },
   web_download: { pending: '下载确认', ok: '确认下载', no: '拒绝', done: '已批准下载', acked: '已受理' },
+  run_python: { pending: '执行确认', ok: '确认执行', no: '拒绝', done: '已批准执行', acked: '已受理' },
   db_write: { pending: '数据库写入确认', ok: '确认写入', no: '拒绝', done: '已批准写库', acked: '已受理' },
   preview_restart: { pending: '重启预览', ok: '确认重启', no: '取消', done: '已确认重启', acked: '已受理，正在重启' },
 }

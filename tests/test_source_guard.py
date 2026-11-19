@@ -8,6 +8,8 @@
 pytestmark，否则纯同步用例每个多刷一条 PytestWarning，同 test_nics.py /
 test_skills_generator.py）。
 """
+import ipaddress
+
 import httpx
 import pytest
 
@@ -43,6 +45,30 @@ def test_url_length_cap():
     with pytest.raises(guard.GuardError) as e:
         guard.validate_http_url("https://example.com/" + "a" * guard.MAX_URL_LEN)
     assert "字符上限" in str(e.value)
+
+
+def test_is_internal_ip_flags_private():
+    """私网地址判为内网——沙箱网络层出口过滤与 URL 闸共用这一份判定（ADR-0056）。"""
+    assert guard.is_internal_ip(ipaddress.ip_address("10.0.0.5")) is True
+
+
+@pytest.mark.parametrize("ip_str,expected", [
+    ("8.8.8.8", False),
+    ("1.1.1.1", False),
+    ("2001:4860:4860::8888", False),
+    ("127.0.0.1", True),
+    ("10.0.0.5", True),
+    ("192.168.1.1", True),
+    ("169.254.169.254", True),
+    ("224.0.0.1", True),
+    ("0.0.0.0", True),
+    ("240.0.0.1", True),
+    ("::1", True),
+    ("fe80::1", True),
+])
+def test_is_internal_ip_contract(ip_str, expected):
+    """谓词契约：公网放行，私网/回环/链路本地/组播/未指定/保留全拦（IPv4/IPv6 同口径）。"""
+    assert guard.is_internal_ip(ipaddress.ip_address(ip_str)) is expected
 
 
 # 终审 F1：`urlparse().hostname` 按定义不含 userinfo，所以 SSRF 判据对「URL 里内嵌的凭证」天生盲。
