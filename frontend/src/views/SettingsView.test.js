@@ -24,11 +24,11 @@ describe('设置页字段绑定', () => {
     expect([...new Set(bound)].filter((k) => !(k in form))).toEqual([])
   })
 
-  it('「确认策略」卡收着两个确认开关，且全页各只绑一次', () => {
-    const card = TEMPLATE.match(/<a-card title="确认策略"[\s\S]*?<\/a-card>/)?.[0] ?? ''
-    expect(card, '确认开关必须并在这同一张卡里').not.toBe('')
+  it('「确认策略」组收着两个确认开关，且全页各只绑一次', () => {
+    const group = TEMPLATE.match(/<h3 class="zc-group-title">确认策略<\/h3>[\s\S]*?<\/section>/)?.[0] ?? ''
+    expect(group, '确认开关必须并在同一组里').not.toBe('')
     for (const field of ['writeConfirm', 'previewConfirmRunning']) {
-      expect(card).toContain(`store.form.${field}`)
+      expect(group).toContain(`store.form.${field}`)
       // 同一字段绑两个 switch 会联动：改一个另一个跟着变，用户看不出自己动了什么
       expect(bound.filter((k) => k === field)).toHaveLength(1)
     }
@@ -39,6 +39,30 @@ describe('设置页字段绑定', () => {
       expect(TEMPLATE).toContain(tab)
     }
     expect(TEMPLATE).toContain('tab="运行参数"')
+  })
+})
+
+describe('设置页视觉纪律', () => {
+  const STYLE = TEMPLATE.match(/<style scoped>([\s\S]*?)<\/style>/)?.[1] ?? ''
+
+  it('样式块存在且消费几何 token：无裸 px 字号与圆角', () => {
+    expect(STYLE).not.toBe('')
+    expect(STYLE).not.toMatch(/font-size:\s*[0-9]/)
+    expect(STYLE).not.toMatch(/border-radius:\s*[0-9]/)
+  })
+
+  it('颜色全走语义变量：无裸色值', () => {
+    expect(STYLE).not.toMatch(/#[0-9a-fA-F]{3,8}\b/)
+    expect(STYLE).not.toMatch(/rgba?\(\s*[0-9]/)
+  })
+
+  it('保存条吸底，长页面随时可保存', () => {
+    expect(STYLE).toMatch(/\.zc-save-bar\s*\{[^}]*position:\s*sticky/)
+  })
+
+  it('设置行横排：左标签右控件', () => {
+    expect(TEMPLATE).toContain('class="zc-row"')
+    expect(STYLE).toMatch(/\.zc-row\s*\{[^}]*display:\s*flex/)
   })
 })
 

@@ -237,3 +237,33 @@ body.zc-folder-dragging * {
   cursor: grabbing !important;
   user-select: none !important;
 }
+
+/* 几何 token（ADR-0059 决策 8）：字阶 / 间距 / 圆角 / 阴影层级，与主题无关，浅深共用。
+   上面的深色块不得覆写本块任何变量——颜色只有一份真源在颜色 token 里，几何也只有这一份。
+   阴影刻意只给偏移与模糊、不带颜色：颜色由调用点接阴影 RGB 三元组，
+   否则阴影会随主题换值，破坏「几何浅深同值」这条不变式。
+   守卫见 frontend/tests/design-tokens.test.js。 */
+:root {
+  /* 字阶四档。收敛前的混用映射：10/11/12/12.5 → xs，13 → sm，14/15 → md，30 → lg */
+  --zc-font-xs: 12px;
+  --zc-font-sm: 13px;
+  --zc-font-md: 15px;
+  --zc-font-lg: 20px;
+
+  /* 间距：4 的倍数节奏。hair 是 1-3px 微间距的显式半档——
+     把 1px 图标间隙强行抬到 4px 会让密集卡片明显发胖，故留这一档并在此记明理由 */
+  --zc-space-hair: 2px;
+  --zc-space-1: 4px;
+  --zc-space-2: 8px;
+  --zc-space-3: 12px;
+  --zc-space-4: 16px;
+  --zc-space-5: 24px;
+
+  /* 圆角：外壳 8、内层 6。pill 是内容形态（胶囊标签）不是外壳圆角 */
+  --zc-radius-card: 8px;
+  --zc-radius-inner: 6px;
+  --zc-radius-pill: 999px;
+
+  /* 阴影层级：只一层 */
+  --zc-shadow-1: 0 1px 2px;
+}

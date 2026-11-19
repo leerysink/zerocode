@@ -57,6 +57,12 @@ const routes = [
     name: 'store',
     component: () => import('../views/StoreView.vue'),
   },
+  {
+    // 商店管理（创始人）：上架生命周期/审批队列/分类总览；门禁在视图与后端双层
+    path: '/store-admin',
+    name: 'store-admin',
+    component: () => import('../views/StoreAdminView.vue'),
+  },
 ]
 
 const router = createRouter({

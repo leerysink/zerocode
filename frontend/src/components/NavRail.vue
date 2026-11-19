@@ -2,13 +2,19 @@
 export const NAV_RAIL_WIDTH = 64
 </script>
 <script setup>
-import { AppstoreOutlined, SettingOutlined, ShopOutlined, ThunderboltOutlined } from '@ant-design/icons-vue'
+import { computed } from 'vue'
+import { AppstoreOutlined, AuditOutlined, SettingOutlined, ShopOutlined, ThunderboltOutlined } from '@ant-design/icons-vue'
+import { useAuthStore } from '../stores/auth'
+
+const auth = useAuthStore()
+const isFounder = computed(() => !!auth.user?.is_founder)
 </script>
 
 <template>
   <nav class="zc-rail" aria-label="主导航">
     <router-link to="/apps"><appstore-outlined />应用</router-link>
     <router-link to="/store"><shop-outlined />商店</router-link>
+    <router-link v-if="isFounder" to="/store-admin"><audit-outlined />管理</router-link>
     <router-link to="/settings"><setting-outlined />设置</router-link>
     <router-link to="/skills"><thunderbolt-outlined />技能</router-link>
   </nav>

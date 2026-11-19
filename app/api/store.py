@@ -107,6 +107,54 @@ async def list_releases(request: Request, actor: dict = Actor,
     return out
 
 
+@router.get("/admin/releases")
+async def admin_releases(request: Request, actor: dict = Actor, status: str = ""):
+    """商店管理列表（仅创始人）：含 withdrawn 的全量版本行，管理页按 status 切 tab。
+
+    与发现页「每 slug 只露最新 published」刻意不同：管理要看每一行的状态，
+    故全量行按 id 倒序；预览地址优先 prod 在服，回落 dev 在服。
+    """
+    if not actor.get("is_founder"):
+        raise _http(DeployError("商店管理仅创始人可见", status=403))
+    if status not in ("", "published", "withdrawn"):
+        raise _http(DeployError("status 只支持 published|withdrawn", status=400))
+    sf = request.app.state.session_factory
+    where = ""
+    params: dict = {}
+    if status:
+        where = "WHERE r.status = :st"
+        params["st"] = status
+    async with sf() as s:
+        rows = (await s.execute(text(
+            "SELECT r.id, r.app_id, r.slug, r.version, r.title, r.summary, r.stack, r.category, "
+            "r.status, r.screenshots, r.created_at, a.nickname AS publisher, "
+            "src.status_dev AS src_status_dev, src.dev_port AS src_dev_port, "
+            "src.status_prod AS src_status_prod, src.prod_port AS src_prod_port, "
+            "(SELECT count(*) FROM release_application q WHERE q.release_id = r.id "
+            " AND q.status = 'approved') AS install_count "
+            "FROM app_release r "
+            "LEFT JOIN actor a ON a.id = r.created_by "
+            "LEFT JOIN app_project src ON src.id = r.app_id "
+            f"{where} ORDER BY r.id DESC"), params)).mappings().all()
+    from app.deploy import nics
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["created_at"] = d["created_at"].isoformat() if d.get("created_at") else None
+        d["install_count"] = int(d["install_count"])
+        d["screenshots"] = shots.shot_urls(d["id"], d["screenshots"])
+        st_dev, dev_port = d.pop("src_status_dev"), d.pop("src_dev_port")
+        st_prod, prod_port = d.pop("src_status_prod"), d.pop("src_prod_port")
+        if st_prod == "running" and prod_port:
+            d["preview_url"] = nics.app_url({"slug": d["slug"], "prod_port": prod_port})
+        elif st_dev == "running" and dev_port:
+            d["preview_url"] = preview_url(dev_port)
+        else:
+            d["preview_url"] = ""
+        out.append(d)
+    return out
+
+
 @router.post("/releases/{release_id}/screenshots", status_code=201)
 async def add_screenshot(request: Request, release_id: int,
                          file: UploadFile = File(...), actor: dict = Actor):
@@ -224,9 +272,29 @@ async def withdraw(request: Request, release_id: int, actor: dict = Actor):
             {"i": release_id})).mappings().first()
         if not row:
             raise _http(DeployError("版本不存在", status=404))
-        if row["created_by"] != actor["id"]:
-            raise _http(DeployError("只能下架自己发布的版本", status=403))
+        if row["created_by"] != actor["id"] and not actor.get("is_founder"):
+            raise _http(DeployError("只能下架自己发布的版本（创始人可代管）", status=403))
         await s.execute(text("UPDATE app_release SET status='withdrawn' WHERE id=:i"),
+                        {"i": release_id})
+        await s.commit()
+    return {"ok": True}
+
+
+@router.post("/releases/{release_id}/republish")
+async def republish(request: Request, release_id: int, actor: dict = Actor):
+    """重新上架：withdrawn → published。所有者管自己的版本，创始人商店管理可代管。"""
+    sf = request.app.state.session_factory
+    async with sf() as s:
+        row = (await s.execute(text(
+            "SELECT r.id, r.created_by, r.status FROM app_release r WHERE r.id = :i"),
+            {"i": release_id})).mappings().first()
+        if not row:
+            raise _http(DeployError("版本不存在", status=404))
+        if row["created_by"] != actor["id"] and not actor.get("is_founder"):
+            raise _http(DeployError("只能重新上架自己发布的版本（创始人可代管）", status=403))
+        if row["status"] != "withdrawn":
+            raise _http(DeployError("只有已下架的版本能重新上架", status=409))
+        await s.execute(text("UPDATE app_release SET status='published' WHERE id=:i"),
                         {"i": release_id})
         await s.commit()
     return {"ok": True}

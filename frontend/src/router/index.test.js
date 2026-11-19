@@ -50,4 +50,10 @@ describe('router', () => {
     // 嵌在 /settings 下时窄栏「设置」会跟着一起高亮：router-link-active 是父路径包含匹配
     expect(hit.path).toBe('/skills')
   })
+
+  it('注册了商店管理整页路由（创始人门禁在视图与后端）', () => {
+    const hit = router.options.routes.find((r) => r.name === 'store-admin')
+    expect(hit).toBeTruthy()
+    expect(hit.path).toBe('/store-admin')
+  })
 })

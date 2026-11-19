@@ -156,7 +156,9 @@ export const systemNics = () => http.get('/system/nics')
 // ---- 应用商店 M3-a（上架 / 申请审批）----
 // Ticket 008 身份合流：identify/storeMe 已退役，身份一律走 /api/auth/me（authMe）。
 export const storeReleases = (params) => http.get('/store/releases', { params })
+export const storeAdminReleases = (params) => http.get('/store/admin/releases', { params })
 export const storeWithdraw = (id) => http.post(`/store/releases/${id}/withdraw`)
+export const storeRepublish = (id) => http.post(`/store/releases/${id}/republish`)
 export const storeApplications = (box = 'mine') => http.get('/store/applications', { params: { box } })
 export const storeMyReleases = () => http.get('/store/applications', { params: { box: 'review' } })
 export const storeApply = (releaseId, wantName) =>

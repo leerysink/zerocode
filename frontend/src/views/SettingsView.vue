@@ -188,8 +188,11 @@ async function save() {
 
     <a-tabs v-model:activeKey="activeTab" class="zc-tabs">
       <a-tab-pane key="models" tab="模型库">
-        <a-button type="primary" class="zc-model-add" @click="openCreate">新增模型</a-button>
+        <div class="zc-toolbar">
+          <a-button type="primary" @click="openCreate">新增模型</a-button>
+        </div>
         <a-table
+          class="zc-models"
           :data-source="models"
           :loading="modelsLoading"
           :columns="modelColumns"
@@ -251,86 +254,150 @@ async function save() {
       </a-tab-pane>
 
       <a-tab-pane key="base" tab="基础配置">
-        <a-card title="模型接入" class="zc-card">
-          <a-form layout="vertical">
-            <a-form-item label="Base URL">
+        <section class="zc-group">
+          <h3 class="zc-group-title">模型接入</h3>
+          <div class="zc-row">
+            <div class="zc-row-label">
+              <span class="zc-row-name">Base URL</span>
+            </div>
+            <div class="zc-row-control">
               <a-input v-model:value="store.form.baseUrl" placeholder="https://api.deepseek.com/v1" />
-            </a-form-item>
-            <a-form-item label="模型">
+            </div>
+          </div>
+          <div class="zc-row">
+            <div class="zc-row-label">
+              <span class="zc-row-name">模型</span>
+            </div>
+            <div class="zc-row-control">
               <a-input v-model:value="store.form.model" placeholder="deepseek-chat" />
-            </a-form-item>
-            <a-form-item label="API Key" extra="保存后以掩码 sk-*** 显示；重新输入即覆盖">
+            </div>
+          </div>
+          <div class="zc-row">
+            <div class="zc-row-label">
+              <span class="zc-row-name">API Key</span>
+              <span class="zc-row-desc">保存后以掩码 sk-*** 显示；重新输入即覆盖</span>
+            </div>
+            <div class="zc-row-control">
               <a-input-password v-model:value="store.form.apiKey" placeholder="sk-***" />
-            </a-form-item>
-            <a-form-item
-              label="支持图片输入"
-              extra="仅在未配置默认对话模型时生效；有默认模型时以模型库设置为准"
-            >
+            </div>
+          </div>
+          <div class="zc-row">
+            <div class="zc-row-label">
+              <span class="zc-row-name">支持图片输入</span>
+              <span class="zc-row-desc">仅在未配置默认对话模型时生效；有默认模型时以模型库设置为准</span>
+            </div>
+            <div class="zc-row-control">
               <a-switch v-model:checked="store.form.supportsVision" />
-            </a-form-item>
+            </div>
+          </div>
+          <div class="zc-group-actions">
             <a-button type="primary" :loading="testing" @click="runTest">测试连接</a-button>
-          </a-form>
-        </a-card>
+          </div>
+        </section>
 
-        <a-card title="确认策略" class="zc-card">
-          <a-form layout="vertical">
-            <a-form-item
-              label="写入前确认"
-              extra="AI 落盘前先给你看改动再动手，覆盖 write/edit/delete/move/revert 五个工具。数据库写入不可回滚，恒确认，不受这一项影响。"
-            >
+        <section class="zc-group">
+          <h3 class="zc-group-title">确认策略</h3>
+          <div class="zc-row">
+            <div class="zc-row-label">
+              <span class="zc-row-name">写入前确认</span>
+              <span class="zc-row-desc">AI 落盘前先给你看改动再动手，覆盖 write/edit/delete/move/revert 五个工具。数据库写入不可回滚，恒确认，不受这一项影响。</span>
+            </div>
+            <div class="zc-row-control">
               <a-switch v-model:checked="store.form.writeConfirm" />
-            </a-form-item>
-            <a-form-item
-              label="重启预览需确认"
-              extra="只在预览正在运行时拦一道：重启会中断你正在用的调试。预览停着时模型直接启动、不问；关掉则运行中的也直接重启。这两项都是平台级配置，保存后对所有账号生效。"
-            >
+            </div>
+          </div>
+          <div class="zc-row">
+            <div class="zc-row-label">
+              <span class="zc-row-name">重启预览需确认</span>
+              <span class="zc-row-desc">只在预览正在运行时拦一道：重启会中断你正在用的调试。预览停着时模型直接启动、不问；关掉则运行中的也直接重启。这两项都是平台级配置，保存后对所有账号生效。</span>
+            </div>
+            <div class="zc-row-control">
               <a-switch v-model:checked="store.form.previewConfirmRunning" />
-            </a-form-item>
-          </a-form>
-        </a-card>
+            </div>
+          </div>
+        </section>
 
-        <a-card title="执行参数" class="zc-card">
-          <a-form layout="vertical">
-            <a-form-item
-              label="需求澄清模式"
-              extra="开启后 AI 改文件前会先跟你对齐需求（先给解读、再逐题确认）；这一项按账户生效，关掉只影响你自己"
-            >
+        <section class="zc-group">
+          <h3 class="zc-group-title">执行参数</h3>
+          <div class="zc-row">
+            <div class="zc-row-label">
+              <span class="zc-row-name">需求澄清模式</span>
+              <span class="zc-row-desc">开启后 AI 改文件前会先跟你对齐需求（先给解读、再逐题确认）；这一项按账户生效，关掉只影响你自己</span>
+            </div>
+            <div class="zc-row-control">
               <a-switch v-model:checked="store.form.clarifyEnabled" />
-            </a-form-item>
-            <a-form-item
-              label="提问提醒题数"
-              extra="本轮问满 N 题时提醒模型停止追问（软提醒，不禁止提问）；0=不提醒"
-            >
+            </div>
+          </div>
+          <div class="zc-row">
+            <div class="zc-row-label">
+              <span class="zc-row-name">提问提醒题数</span>
+              <span class="zc-row-desc">本轮问满 N 题时提醒模型停止追问（软提醒，不禁止提问）；0=不提醒</span>
+            </div>
+            <div class="zc-row-control">
               <a-input-number v-model:value="store.form.askRemindAt" :min="0" style="width: 180px" />
-            </a-form-item>
-            <a-form-item label="提问等待超时（秒）" extra="0=不限制">
+            </div>
+          </div>
+          <div class="zc-row">
+            <div class="zc-row-label">
+              <span class="zc-row-name">提问等待超时（秒）</span>
+              <span class="zc-row-desc">0=不限制</span>
+            </div>
+            <div class="zc-row-control">
               <a-input-number v-model:value="store.form.askTimeoutSeconds" :min="0" style="width: 180px" />
-            </a-form-item>
-            <a-form-item label="最大工具轮数" extra="0=不限制">
+            </div>
+          </div>
+          <div class="zc-row">
+            <div class="zc-row-label">
+              <span class="zc-row-name">最大工具轮数</span>
+              <span class="zc-row-desc">0=不限制</span>
+            </div>
+            <div class="zc-row-control">
               <a-input-number v-model:value="store.form.maxToolRounds" :min="0" style="width: 180px" />
-            </a-form-item>
-            <a-form-item label="预览重启次数上限" extra="单次任务内启动/重启预览的次数上限；0=不限制">
+            </div>
+          </div>
+          <div class="zc-row">
+            <div class="zc-row-label">
+              <span class="zc-row-name">预览重启次数上限</span>
+              <span class="zc-row-desc">单次任务内启动/重启预览的次数上限；0=不限制</span>
+            </div>
+            <div class="zc-row-control">
               <a-input-number v-model:value="store.form.previewMaxRestarts" :min="0" style="width: 180px" />
-            </a-form-item>
-            <a-form-item label="历史窗口（条数）">
+            </div>
+          </div>
+          <div class="zc-row">
+            <div class="zc-row-label">
+              <span class="zc-row-name">历史窗口（条数）</span>
+            </div>
+            <div class="zc-row-control">
               <a-input-number v-model:value="store.form.historyWindow" :min="0" style="width: 180px" />
-            </a-form-item>
-            <a-form-item
-              label="打开文件夹方式"
-              extra="默认在页面里弹出内置文件管理器（网页版目录）；自动判定=本机访问直开系统资源管理器、远端访问走网页；强制直开留给确定同机的场合"
-            >
+            </div>
+          </div>
+          <div class="zc-row">
+            <div class="zc-row-label">
+              <span class="zc-row-name">打开文件夹方式</span>
+              <span class="zc-row-desc">默认在页面里弹出内置文件管理器（网页版目录）；自动判定=本机访问直开系统资源管理器、远端访问走网页；强制直开留给确定同机的场合</span>
+            </div>
+            <div class="zc-row-control">
               <a-select v-model:value="store.form.openFolderMode" :options="openFolderModeOptions" style="width: 260px" />
-            </a-form-item>
-          </a-form>
-        </a-card>
+            </div>
+          </div>
+        </section>
 
-        <a-card title="环境状态" class="zc-card">
-          <a-spin v-if="!pg" />
-          <template v-else>
-            <a-tag :color="pg.ok ? 'green' : 'red'">{{ pg.ok ? 'PostgreSQL 正常' : 'PostgreSQL 异常' }}</a-tag>
-            <span class="zc-pg-version">{{ pg.ok ? pg.version : pg.error }}</span>
-          </template>
-        </a-card>
+        <section class="zc-group">
+          <h3 class="zc-group-title">环境状态</h3>
+          <div class="zc-row">
+            <div class="zc-row-label">
+              <span class="zc-row-name">PostgreSQL</span>
+            </div>
+            <div class="zc-row-control">
+              <a-spin v-if="!pg" />
+              <template v-else>
+                <a-tag :color="pg.ok ? 'green' : 'red'">{{ pg.ok ? '正常' : '异常' }}</a-tag>
+                <span class="zc-pg-version">{{ pg.ok ? pg.version : pg.error }}</span>
+              </template>
+            </div>
+          </div>
+        </section>
 
         <div class="zc-save-bar">
           <a-button type="primary" :loading="store.saving" @click="save">保存</a-button>
@@ -344,98 +411,218 @@ async function save() {
           show-icon
           message="除「记忆召回」与「子任务委派上限」按账户生效外，本页其余项都是平台级配置：保存后对所有账号的会话生效。数值框的上下限与后端夹取区间一致，超出的值后端会回落。"
         />
-        <a-card title="上下文压缩" class="zc-card">
-          <a-form layout="vertical">
-            <a-form-item label="自动压缩阈值（字符）" extra="水位之后的消息估算超过这个字符数就自动摘要，0=关闭自动压缩">
+        <section class="zc-group">
+          <h3 class="zc-group-title">上下文压缩</h3>
+          <div class="zc-row">
+            <div class="zc-row-label">
+              <span class="zc-row-name">自动压缩阈值（字符）</span>
+              <span class="zc-row-desc">水位之后的消息估算超过这个字符数就自动摘要，0=关闭自动压缩</span>
+            </div>
+            <div class="zc-row-control">
               <a-input-number v-model:value="store.form.autoCompactChars" :min="0" :step="1000" style="width: 180px" />
-            </a-form-item>
-            <a-form-item label="压缩最少新增消息数" extra="距上次压缩至少新增这么多条才允许再压，0=不设下限">
+            </div>
+          </div>
+          <div class="zc-row">
+            <div class="zc-row-label">
+              <span class="zc-row-name">压缩最少新增消息数</span>
+              <span class="zc-row-desc">距上次压缩至少新增这么多条才允许再压，0=不设下限</span>
+            </div>
+            <div class="zc-row-control">
               <a-input-number v-model:value="store.form.compactMinNew" :min="0" style="width: 180px" />
-            </a-form-item>
-            <a-form-item label="压缩保留原文条数" extra="最近 N 条消息不进摘要，保持原文">
+            </div>
+          </div>
+          <div class="zc-row">
+            <div class="zc-row-label">
+              <span class="zc-row-name">压缩保留原文条数</span>
+              <span class="zc-row-desc">最近 N 条消息不进摘要，保持原文</span>
+            </div>
+            <div class="zc-row-control">
               <a-input-number v-model:value="store.form.compactKeepRecent" :min="1" style="width: 180px" />
-            </a-form-item>
-          </a-form>
-        </a-card>
+            </div>
+          </div>
+        </section>
 
-        <a-card title="执行与预览" class="zc-card">
-          <a-form layout="vertical">
-            <a-form-item label="插话队列上限（条）" extra="执行中最多排几条插话，0=禁用插话">
+        <section class="zc-group">
+          <h3 class="zc-group-title">执行与预览</h3>
+          <div class="zc-row">
+            <div class="zc-row-label">
+              <span class="zc-row-name">插话队列上限（条）</span>
+              <span class="zc-row-desc">执行中最多排几条插话，0=禁用插话</span>
+            </div>
+            <div class="zc-row-control">
               <a-input-number v-model:value="store.form.steeringQueueMax" :min="0" style="width: 180px" />
-            </a-form-item>
-            <a-form-item label="预览启动等待（秒）" extra="preview_restart 单次最长等待，0..900">
+            </div>
+          </div>
+          <div class="zc-row">
+            <div class="zc-row-label">
+              <span class="zc-row-name">预览启动等待（秒）</span>
+              <span class="zc-row-desc">preview_restart 单次最长等待，0..900</span>
+            </div>
+            <div class="zc-row-control">
               <a-input-number v-model:value="store.form.previewWaitSeconds" :min="0" :max="900" style="width: 180px" />
-            </a-form-item>
-            <a-form-item label="预览日志行数" extra="返回给模型的最近日志行数，10..300">
+            </div>
+          </div>
+          <div class="zc-row">
+            <div class="zc-row-label">
+              <span class="zc-row-name">预览日志行数</span>
+              <span class="zc-row-desc">返回给模型的最近日志行数，10..300</span>
+            </div>
+            <div class="zc-row-control">
               <a-input-number v-model:value="store.form.previewLogLines" :min="10" :max="300" style="width: 180px" />
-            </a-form-item>
-            <a-form-item label="单批委派子任务上限（个）" extra="账户级、只影响自己；一次 delegate 最多并行几个只读子 agent，1..8">
+            </div>
+          </div>
+          <div class="zc-row">
+            <div class="zc-row-label">
+              <span class="zc-row-name">单批委派子任务上限（个）</span>
+              <span class="zc-row-desc">账户级、只影响自己；一次 delegate 最多并行几个只读子 agent，1..8</span>
+            </div>
+            <div class="zc-row-control">
               <a-input-number v-model:value="store.form.subrunMaxTasks" :min="1" :max="8" style="width: 180px" />
-            </a-form-item>
-            <a-form-item label="子任务轮数上限（轮）" extra="账户级、只影响自己；每个子 agent 最多跑几轮，0 表示不限制（有限值最大 50）">
+            </div>
+          </div>
+          <div class="zc-row">
+            <div class="zc-row-label">
+              <span class="zc-row-name">子任务轮数上限（轮）</span>
+              <span class="zc-row-desc">账户级、只影响自己；每个子 agent 最多跑几轮，0 表示不限制（有限值最大 50）</span>
+            </div>
+            <div class="zc-row-control">
               <a-input-number v-model:value="store.form.subrunMaxRounds" :min="0" :max="50" style="width: 180px" />
-            </a-form-item>
-          </a-form>
-        </a-card>
+            </div>
+          </div>
+        </section>
 
-        <a-card title="浏览器检查" class="zc-card">
-          <a-form layout="vertical">
-            <a-form-item label="只读检查次数上限（次/任务）" extra="0=不限，最大 100">
+        <section class="zc-group">
+          <h3 class="zc-group-title">浏览器检查</h3>
+          <div class="zc-row">
+            <div class="zc-row-label">
+              <span class="zc-row-name">只读检查次数上限（次/任务）</span>
+              <span class="zc-row-desc">0=不限，最大 100</span>
+            </div>
+            <div class="zc-row-control">
               <a-input-number v-model:value="store.form.browserMaxPerRun" :min="0" :max="100" style="width: 180px" />
-            </a-form-item>
-            <a-form-item label="交互步数上限（步/任务）" extra="0=不限，最大 200">
+            </div>
+          </div>
+          <div class="zc-row">
+            <div class="zc-row-label">
+              <span class="zc-row-name">交互步数上限（步/任务）</span>
+              <span class="zc-row-desc">0=不限，最大 200</span>
+            </div>
+            <div class="zc-row-control">
               <a-input-number v-model:value="store.form.browserMaxStepsPerRun" :min="0" :max="200" style="width: 180px" />
-            </a-form-item>
-            <a-form-item label="单步超时（秒）" extra="打开页面与检查的 HTTP 超时，10..120">
+            </div>
+          </div>
+          <div class="zc-row">
+            <div class="zc-row-label">
+              <span class="zc-row-name">单步超时（秒）</span>
+              <span class="zc-row-desc">打开页面与检查的 HTTP 超时，10..120</span>
+            </div>
+            <div class="zc-row-control">
               <a-input-number v-model:value="store.form.browserTimeoutSeconds" :min="10" :max="120" style="width: 180px" />
-            </a-form-item>
-            <a-form-item label="断言等待超时（毫秒）" extra="expect 轮询上限，500..8000">
+            </div>
+          </div>
+          <div class="zc-row">
+            <div class="zc-row-label">
+              <span class="zc-row-name">断言等待超时（毫秒）</span>
+              <span class="zc-row-desc">expect 轮询上限，500..8000</span>
+            </div>
+            <div class="zc-row-control">
               <a-input-number v-model:value="store.form.browserExpectTimeoutMs" :min="500" :max="8000" :step="100" style="width: 180px" />
-            </a-form-item>
-            <a-form-item label="页面静置等待（毫秒）" extra="导航后留给动画的时间，0..5000">
+            </div>
+          </div>
+          <div class="zc-row">
+            <div class="zc-row-label">
+              <span class="zc-row-name">页面静置等待（毫秒）</span>
+              <span class="zc-row-desc">导航后留给动画的时间，0..5000</span>
+            </div>
+            <div class="zc-row-control">
               <a-input-number v-model:value="store.form.browserSettleMs" :min="0" :max="5000" :step="100" style="width: 180px" />
-            </a-form-item>
-            <a-form-item label="交互元素清单条数" extra="喂给模型的可点元素清单长度，1..200，调大即调高每轮 token">
+            </div>
+          </div>
+          <div class="zc-row">
+            <div class="zc-row-label">
+              <span class="zc-row-name">交互元素清单条数</span>
+              <span class="zc-row-desc">喂给模型的可点元素清单长度，1..200，调大即调高每轮 token</span>
+            </div>
+            <div class="zc-row-control">
               <a-input-number v-model:value="store.form.browserInteractiveMax" :min="1" :max="200" style="width: 180px" />
-            </a-form-item>
-          </a-form>
-        </a-card>
+            </div>
+          </div>
+        </section>
 
-        <a-card title="联网工具" class="zc-card">
-          <a-form layout="vertical">
-            <a-form-item label="网页读取次数上限（次/任务）" extra="web_fetch 每次任务最多抓几个页面，0=不限，最大 200；公网走查的步数沿用上面的交互步数上限">
+        <section class="zc-group">
+          <h3 class="zc-group-title">联网工具</h3>
+          <div class="zc-row">
+            <div class="zc-row-label">
+              <span class="zc-row-name">网页读取次数上限（次/任务）</span>
+              <span class="zc-row-desc">web_fetch 每次任务最多抓几个页面，0=不限，最大 200；公网走查的步数沿用上面的交互步数上限</span>
+            </div>
+            <div class="zc-row-control">
               <a-input-number v-model:value="store.form.webMaxFetchesPerRun" :min="0" :max="200" style="width: 180px" />
-            </a-form-item>
-          </a-form>
-        </a-card>
+            </div>
+          </div>
+        </section>
 
-        <a-card title="应用数据库工具" class="zc-card">
-          <a-form layout="vertical">
-            <a-form-item label="查询结果行数上限" extra="返回给模型的行数，10..1000">
+        <section class="zc-group">
+          <h3 class="zc-group-title">应用数据库工具</h3>
+          <div class="zc-row">
+            <div class="zc-row-label">
+              <span class="zc-row-name">查询结果行数上限</span>
+              <span class="zc-row-desc">返回给模型的行数，10..1000</span>
+            </div>
+            <div class="zc-row-control">
               <a-input-number v-model:value="store.form.dbRowsLimit" :min="10" :max="1000" style="width: 180px" />
-            </a-form-item>
-            <a-form-item label="断言比对行数上限" extra="rows 断言两侧各比对的行数，1..1000">
+            </div>
+          </div>
+          <div class="zc-row">
+            <div class="zc-row-label">
+              <span class="zc-row-name">断言比对行数上限</span>
+              <span class="zc-row-desc">rows 断言两侧各比对的行数，1..1000</span>
+            </div>
+            <div class="zc-row-control">
               <a-input-number v-model:value="store.form.dbRowsAssertMax" :min="1" :max="1000" style="width: 180px" />
-            </a-form-item>
-          </a-form>
-        </a-card>
+            </div>
+          </div>
+        </section>
 
-        <a-card title="记忆召回" class="zc-card">
-          <a-form layout="vertical">
-            <a-form-item label="注入召回记忆" extra="关掉只是不再往提示词里塞记忆，AI 仍可写入记忆">
+        <section class="zc-group">
+          <h3 class="zc-group-title">记忆召回</h3>
+          <div class="zc-row">
+            <div class="zc-row-label">
+              <span class="zc-row-name">注入召回记忆</span>
+              <span class="zc-row-desc">关掉只是不再往提示词里塞记忆，AI 仍可写入记忆</span>
+            </div>
+            <div class="zc-row-control">
               <a-switch v-model:checked="store.form.memoryEnabled" />
-            </a-form-item>
-            <a-form-item label="召回条数" extra="每次最多带几条记忆，1..100">
+            </div>
+          </div>
+          <div class="zc-row">
+            <div class="zc-row-label">
+              <span class="zc-row-name">召回条数</span>
+              <span class="zc-row-desc">每次最多带几条记忆，1..100</span>
+            </div>
+            <div class="zc-row-control">
               <a-input-number v-model:value="store.form.memoryTopK" :min="1" :max="100" style="width: 180px" />
-            </a-form-item>
-            <a-form-item label="相似度阈值" extra="-1..1；-1 表示一条都不因阈值被滤掉">
+            </div>
+          </div>
+          <div class="zc-row">
+            <div class="zc-row-label">
+              <span class="zc-row-name">相似度阈值</span>
+              <span class="zc-row-desc">-1..1；-1 表示一条都不因阈值被滤掉</span>
+            </div>
+            <div class="zc-row-control">
               <a-input-number v-model:value="store.form.memoryMinSimilarity" :min="-1" :max="1" :step="0.05" style="width: 180px" />
-            </a-form-item>
-            <a-form-item label="记忆注入预算（token）" extra="1..20000；召回按分数排序逐条累计，触顶的整条丢弃">
+            </div>
+          </div>
+          <div class="zc-row">
+            <div class="zc-row-label">
+              <span class="zc-row-name">记忆注入预算（token）</span>
+              <span class="zc-row-desc">1..20000；召回按分数排序逐条累计，触顶的整条丢弃</span>
+            </div>
+            <div class="zc-row-control">
               <a-input-number v-model:value="store.form.memoryMaxTokens" :min="1" :max="20000" :step="100" style="width: 180px" />
-            </a-form-item>
-          </a-form>
-        </a-card>
+            </div>
+          </div>
+        </section>
 
         <div class="zc-save-bar">
           <a-button type="primary" :loading="store.saving" @click="save">保存</a-button>
@@ -452,44 +639,118 @@ async function save() {
   max-width: 720px;
   min-width: 320px;
   margin: 0 auto;
-  padding: 24px 0 40px;
+  padding: var(--zc-space-5) 0 var(--zc-space-4);
 }
 .zc-page-head {
   display: flex;
   align-items: center;
-  gap: 8px;
-  margin: 0 0 16px;
-}
-.zc-agent-note {
-  margin-bottom: 16px;
+  gap: var(--zc-space-2);
+  margin: 0 0 var(--zc-space-4);
 }
 .zc-back {
-  padding-inline: 6px;
+  padding-inline: var(--zc-space-1);
   color: var(--zc-text-sub);
 }
 .zc-back:hover {
   color: var(--zc-primary);
 }
 .zc-page-title {
-  font-size: 18px;
+  font-size: var(--zc-font-lg);
   font-weight: 600;
   color: var(--zc-text);
   margin: 0;
 }
-.zc-card {
-  margin-bottom: 16px;
-  border: 1px solid var(--zc-border);
-  border-radius: 6px;
+.zc-agent-note {
+  margin-bottom: var(--zc-space-4);
+}
+/* 分组：标题 + 细线替代卡片外壳，组间大留白 */
+.zc-group + .zc-group {
+  margin-top: var(--zc-space-5);
+}
+.zc-group-title {
+  font-size: var(--zc-font-md);
+  font-weight: 600;
+  color: var(--zc-text);
+  margin: 0;
+  padding-bottom: var(--zc-space-2);
+  border-bottom: 1px solid var(--zc-border);
+}
+/* 设置行：左标签 + 说明，右控件；组内行用浅分隔线 */
+.zc-row {
+  display: flex;
+  align-items: center;
+  gap: var(--zc-space-4);
+  padding: var(--zc-space-3) 0;
+}
+.zc-row + .zc-row {
+  border-top: 1px solid var(--zc-border-soft);
+}
+.zc-row-label {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--zc-space-hair);
+}
+.zc-row-name {
+  font-size: var(--zc-font-sm);
+  color: var(--zc-text);
+}
+.zc-row-desc {
+  font-size: var(--zc-font-xs);
+  color: var(--zc-text-sub);
+  line-height: 1.6;
+}
+.zc-row-control {
+  flex: 0 0 320px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--zc-space-2);
+}
+.zc-group-actions {
+  display: flex;
+  justify-content: flex-end;
+  padding-top: var(--zc-space-3);
 }
 .zc-pg-version {
-  font-size: 12px;
+  font-size: var(--zc-font-xs);
   color: var(--zc-text-sub);
-  margin-left: 8px;
 }
+/* 吸底保存条：长页面滚动时随时可保存 */
 .zc-save-bar {
-  text-align: right;
+  position: sticky;
+  bottom: 0;
+  display: flex;
+  justify-content: flex-end;
+  margin-top: var(--zc-space-4);
+  padding: var(--zc-space-3) 0;
+  background: var(--zc-bg-card);
+  border-top: 1px solid var(--zc-border);
 }
-.zc-model-add {
-  margin-bottom: 12px;
+.zc-toolbar {
+  margin-bottom: var(--zc-space-3);
+}
+/* 模型库表格：表头弱化、字号收进字阶 */
+.zc-models :deep(.ant-table) {
+  font-size: var(--zc-font-sm);
+}
+.zc-models :deep(.ant-table-thead > tr > th) {
+  background: var(--zc-bg-card-soft);
+  color: var(--zc-text-sub);
+  font-size: var(--zc-font-xs);
+  font-weight: 500;
+}
+/* 窄屏：设置行改竖排，控件占满 */
+@media (max-width: 640px) {
+  .zc-row {
+    flex-direction: column;
+    align-items: stretch;
+    gap: var(--zc-space-2);
+  }
+  .zc-row-control {
+    flex-basis: auto;
+    justify-content: flex-start;
+  }
 }
 </style>

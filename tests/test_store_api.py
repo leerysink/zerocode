@@ -258,3 +258,61 @@ async def test_已装实例打开地址走投影(client, monkeypatch):
     assert (await inst())["prod_url"] == f"https://instapp.{nics.GATEWAY_DOMAIN}"
     monkeypatch.setenv("ZEROCODE_SSL_ENABLE", "false")
     assert (await inst())["prod_url"] == f"http://{preview_base_host()}:18402"
+
+
+async def _insert_release(sf, *, slug, version, status, creator):
+    return (await sf_execute(sf,
+        "INSERT INTO app_release (app_id, slug, version, title, stack, anchor, "
+        "fingerprint, status, created_by) VALUES (0, :sl, :v, '管理页', "
+        "'vue3-fastapi', '[]'::jsonb, :f, :st, :a) RETURNING id",
+        {"sl": slug, "v": version, "f": f"fp-{slug}-{version}", "st": status, "a": creator}))
+
+
+async def sf_execute(sf, sql, params):
+    async with sf() as s:
+        r = (await s.execute(text(sql), params)).scalar()
+        await s.commit()
+    return r
+
+
+async def test_admin_releases_仅创始人且含下架全量行(two_auth_clients):
+    """管理列表与发现页刻意不同：全量行含 withdrawn；非创始人 403；status 过滤、非法 400。"""
+    alice, bob = two_auth_clients
+    sf = alice.app.state.session_factory
+    async with sf() as s:
+        bob_id = (await s.execute(text("SELECT id FROM actor WHERE nickname = 'bob'"))).scalar()
+    await _insert_release(sf, slug="adm", version="b1", status="published", creator=bob_id)
+    await _insert_release(sf, slug="adm", version="b0", status="withdrawn", creator=bob_id)
+    assert (await bob.get("/api/store/admin/releases")).status_code == 403
+    rows = (await alice.get("/api/store/admin/releases")).json()
+    assert [r["version"] for r in rows] == ["b1", "b0"]
+    assert [r["status"] for r in rows] == ["published", "withdrawn"]
+    assert rows[0]["install_count"] == 0 and rows[0]["preview_url"] == ""
+    assert rows[0]["publisher"] == "bob"
+    only = (await alice.get("/api/store/admin/releases?status=withdrawn")).json()
+    assert [r["version"] for r in only] == ["b0"]
+    assert (await alice.get("/api/store/admin/releases?status=bogus")).status_code == 400
+
+
+async def test_下架重新上架所有者与创始人代管(two_auth_clients):
+    """withdraw/republish：所有者管自己、创始人代管、旁人 403；published 重上架 409；不存在 404。"""
+    alice, bob = two_auth_clients
+    sf = alice.app.state.session_factory
+    async with sf() as s:
+        ids = dict((await s.execute(text(
+            "SELECT nickname, id FROM actor"))).all())
+    rid = await _insert_release(sf, slug="own", version="b1", status="published", creator=ids["bob"])
+    rid_a = await _insert_release(sf, slug="ali", version="b1", status="withdrawn", creator=ids["alice"])
+    # 所有者下架自己的 → 重新上架 → 再上架 409
+    assert (await bob.post(f"/api/store/releases/{rid}/withdraw")).status_code == 200
+    assert (await bob.post(f"/api/store/releases/{rid}/republish")).status_code == 200
+    assert (await bob.post(f"/api/store/releases/{rid}/republish")).status_code == 409
+    # 创始人代管 bob 的版本
+    assert (await alice.post(f"/api/store/releases/{rid}/withdraw")).status_code == 200
+    assert (await alice.post(f"/api/store/releases/{rid}/republish")).status_code == 200
+    # 旁人碰创始人的版本：403（权限先于状态判定）
+    assert (await bob.post(f"/api/store/releases/{rid_a}/withdraw")).status_code == 403
+    assert (await bob.post(f"/api/store/releases/{rid_a}/republish")).status_code == 403
+    # 创始人重新上架自己的 withdrawn
+    assert (await alice.post(f"/api/store/releases/{rid_a}/republish")).status_code == 200
+    assert (await bob.post("/api/store/releases/999999/republish")).status_code == 404
