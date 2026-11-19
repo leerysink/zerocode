@@ -11,9 +11,9 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { message } from 'ant-design-vue'
 import {
-  AppstoreOutlined, CheckCircleFilled, ClockCircleOutlined, CloseCircleFilled,
+  CheckCircleFilled, ClockCircleOutlined, CloseCircleFilled,
   DeleteOutlined, EllipsisOutlined, FolderOutlined, LoadingOutlined, PlusOutlined,
-  RightOutlined, SettingOutlined, ShopOutlined,
+  RightOutlined,
 } from '@ant-design/icons-vue'
 import {
   createSession, deleteApp, deleteSession, listApps, listSessions, listSharedApps,
@@ -313,13 +313,6 @@ async function doDelete() {
         </div>
       </template>
     </div>
-    <div class="zc-footer">
-      <div class="zc-footer-row">
-        <router-link to="/apps"><appstore-outlined /> 应用</router-link>
-        <router-link to="/store"><shop-outlined /> 商店</router-link>
-        <router-link to="/settings"><setting-outlined /> 设置</router-link>
-      </div>
-    </div>
     <NewSessionModal v-model:open="showNew" :apps="apps" @created="loadAll" />
 
     <a-modal v-model:open="rename.open" title="重命名应用" ok-text="保存" destroy-on-close
@@ -566,23 +559,6 @@ async function doDelete() {
   color: var(--zc-text-sub);
   background: var(--zc-bg);
   border-radius: 9px;
-}
-.zc-footer {
-  border-top: 1px solid var(--zc-border);
-  padding-top: 10px;
-}
-.zc-footer-row {
-  display: flex;
-  justify-content: space-between;
-}
-.zc-footer a {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  color: var(--zc-text-sub);
-}
-.zc-footer a:hover {
-  color: var(--zc-primary);
 }
 .zc-modal-tip {
   margin: 8px 0 0;

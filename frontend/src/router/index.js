@@ -20,7 +20,7 @@ const routes = [
     component: () => import('../views/SettingsView.vue'),
   },
   {
-    path: '/settings/skills',
+    path: '/skills',
     name: 'skills',
     component: () => import('../views/SkillsView.vue'),
   },

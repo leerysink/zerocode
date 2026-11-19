@@ -38,6 +38,8 @@ export function useChatSidePanels(options = {}) {
   const storage = options.storage ?? browserStorage()
   const getViewportWidth = options.getViewportWidth ?? (() => window.innerWidth)
   const centerMinWidth = options.centerMinWidth ?? CENTER_MIN_WIDTH
+  // 左缘常驻窄栏等固定占位：不随收起消失，中栏保底要把它扣掉
+  const fixedLeft = options.fixedLeft ?? 0
 
   const saved = readSaved(storage)
   const leftWidth = ref(savedWidth(saved.leftWidth, LEFT_PANEL))
@@ -69,7 +71,7 @@ export function useChatSidePanels(options = {}) {
   }
 
   function roomFor(side) {
-    return getViewportWidth() - occupiedOther(side) - centerMinWidth
+    return getViewportWidth() - fixedLeft - occupiedOther(side) - centerMinWidth
   }
 
   // 拖拽上限 = 固定上限与「中栏至少 centerMinWidth」取小；已超限的当前宽不被强行压回

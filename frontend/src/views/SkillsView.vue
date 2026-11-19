@@ -2,7 +2,7 @@
 // 技能管理页（Ticket 001~003 / ADR-0004）：直链 + GitHub 仓库安装 + AI 生成 + 列表 + 启用开关 + 删除。
 // GitHub monorepo 多命中时后端返回 candidates，这里展示可选清单、带 subpath 二次提交。
 // AI 生成是两段式：generate 出草稿（可编辑）→ adopt 落盘落库；人在环，不静默安装。
-// 回退优先浏览器历史、兜底回设置页。
+// 回退优先浏览器历史、兜底回首页（技能是窄栏一级页）。
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { message, Modal } from 'ant-design-vue'
@@ -13,7 +13,7 @@ import { skillSourceLabel } from '../utils/skillSource'
 const router = useRouter()
 function goBack() {
   if (window.history.state?.back) router.back()
-  else router.push('/settings')
+  else router.push('/')
 }
 
 const skills = ref([])

@@ -41,3 +41,10 @@ describe('设置页字段绑定', () => {
     expect(TEMPLATE).toContain('tab="运行参数"')
   })
 })
+
+describe('设置页入口', () => {
+  it('技能已升为首页窄栏一级入口，设置页不再留跳转链接', () => {
+    expect(TEMPLATE).not.toContain('技能管理')
+    expect(TEMPLATE).not.toContain('/settings/skills')
+  })
+})

@@ -13,6 +13,7 @@ import { message } from 'ant-design-vue'
 import { useChatStore } from '../stores/chat'
 import { useChatSidePanels } from '../composables/useChatSidePanels'
 import SideBar from '../components/SideBar.vue'
+import NavRail, { NAV_RAIL_WIDTH } from '../components/NavRail.vue'
 import ChatMessages from '../components/ChatMessages.vue'
 import ChatInput from '../components/ChatInput.vue'
 import TodoBar from '../components/TodoBar.vue'
@@ -23,7 +24,7 @@ const store = useChatStore()
 const {
   leftWidth, rightWidth, leftCollapsed, rightCollapsed, dragging,
   startDrag, resetWidth, toggleLeft, toggleRight,
-} = useChatSidePanels()
+} = useChatSidePanels({ fixedLeft: NAV_RAIL_WIDTH })
 onMounted(() => store.loadWorkspaces())
 
 // 角色以 GET /workspaces 带回的 role 为准：刷新页面/直接开链接也判得出只读，不靠「从哪点进来」
@@ -39,16 +40,20 @@ watch(() => store.shareRevoked, (v) => {
 
 <template>
   <a-layout class="zc-layout" has-sider>
-    <SideBar :width="leftWidth" :collapsed="leftCollapsed" />
-    <SidePanelHandle
-      side="left"
-      :edge="leftWidth"
-      :collapsed="leftCollapsed"
-      :dragging="dragging === 'left'"
-      @dragstart="startDrag('left', $event)"
-      @reset="resetWidth('left')"
-      @toggle="toggleLeft"
-    />
+    <NavRail />
+    <!-- 窄栏独立于左栏收起；手柄以左栏容器为基准，坐标不含窄栏 -->
+    <div class="zc-left-wrap">
+      <SideBar :width="leftWidth" :collapsed="leftCollapsed" />
+      <SidePanelHandle
+        side="left"
+        :edge="leftWidth"
+        :collapsed="leftCollapsed"
+        :dragging="dragging === 'left'"
+        @dragstart="startDrag('left', $event)"
+        @reset="resetWidth('left')"
+        @toggle="toggleLeft"
+      />
+    </div>
     <a-layout class="zc-center">
       <ChatMessages
         :messages="store.messages"
@@ -89,6 +94,11 @@ watch(() => store.shareRevoked, (v) => {
   height: calc(100vh - 40px);
   /* 边缘手柄（收起钮/拖拽热区）以三栏容器为定位基准 */
   position: relative;
+}
+.zc-left-wrap {
+  position: relative;
+  display: flex;
+  flex: 0 0 auto;
 }
 .zc-center {
   min-width: 0;

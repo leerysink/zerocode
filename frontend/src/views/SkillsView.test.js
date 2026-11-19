@@ -286,3 +286,13 @@ describe('SkillsView AI 生成卡片', () => {
     expect(cells).toEqual(['AI 生成', 'GitHub', 'future-type'])
   })
 })
+
+describe('SkillsView 返回', () => {
+  it('直链进来无浏览器历史：兜底回首页（技能已是窄栏一级页，不再回设置）', async () => {
+    window.history.replaceState(null, '')
+    const wrapper = await mountView()
+    await wrapper.find('.zc-back').trigger('click')
+    expect(mocks.router.push).toHaveBeenCalledWith('/')
+    expect(mocks.router.back).not.toHaveBeenCalled()
+  })
+})

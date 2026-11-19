@@ -128,6 +128,30 @@ describe('拖拽调宽', () => {
     pointer('pointerup', 600)
   })
 
+  it('fixedLeft 占位：中栏保底把左缘窄栏宽度扣掉', () => {
+    viewport.width = 1104
+    const api = mountPanels({ storage: fakeStorage(), getViewportWidth: viewportWidth, fixedLeft: 64 })
+
+    api.startDrag('left', { button: 0, clientX: 300 })
+    pointer('pointermove', 600)
+    expect(api.leftWidth.value).toBe(260) // 1104 - 64 - 300 - 480
+    pointer('pointerup', 600)
+  })
+
+  it('fixedLeft 占位：左栏收起时右栏上限同样扣窄栏', () => {
+    viewport.width = 1100
+    const api = mountPanels({
+      storage: fakeStorage(stored({ leftCollapsed: true })),
+      getViewportWidth: viewportWidth,
+      fixedLeft: 64,
+    })
+
+    api.startDrag('right', { button: 0, clientX: 900 })
+    pointer('pointermove', 300)
+    expect(api.rightWidth.value).toBe(556) // 1100 - 64 - 480，低于 560 固定上限
+    pointer('pointerup', 300)
+  })
+
   it('已收起的侧栏不占位：左栏收起后右栏能拖到 560', () => {
     viewport.width = 1200
     const api = mountPanels({

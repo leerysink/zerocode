@@ -43,4 +43,11 @@ describe('router', () => {
     const hit = router.options.routes.find((r) => r.name === 'workspace-memory-detail')
     expect(hit.path.replace(':id', '933').replace(':memoryId', '12')).toBe(memoryDetailPath(933, 12))
   })
+
+  it('技能是一级页：路由挂在 /skills，不再嵌在设置下', () => {
+    const hit = router.options.routes.find((r) => r.name === 'skills')
+    expect(hit).toBeTruthy()
+    // 嵌在 /settings 下时窄栏「设置」会跟着一起高亮：router-link-active 是父路径包含匹配
+    expect(hit.path).toBe('/skills')
+  })
 })

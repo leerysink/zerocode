@@ -35,6 +35,14 @@ vi.mock('../components/SideBar.vue', async () => {
   }
 })
 
+vi.mock('../components/NavRail.vue', async () => {
+  const { h } = await import('vue')
+  return {
+    NAV_RAIL_WIDTH: 64,
+    default: { name: 'NavRail', render: () => h('nav', { class: 'stub-rail' }) },
+  }
+})
+
 vi.mock('../components/FilePanel.vue', async () => {
   const { h } = await import('vue')
   return {
@@ -113,6 +121,15 @@ describe('ChatView 侧栏手柄', () => {
     expect(wrapper.find('.zc-edge-right').exists()).toBe(false)
     expect(wrapper.find('.stub-file-panel').exists()).toBe(false)
     expect(wrapper.find('.stub-sidebar').attributes('data-width')).toBe('260')
+  })
+
+  it('窄栏常驻：排在左栏之前，左栏收起后仍在', async () => {
+    const { wrapper } = await mountView()
+
+    expect(wrapper.find('.stub-layout').element.children[0].classList.contains('stub-rail')).toBe(true)
+    await wrapper.find('.zc-edge-left .zc-edge-toggle').trigger('click')
+    expect(wrapper.find('.stub-sidebar').attributes('data-collapsed')).toBe('true')
+    expect(wrapper.find('.stub-rail').exists()).toBe(true)
   })
 
   it('点左钮：SideBar 收起、按钮变展开、拖拽热区消失并写入本地记忆', async () => {
