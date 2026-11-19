@@ -1029,3 +1029,38 @@ README-deploy 与 developer-guide；Agent 工具的参数级参考不在本卷�
 旧图逐张对照当前代码，仍准的才放回对应章节，过期的不收录（2026-11-19 裁定取代
 「不嵌截图」）。
 
+## 运营编辑（ops edit）
+
+创始人对**已上架版本条目**的描述性元数据修改，字段面固定为 `title` / `summary` / `category`
+（截图增删算同一类）。它**不是**一次发布：不新增 `app_release` 行、不动包与版本、不重跑发布前
+体检、不重走审批。与「作者改版」的分界正在此处——作者改版是新行新审批，可升级判定照旧。
+留痕在行上的 `updated_at` / `updated_by`，没有逐字段 diff（ADR-0061）。
+
+## 硬删（purge）与下架（withdraw）
+
+「下架」是把版本行置 `status='withdrawn'`：行保留，可重新上架。「硬删」是真 `DELETE` 该行，
+**只对无任何引用行开放**；引用指被 `app_release.prev_release_id`、`release_application.release_id`、
+`app_instance_link.release_id` 三处之一指向，此时一律拒绝并提示「先下架」。口语里的「删除版本」
+在本域指硬删，不指下架（ADR-0061）。
+
+## 分类字典（store_category）与分类 key
+
+分类的展示名、顺序、启停在 `store_category` 字典表（`key` / `label` / `sort` / `enabled`），
+条目上存的仍是 **key**——`app_release.category` 是 `VARCHAR(20)`，无外键。「其他」是代码层兜底值：
+字典里锁死不可删，未设置或指向已停用分类时都回落到它。「停用」= `enabled=false`，存量条目继续显示
+其 label，但不再出现在上架与编辑的可选项里。说「分类」时先问是字典项还是条目上的 key。
+
+## 薄组件（Zc* 展示件）
+
+只接收 props 与插槽、不含业务与取数逻辑的复用件，本轮共三个：`ZcPageHeader`（页头 + 返回 +
+统计格）、`ZcEntityCard`（卡片骨架：封面 / 标题 / 摘要两行截断 / 左缘状态轨 / ☰ 菜单槽 /
+动作条槽）、`ZcEmptyState`。它们**不是** antd 封装层——不包装 `a-card` / `a-modal` / `a-drawer`，
+业务页照旧直接用 antd（ADR-0062）。
+
+## 运营台（store admin）
+
+`/store-admin` 这一页的职能名，仅创始人可见（视图与后端双层门禁），管的是**版本行**：
+审批队列、全量状态（含 withdrawn）、运营编辑、下架与硬删、分类字典。它与商店页 `/store`
+的区别是口径而非权限：商店页「每 slug 只露最新 published」，运营台看每一行且能改。
+口语里的「管理页」「商店管理」都指它，不含应用数据库的查询控制台。
+
