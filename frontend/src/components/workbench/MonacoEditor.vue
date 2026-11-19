@@ -19,7 +19,7 @@ const props = defineProps({
   savedValue: { type: String, default: '' },
   language: { type: String, default: 'plaintext' },
   readOnly: { type: Boolean, default: false },
-  theme: { type: String, default: 'dark' },
+  theme: { type: String, default: 'light' },
   openPaths: { type: Array, default: () => [] },
 })
 

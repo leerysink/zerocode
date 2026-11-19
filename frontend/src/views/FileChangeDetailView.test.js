@@ -5,6 +5,7 @@
 // 顶栏与状态栏的口径、左栏切换与地址同步、主题与「在编辑器中打开」。
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { mount } from '@vue/test-utils'
+import { createPinia } from 'pinia'
 
 const mocks = vi.hoisted(() => ({
   route: { params: {}, query: {} },
@@ -59,7 +60,7 @@ const CHANGE2 = {
 
 async function mountView({ sessionId = '12', changeId = '345' } = {}) {
   mocks.route.params = { sessionId, changeId }
-  const wrapper = mount(FileChangeDetailView)
+  const wrapper = mount(FileChangeDetailView, { global: { plugins: [createPinia()] } })
   await flush()
   return wrapper
 }
@@ -223,14 +224,15 @@ describe('FileChangeDetailView 左侧文件索引', () => {
 })
 
 describe('FileChangeDetailView 主题与跳转', () => {
-  it('默认深色，点主题按钮切到浅色并记在本机', async () => {
+  it('默认浅色（全局口径），点主题按钮拨全局偏好并记在新键', async () => {
     const wrapper = await mountView()
-    expect(wrapper.find('.zc-fcd').attributes('data-theme')).toBe('dark')
+    expect(wrapper.find('.zc-fcd').attributes('data-theme')).toBe('light')
 
     await wrapper.find('.zc-fcd-theme-toggle').trigger('click')
 
-    expect(wrapper.find('.zc-fcd').attributes('data-theme')).toBe('light')
-    expect(localStorage.getItem('zc.workbench.theme.v1')).toBe('light')
+    expect(wrapper.find('.zc-fcd').attributes('data-theme')).toBe('dark')
+    expect(localStorage.getItem('zc.console.theme.v1')).toBe('dark')
+    expect(localStorage.getItem('zc.workbench.theme.v1')).toBe(null) // 旧键不再被写
   })
 
   it('「在编辑器中打开该文件」按工作区开文件管理器整页，并带上这条变更的路径', async () => {

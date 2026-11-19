@@ -92,7 +92,7 @@ watch(() => store.shareRevoked, (v) => {
 }
 .zc-center {
   min-width: 0;
-  background: #fff;
+  background: var(--zc-bg-card);
 }
 /* 只读旁观条：代替输入区常驻底部，位置与高度接近原输入框，页面不塌 */
 .zc-readonly-bar {

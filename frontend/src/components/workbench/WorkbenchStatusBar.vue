@@ -11,7 +11,7 @@ const props = defineProps({
   cursor: { type: Object, default: () => ({ line: 1, column: 1, selected: 0 }) },
   readOnly: { type: Boolean, default: false },
   saveText: { type: String, default: '' },
-  theme: { type: String, default: 'dark' },
+  theme: { type: String, default: 'light' },
 })
 
 defineEmits(['toggle-theme'])

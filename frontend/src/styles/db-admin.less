@@ -35,10 +35,64 @@
   --zc-db-err: #c0392b;
   --zc-db-err-bg: #fdf2f2;
   --zc-db-muted: #a2adba;           // skipped / 占位
+  --zc-db-warn-line: #e8d4ae;
+  --zc-db-info-line: #cfe0f5;
+  --zc-db-info-bg: #f0f6ff;
+  --zc-db-info: #2b5cab;
+  --zc-db-hover: #e9edf2;
+  --zc-db-err-bg-strong: #f8dcd9;
+  --zc-db-err-line: #efc7c4;
+  --zc-db-err-bg-soft: #fbe6e3;
+  --zc-db-err-text: #922b21;
+  --zc-db-err-bg-deep: #f7ddd9;
+  --zc-db-code-bg: #f6f8fa;
+  --zc-db-accent-rgb: 74, 109, 148;
+  --zc-db-shadow-rgb: 31, 45, 61;
   --zc-db-radius: 4px;              // 全站统一 4px（原来 6px 与 4px 混用）
   --zc-db-row-h: 26px;
   --zc-db-font-sans: -apple-system, 'Segoe UI', 'Microsoft YaHei', Roboto, Helvetica, Arial, sans-serif;
   --zc-db-font-mono: ui-monospace, 'Cascadia Mono', Consolas, 'Liberation Mono', Menlo, monospace;
+}
+
+// ---- 深色变量层（ADR-0055 / 007 票）：只换值不重写规则，兑现文件头「深色模式预留」 ----
+// portal 到 body 的下拉/弹框同样是 html 后代，:root[data-theme] 选择器够得着。
+:root[data-theme='dark'] .zc-db,
+:root[data-theme='dark'] .zc-db-drawer,
+:root[data-theme='dark'] .zc-db-dd,
+:root[data-theme='dark'] .zc-sql-confirm-modal,
+:root[data-theme='dark'] .zc-db-edit-modal {
+  --zc-db-accent: #6b93c0;
+  --zc-db-accent-hover: #82a8d0;
+  --zc-db-accent-soft: #2a3644;
+  --zc-db-accent-line: #3a4a5c;
+  --zc-db-page: #14181e;
+  --zc-db-panel: #1e242c;
+  --zc-db-chrome: #232a33;
+  --zc-db-zebra: #202730;
+  --zc-db-border: #313a45;
+  --zc-db-border-strong: #3d4855;
+  --zc-db-text: #d5dce4;
+  --zc-db-text-sub: #93a1b0;
+  --zc-db-ok: #6fc98f;
+  --zc-db-ok-bg: #1e2b22;
+  --zc-db-warn: #d9a85a;
+  --zc-db-warn-bg: #2b261c;
+  --zc-db-err: #e08a8a;
+  --zc-db-err-bg: #33201f;
+  --zc-db-muted: #6b7885;
+  --zc-db-warn-line: #5a4a2e;
+  --zc-db-info-line: #3a4a5c;
+  --zc-db-info-bg: #222c38;
+  --zc-db-info: #82a8d0;
+  --zc-db-hover: #2a323c;
+  --zc-db-err-bg-strong: #4a2826;
+  --zc-db-err-line: #5a3a38;
+  --zc-db-err-bg-soft: #3a2422;
+  --zc-db-err-text: #e08a8a;
+  --zc-db-err-bg-deep: #4a2826;
+  --zc-db-code-bg: #1a2028;
+  --zc-db-accent-rgb: 107, 147, 192;
+  --zc-db-shadow-rgb: 0, 0, 0;
 }
 
 // ---- antd 部件主色覆写：把仍吃全局 colorPrimary(#5b7a9d) 的部件拉回 --zc-db-accent ----
@@ -96,11 +150,11 @@
   .ant-input-affix-wrapper:focus,
   .ant-input-affix-wrapper-focused {
     border-color: var(--zc-db-accent);
-    box-shadow: 0 0 0 2px rgba(74, 109, 148, .12);
+    box-shadow: 0 0 0 2px rgba(var(--zc-db-accent-rgb), .12);
   }
   .ant-select-focused:not(.ant-select-disabled) .ant-select-selector {
     border-color: var(--zc-db-accent) !important;
-    box-shadow: 0 0 0 2px rgba(74, 109, 148, .12) !important;
+    box-shadow: 0 0 0 2px rgba(var(--zc-db-accent-rgb), .12) !important;
   }
   // 链接型按钮与排序器激活态也不留旧主色
   .ant-btn-link,
@@ -176,7 +230,7 @@
   // prod 环境把工具栏染成警示色，比一条 alert 更早被看到
   &.is-prod .zc-db-head {
     background: var(--zc-db-warn-bg);
-    border-bottom-color: #e8d4ae;
+    border-bottom-color: var(--zc-db-warn-line);
     // 顶部 3px 实心警示条：用 inset 阴影画，不占高度、不影响 flex 布局
     box-shadow: inset 0 3px 0 var(--zc-db-warn);
   }
@@ -187,7 +241,7 @@
     padding: 6px 12px;
     font-size: 12px;
     border: 0;
-    border-bottom: 1px solid #e8d4ae;
+    border-bottom: 1px solid var(--zc-db-warn-line);
     border-radius: 0;
     background: var(--zc-db-warn-bg);
     color: var(--zc-db-warn);
@@ -200,10 +254,10 @@
     padding: 6px 12px;
     font-size: 12px;
     border: 0;
-    border-bottom: 1px solid #cfe0f5;
+    border-bottom: 1px solid var(--zc-db-info-line);
     border-radius: 0;
-    background: #f0f6ff;
-    color: #2b5cab;
+    background: var(--zc-db-info-bg);
+    color: var(--zc-db-info);
   }
 
   // ---- 主体：左对象树 + 右内容，中间一条分隔而不是 12px 空隙 ----
@@ -464,7 +518,7 @@
   .zc-db-edit-disabled {
     margin-bottom: 8px;
     padding: 6px 10px;
-    border: 1px solid #e8d4ae;
+    border: 1px solid var(--zc-db-warn-line);
     border-left: 3px solid var(--zc-db-warn);
     border-radius: var(--zc-db-radius);
     background: var(--zc-db-warn-bg);
@@ -475,11 +529,11 @@
   .zc-db-ro-hint {
     margin-bottom: 8px;
     padding: 6px 10px;
-    border: 1px solid #cfe0f5;
-    border-left: 3px solid #2b5cab;
+    border: 1px solid var(--zc-db-info-line);
+    border-left: 3px solid var(--zc-db-info);
     border-radius: var(--zc-db-radius);
-    background: #f0f6ff;
-    color: #2b5cab;
+    background: var(--zc-db-info-bg);
+    color: var(--zc-db-info);
     font-size: 12px;
   }
 
@@ -632,7 +686,7 @@
     flex: 0 0 auto;
     margin-bottom: 8px;
     padding: 6px 10px;
-    border: 1px solid #e8d4ae;
+    border: 1px solid var(--zc-db-warn-line);
     border-left: 3px solid var(--zc-db-warn);
     border-radius: var(--zc-db-radius);
     background: var(--zc-db-warn-bg);
@@ -664,7 +718,7 @@
     border: 1px solid var(--zc-db-border-strong);
     border-radius: var(--zc-db-radius);
     background: var(--zc-db-panel);
-    box-shadow: 0 6px 18px rgba(31, 45, 61, .14);
+    box-shadow: 0 6px 18px rgba(var(--zc-db-shadow-rgb), .14);
   }
   .zc-sql-editor-host .cm-tooltip-autocomplete ul {
     font-family: var(--zc-db-font-mono);
@@ -833,19 +887,19 @@
     font-weight: 400;
   }
   .zc-sql-rtab--skipped .zc-sql-rtab-op {
-    background: #e9edf2;
+    background: var(--zc-db-hover);
     color: var(--zc-db-muted);
   }
   .zc-sql-rtab-state {
     padding: 0 5px;
     border-radius: 2px;
-    background: #e9edf2;
+    background: var(--zc-db-hover);
     color: var(--zc-db-muted);
     font-size: 11px;
     font-weight: 400;
   }
   .zc-sql-rtab-state--error {
-    background: #f8dcd9;
+    background: var(--zc-db-err-bg-strong);
     color: var(--zc-db-err);
     font-weight: 600;
   }
@@ -872,11 +926,11 @@
   // 三态靠左侧色条 + 底色区分，不再只靠肉眼难辨的边框色差
   .zc-sql-block--error {
     background: var(--zc-db-err-bg);
-    border-color: #efc7c4;
+    border-color: var(--zc-db-err-line);
     border-left-color: var(--zc-db-err);
   }
   .zc-sql-block--skipped {
-    background: #f6f8fa;
+    background: var(--zc-db-code-bg);
     border-color: var(--zc-db-border);
     border-left-color: var(--zc-db-muted);
   }
@@ -903,11 +957,11 @@
     color: var(--zc-db-accent);
   }
   .zc-sql-block-state {
-    background: #e9edf2;
+    background: var(--zc-db-hover);
     color: var(--zc-db-muted);
   }
   .zc-sql-block-state--error {
-    background: #f8dcd9;
+    background: var(--zc-db-err-bg-strong);
     color: var(--zc-db-err);
     font-weight: 600;
   }
@@ -927,10 +981,10 @@
   .zc-sql-error-text {
     margin: 0;
     padding: 6px 8px;
-    background: #fbe6e3;
+    background: var(--zc-db-err-bg-soft);
     border-left: 3px solid var(--zc-db-err);
     border-radius: 2px;
-    color: #922b21;               // 原 #b96a6a 只有 3.48:1
+    color: var(--zc-db-err-text);               // 原 #b96a6a 只有 3.48:1
     font-family: var(--zc-db-font-mono);
     font-size: 12px;
     line-height: 1.5;
@@ -980,7 +1034,7 @@
   .ant-modal-content {
     border: 1px solid var(--zc-db-border-strong);
     border-radius: var(--zc-db-radius);
-    box-shadow: 0 12px 32px rgba(31, 45, 61, .18);
+    box-shadow: 0 12px 32px rgba(var(--zc-db-shadow-rgb), .18);
   }
   .ant-modal-header {
     padding: 10px 14px;
@@ -1045,7 +1099,7 @@
     font-size: 11px;
   }
   .zc-sql-confirm-item--risk .zc-sql-confirm-op {
-    background: #f7ddd9;
+    background: var(--zc-db-err-bg-deep);
     color: var(--zc-db-err);
   }
   .zc-sql-confirm-at {
@@ -1234,7 +1288,7 @@
   .ant-modal-content {
     border: 1px solid var(--zc-db-border-strong);
     border-radius: var(--zc-db-radius);
-    box-shadow: 0 12px 32px rgba(31, 45, 61, .18);
+    box-shadow: 0 12px 32px rgba(var(--zc-db-shadow-rgb), .18);
   }
   .ant-modal-header {
     padding: 10px 14px;

@@ -432,9 +432,9 @@ async function resetIcon() {
 .zc-mobile-bar { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .zc-mobile-hint { font-size: 12px; color: var(--zc-text-sub); }
 
-.zc-m-block { display: flex; gap: 18px; padding: 14px 16px; background: #fff;
+.zc-m-block { display: flex; gap: 18px; padding: 14px 16px; background: var(--zc-bg-card);
               border: 1px solid var(--zc-border); border-radius: 12px;
-              box-shadow: 0 1px 4px rgba(47, 58, 71, 0.05); }
+              box-shadow: 0 1px 4px rgba(var(--zc-shadow-rgb), 0.05); }
 .zc-m-block-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 10px; }
 
 .zc-m-tabs { display: flex; align-items: center; gap: 8px; }
@@ -442,10 +442,10 @@ async function resetIcon() {
             padding: 3px 12px; font-size: 12px; cursor: pointer; color: var(--zc-text-sub);
             transition: all 0.15s; }
 .zc-m-tab:hover { color: var(--zc-primary); }
-.zc-m-tab.active { background: #fff; border-color: var(--zc-primary); color: var(--zc-primary);
-                   font-weight: 600; box-shadow: 0 1px 3px rgba(47, 58, 71, 0.10); }
+.zc-m-tab.active { background: var(--zc-bg-card); border-color: var(--zc-primary); color: var(--zc-primary);
+                   font-weight: 600; box-shadow: 0 1px 3px rgba(var(--zc-shadow-rgb), 0.10); }
 .zc-env-state { font-size: 11px; color: var(--zc-text-sub); }
-.zc-env-state.ok { color: #5b8a72; }
+.zc-env-state.ok { color: var(--zc-success); }
 
 .zc-m-url { display: flex; align-items: baseline; gap: 10px; min-width: 0; }
 .zc-m-k { flex: 0 0 auto; font-size: 12px; font-weight: 600; color: var(--zc-text-sub); }
@@ -455,8 +455,8 @@ async function resetIcon() {
 
 .zc-m-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
 .zc-m-tip { margin: 0; font-size: 12px; color: var(--zc-text-sub); line-height: 1.6; }
-.zc-m-tip.warn { color: #b06a3e; }
-.zc-m-error { color: #b96a6a; }
+.zc-m-tip.warn { color: var(--zc-warning-orange); }
+.zc-m-error { color: var(--zc-danger); }
 
 .zc-m-qr { flex: 0 0 auto; display: flex; flex-direction: column; align-items: center; gap: 6px; }
 .zc-qr-svg { width: 148px; height: 148px; display: block; border-radius: 8px; }
@@ -477,12 +477,12 @@ async function resetIcon() {
 .zc-m-apk-head { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
 .zc-apk-badge { font-size: 11px; color: var(--zc-text-sub); background: var(--zc-bg);
                 border: 1px solid var(--zc-border); border-radius: 10px; padding: 1px 8px; }
-.zc-apk-badge.ok { color: #5b8a72; border-color: rgba(91, 138, 114, 0.35);
-                   background: rgba(91, 138, 114, 0.08); }
-.zc-apk-badge.busy { color: #9a7b3e; border-color: rgba(154, 123, 62, 0.35);
-                     background: rgba(154, 123, 62, 0.08); }
-.zc-apk-badge.bad { color: #b96a6a; border-color: rgba(185, 106, 106, 0.35);
-                    background: rgba(185, 106, 106, 0.08); }
+.zc-apk-badge.ok { color: var(--zc-success); border-color: rgba(var(--zc-success-rgb), 0.35);
+                   background: rgba(var(--zc-success-rgb), 0.08); }
+.zc-apk-badge.busy { color: var(--zc-warning-text-alt); border-color: rgba(var(--zc-warn-text-rgb), 0.35);
+                     background: rgba(var(--zc-warn-text-rgb), 0.08); }
+.zc-apk-badge.bad { color: var(--zc-danger); border-color: rgba(var(--zc-danger-rgb), 0.35);
+                    background: rgba(var(--zc-danger-rgb), 0.08); }
 .zc-apk-meta { font-size: 11px; color: var(--zc-text-sub); }
 .zc-apk-meta.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 .zc-apk-get { display: inline-flex; align-items: center; gap: 4px; font-size: 12px;

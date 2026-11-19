@@ -32,7 +32,7 @@ const STATUS_TEXT = { pending: '待办', in_progress: '进行中', completed: '�
   margin: 0 28px;
   border: 1px solid var(--zc-border);
   border-radius: 8px;
-  background: #fff;
+  background: var(--zc-bg-card);
   overflow: hidden;
 }
 .zc-todo-head {
@@ -41,7 +41,7 @@ const STATUS_TEXT = { pending: '待办', in_progress: '进行中', completed: '�
   align-items: center;
   gap: 8px;
   border: none;
-  background: rgba(91, 122, 157, 0.05);
+  background: rgba(var(--zc-primary-rgb), 0.05);
   padding: 6px 12px;
   font-size: 12.5px;
   color: var(--zc-text);
@@ -53,7 +53,7 @@ const STATUS_TEXT = { pending: '待办', in_progress: '进行中', completed: '�
 .zc-todo-list li { display: flex; align-items: center; gap: 8px; padding: 3px 0; font-size: 13px; }
 .zc-todo-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--zc-border); flex: 0 0 auto; }
 .is-in_progress .zc-todo-dot { background: var(--zc-primary); }
-.is-completed .zc-todo-dot { background: #7aa77a; }
+.is-completed .zc-todo-dot { background: var(--zc-success-soft); }
 .is-completed .zc-todo-text { color: var(--zc-text-sub); text-decoration: line-through; }
 .zc-todo-status { margin-left: auto; font-size: 11px; color: var(--zc-text-sub); }
 </style>

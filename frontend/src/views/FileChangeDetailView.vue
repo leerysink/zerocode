@@ -12,7 +12,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { getFileChange, getFileChanges } from '../api'
 import { normalizeId, openWorkspaceFilesPage } from '../utils/openFolder'
 import { buildSideBySide } from '../utils/sideBySide'
-import { nextTheme, readWorkbenchTheme, writeWorkbenchTheme } from '../utils/theme'
+import { useThemeStore } from '../stores/theme'
 import ChangeDiffPane from '../components/change/ChangeDiffPane.vue'
 import ChangeFileList from '../components/change/ChangeFileList.vue'
 
@@ -131,12 +131,13 @@ const statusText = computed(() => {
   return `+${m.added} -${m.removed}`
 })
 
-const theme = ref(readWorkbenchTheme())
+// 主题统一管辖（ADR-0055）：本页按钮是全局偏好的别名入口，与工作台/顶栏同一份真源
+const themeStore = useThemeStore()
+const theme = computed(() => themeStore.theme)
 const themeLabel = computed(() => (theme.value === 'dark' ? '浅色' : '深色'))
 
 function toggleTheme() {
-  theme.value = nextTheme(theme.value)
-  writeWorkbenchTheme(theme.value)
+  themeStore.toggle()
 }
 
 // 死内容看够了要能跳回活文件：整页复用「打开文件夹」那一条地址，同一工作区仍复用同一个标签
@@ -223,6 +224,7 @@ function openInEditor() {
   --zc-border: #3c3c3c;
   --zc-text: #cccccc;
   --zc-text-sub: #8c8c8c;
+  --zc-bg-card: #252526;
 }
 .zc-fcd[data-theme='light'] {
   --zc-bg: #ffffff;
@@ -230,6 +232,7 @@ function openInEditor() {
   --zc-border: #e0e0e0;
   --zc-text: #333333;
   --zc-text-sub: #6b6b6b;
+  --zc-bg-card: #ffffff;
 }
 .zc-fcd-head {
   flex: 0 0 auto;

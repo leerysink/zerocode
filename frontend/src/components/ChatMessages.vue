@@ -22,6 +22,7 @@ import PageInspectCard from './PageInspectCard.vue'
 import BrowserFlowCard from './BrowserFlowCard.vue'
 import WebFetchCard from './WebFetchCard.vue'
 import WebDownloadCard from './WebDownloadCard.vue'
+import RunPythonCard from './RunPythonCard.vue'
 import ChatPromptRail from './ChatPromptRail.vue'
 
 const props = defineProps({
@@ -52,6 +53,8 @@ const BROWSER_SESSION_TOOL_NAMES = ['browser_open', 'browser_step', 'browser_clo
 const WEB_SESSION_TOOL_NAMES = ['web_open', 'web_step', 'web_close']
 // 联网读取与资源下载（ADR-0053/0054）：各有自己的结果卡（正文/链接 vs url→path 落盘回执）。
 const WEB_FETCH_TOOL_NAMES = ['web_fetch', 'web_download']
+// Python 沙箱（ADR-0056）：名单与后端 llm.PYTHON_TOOL_NAMES 同名同序；漏改落回通用折叠块。
+const PYTHON_TOOL_NAMES = ['run_python']
 
 // 渲染前统一归一化：实时事件形状与历史行形状都过这一个函数，组件只认归一化后的字段。
 // 归一化后一次工具调用恒为一条记录（args 与 result 同体），所以「call 行/result 行」的
@@ -112,6 +115,15 @@ function isWebFetchCard(m, i) {
 // 模板里排在 WebFetchCard 之前，web_download 不会落进读取卡。
 function isWebDownloadCard(m, i) {
   return (m.name || '') === 'web_download' && !!(m.result || i === view.value.length - 1)
+}
+
+function isPythonTool(m) {
+  return PYTHON_TOOL_NAMES.includes(m.name || '')
+}
+
+// 与其余卡同一道闸：有结果或仍是最后一条
+function isPythonCard(m, i) {
+  return isPythonTool(m) && !!(m.result || i === view.value.length - 1)
 }
 
 // 进度只给「消息流最后一条、还没有结果」的那张卡：历史卡片复活进度条会让人以为又在重启
@@ -274,6 +286,7 @@ onBeforeUnmount(cancelFill)
             <WebFetchCard v-else-if="isWebFetchCard(item.m, item.i)" :msg="item.m" :progress="liveProgress(item.m, item.i)" />
             <BrowserFlowCard v-else-if="isBrowserCard(item.m, item.i)" :msg="item.m" :progress="liveProgress(item.m, item.i)" />
             <PreviewCard v-else-if="isPreviewCard(item.m, item.i)" :msg="item.m" :progress="liveProgress(item.m, item.i)" />
+            <RunPythonCard v-else-if="isPythonCard(item.m, item.i)" :msg="item.m" :progress="liveProgress(item.m, item.i)" />
             <!-- 会话 id 兜空串：null 会撞在 [Number,String] 的 props 校验上刷一屏警告，
                  而空串本来就是「跳不过去」的合法取值（DiffBlock 据此不渲染入口） -->
             <ToolCallBlock v-else :msg="item.m" :session-id="store.currentSessionId ?? ''" />
@@ -373,7 +386,7 @@ onBeforeUnmount(cancelFill)
 .zc-notice-text {
   font-size: 12px;
   color: var(--zc-text-sub);
-  background: rgba(91, 122, 157, 0.06);
+  background: rgba(var(--zc-primary-rgb), 0.06);
   border-radius: 999px;
   padding: 3px 12px;
 }
@@ -385,7 +398,7 @@ onBeforeUnmount(cancelFill)
 /* user 浅蓝气泡 */
 .zc-bubble {
   max-width: 72%;
-  background: #e8f1fb;
+  background: var(--zc-bg-bubble);
   border-radius: 10px 10px 2px 10px;
   padding: 8px 12px;
   font-size: 14px;
@@ -424,8 +437,8 @@ onBeforeUnmount(cancelFill)
   padding: 1px 6px;
   border-radius: 8px;
   font-size: 11px;
-  color: #a17c5b;
-  background: rgba(161, 124, 91, 0.1);
+  color: var(--zc-warning-brown);
+  background: rgba(var(--zc-brown-rgb), 0.1);
   white-space: nowrap;
 }
 
@@ -434,15 +447,15 @@ onBeforeUnmount(cancelFill)
   align-items: center;
   gap: 4px;
   max-width: 72%;
-  background: #fdeeee;
-  border: 1px solid #f2d8d8;
+  background: var(--zc-danger-bg);
+  border: 1px solid var(--zc-danger-border-soft);
   border-radius: 8px;
   padding: 8px 12px;
 }
 .zc-error-text {
   flex: 1;
   min-width: 0;
-  color: #a05a5a;
+  color: var(--zc-danger-text);
   font-size: 13px;
   line-height: 1.7;
   white-space: pre-wrap;
@@ -483,13 +496,13 @@ onBeforeUnmount(cancelFill)
 .zc-md :deep(code) {
   font-family: ui-monospace, SFMono-Regular, Consolas, 'Courier New', monospace;
   font-size: 13px;
-  background: rgba(91, 122, 157, 0.08);
+  background: rgba(var(--zc-primary-rgb), 0.08);
   border-radius: 4px;
   padding: 1px 5px;
 }
 .zc-md :deep(pre) {
   margin: 8px 0;
-  background: #f6f8fa;
+  background: var(--zc-bg-code);
   border: 1px solid var(--zc-border);
   border-radius: 6px;
   padding: 10px 12px;

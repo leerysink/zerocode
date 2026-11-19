@@ -13,6 +13,7 @@ vi.mock('../api', () => ({
 vi.mock('ant-design-vue', () => ({ message: { success: vi.fn(), error: vi.fn(), warning: vi.fn() } }))
 
 import { authMe, authLogout } from '../api'
+import { CONSOLE_THEME_KEY } from '../utils/theme'
 import AccountBar from './AccountBar.vue'
 
 const stubs = { 'a-layout-header': { name: 'a-layout-header', render() { return h('header', this.$slots.default?.()) } } }
@@ -82,5 +83,22 @@ describe('AccountBar 右上角账户区', () => {
     } finally {
       restore()
     }
+  })
+
+  it('主题切换按钮：显示目标主题名，点击拨全局偏好并落到 html', async () => {
+    localStorage.clear()
+    document.documentElement.removeAttribute('data-theme')
+    const wrapper = await mountBar({ id: 1, nickname: '小明' })
+    const btn = wrapper.find('[data-test="theme-toggle"]')
+    expect(btn.exists()).toBe(true)
+    expect(btn.text()).toBe('深色')
+    expect(btn.attributes('aria-label')).toBe('切换到深色主题')
+    await btn.trigger('click')
+    expect(document.documentElement.dataset.theme).toBe('dark')
+    expect(localStorage.getItem(CONSOLE_THEME_KEY)).toBe('dark')
+    expect(wrapper.find('[data-test="theme-toggle"]').text()).toBe('浅色')
+    await wrapper.find('[data-test="theme-toggle"]').trigger('click')
+    expect(document.documentElement.dataset.theme).toBe('light')
+    expect(localStorage.getItem(CONSOLE_THEME_KEY)).toBe('light')
   })
 })

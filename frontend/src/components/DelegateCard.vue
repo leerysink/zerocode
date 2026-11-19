@@ -81,7 +81,7 @@ const pretty = (v) => JSON.stringify(v, null, 2)
   border: 1px solid var(--zc-border);
   border-radius: 8px;
   padding: 10px 12px;
-  background: #fff;
+  background: var(--zc-bg-card);
 }
 .zc-delegate-head {
   display: flex;
@@ -96,10 +96,10 @@ const pretty = (v) => JSON.stringify(v, null, 2)
   color: var(--zc-text);
 }
 .zc-delegate-note {
-  color: #a17c5b;
+  color: var(--zc-warning-brown);
 }
 .zc-delegate-fail {
-  color: #a05a5a;
+  color: var(--zc-danger-text);
   word-break: break-word;
 }
 .zc-delegate-row {
@@ -126,23 +126,23 @@ const pretty = (v) => JSON.stringify(v, null, 2)
   padding: 1px 8px;
   border-radius: 8px;
   color: var(--zc-text-sub);
-  background: rgba(91, 122, 157, 0.08);
+  background: rgba(var(--zc-primary-rgb), 0.08);
 }
 .zc-delegate-badge.is-running {
   color: var(--zc-primary);
-  background: rgba(91, 122, 157, 0.12);
+  background: rgba(var(--zc-primary-rgb), 0.12);
 }
 .zc-delegate-badge.is-completed {
-  color: #4f7d4f;
-  background: rgba(122, 167, 122, 0.14);
+  color: var(--zc-done-text);
+  background: rgba(var(--zc-success-soft-rgb), 0.14);
 }
 .zc-delegate-badge.is-error {
-  color: #a05a5a;
-  background: rgba(160, 90, 90, 0.1);
+  color: var(--zc-danger-text);
+  background: rgba(var(--zc-danger-text-rgb), 0.1);
 }
 .zc-delegate-badge.is-cancelled {
-  color: #a17c5b;
-  background: rgba(161, 124, 91, 0.1);
+  color: var(--zc-warning-brown);
+  background: rgba(var(--zc-brown-rgb), 0.1);
 }
 .zc-delegate-progress {
   margin: 2px 0 0;
@@ -187,7 +187,7 @@ const pretty = (v) => JSON.stringify(v, null, 2)
   margin: 3px 0 0;
   max-height: 240px;
   overflow: auto;
-  background: #f6f8fa;
+  background: var(--zc-bg-code);
   border: 1px solid var(--zc-border);
   border-radius: 6px;
   padding: 6px 8px;

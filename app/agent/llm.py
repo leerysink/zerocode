@@ -25,6 +25,8 @@ WEB_TOOLS = _registry.schemas("web")
 WEB_TOOL_NAMES = _registry.names("web")
 WEB_SESSION_TOOLS = _registry.schemas("web_session")
 WEB_SESSION_TOOL_NAMES = _registry.names("web_session")
+PYTHON_TOOLS = _registry.schemas("python")
+PYTHON_TOOL_NAMES = _registry.names("python")
 
 
 def _reasoning_of(delta):

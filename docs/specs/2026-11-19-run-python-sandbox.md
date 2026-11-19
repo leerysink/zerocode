@@ -174,6 +174,21 @@ docker 一律替身桩（沿 `tests/test_agent_check_tools.py` 既有桩法）�
 - **冷启动**：Python 镜像拉起秒级，远快于 mvn；预装常用库避免每次 pip install 冷启动重装。
 - **deploy 遮蔽须真遮蔽**：空挂载覆盖 `/workspace/deploy`，不能靠提示词约束脚本不读——
   与 M-3 在 read_file 层的硬禁同口径。
-- **实现期注意**：`app/agent/loop.py` 与 `tests/test_agent_loop.py` 可能有另一会话的未提交 WIP
-  （沿 web-download spec 提醒），动这两处前先复核归属；本票预期不改 loop.py——确认闸走注册表
-  通用分支。新增工具须同步注册表、llm 名单、前端名单、红线测试四处（防漂移）。
+- **实现期注意**：确认闸走注册表通用分支，**不改 loop 的 if 链**；但提示词恒注入需在 loop.py
+  追加 `build_python_prompt`（仅 import + 注入链一行，python 块插在 web 之前以保住 `</web_session>`
+  尾部锚）。`app/agent/loop.py` 与 `tests/test_agent_loop.py` 在主工作区可能有另一会话 WIP，
+  本功能在独立 worktree 构建（clean HEAD），合回时再 reconcil。新增工具须同步注册表、llm 名单、
+  前端名单、红线测试，以及 test_llm/test_preview_tools 的旧 base 集合钉（防漂移）。
+
+## 8. 实现状态（2026-11-19）
+
+- **已交付**：001（共享私网判定）/002（纯计算示踪弹）/003（只读挂载 + deploy 遮蔽）/004（scratch
+  产物回读）/006（资源/超时/取消）/007（确认流 + 卡片 + 提示词）。后端定向回归 + 全量、前端全量绿。
+- **005 待落地（离线 interim）**：沙箱当前 `--network none`（fail-closed，比仅公网更严），离线
+  计算/数据处理可用；公网数据经 web_fetch/web_download 落工作区再喂脚本。「仅公网」出口过滤需
+  宿主级网络基建（专用网络 + iptables 或 egress 代理），沙箱内自管 iptables 会被脚本绕过（假安全），
+  故独立成票待真机验证。详见 tickets/005 状态节。
+- **非 root**：容器 `--user 1000:1000`，scratch 宿主目录 chmod 0777 供任意 uid 写；真机权限行为
+  待手工矩阵核实。
+- **真机手工矩阵待跑**：只读 EROFS、deploy 遮蔽有效、scratch 落盘→write_file、超时/OOM/fork bomb
+  被拦、取消清理、非 root 权限。单测以 docker 替身桩验 argv 与结果形状，真容器行为需手工核实。

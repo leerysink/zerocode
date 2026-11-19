@@ -80,7 +80,7 @@ const pretty = (v) => JSON.stringify(v, null, 2)
   margin: 0;
   max-height: 240px;
   overflow: auto;
-  background: #f6f8fa;
+  background: var(--zc-bg-code);
   border: 1px solid var(--zc-border);
   border-radius: 6px;
   padding: 8px 10px;

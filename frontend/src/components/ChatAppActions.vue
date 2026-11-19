@@ -329,10 +329,10 @@ watch(prodStatus, (next) => {
   gap: 8px;
 }
 .zc-app-menu {
-  background: #fff;
+  background: var(--zc-bg-card);
   border: 1px solid var(--zc-border);
   border-radius: 8px;
-  box-shadow: 0 4px 16px rgba(47, 58, 71, 0.12);
+  box-shadow: 0 4px 16px rgba(var(--zc-shadow-rgb), 0.12);
   padding: 4px 0;
   min-width: 160px;
 }
@@ -347,7 +347,7 @@ watch(prodStatus, (next) => {
   text-decoration: none;
 }
 .zc-app-menu-item:hover {
-  background: rgba(91, 122, 157, 0.1);
+  background: rgba(var(--zc-primary-rgb), 0.1);
 }
 .zc-app-menu-sep {
   height: 1px;

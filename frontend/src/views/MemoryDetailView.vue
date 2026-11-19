@@ -10,7 +10,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { deleteMemory, listMemories, updateMemory } from '../api'
 import { normalizeId } from '../utils/openFolder'
 import { TYPE_LABELS, groupMemories } from '../utils/memory'
-import { nextTheme, readWorkbenchTheme, writeWorkbenchTheme } from '../utils/theme'
+import { useThemeStore } from '../stores/theme'
 import MemoryItemList from '../components/memory/MemoryItemList.vue'
 
 const route = useRoute()
@@ -225,12 +225,13 @@ const statusText = computed(() => {
   return parts.join(' · ')
 })
 
-const theme = ref(readWorkbenchTheme())
+// 主题统一管辖（ADR-0055）：本页按钮是全局偏好的别名入口，与工作台/顶栏同一份真源
+const themeStore = useThemeStore()
+const theme = computed(() => themeStore.theme)
 const themeLabel = computed(() => (theme.value === 'dark' ? '浅色' : '深色'))
 
 function toggleTheme() {
-  theme.value = nextTheme(theme.value)
-  writeWorkbenchTheme(theme.value)
+  themeStore.toggle()
 }
 
 onMounted(() => {
@@ -335,6 +336,7 @@ onMounted(() => {
   --zc-border: #3c3c3c;
   --zc-text: #cccccc;
   --zc-text-sub: #8c8c8c;
+  --zc-bg-card: #252526;
 }
 .zc-memd[data-theme='light'] {
   --zc-bg: #ffffff;
@@ -342,6 +344,7 @@ onMounted(() => {
   --zc-border: #e0e0e0;
   --zc-text: #333333;
   --zc-text-sub: #6b6b6b;
+  --zc-bg-card: #ffffff;
 }
 .zc-memd-head {
   flex: 0 0 auto;

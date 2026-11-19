@@ -160,26 +160,26 @@ const loadingLine = computed(() => props.progress?.line || '正在打开预览�
   border-left: 3px solid var(--zc-border);
   border-radius: 8px;
   padding: 10px 12px;
-  background: #fbfcfd;
+  background: var(--zc-bg-card-soft);
 }
 .zc-page.is-ok {
-  border-left-color: #52a06b;
-  background: #f6fbf7;
+  border-left-color: var(--zc-success-bright);
+  background: var(--zc-success-bg);
 }
 .zc-page.is-warn {
-  border-left-color: #d99a3c;
-  background: #fdfaf3;
+  border-left-color: var(--zc-warning-bright);
+  background: var(--zc-warning-bg);
 }
 .zc-page.is-error {
-  border-left-color: #c4636a;
-  background: #fdeeee;
+  border-left-color: var(--zc-danger-bright);
+  background: var(--zc-danger-bg);
 }
 .zc-page.is-info {
   border-left-color: var(--zc-primary);
-  background: #f4f8fd;
+  background: var(--zc-bg-info);
 }
 .zc-page.is-muted {
-  border-left-color: #b6bfca;
+  border-left-color: var(--zc-neutral-rail);
 }
 .zc-page-head {
   display: flex;
@@ -195,14 +195,14 @@ const loadingLine = computed(() => props.progress?.line || '正在打开预览�
 .zc-page-tool {
   font-size: 11px;
   color: var(--zc-text-sub);
-  background: rgba(91, 122, 157, 0.08);
+  background: rgba(var(--zc-primary-rgb), 0.08);
   border-radius: 4px;
   padding: 1px 6px;
 }
 .zc-page-badge {
   font-size: 11px;
-  color: #a17c5b;
-  background: rgba(161, 124, 91, 0.12);
+  color: var(--zc-warning-brown);
+  background: rgba(var(--zc-brown-rgb), 0.12);
   border-radius: 999px;
   padding: 1px 8px;
 }
@@ -213,12 +213,12 @@ const loadingLine = computed(() => props.progress?.line || '正在打开预览�
   white-space: nowrap;
 }
 .zc-page-identity.is-admin {
-  color: #3f6b52;
-  background: rgba(82, 160, 107, 0.14);
+  color: var(--zc-ok-text);
+  background: rgba(var(--zc-success-bright-rgb), 0.14);
 }
 .zc-page-identity.is-anonymous {
-  color: #8a6b3f;
-  background: rgba(217, 154, 60, 0.16);
+  color: var(--zc-warning-deep-alt);
+  background: rgba(var(--zc-amber-bright-rgb), 0.16);
 }
 .zc-page-link {
   margin-left: auto;
@@ -237,7 +237,7 @@ const loadingLine = computed(() => props.progress?.line || '正在打开预览�
   margin-top: 8px;
   font-size: 13px;
   line-height: 1.7;
-  color: #a05a5a;
+  color: var(--zc-danger-text);
   white-space: pre-wrap;
   word-break: break-word;
 }
@@ -253,7 +253,7 @@ const loadingLine = computed(() => props.progress?.line || '正在打开预览�
   font-size: 12.5px;
   line-height: 1.7;
   color: var(--zc-text);
-  background: rgba(91, 122, 157, 0.06);
+  background: rgba(var(--zc-primary-rgb), 0.06);
   border-radius: 6px;
   white-space: pre-wrap;
   word-break: break-word;
@@ -266,7 +266,7 @@ const loadingLine = computed(() => props.progress?.line || '正在打开预览�
   padding: 8px 10px;
   max-height: 260px;
   overflow: auto;
-  background: #fff;
+  background: var(--zc-bg-card);
   border: 1px solid var(--zc-border);
   border-radius: 6px;
   font-family: ui-monospace, SFMono-Regular, Consolas, 'Courier New', monospace;
@@ -302,7 +302,7 @@ const loadingLine = computed(() => props.progress?.line || '正在打开预览�
   max-height: 220px;
   overflow: auto;
   list-style: none;
-  background: #fff;
+  background: var(--zc-bg-card);
   border: 1px solid var(--zc-border);
   border-radius: 6px;
   font-family: ui-monospace, SFMono-Regular, Consolas, 'Courier New', monospace;
@@ -321,10 +321,10 @@ const loadingLine = computed(() => props.progress?.line || '正在打开预览�
   flex: none;
   font-size: 10px;
   text-transform: uppercase;
-  color: #a05a5a;
+  color: var(--zc-danger-text);
 }
 .zc-page-list li.is-warning .zc-page-level {
-  color: #a17c5b;
+  color: var(--zc-warning-brown);
 }
 .zc-page-method {
   flex: none;
@@ -335,7 +335,7 @@ const loadingLine = computed(() => props.progress?.line || '正在打开预览�
   color: var(--zc-text-sub);
 }
 .zc-page-status.is-bad {
-  color: #a05a5a;
+  color: var(--zc-danger-text);
 }
 .zc-page-url {
   min-width: 0;

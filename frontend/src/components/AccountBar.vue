@@ -1,10 +1,15 @@
 <script setup>
-// 顶栏账户区（原 SideBar 页脚账户行迁移至此）：昵称回显 + 登出，常驻页面右上角。
+// 顶栏账户区（原 SideBar 页脚账户行迁移至此）：昵称回显 + 主题切换 + 登出，常驻页面右上角。
 // 身份单源 /api/auth/me，与商店页同一接缝；authMe 在拦截器豁免名单里，
 // 未登录不会自动跳，这里收到 401（被踢/会话过期）时兜底引导回登录页。
-import { onMounted, ref } from 'vue'
+// 主题切换是全局偏好的规范入口（ADR-0055），拨 theme store，与工作台状态栏按钮同源。
+import { computed, onMounted, ref } from 'vue'
 import { LogoutOutlined, UserOutlined } from '@ant-design/icons-vue'
 import { authLogout, authMe } from '../api'
+import { useThemeStore } from '../stores/theme'
+
+const themeStore = useThemeStore()
+const themeLabel = computed(() => (themeStore.theme === 'dark' ? '浅色' : '深色'))
 
 const me = ref(null)
 async function loadMe() {
@@ -24,6 +29,13 @@ onMounted(loadMe)
 <template>
   <a-layout-header class="zc-account-bar">
     <span class="zc-account-name" data-test="account-nickname"><user-outlined /> {{ me?.nickname || '' }}</span>
+    <a
+      class="zc-theme-toggle"
+      data-test="theme-toggle"
+      :title="`切换到${themeLabel}主题`"
+      :aria-label="`切换到${themeLabel}主题`"
+      @click="themeStore.toggle()"
+    >{{ themeLabel }}</a>
     <a class="zc-logout" data-test="logout-btn" @click="doLogout"><logout-outlined /> 登出</a>
   </a-layout-header>
 </template>
@@ -58,6 +70,13 @@ onMounted(loadMe)
   color: var(--zc-text-sub);
 }
 .zc-logout:hover {
+  color: var(--zc-primary);
+}
+.zc-theme-toggle {
+  flex-shrink: 0;
+  color: var(--zc-text-sub);
+}
+.zc-theme-toggle:hover {
   color: var(--zc-primary);
 }
 </style>

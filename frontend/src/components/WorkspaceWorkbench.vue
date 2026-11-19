@@ -13,7 +13,7 @@ import {
   closeTab, decodeTabs, encodeTabs, openTab, tabCloseSet, tabsStorageKey,
 } from '../utils/workbenchTabs'
 import { isReadOnlyPath } from '../utils/fileTypes'
-import { nextTheme, readWorkbenchTheme, writeWorkbenchTheme } from '../utils/theme'
+import { useThemeStore } from '../stores/theme'
 import FileIcon from './workbench/FileIcon.vue'
 import WorkbenchEditor from './workbench/WorkbenchEditor.vue'
 import WorkbenchStatusBar from './workbench/WorkbenchStatusBar.vue'
@@ -40,12 +40,13 @@ const active = ref('')
 const files = ref({})
 const cursor = ref({ line: 1, column: 1, selected: 0 })
 
-// 主题只落在工作台根节点上（data-theme + 局部 CSS 变量），不动全局 :root
-const theme = ref(readWorkbenchTheme())
+// 主题统一管辖（ADR-0055）：真源是全局 theme store，工作台根节点仍落 data-theme + 局部 CSS 变量，
+// 状态栏按钮是全局偏好的别名入口——拨的是同一份偏好，不是第二份真源。
+const themeStore = useThemeStore()
+const theme = computed(() => themeStore.theme)
 
 function toggleTheme() {
-  theme.value = nextTheme(theme.value)
-  writeWorkbenchTheme(theme.value)
+  themeStore.toggle()
 }
 
 // 状态栏的保存态与冲突/关闭确认弹框；saving 收口并发保存（一次只发一个写请求）

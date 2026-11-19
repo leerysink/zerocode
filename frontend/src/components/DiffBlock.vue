@@ -70,7 +70,7 @@ const lines = computed(() =>
   border: 1px solid var(--zc-border);
   border-radius: 6px;
   overflow: hidden;
-  background: #fff;
+  background: var(--zc-bg-card);
 }
 .zc-diff-head {
   display: flex;
@@ -84,7 +84,7 @@ const lines = computed(() =>
 .zc-diff-action {
   flex-shrink: 0;
   color: var(--zc-primary);
-  background: rgba(91, 122, 157, 0.1);
+  background: rgba(var(--zc-primary-rgb), 0.1);
   border-radius: 4px;
   padding: 0 6px;
   line-height: 18px;
@@ -101,7 +101,7 @@ const lines = computed(() =>
   margin-left: auto;
   border: 1px solid var(--zc-border);
   border-radius: 4px;
-  background: #fff;
+  background: var(--zc-bg-card);
   color: var(--zc-text-sub);
   font-size: 11px;
   line-height: 16px;
@@ -127,12 +127,12 @@ const lines = computed(() =>
   color: var(--zc-text);
 }
 .zc-diff-line.is-add {
-  background: #edf6ed;
-  color: #47705a;
+  background: var(--zc-diff-add-bg);
+  color: var(--zc-diff-add-text);
 }
 .zc-diff-line.is-del {
-  background: #fbf0f0;
-  color: #a05a5a;
+  background: var(--zc-diff-del-bg);
+  color: var(--zc-danger-text);
 }
 .zc-diff-line.is-hunk {
   color: var(--zc-text-sub);

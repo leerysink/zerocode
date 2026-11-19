@@ -168,8 +168,8 @@ describe('AppsView 发布接线', () => {
     expect(dev.find('.zc-env-dot').exists()).toBe(true)
     expect(prod.find('.zc-env-dot').exists()).toBe(true)
     // 点不是装饰：颜色就是该环境的实时状态（夹具 dev 停 / prod 跑）
-    expect(dev.find('.zc-env-dot').attributes('style')).toContain('background: #9aa0a6')
-    expect(prod.find('.zc-env-dot').attributes('style')).toContain('background: #5b8a72')
+    expect(dev.find('.zc-env-dot').attributes('style')).toContain('background: var(--zc-neutral)')
+    expect(prod.find('.zc-env-dot').attributes('style')).toContain('background: var(--zc-success)')
     // 胶囊里只写 dev / prod，中文全称退回 title（悬停说明），行宽才压得下来
     expect(dev.text()).toContain('dev')
     expect(dev.attributes('title')).toContain('测试环境')
