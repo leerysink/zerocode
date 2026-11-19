@@ -201,11 +201,17 @@ export const authMe = () => http.get('/auth/me')
 
 // ---- 账户级技能库（Ticket 001~003 / ADR-0004）----
 export const listSkills = () => http.get('/skills')
-export const installSkill = (data) => http.post('/skills/install', data) // {url, subpath?}；多命中返 {candidates}
+export const installSkill = (data) => http.post('/skills/install', data) // {url, subpath?} 直装 或 {token} 快照安装；多命中返 {candidates}
+export const previewSkill = (data) => http.post('/skills/preview', data) // {url, subpath?}；返 {token,name,description,files,skill_md} 或 {candidates}
 export const patchSkill = (id, data) => http.patch(`/skills/${id}`, data) // {enabled}
 export const deleteSkill = (id) => http.delete(`/skills/${id}`)
 export const generateSkill = (data) => http.post('/skills/generate', data) // {prompt}；返草稿 {name, description, content, warnings}
 export const adoptSkill = (data) => http.post('/skills/adopt', data) // {content, prompt?}；name 由服务端从正文重新解析
+export const skillFiles = (id) => http.get(`/skills/${id}/files`) // {files:[{path,size,kind}]}
+export const skillFileContent = (id, path) => http.get(`/skills/${id}/files/content`, { params: { path } })
+export const skillFileRawUrl = (id, path) => `/api/skills/${id}/files/raw?path=${encodeURIComponent(path)}`
+export const previewFileContent = (token, path) => http.get(`/skills/preview/${token}/content`, { params: { path } })
+export const previewFileRawUrl = (token, path) => `/api/skills/preview/${token}/raw?path=${encodeURIComponent(path)}`
 
 // ---- 应用 DB 操作台（设计 2026-09-28）----
 export const dbTables = (id, env) => http.get(`/apps/${id}/db/${env}/tables`)

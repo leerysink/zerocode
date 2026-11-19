@@ -16,10 +16,13 @@ const tone = computed(() => {
   return result.value.ok === false ? 'error' : 'ok'
 })
 const title = computed(() => {
+  const skill = result.value?.script
   if (!result.value) return '正在执行 Python 脚本…'
-  if (result.value.ok === false) return 'Python 沙箱执行失败'
-  return result.value.exit_code === 0 ? 'Python 脚本已执行' : 'Python 脚本已执行（非零退出）'
+  if (result.value.ok === false) return skill ? '技能脚本执行失败' : 'Python 沙箱执行失败'
+  const base = skill ? '技能脚本已执行' : 'Python 脚本已执行'
+  return result.value.exit_code === 0 ? base : `${base}（非零退出）`
 })
+const scriptLine = computed(() => (typeof result.value?.script === 'string' ? result.value.script : ''))
 const metaLine = computed(() => {
   const r = result.value
   if (!r || r.ok === false) return ''
@@ -47,6 +50,7 @@ const toolName = computed(() => props.msg.name ?? props.msg.tool_name ?? 'run_py
         {{ result.error || 'Python 沙箱执行失败' }}
       </div>
       <div v-if="metaLine" class="zc-page-meta">{{ metaLine }}</div>
+      <div v-if="scriptLine" class="zc-page-meta" data-test="python-script">脚本：{{ scriptLine }}</div>
       <pre v-if="output" class="zc-page-output" data-test="python-output">{{ output }}</pre>
       <div v-if="artifacts.length" class="zc-page-artifacts" data-test="python-artifacts">
         <div class="zc-page-meta">产物（文本经 write_file 落盘）：</div>

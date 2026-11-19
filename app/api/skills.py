@@ -6,8 +6,9 @@
 import asyncio
 import logging
 import shutil
+from pathlib import Path
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import text
@@ -15,7 +16,7 @@ from sqlalchemy.exc import IntegrityError
 
 from app.agent.model_resolver import resolve_model_for_user
 from app.services import config_service
-from app.skills import generator, installer
+from app.skills import files, generator, installer, preview
 from app.skills.library import (NAME_MAX, SkillError, delete_skill_dir, next_free_slug,
                                 parse_skill_md, slugify, write_skill_dir)
 
@@ -27,8 +28,14 @@ _COLUMNS = ("id, slug, name, description, source_type, source_url, "
 
 
 class InstallIn(BaseModel):
+    url: str | None = None        # 直装通道（兼容）；与 token 二选一
+    subpath: str | None = None    # 仅 GitHub 仓库通道有意义（monorepo 候选二次提交）
+    token: str | None = None      # 预览快照通道（ADR-0061）：preview 返回的 token
+
+
+class PreviewIn(BaseModel):
     url: str
-    subpath: str | None = None  # 仅 GitHub 仓库通道有意义（monorepo 候选二次提交）
+    subpath: str | None = None
 
 
 class PatchIn(BaseModel):
@@ -99,24 +106,45 @@ async def list_skills(request: Request):
         rows = (await s.execute(text(
             f"SELECT {_COLUMNS} FROM user_skill WHERE owner_user_id=:u ORDER BY id"),
             {"u": uid})).mappings().all()
-    return [dict(r) for r in rows]
+    out = []
+    for r in rows:
+        d = dict(r)
+        # 聚合副信息（ADR-0061 / spec 故事1/2）：实时扫母本；残行母本缺失降级 0/false
+        sd = files.owned_skill_dir(uid, d["skill_dir"])
+        if sd is None:
+            d.update(file_count=0, total_bytes=0, has_scripts=False)
+        else:
+            fl = files.list_files(sd)
+            d.update(file_count=len(fl), total_bytes=sum(f["size"] for f in fl),
+                     has_scripts=any(f["path"].lower().endswith(".py") for f in fl))
+        out.append(d)
+    return out
+
+
+async def _fetch_payload(url: str, subpath, transport) -> dict:
+    """url/GitHub 取回技能载荷（install 直装与 preview 共用）；多命中回 candidates。"""
+    if installer.parse_github_url(url) is not None:
+        return await installer.fetch_skill_from_github(url, subpath=subpath, transport=transport)
+    if (subpath or "").strip():
+        raise HTTPException(400, "subpath 仅对 GitHub 仓库 URL 有意义")
+    return await installer.fetch_skill_from_url(url, transport=transport)
 
 
 @router.post("/install", status_code=201)
 async def install(request: Request, body: InstallIn):
     uid = request.state.actor["id"]
+    # 预览快照通道（ADR-0061）：从快照落盘，preview==install；过期/越权 token 拒
+    if body.token:
+        payload = preview.consume_snapshot(uid, body.token)
+        if payload is None:
+            raise HTTPException(400, "预览已过期或无效，请重新预览")
+        return await _persist_skill(request, uid, payload)
     url = (body.url or "").strip()
     if not url:
-        raise HTTPException(400, "请提供 url")
+        raise HTTPException(400, "请提供 url 或 preview token")
     transport = getattr(request.app.state, "skills_http_transport", None)
     try:
-        if installer.parse_github_url(url) is not None:
-            payload = await installer.fetch_skill_from_github(
-                url, subpath=body.subpath, transport=transport)
-        else:
-            if (body.subpath or "").strip():
-                raise HTTPException(400, "subpath 仅对 GitHub 仓库 URL 有意义")
-            payload = await installer.fetch_skill_from_url(url, transport=transport)
+        payload = await _fetch_payload(url, body.subpath, transport)
     except SkillError as e:
         raise HTTPException(400, str(e))
 
@@ -125,6 +153,56 @@ async def install(request: Request, body: InstallIn):
         return JSONResponse(status_code=200, content={"candidates": payload["candidates"]})
 
     return await _persist_skill(request, uid, payload)
+
+
+@router.post("/preview")
+async def preview_skill(request: Request, body: PreviewIn):
+    """安装前预览（ADR-0061 / spec 故事9-13）：取回整包暂存为快照，回清单+SKILL.md，不落地母本。"""
+    uid = request.state.actor["id"]
+    url = (body.url or "").strip()
+    if not url:
+        raise HTTPException(400, "请提供 url")
+    transport = getattr(request.app.state, "skills_http_transport", None)
+    try:
+        payload = await _fetch_payload(url, body.subpath, transport)
+    except SkillError as e:
+        raise HTTPException(400, str(e))
+    if "candidates" in payload:
+        return JSONResponse(status_code=200, content={"candidates": payload["candidates"]})
+    try:
+        token = preview.save_snapshot(uid, payload)
+    except SkillError as e:
+        raise HTTPException(400, str(e))
+    return {"token": token, **preview.snapshot_manifest(uid, token)}
+
+
+@router.get("/preview/{token}/content")
+async def preview_file_content(request: Request, token: str, path: str):
+    """预览态读快照文本文件（spec 故事9）：owner+TTL 校验，白名单+围栏。"""
+    uid = request.state.actor["id"]
+    sd = preview.snapshot_files_dir(uid, token)
+    if sd is None:
+        raise HTTPException(400, "预览已过期或无效，请重新预览")
+    try:
+        content = files.read_text(sd, path)
+    except SkillError as e:
+        raise HTTPException(400, str(e))
+    return {"path": path, "content": content}
+
+
+@router.get("/preview/{token}/raw")
+async def preview_file_image(request: Request, token: str, path: str):
+    """预览态读快照图片（spec 故事9）：类型围栏+nosniff。"""
+    uid = request.state.actor["id"]
+    sd = preview.snapshot_files_dir(uid, token)
+    if sd is None:
+        raise HTTPException(400, "预览已过期或无效，请重新预览")
+    try:
+        blob, ct = files.read_image(sd, path)
+    except SkillError as e:
+        raise HTTPException(400, str(e))
+    return Response(content=blob, media_type=ct,
+                    headers={"X-Content-Type-Options": "nosniff"})
 
 
 @router.post("/generate")
@@ -229,3 +307,50 @@ async def delete_skill(request: Request, skill_id: int):
             {"i": skill_id, "u": uid})
         await s.commit()
     return {"ok": True}
+
+
+async def _owned_skill_dir(request: Request, uid, skill_id: int) -> Path:
+    """owner 隔离取技能母本目录：行不存在/越权 404；母本目录缺失（残行）也 404。"""
+    async with request.app.state.session_factory() as s:
+        row = (await s.execute(text(
+            "SELECT skill_dir FROM user_skill WHERE id=:i AND owner_user_id=:u"),
+            {"i": skill_id, "u": uid})).first()
+    if row is None:
+        raise HTTPException(404, "技能不存在")
+    sd = files.owned_skill_dir(uid, row[0])
+    if sd is None:
+        raise HTTPException(404, "技能母本不存在")
+    return sd
+
+
+@router.get("/{skill_id}/files")
+async def list_skill_files(request: Request, skill_id: int):
+    """技能详情文件树（ADR-0061 / spec 故事3）：只读，owner 隔离。"""
+    uid = request.state.actor["id"]
+    sd = await _owned_skill_dir(request, uid, skill_id)
+    return {"files": files.list_files(sd)}
+
+
+@router.get("/{skill_id}/files/content")
+async def read_skill_file(request: Request, skill_id: int, path: str):
+    """读文本文件（spec 故事4）：白名单+围栏；SkillError→400。"""
+    uid = request.state.actor["id"]
+    sd = await _owned_skill_dir(request, uid, skill_id)
+    try:
+        content = files.read_text(sd, path)
+    except SkillError as e:
+        raise HTTPException(400, str(e))
+    return {"path": path, "content": content}
+
+
+@router.get("/{skill_id}/files/raw")
+async def read_skill_image(request: Request, skill_id: int, path: str):
+    """图片内联预览（spec 故事5）：类型围栏+nosniff；非图片 SkillError→400。"""
+    uid = request.state.actor["id"]
+    sd = await _owned_skill_dir(request, uid, skill_id)
+    try:
+        blob, ct = files.read_image(sd, path)
+    except SkillError as e:
+        raise HTTPException(400, str(e))
+    return Response(content=blob, media_type=ct,
+                    headers={"X-Content-Type-Options": "nosniff"})

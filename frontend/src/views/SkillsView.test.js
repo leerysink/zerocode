@@ -10,10 +10,16 @@ const mocks = vi.hoisted(() => ({
   api: {
     listSkills: vi.fn(() => Promise.resolve({ data: [] })),
     installSkill: vi.fn(),
+    previewSkill: vi.fn(),
     patchSkill: vi.fn(),
     deleteSkill: vi.fn(),
     generateSkill: vi.fn(),
     adoptSkill: vi.fn(),
+    skillFiles: vi.fn(() => Promise.resolve({ data: { files: [] } })),
+    skillFileContent: vi.fn(() => Promise.resolve({ data: { content: '' } })),
+    skillFileRawUrl: vi.fn((id, p) => `/api/skills/${id}/files/raw?path=${p}`),
+    previewFileContent: vi.fn(() => Promise.resolve({ data: { content: '' } })),
+    previewFileRawUrl: vi.fn((t, p) => `/api/skills/preview/${t}/raw?path=${p}`),
   },
   antd: {
     message: { success: vi.fn(), error: vi.fn(), info: vi.fn(), warning: vi.fn() },
@@ -73,6 +79,12 @@ const STUBS = {
   },
   'a-switch': slot('a-switch'),
   'a-empty': slot('a-empty'),
+  'SkillDetailDrawer': {
+    name: 'SkillDetailDrawer',
+    props: { open: Boolean, title: String, files: Array, skillMd: String, confirmable: Boolean, confirming: Boolean },
+    emits: ['close', 'confirm'],
+    render() { return h('div', { class: 'stub-skill-drawer' }) },
+  },
 }
 
 async function mountView() {
@@ -294,5 +306,77 @@ describe('SkillsView 返回', () => {
     await wrapper.find('.zc-back').trigger('click')
     expect(mocks.router.push).toHaveBeenCalledWith('/')
     expect(mocks.router.back).not.toHaveBeenCalled()
+  })
+})
+
+describe('SkillsView 多文件展示（ADR-0061）', () => {
+  const installCard = (w) => w.findAll('.stub-card').find((c) => c.text().includes('从链接安装'))
+  const previewBtn = (w) => installCard(w).findAll('.stub-a-button')
+    .find((b) => b.text().replace(/\s+/g, '') === '预览')
+  const drawers = (w) => w.findAllComponents({ name: 'SkillDetailDrawer' })
+
+  it('列表名称下渲染副信息「N 文件 · X KB · 含脚本」', async () => {
+    mocks.api.listSkills.mockResolvedValue({ data: [
+      { id: 1, name: 'pdf', description: 'd', source_type: 'github', enabled: true,
+        file_count: 3, total_bytes: 2048, has_scripts: true },
+      { id: 2, name: 'note', description: 'd', source_type: 'url', enabled: true,
+        file_count: 1, total_bytes: 100, has_scripts: false },
+    ] })
+    const w = await mountView()
+    const subs = w.findAll('[data-test="skill-subline"]').map((s) => s.text())
+    expect(subs[0]).toBe('3 文件 · 2.0 KB · 含脚本')
+    expect(subs[1]).toBe('1 文件 · 100 B')
+  })
+
+  it('点详情 → 开只读抽屉并拉文件清单', async () => {
+    mocks.api.listSkills.mockResolvedValue({ data: [
+      { id: 7, name: 'pdf', description: 'd', source_type: 'github', enabled: true,
+        file_count: 1, total_bytes: 10, has_scripts: false }] })
+    mocks.api.skillFiles.mockResolvedValue({ data: { files: [{ path: 'SKILL.md', size: 10, kind: 'text' }] } })
+    const w = await mountView()
+    const detailBtn = w.findAll('[data-key="ops"] .stub-a-button')
+      .find((b) => b.text().replace(/\s+/g, '') === '详情')
+    await detailBtn.trigger('click')
+    await flushPromises()
+    expect(mocks.api.skillFiles).toHaveBeenCalledWith(7)
+    const d = drawers(w)[0]
+    expect(d.props('open')).toBe(true)
+    expect(d.props('files')).toEqual([{ path: 'SKILL.md', size: 10, kind: 'text' }])
+    expect(d.props('confirmable')).toBe(false)
+  })
+
+  it('预览→确认安装走 token 快照（preview==install）', async () => {
+    mocks.api.previewSkill.mockResolvedValue({ data: {
+      token: 'tok123', name: 'pdf', description: 'd',
+      files: [{ path: 'SKILL.md', size: 10, kind: 'text' }], skill_md: '正文' } })
+    mocks.api.installSkill.mockResolvedValue({ data: { id: 9, name: 'pdf', source_type: 'github' } })
+    const w = await mountView()
+    await w.find('.stub-input').setValue('https://github.com/o/r')
+    await previewBtn(w).trigger('click')
+    await flushPromises()
+    expect(mocks.api.previewSkill).toHaveBeenCalledWith({ url: 'https://github.com/o/r' })
+    const p = drawers(w)[1]
+    expect(p.props('open')).toBe(true)
+    expect(p.props('confirmable')).toBe(true)
+    expect(p.props('skillMd')).toBe('正文')
+    p.vm.$emit('confirm')
+    await flushPromises()
+    expect(mocks.api.installSkill).toHaveBeenCalledWith({ token: 'tok123' })
+    expect(mocks.antd.message.success).toHaveBeenCalledWith('已安装技能：pdf')
+  })
+
+  it('预览多命中 → 候选卡，带 subpath 二次预览', async () => {
+    mocks.api.previewSkill
+      .mockResolvedValueOnce({ data: { candidates: [{ path: 'skills/a' }] } })
+      .mockResolvedValueOnce({ data: { token: 't2', name: 'a', description: 'd', files: [], skill_md: null } })
+    const w = await mountView()
+    await w.find('.stub-input').setValue('https://github.com/o/r')
+    await previewBtn(w).trigger('click')
+    await flushPromises()
+    expect(w.text()).toContain('选择要预览的技能')
+    await w.find('.zc-cand-row .stub-a-button').trigger('click')
+    await flushPromises()
+    expect(mocks.api.previewSkill).toHaveBeenLastCalledWith({ url: 'https://github.com/o/r', subpath: 'skills/a' })
+    expect(drawers(w)[1].props('open')).toBe(true)
   })
 })

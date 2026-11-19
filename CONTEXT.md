@@ -141,6 +141,11 @@ Agent 在工作区干活时自动遵循已启用技能。它不是生成应用�
 生成型技能的 `source_url` 填占位哨兵 `ai://generated`（仅为满足 `NOT NULL`，且永不发起请求），
 判定来源一律看 `source_type` 而非 `source_url`。
 
+技能数据分两层：**技能元数据**（`user_skill` 表行：name/description/source_type/enabled 等，
+管理页列表展示面）与**技能母本**（磁盘 `data/users/<uid>/skills/<slug>/` 多文件包：
+SKILL.md + references/assets + scripts，内容真源，对 Agent 只读，ADR-0004）。
+「技能详情」指对母本的只读浏览视图，与列表的元数据展示相对。
+
 ## 创始人（founder）
 
 第一个注册的账号（`actor.is_founder`），注册同事务承接全部无主存量数据。

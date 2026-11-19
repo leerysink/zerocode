@@ -6,9 +6,14 @@
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { message, Modal } from 'ant-design-vue'
-import { ArrowLeftOutlined, DeleteOutlined, RobotOutlined } from '@ant-design/icons-vue'
-import { adoptSkill, deleteSkill, generateSkill, installSkill, listSkills, patchSkill } from '../api'
+import { ArrowLeftOutlined, DeleteOutlined, EyeOutlined, RobotOutlined } from '@ant-design/icons-vue'
+import {
+  adoptSkill, deleteSkill, generateSkill, installSkill, listSkills, patchSkill,
+  previewSkill, skillFiles, skillFileContent, skillFileRawUrl,
+  previewFileContent, previewFileRawUrl,
+} from '../api'
 import { skillSourceLabel } from '../utils/skillSource'
+import SkillDetailDrawer from '../components/SkillDetailDrawer.vue'
 
 const router = useRouter()
 function goBack() {
@@ -39,12 +44,62 @@ function resetDraft() {
 }
 
 const columns = [
-  { title: '名称', dataIndex: 'name' },
+  { title: '名称', dataIndex: 'name', key: 'name' },
   { title: '描述', dataIndex: 'description' },
   { title: '来源', dataIndex: 'source_type', key: 'source', width: 90 },
   { title: '状态', dataIndex: 'enabled', key: 'enabled', width: 110 },
-  { title: '操作', key: 'ops', width: 72 },
+  { title: '操作', key: 'ops', width: 120 },
 ]
+
+function fmtBytes(n) {
+  if (typeof n !== 'number') return ''
+  return n < 1024 ? `${n} B` : `${(n / 1024).toFixed(1)} KB`
+}
+function subLine(record) {
+  const parts = [`${record.file_count ?? 0} 文件`, fmtBytes(record.total_bytes ?? 0)]
+  if (record.has_scripts) parts.push('含脚本')
+  return parts.join(' · ')
+}
+
+// ---- 详情抽屉（001/002）：只读浏览母本 ----
+const detailOpen = ref(false)
+const detailId = ref(null)
+const detailTitle = ref('技能详情')
+const detailFiles = ref([])
+async function openDetail(record) {
+  detailId.value = record.id
+  detailTitle.value = record.name
+  detailFiles.value = []
+  detailOpen.value = true
+  try {
+    detailFiles.value = (await skillFiles(record.id)).data.files
+  } catch (e) {
+    message.error(e?.response?.data?.detail || '文件清单加载失败')
+  }
+}
+const detailLoadContent = (path) => skillFileContent(detailId.value, path).then((r) => r.data.content)
+const detailRawUrl = (path) => skillFileRawUrl(detailId.value, path)
+
+// ---- 安装预览（004）：两段式快照，preview==install ----
+const previewOpen = ref(false)
+const previewData = ref(null)
+const previewConfirming = ref(false)
+const previewLoadContent = (path) => previewFileContent(previewData.value.token, path).then((r) => r.data.content)
+const previewRawUrl = (path) => previewFileRawUrl(previewData.value.token, path)
+async function confirmPreview() {
+  if (previewConfirming.value || !previewData.value) return
+  previewConfirming.value = true
+  try {
+    const { data } = await installSkill({ token: previewData.value.token })
+    previewOpen.value = false
+    previewData.value = null
+    finishInstall(data)
+  } catch (e) {
+    message.error(e?.response?.data?.detail || '安装失败')
+  } finally {
+    previewConfirming.value = false
+  }
+}
 
 async function load() {
   loading.value = true
@@ -58,28 +113,29 @@ async function load() {
 }
 onMounted(load)
 
-async function doInstall() {
-  if (installing.value) return  // 点击与 Enter 两条入口统一短路，防在飞时二次提交（复审 Nit-2）
+async function doPreview() {
+  if (installing.value) return  // 点击与 Enter 两条入口统一短路，防在飞时二次提交
   const u = url.value.trim()
   if (!u) {
     message.warning('请粘贴 GitHub 仓库或 SKILL.md 链接')
     return
   }
-  // 换 URL 重新安装时清掉旧候选卡：残留候选可能带错误仓库二次提交（审查 M-3）
+  // 换 URL 重新预览时清掉旧候选卡：残留候选可能带错误仓库二次提交
   candidates.value = null
   candidateUrl.value = ''
   installing.value = true
   try {
-    const { data } = await installSkill({ url: u })
+    const { data } = await previewSkill({ url: u })
     if (data.candidates) {
       candidates.value = data.candidates
       candidateUrl.value = u
-      message.info('检测到多个技能，请选择要安装的一个')
+      message.info('检测到多个技能，请选择要预览的一个')
       return
     }
-    finishInstall(data)
+    previewData.value = data
+    previewOpen.value = true
   } catch (e) {
-    message.error(e?.response?.data?.detail || '安装失败')
+    message.error(e?.response?.data?.detail || '预览失败')
   } finally {
     installing.value = false
   }
@@ -89,16 +145,17 @@ async function pickCandidate(path) {
   installing.value = true
   pendingPath.value = path
   try {
-    const { data } = await installSkill({ url: candidateUrl.value, subpath: path })
-    // 二次提交仍可能返回候选（候选目录嵌套多技能）：不守卫会假成功 toast「undefined」（审查 B-1）
+    const { data } = await previewSkill({ url: candidateUrl.value, subpath: path })
+    // 二次提交仍可能返回候选（候选目录嵌套多技能）：不守卫会假成功 toast「undefined」
     if (data.candidates) {
       candidates.value = data.candidates
       message.info('该路径下仍有多个技能，请再选一次')
       return
     }
-    finishInstall(data)
+    previewData.value = data
+    previewOpen.value = true
   } catch (e) {
-    message.error(e?.response?.data?.detail || '安装失败')
+    message.error(e?.response?.data?.detail || '预览失败')
   } finally {
     installing.value = false
     pendingPath.value = null
@@ -234,12 +291,13 @@ function removeSkill(record) {
           v-model:value="url"
           placeholder="粘贴 GitHub 仓库链接（如 https://github.com/owner/repo）或指向 SKILL.md 的直链"
           allow-clear
-          @press-enter="doInstall()"
+          @press-enter="doPreview()"
         />
         <a-button type="primary" :disabled="installing" :loading="installing && !pendingPath"
-                  @click="doInstall()">安装</a-button>
+                  data-test="skill-preview-btn"
+                  @click="doPreview()">预览</a-button>
       </div>
-      <p class="zc-tip">技能遵循 Anthropic Agent Skills 标准；安装后归属当前账户，工作区不会出现技能文件。</p>
+      <p class="zc-tip">先预览整包文件再确认安装（装的就是预览的那一份）；技能遵循 Anthropic Agent Skills 标准，安装后归属当前账户，工作区不会出现技能文件。</p>
     </a-card>
 
     <a-card class="zc-card zc-ai-card" title="用 AI 生成">
@@ -285,12 +343,12 @@ function removeSkill(record) {
       </template>
     </a-card>
 
-    <a-card v-if="candidates" class="zc-card" title="选择要安装的技能">
+    <a-card v-if="candidates" class="zc-card" title="选择要预览的技能">
       <div v-for="c in candidates" :key="c.path" class="zc-cand-row">
         <span class="zc-cand-path">{{ c.path || '（仓库根目录）' }}</span>
         <a-button size="small" type="primary" :disabled="installing"
                   :loading="pendingPath === c.path"
-                  @click="pickCandidate(c.path)">安装</a-button>
+                  @click="pickCandidate(c.path)">预览</a-button>
       </div>
     </a-card>
 
@@ -304,6 +362,11 @@ function removeSkill(record) {
       size="small"
     >
       <template #bodyCell="{ column, record }">
+        <!-- 名称列：副信息「N 文件 · X KB · 含脚本」（ADR-0061 / ticket 003） -->
+        <template v-if="column.key === 'name'">
+          <div class="zc-skill-name">{{ record.name }}</div>
+          <div class="zc-skill-sub" data-test="skill-subline">{{ subLine(record) }}</div>
+        </template>
         <!-- 来源列：未知 source_type 原样显示，未来新增类型不必改前端 -->
         <template v-if="column.key === 'source'">
           {{ skillSourceLabel(record.source_type) }}
@@ -315,6 +378,9 @@ function removeSkill(record) {
                     @change="(v) => toggleEnabled(record, v)" />
         </template>
         <template v-if="column.key === 'ops'">
+          <a-button size="small" type="text" data-test="skill-detail-btn" @click="openDetail(record)">
+            <eye-outlined /> 详情
+          </a-button>
           <a-button size="small" danger type="text" @click="removeSkill(record)">
             <delete-outlined /> 删除
           </a-button>
@@ -324,6 +390,21 @@ function removeSkill(record) {
         <a-empty description="还没有技能" />
       </template>
     </a-table>
+
+    <!-- 详情抽屉（只读浏览母本，001/002） -->
+    <SkillDetailDrawer
+      :open="detailOpen" :title="detailTitle" :files="detailFiles"
+      :load-content="detailLoadContent" :raw-url="detailRawUrl"
+      @close="detailOpen = false"
+    />
+    <!-- 安装预览抽屉（快照审视→确认安装，004） -->
+    <SkillDetailDrawer
+      :open="previewOpen" :title="`预览：${previewData?.name || ''}`"
+      :files="previewData?.files || []" :skill-md="previewData?.skill_md ?? null"
+      :load-content="previewLoadContent" :raw-url="previewRawUrl"
+      confirmable :confirming="previewConfirming"
+      @close="previewOpen = false" @confirm="confirmPreview"
+    />
   </div>
 </template>
 
@@ -364,6 +445,8 @@ function removeSkill(record) {
   font-family: ui-monospace, Consolas, Menlo, monospace;
   font-size: 13px;
 }
+.zc-skill-name { font-size: 13px; }
+.zc-skill-sub { font-size: 11px; color: var(--zc-text-sub); margin-top: 2px; }
 .zc-tip {
   margin: 8px 0 0;
   color: var(--zc-text-sub);
