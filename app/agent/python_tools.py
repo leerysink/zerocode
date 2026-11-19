@@ -62,8 +62,51 @@ async def run_python_tool(ctx, args: dict, *, confirmed: bool = False) -> dict:
 
     args = args if isinstance(args, dict) else {}
     code = args.get("code")
-    if not isinstance(code, str) or not code.strip():
-        return {"ok": False, "error": "code 必填：要执行的 Python 源码字符串"}
+    skill_dir = args.get("skill_dir")
+    script = args.get("script")
+    has_code = isinstance(code, str) and bool(code.strip())
+    has_skill = skill_dir is not None or script is not None
+    if has_code and has_skill:
+        return {"ok": False, "error": "code 与 skill_dir/script 互斥，二选一"}
+    extra_mount: list[str] = []
+    script_rel = None
+    if has_skill:
+        if not (isinstance(skill_dir, str) and skill_dir.strip()
+                and isinstance(script, str) and script.strip()):
+            return {"ok": False, "error": "skill 模式需同时给 skill_dir 与 script"}
+        from app.agent.tools import resolve_skill_path
+        sd = resolve_skill_path(ctx.skills_root, skill_dir)
+        if sd is None or not sd.is_dir():
+            return {"ok": False, "error": "skill_dir 必须是当前用户技能根内的目录"}
+        sd_r = sd.resolve()
+        if sd_r == Path(ctx.skills_root).resolve():
+            return {"ok": False, "error": "skill_dir 必须是技能根下的单个技能目录，不能是根本身"}
+        sp = Path(script)
+        if sp.is_absolute():
+            return {"ok": False, "error": "script 必须是技能目录内的相对路径"}
+        try:
+            full = (sd_r / sp).resolve()
+        except (OSError, RuntimeError, ValueError):
+            return {"ok": False, "error": "script 路径异常"}
+        if sd_r != full and sd_r not in full.parents:
+            return {"ok": False, "error": "script 越出技能目录"}
+        if full.suffix.lower() != ".py":
+            return {"ok": False, "error": "script 必须是 .py 文件"}
+        if not full.is_file():
+            return {"ok": False, "error": f"script 不存在: {script}"}
+        argv = args.get("argv") or []
+        if not isinstance(argv, list) or not all(isinstance(a, str) for a in argv):
+            return {"ok": False, "error": "argv 必须是字符串数组"}
+        if len(argv) > 32 or any(len(a) > 2000 for a in argv):
+            return {"ok": False, "error": "argv 超限（≤32 个、单个 ≤2000 字符）"}
+        script_rel = full.relative_to(sd_r).as_posix()
+        extra_mount = ["-v", f"{sd_r}:/skill:ro"]
+        cmd = ["python", f"/skill/{script_rel}", *argv]
+    elif has_code:
+        cmd = ["python", "-c", code]
+    else:
+        return {"ok": False,
+                "error": "code 必填：要执行的 Python 源码字符串（或给 skill_dir+script 跑技能脚本）"}
     scratch = tempfile.mkdtemp(prefix="zc-pysandbox-")
     os.chmod(scratch, 0o777)   # 容器以非 root（1000）跑，scratch 须任意 uid 可写
     try:
@@ -76,8 +119,9 @@ async def run_python_tool(ctx, args: dict, *, confirmed: bool = False) -> dict:
             "-v", f"{ctx.root}:/workspace:ro",
             "--tmpfs", "/workspace/deploy:ro",
             "-v", f"{scratch}:/scratch",
+            *extra_mount,
             "-w", "/workspace",
-            SANDBOX_IMAGE, "python", "-c", code,
+            SANDBOX_IMAGE, *cmd,
             timeout=RUN_TIMEOUT)
         artifacts = _scan_artifacts(scratch)
     except Exception as e:
@@ -85,17 +129,24 @@ async def run_python_tool(ctx, args: dict, *, confirmed: bool = False) -> dict:
         return {"ok": False, "error": _safe_error(e)}
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
-    return {"ok": True, "exit_code": exit_code,
-            "duration_seconds": round(time.monotonic() - t0, 1),
-            "output": (log or "")[-OUTPUT_CHARS:],
-            "artifacts": artifacts}
+    result = {"ok": True, "exit_code": exit_code,
+              "duration_seconds": round(time.monotonic() - t0, 1),
+              "output": (log or "")[-OUTPUT_CHARS:],
+              "artifacts": artifacts}
+    if script_rel is not None:
+        result["script"] = script_rel
+    return result
 
 
 def build_python_prompt() -> str:
     """`<python_sandbox>` 使用口径：与 run_python 同生同灭（SCOPE_ALWAYS，恒注入）。"""
     return "\n".join([
         "\n\n<python_sandbox>",
-        "run_python 在隔离一次性容器里跑你给的 Python 脚本（code 参数），用于数据处理/计算/验证：",
+        "run_python 在隔离一次性容器里跑 Python 脚本，用于数据处理/计算/验证，两种模式二选一：",
+        "- code：你给的源码字符串（python -c）。",
+        "- skill_dir+script（+argv）：跑技能母本里的 .py 脚本——skill_dir 填 <available_skills> 索引的 path，",
+        "  script 填技能目录内相对路径（如 scripts/run.py），技能目录只读挂在 /skill，跑的是母本原件；",
+        "  脚本只用纯标准库（容器离线，第三方库装不了），何时跑哪个脚本按 SKILL.md 说明判断。",
         "- 工作区只读挂在 /workspace（deploy/ 凭据不可读），脚本写只进 /scratch；",
         "  文本产物（CSV/JSON/SQL）工具回全文，再用 write_file 落盘工作区；二进制产物（图片/xlsx）暂不能落盘。",
         "- 容器无网络出口、无数据库凭据：脚本离线跑；要公网数据先 web_fetch/web_download 取到工作区再读，",

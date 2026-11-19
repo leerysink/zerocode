@@ -16,8 +16,8 @@ MAX_SEARCH_MATCHES = 200
 MAX_SEARCH_FILES = 5000
 MAX_SEARCH_LINE_CHARS = 200
 BINARY_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".pdf", ".zip", ".gz", ".exe", ".dll", ".so", ".bin", ".db", ".sqlite", ".mp3", ".mp4"}
-# 技能母本受控读面文本白名单（故事11）：references/assets 常见形态，非此列表一律拒
-SKILL_READ_EXTS = {".md", ".txt", ".json", ".csv", ".yaml", ".yml"}
+# 技能母本受控读面文本白名单（故事11 / ADR-0060）：references/assets 与可执行 .py 脚本，非此列表一律拒
+SKILL_READ_EXTS = {".md", ".txt", ".json", ".csv", ".yaml", ".yml", ".py"}
 # memory_write 的操作面与查重窗口（ticket 003 / D-4：查重只给建议，不硬拦）
 MEMORY_OPS = ("create", "update", "delete")
 MEMORY_DEDUPE_TOP_K = 3
@@ -43,7 +43,7 @@ def resolve_skill_path(skills_root: Path | None, abs_path: str | None) -> Path |
     """技能目录受控读面（spec §5 / 故事11）：把 <available_skills> 给出的**绝对路径**
     收敛到当前用户技能根内。命中返回 Path；非绝对/根缺失/越出技能根/resolve 失败（死链接、
     reparse 点）一律返回 None，由调用方回落到既有工作区越界报错——绝不开第二读面（§4 双保险）。
-    仅 read_file 使用；写类工具不调用本函数（母本对 Agent 只读）。
+    read_file 与 run_python 技能脚本模式使用；写类工具不调用本函数（母本对 Agent 只读）。
     """
     if not skills_root or not abs_path:
         return None
@@ -58,20 +58,6 @@ def resolve_skill_path(skills_root: Path | None, abs_path: str | None) -> Path |
     if root_r != full and root_r not in full.parents:
         return None
     return full
-
-
-def is_skill_scripts(path: Path, root: Path) -> bool:
-    """技能母本 scripts/ 子树检测（故事11：脚本不在 v1 消费面）。
-
-    只对**技能根内的相对段**判定，不看整条绝对路径（复审 I-1）——否则祖先
-    目录（如仓库 clone 进名为 scripts 的父目录、或 ZEROCODE_DATA_DIR 含 scripts 段）
-    同名会误拒整个读面。path 不在 root 内时返回 False（调用方已围栏，理论不可达）。
-    """
-    try:
-        rel_parts = path.relative_to(root).parts
-    except ValueError:
-        return False
-    return "scripts" in rel_parts
 
 
 @dataclasses.dataclass
@@ -331,8 +317,6 @@ async def _handle_read_file(ctx: ToolContext, args: dict, *, confirmed: bool = F
             raise ws_err
         if not sk.is_file():
             raise ToolError(f"文件不存在: {rel}")
-        if is_skill_scripts(sk, Path(ctx.skills_root).resolve()):
-            raise ToolError(f"技能 scripts/ 目录不在读取范围: {rel}")
         if sk.suffix.lower() not in SKILL_READ_EXTS:
             raise ToolError(
                 f"技能目录仅可读文本类文件（{'/'.join(sorted(SKILL_READ_EXTS))}）: {rel}")

@@ -111,7 +111,9 @@ def _render_available_skills(skills: list[dict]) -> str:
         "\n\n<available_skills>",
         "以下是当前账户已启用的技能。技能是已验证的扩展指令：判断某个技能与当前任务相关时，"
         "用 read_file 读取其 path 目录下的 SKILL.md 全文，再按其说明执行；"
-        "技能目录及其 references/assets 只读，不要向其中写入。",
+        "技能目录及其 references/assets 只读，不要向其中写入。"
+        "技能内的 .py 脚本（含 scripts/）可 read_file 查看源码，也可用 run_python 的 "
+        "skill_dir+script（+argv）模式执行——母本只读挂进沙箱、离线纯标准库；跑哪个脚本按 SKILL.md 说明判断。",
     ]
     for s in skills:
         name = (s.get("name") or "").strip() or "(未命名)"

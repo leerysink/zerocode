@@ -21,6 +21,7 @@ def test_available_skills_block_rendered():
     assert "<available_skills>" in p and "</available_skills>" in p
     assert "PDF 导出" in p and "生成 PDF" in p and "/data/users/1/skills/pdf" in p
     assert "read_file" in p and "SKILL.md" in p
+    assert "run_python" in p and "skill_dir" in p   # ADR-0060：技能脚本执行入口要教会模型
 
 
 def test_no_available_skills_block_when_empty():

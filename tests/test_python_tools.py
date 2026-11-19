@@ -210,5 +210,151 @@ def test_python_prompt_names_boundaries():
     from app.agent import python_tools
     text = python_tools.build_python_prompt()
     assert "<python_sandbox>" in text and "</python_sandbox>" in text
-    for kw in ("/workspace", "/scratch", "write_file", "db_query", "无网络出口"):
+    for kw in ("/workspace", "/scratch", "write_file", "db_query", "无网络出口", "skill_dir", "/skill"):
         assert kw in text, kw
+
+
+# ---- 技能脚本模式（ADR-0060）：skill_dir+script+argv，母本只读挂载进同一沙箱 ----
+
+def _skill_tree(tmp_path):
+    skills = tmp_path / "users" / "1" / "skills"
+    pdf = skills / "pdf"
+    (pdf / "scripts").mkdir(parents=True)
+    (pdf / "scripts" / "run.py").write_text("print('hi')", encoding="utf-8")
+    (pdf / "SKILL.md").write_text("---\nname: pdf\ndescription: d\n---\n读我", encoding="utf-8")
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    return skills, pdf, ws
+
+
+def _skill_ctx(ws, skills):
+    return ToolContext(root=ws, session_id=1, session_factory=None, send=Recorder(),
+                       skills_root=skills)
+
+
+async def test_skill_mode_mounts_readonly_and_runs_master_copy(preflight_ok, monkeypatch, tmp_path):
+    skills, pdf, ws = _skill_tree(tmp_path)
+    spy = DockerSpy(0, "hi")
+    monkeypatch.setattr(engine, "docker", spy)
+    r = await execute_tool(_skill_ctx(ws, skills), "run_python",
+                           {"skill_dir": str(pdf), "script": "scripts/run.py"})
+    assert r["ok"] is True and r["exit_code"] == 0
+    assert r["script"] == "scripts/run.py"
+    (args, _), = spy.calls
+    assert f"{pdf.resolve()}:/skill:ro" in args          # 单技能目录只读挂载
+    assert "python" in args and "/skill/scripts/run.py" in args
+    assert "-c" not in args                              # 跑母本原件，不是 python -c
+    assert "--network" in args and "none" in args        # 安全口径不变
+    assert f"{ws}:/workspace:ro" in args
+
+
+async def test_skill_mode_argv_passed_in_order(preflight_ok, monkeypatch, tmp_path):
+    skills, pdf, ws = _skill_tree(tmp_path)
+    spy = DockerSpy(0, "")
+    monkeypatch.setattr(engine, "docker", spy)
+    await execute_tool(_skill_ctx(ws, skills), "run_python",
+                       {"skill_dir": str(pdf), "script": "scripts/run.py", "argv": ["in.csv", "42"]})
+    (args, _), = spy.calls
+    i = args.index("/skill/scripts/run.py")
+    assert args[i + 1:i + 3] == ("in.csv", "42")
+
+
+async def test_code_and_skill_mode_mutually_exclusive(preflight_ok, monkeypatch, tmp_path):
+    skills, pdf, ws = _skill_tree(tmp_path)
+    spy = DockerSpy()
+    monkeypatch.setattr(engine, "docker", spy)
+    r = await execute_tool(_skill_ctx(ws, skills), "run_python",
+                           {"code": "print(1)", "skill_dir": str(pdf), "script": "scripts/run.py"})
+    assert r["ok"] is False and "互斥" in r["error"]
+    assert spy.calls == []
+
+
+async def test_skill_mode_requires_both_fields(preflight_ok, monkeypatch, tmp_path):
+    skills, pdf, ws = _skill_tree(tmp_path)
+    spy = DockerSpy()
+    monkeypatch.setattr(engine, "docker", spy)
+    for bad in ({"skill_dir": str(pdf)}, {"script": "scripts/run.py"}):
+        r = await execute_tool(_skill_ctx(ws, skills), "run_python", bad)
+        assert r["ok"] is False and "skill" in r["error"], bad
+    assert spy.calls == []
+
+
+async def test_skill_dir_out_of_root_rejected(preflight_ok, monkeypatch, tmp_path):
+    skills, pdf, ws = _skill_tree(tmp_path)
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    spy = DockerSpy()
+    monkeypatch.setattr(engine, "docker", spy)
+    r = await execute_tool(_skill_ctx(ws, skills), "run_python",
+                           {"skill_dir": str(outside), "script": "x.py"})
+    assert r["ok"] is False and "skill_dir" in r["error"]
+    assert spy.calls == []
+
+
+async def test_skill_dir_must_be_directory_not_root(preflight_ok, monkeypatch, tmp_path):
+    skills, pdf, ws = _skill_tree(tmp_path)
+    spy = DockerSpy()
+    monkeypatch.setattr(engine, "docker", spy)
+    ctx = _skill_ctx(ws, skills)
+    r1 = await execute_tool(ctx, "run_python",
+                            {"skill_dir": str(pdf / "SKILL.md"), "script": "scripts/run.py"})
+    assert r1["ok"] is False and "skill_dir" in r1["error"]   # 指向文件
+    r2 = await execute_tool(ctx, "run_python",
+                            {"skill_dir": str(skills), "script": "pdf/scripts/run.py"})
+    assert r2["ok"] is False and "skill_dir" in r2["error"]   # 技能根本身：不挂整个根
+    assert spy.calls == []
+
+
+async def test_script_fence_matrix(preflight_ok, monkeypatch, tmp_path):
+    skills, pdf, ws = _skill_tree(tmp_path)
+    (pdf / "notpy.txt").write_text("x", encoding="utf-8")
+    spy = DockerSpy()
+    monkeypatch.setattr(engine, "docker", spy)
+    ctx = _skill_ctx(ws, skills)
+    cases = [
+        {"skill_dir": str(pdf), "script": str(pdf / "scripts" / "run.py")},  # 绝对路径
+        {"skill_dir": str(pdf), "script": "../escape.py"},                    # 逃逸出 skill_dir
+        {"skill_dir": str(pdf), "script": "notpy.txt"},                       # 非 .py
+        {"skill_dir": str(pdf), "script": "scripts/missing.py"},              # 不存在
+    ]
+    for c in cases:
+        r = await execute_tool(ctx, "run_python", c)
+        assert r["ok"] is False and "script" in r["error"], c
+    assert spy.calls == []
+
+
+async def test_argv_limits(preflight_ok, monkeypatch, tmp_path):
+    skills, pdf, ws = _skill_tree(tmp_path)
+    spy = DockerSpy()
+    monkeypatch.setattr(engine, "docker", spy)
+    ctx = _skill_ctx(ws, skills)
+    base = {"skill_dir": str(pdf), "script": "scripts/run.py"}
+    bads = [
+        {**base, "argv": ["x"] * 33},
+        {**base, "argv": ["x" * 2001]},
+        {**base, "argv": "notalist"},
+        {**base, "argv": [123]},
+    ]
+    for b in bads:
+        r = await execute_tool(ctx, "run_python", b)
+        assert r["ok"] is False and "argv" in r["error"], b
+    assert spy.calls == []
+
+
+async def test_no_skills_root_skill_mode_rejected(preflight_ok, monkeypatch, tmp_path):
+    skills, pdf, ws = _skill_tree(tmp_path)
+    spy = DockerSpy()
+    monkeypatch.setattr(engine, "docker", spy)
+    ctx = ToolContext(root=ws, session_id=1, session_factory=None, send=Recorder())  # skills_root=None
+    r = await execute_tool(ctx, "run_python", {"skill_dir": str(pdf), "script": "scripts/run.py"})
+    assert r["ok"] is False and "skill" in r["error"]
+    assert spy.calls == []
+
+
+async def test_code_mode_has_no_skill_mount(preflight_ok, monkeypatch, tmp_path):
+    spy = DockerSpy(0, "")
+    monkeypatch.setattr(engine, "docker", spy)
+    await execute_tool(make_ctx(tmp_path), "run_python", {"code": "print(1)"})
+    (args, _), = spy.calls
+    assert not any(a.endswith(":/skill:ro") for a in args)
+    assert "-c" in args

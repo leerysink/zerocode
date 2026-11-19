@@ -1168,9 +1168,10 @@ async def test_no_command_execution_tool_exists(tmp_path):
     """红线（ADR-0046 → ADR-0056 改写后）：工具面无通用命令执行能力，只允许平台写死的 preset
     与隔离 Python 沙箱。
 
-    语义是「白名单」：任何 schema 都不得出现 command/cmd/argv/shell/script 参数；两个执行类
-    工具各自锁死——run_check 只能选写死的 preset，run_python 是 sanctioned 沙箱、只收 code
-    （触达面由容器围栏锁死，不是通用 shell）。
+    语义是「白名单」：除 run_python 外任何 schema 都不得出现 command/cmd/argv/shell/script 参数；
+    两个执行类工具各自锁死——run_check 只能选写死的 preset，run_python 是 sanctioned 沙箱，
+    收 code（自由代码）或 skill_dir/script/argv（技能脚本，ADR-0060），触达面由容器围栏锁死，
+    不是通用 shell。script/argv 仅在 run_python 的技能脚本模式里合法。
     """
     from app.agent import registry
     from app.agent.llm import PREVIEW_TOOL_NAMES, TOOLS
@@ -1185,7 +1186,8 @@ async def test_no_command_execution_tool_exists(tmp_path):
     for spec in registry.SPECS:
         props = spec.schema["function"]["parameters"].get("properties", {})
         if spec.name == "run_python":
-            assert set(props) == {"code"}, "run_python 是 sanctioned 沙箱，只收 code"
+            assert set(props) == {"code", "skill_dir", "script", "argv"}, \
+                "run_python 是 sanctioned 沙箱：code 或技能脚本 skill_dir/script/argv（ADR-0060）"
             continue
         assert not (set(props) & {"command", "cmd", "argv", "shell", "script"}), spec.name
     check = registry.spec_of("run_check").schema["function"]["parameters"]

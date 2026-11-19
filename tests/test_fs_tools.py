@@ -1,7 +1,7 @@
 import dataclasses, json, pytest
 from pathlib import Path
 from app.agent.tools import (ToolContext, ToolError, resolve_in_workspace, resolve_skill_path,
-                             is_skill_scripts, execute_tool)
+                             execute_tool)
 
 @dataclasses.dataclass
 class FakeSF:  # 不落库的最小替代：execute_tool 内写 file_change 需 session_factory
@@ -132,13 +132,6 @@ def test_resolve_skill_path_fence(tmp_path):
     assert resolve_skill_path(root, "pdf/SKILL.md") is None  # 非绝对（工作区相对面管）
     assert resolve_skill_path(root, None) is None
     assert resolve_skill_path(None, str(inner)) is None  # 无读面默认关
-    assert is_skill_scripts(root / "pdf" / "scripts" / "run.py", root) is True
-    assert is_skill_scripts(root / "pdf" / "SKILL.md", root) is False
-    # 复审 I-1：祖先目录名为 scripts 不误伤（只看根内相对段）
-    assert is_skill_scripts(Path("/scripts/u1/skills/pdf/SKILL.md"),
-                            Path("/scripts/u1/skills")) is False
-    assert is_skill_scripts(Path("/scripts/u1/skills/pdf/scripts/run.py"),
-                            Path("/scripts/u1/skills")) is True
 
 
 @pytest.mark.asyncio
@@ -152,12 +145,26 @@ async def test_skill_absolute_path_readable(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_skill_scripts_denied(tmp_path):
+async def test_skill_scripts_py_readable(tmp_path):
+    # story-11 改写（ADR-0060）：scripts/ 的 .py 可读——执行面也是阅读面，便于先理解再跑、出错对照修
     skills, pdf, ws = _skills_fixture(tmp_path)
     ctx = _mk_skill_ctx(ws, skills)
+    r = await execute_tool(ctx, "read_file", {"path": str(pdf / "scripts" / "run.py")})
+    assert "print(1)" in r["content"]
+
+
+@pytest.mark.asyncio
+async def test_skill_py_readable_anywhere_and_scripts_binary_denied(tmp_path):
+    # .py 进白名单后技能目录任意位置可读；去掉 scripts/ 拦截不等于放开二进制（白名单仍挡）
+    skills, pdf, ws = _skills_fixture(tmp_path)
+    (pdf / "helper.py").write_text("X = 1", encoding="utf-8")
+    (pdf / "scripts" / "data.bin").write_bytes(b"\x00\x01")
+    ctx = _mk_skill_ctx(ws, skills)
+    r = await execute_tool(ctx, "read_file", {"path": str(pdf / "helper.py")})
+    assert "X = 1" in r["content"]
     with pytest.raises(ToolError) as e:
-        await execute_tool(ctx, "read_file", {"path": str(pdf / "scripts" / "run.py")})
-    assert "scripts" in str(e.value)
+        await execute_tool(ctx, "read_file", {"path": str(pdf / "scripts" / "data.bin")})
+    assert "文本类" in str(e.value)
 
 
 @pytest.mark.asyncio

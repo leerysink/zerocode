@@ -300,9 +300,17 @@ _WEB_CLOSE = _fn("web_close", "关闭当前公网浏览器会话，返回本次�
 _RUN_PYTHON = _fn(
     "run_python",
     "在隔离一次性容器里执行 Python 脚本（工作区只读、写只进 scratch、离线无网络、无库凭据）；"
-    "回退出码与输出，文本产物经 write_file 落盘。数据处理/计算/验证用，改完跑一次不反复跑",
-    {"code": {"type": "string", "description": "要执行的 Python 源码"}},
-    ["code"])
+    "回退出码与输出，文本产物经 write_file 落盘。两种模式二选一：code 跑自由代码；"
+    "skill_dir+script（+argv）跑技能母本里的 .py 脚本（技能目录只读挂进容器）。改完跑一次不反复跑",
+    {"code": {"type": "string",
+              "description": "要执行的 Python 源码（自由代码模式，与 skill_dir/script 互斥）"},
+     "skill_dir": {"type": "string",
+                   "description": "技能脚本模式：<available_skills> 索引给的技能目录绝对路径"},
+     "script": {"type": "string",
+                "description": "技能目录内相对路径的 .py 脚本（如 scripts/run.py），与 skill_dir 成对"},
+     "argv": {"type": "array", "items": {"type": "string"},
+              "description": "传给脚本的命令行参数（≤32 个、单个 ≤2000 字符），可选"}},
+    [])
 
 
 SPECS: tuple[ToolSpec, ...] = (
