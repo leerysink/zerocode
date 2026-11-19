@@ -28,6 +28,9 @@ async def test_engine():
             "TRUNCATE message_attachment, message, file_change, compaction, chat_session, workspace, "
             "app_project, app_share, app_publish_request, model_config, deploy_record, "
             "app_instance_link, release_application, app_release, "
+            # store_category 不被上面任何表引用（条目只存 key，没建外键），CASCADE 带不到它，
+            # 但分类字典的用例会增改停用它——不清就等于把上一轮的运营改动漏给下一轮（ADR-0061 §4）。
+            "store_category, "
             "actor_session, actor RESTART IDENTITY CASCADE"))
         await conn.execute(text(
             "INSERT INTO app_config (key, value) VALUES "
@@ -56,6 +59,13 @@ async def test_engine():
             "('clarify.enabled', 'false'), "
             "('clarify.ask_remind_at', '6') "
             "ON CONFLICT DO NOTHING"))
+        # 分类字典种子与 changelog/V20261120_02 同值：清库后必须重放，否则「其他」锁死、
+        # 停用分类不影响存量 label 这类事实在测试里根本不存在。
+        await conn.execute(text(
+            "INSERT INTO store_category (key, label, sort) VALUES "
+            "('效率工具', '效率工具', 10), ('数据管理', '数据管理', 20), "
+            "('内容展示', '内容展示', 30), ('演示样例', '演示样例', 40), "
+            "('其他', '其他', 90) ON CONFLICT (key) DO NOTHING"))
     await engine.dispose()
 
 @pytest.fixture

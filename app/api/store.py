@@ -12,10 +12,12 @@ from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from app.deploy.errors import DeployError
 from app.deploy.settings import preview_url
 from app.store import release as release_svc
 from app.store import applications as apps_svc
+from app.store import categories
 from app.store import links
 from app.store import shots
 
@@ -25,6 +27,12 @@ apps_ext = APIRouter(prefix="/api/apps")
 
 def _http(e: DeployError):
     return HTTPException(e.status, str(e))
+
+
+def _require_founder(actor: dict) -> None:
+    """运营台门禁：商店管理与分类字典的写操作只对创始人开放（ADR-0061）。"""
+    if not actor.get("is_founder"):
+        raise HTTPException(403, "商店管理仅创始人可见")
 
 
 async def current_actor(request: Request) -> dict:
@@ -63,7 +71,8 @@ async def list_releases(request: Request, actor: dict = Actor,
         params["q"] = f"%{q.strip()}%"
     if category:
         try:
-            params["cat"] = release_svc.normalize_category(category)
+            # 过滤口径认停用分类（存量条目还挂着它），写入口径只认启用项——两套语义见 categories.py
+            params["cat"] = await categories.normalize_filter(sf, category)
         except DeployError as e:
             raise _http(e)
         where.append("COALESCE(r.category, '其他') = :cat")
@@ -114,8 +123,7 @@ async def admin_releases(request: Request, actor: dict = Actor, status: str = ""
     与发现页「每 slug 只露最新 published」刻意不同：管理要看每一行的状态，
     故全量行按 id 倒序；预览地址优先 prod 在服，回落 dev 在服。
     """
-    if not actor.get("is_founder"):
-        raise _http(DeployError("商店管理仅创始人可见", status=403))
+    _require_founder(actor)
     if status not in ("", "published", "withdrawn"):
         raise _http(DeployError("status 只支持 published|withdrawn", status=400))
     sf = request.app.state.session_factory
@@ -127,13 +135,26 @@ async def admin_releases(request: Request, actor: dict = Actor, status: str = ""
     async with sf() as s:
         rows = (await s.execute(text(
             "SELECT r.id, r.app_id, r.slug, r.version, r.title, r.summary, r.stack, r.category, "
-            "r.status, r.screenshots, r.created_at, a.nickname AS publisher, "
+            "r.status, r.screenshots, r.created_at, r.updated_at, r.updated_by, "
+            "a.nickname AS publisher, ed.nickname AS editor, "
             "src.status_dev AS src_status_dev, src.dev_port AS src_dev_port, "
             "src.status_prod AS src_status_prod, src.prod_port AS src_prod_port, "
             "(SELECT count(*) FROM release_application q WHERE q.release_id = r.id "
-            " AND q.status = 'approved') AS install_count "
+            " AND q.status = 'approved') AS install_count, "
+            "(SELECT count(*) FROM release_application q WHERE q.release_id = r.id) "
+            " AS application_count, "
+            "(SELECT count(*) FROM app_release c WHERE c.prev_release_id = r.id) "
+            " AS child_release_count, "
+            "(SELECT count(*) FROM app_instance_link l WHERE l.release_id = r.id) "
+            " AS instance_link_count, "
+            # 能不能硬删由服务端判，UI 只照着置灰：让前端自己加总四个数迟早加错一个
+            "((SELECT count(*) FROM release_application q WHERE q.release_id = r.id) = 0 "
+            " AND (SELECT count(*) FROM app_release c WHERE c.prev_release_id = r.id) = 0 "
+            " AND (SELECT count(*) FROM app_instance_link l WHERE l.release_id = r.id) = 0) "
+            " AS deletable "
             "FROM app_release r "
             "LEFT JOIN actor a ON a.id = r.created_by "
+            "LEFT JOIN actor ed ON ed.id = r.updated_by "
             "LEFT JOIN app_project src ON src.id = r.app_id "
             f"{where} ORDER BY r.id DESC"), params)).mappings().all()
     from app.deploy import nics
@@ -141,7 +162,10 @@ async def admin_releases(request: Request, actor: dict = Actor, status: str = ""
     for r in rows:
         d = dict(r)
         d["created_at"] = d["created_at"].isoformat() if d.get("created_at") else None
+        d["updated_at"] = d["updated_at"].isoformat() if d.get("updated_at") else None
         d["install_count"] = int(d["install_count"])
+        d["application_count"] = int(d["application_count"])
+        d["child_release_count"] = int(d["child_release_count"])
         d["screenshots"] = shots.shot_urls(d["id"], d["screenshots"])
         st_dev, dev_port = d.pop("src_status_dev"), d.pop("src_dev_port")
         st_prod, prod_port = d.pop("src_status_prod"), d.pop("src_prod_port")
@@ -203,7 +227,7 @@ async def publish_to_store(request: Request, app_id: int, body: ReleaseIn,
     from app.services import app_service
     try:
         # 分类校验是全链最便宜的闸（规格 §4.8）：先于所有权与五道闸门，错分类直接 400
-        category = release_svc.normalize_category(body.category)
+        category = await categories.normalize(sf, body.category)
         # 上架仅所有者（规格 2026-11-16 §5.4）：release 服务按 id 直取应用，判权必须在这里先过接缝
         _app, role = await app_service.get_app_for_user(sf, app_id, actor["id"])
         app_service.require_owner(role)
@@ -298,6 +322,164 @@ async def republish(request: Request, release_id: int, actor: dict = Actor):
                         {"i": release_id})
         await s.commit()
     return {"ok": True}
+
+
+# 运营编辑的字段面固定为描述性元数据（ADR-0061 §1）：slug/version 是安装标识与包目录名、
+# stack 决定栈、status 是审批状态机、app_id 是所有权——放开任一条都牵连已装实例与一致性双轨。
+_OPS_EDITABLE = ("title", "summary", "category")
+
+
+@router.patch("/releases/{release_id}")
+async def ops_edit(request: Request, release_id: int, actor: dict = Actor):
+    """运营编辑（仅创始人）：改已上架条目的文案与分类，不新增版本行、不重走审批。
+
+    白名单外的字段出现即 400，不静默忽略——否则运营会以为自己也把 slug 改了。
+    """
+    sf = request.app.state.session_factory
+    # 权限最先（同 withdraw/republish 的口径）：非创始人连字段校验都不该走到
+    _require_founder(actor)
+    try:
+        body = await request.json()
+    except Exception:
+        raise _http(DeployError("请求体必须是 JSON 对象", status=400))
+    if not isinstance(body, dict):
+        raise _http(DeployError("请求体必须是 JSON 对象", status=400))
+    unknown = sorted(set(body) - set(_OPS_EDITABLE))
+    if unknown:
+        raise _http(DeployError(
+            f"这些字段不可编辑：{'/'.join(unknown)}（可编辑：{'/'.join(_OPS_EDITABLE)}）", status=400))
+    if not body:
+        raise _http(DeployError("没有要改的字段", status=400))
+    try:
+        patch: dict = {}
+        if "title" in body:
+            title = (body["title"] or "").strip()
+            if not title:
+                raise DeployError("标题不能为空", status=400)
+            if len(title) > 100:
+                raise DeployError("标题最长 100 字", status=400)
+            patch["title"] = title
+        if "summary" in body:
+            patch["summary"] = (body["summary"] or "").strip()
+        # 键取自 _OPS_EDITABLE 白名单，拼进 SET 子句的不是用户输入
+        async with sf() as s:
+            row = (await s.execute(text(
+                "SELECT id, category FROM app_release WHERE id = :i"),
+                {"i": release_id})).mappings().first()
+            if not row:
+                raise DeployError("版本不存在", status=404)
+            if "category" in body:
+                # allow 传当前值：分类被停用后，挂着它的条目还得改得动标题（否则停用=锁死编辑）
+                patch["category"] = await categories.normalize(
+                    sf, body["category"], allow=row["category"])
+            sets = ", ".join(f"{k} = :{k}" for k in patch)
+            saved = (await s.execute(text(
+                f"UPDATE app_release SET {sets}, updated_at = now(), updated_by = :u "
+                "WHERE id = :i "
+                "RETURNING id, title, summary, category, status, updated_at"),
+                {**patch, "u": actor["id"], "i": release_id})).mappings().first()
+            await s.commit()
+    except DeployError as e:
+        raise _http(e)
+    return dict(saved)
+
+
+@router.delete("/releases/{release_id}")
+async def purge(request: Request, release_id: int, actor: dict = Actor):
+    """硬删（ADR-0061 §3）：只删没人引用过的版本行，有引用一律 409 并把计数码回去。
+
+    app_release(id) 被 prev_release_id / release_application.release_id /
+    app_instance_link.release_id 三处 NOT NULL 引用且都没有 ON DELETE CASCADE：
+    放开级联等于运营一次误点就抹掉别人的申请历史与实例溯源，所以计数先查、非空即拒。
+    已下架（withdrawn）的行同样受这道约束——状态不是免死金牌。
+    """
+    sf = request.app.state.session_factory
+    _require_founder(actor)
+    async with sf() as s:
+        row = (await s.execute(text(
+            "SELECT "
+            "(SELECT count(*) FROM app_release c WHERE c.prev_release_id = r.id) AS child_count, "
+            "(SELECT count(*) FROM release_application q WHERE q.release_id = r.id) AS app_count, "
+            "(SELECT count(*) FROM release_application q WHERE q.release_id = r.id "
+            " AND q.status = 'approved') AS approved_count, "
+            "(SELECT count(*) FROM app_instance_link l WHERE l.release_id = r.id) AS link_count "
+            "FROM app_release r WHERE r.id = :i"), {"i": release_id})).mappings().first()
+        if not row:
+            raise _http(DeployError("版本不存在", status=404))
+        # 三个「被用过」的口径分开数：install_count 与列表同口径（批准的安装申请），
+        # instance_link_count 是真实存在的实例链接，两者不是一回事，混报会让运营看不懂拒绝原因
+        refs = {"child_release_count": row["child_count"], "application_count": row["app_count"],
+                "install_count": row["approved_count"], "instance_link_count": row["link_count"]}
+        if any(refs.values()):
+            raise _http(DeployError(
+                f"这条版本被引用着（{refs['install_count']} 次安装、"
+                f"{refs['application_count']} 条申请、{refs['instance_link_count']} 个已装实例链接、"
+                f"{refs['child_release_count']} 个后继版本），"
+                "不能硬删；请先下架，让它停止接受新申请", status=409))
+        try:
+            await s.execute(text("DELETE FROM app_release WHERE id = :i"), {"i": release_id})
+            await s.commit()
+        except IntegrityError:
+            # 上面查完到真删之间被人抢先装上/申请了：FK 会拦下来，这里翻成同一句 409 口径，
+            # 不把数据库报错原文甩给运营。
+            await s.rollback()
+            raise _http(DeployError("这条版本刚被引用，未删除；请刷新后改走下架", status=409)) from None
+    return {"ok": True, **refs}
+
+
+class CategoryIn(BaseModel):
+    key: str
+    label: str = ""
+    sort: int = 0
+
+
+class CategoryPatchIn(BaseModel):
+    label: str | None = None
+    sort: int | None = None
+    enabled: bool | None = None
+
+
+@router.get("/categories")
+async def list_categories(request: Request):
+    """分类字典全量（含停用）：登录即可读。
+
+    管理侧要看停用项上还挂着多少存量条目，所以不在这里过滤 enabled；
+    上架与运营编辑的可选面由前端按 `enabled` 自己收窄（ADR-0061 §4）。
+    """
+    return await categories.all_rows(request.app.state.session_factory)
+
+
+@router.post("/categories", status_code=201)
+async def create_category(request: Request, body: CategoryIn, actor: dict = Actor):
+    _require_founder(actor)
+    sf = request.app.state.session_factory
+    try:
+        return await categories.create(sf, key=body.key, label=body.label, sort=body.sort)
+    except DeployError as e:
+        raise _http(e)
+
+
+@router.patch("/categories/{key}")
+async def patch_category(request: Request, key: str, body: CategoryPatchIn, actor: dict = Actor):
+    """改名称/排序/启停。key 改不了：它是条目里存的值，改 key 等于批量改存量条目。"""
+    _require_founder(actor)
+    sf = request.app.state.session_factory
+    try:
+        return await categories.update(sf, key=key, label=body.label, sort=body.sort,
+                                       enabled=body.enabled)
+    except DeployError as e:
+        raise _http(e)
+
+
+@router.delete("/categories/{key}")
+async def delete_category(request: Request, key: str, actor: dict = Actor):
+    """只删没条目引用的分类；「其他」是兜底值，任何情况下都不给删。"""
+    _require_founder(actor)
+    sf = request.app.state.session_factory
+    try:
+        return await categories.remove(sf, key=key)
+    except DeployError as e:
+        raise _http(e)
 
 
 class ApplyIn(BaseModel):

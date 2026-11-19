@@ -14,21 +14,16 @@ from app.deploy.scaffold import has_data_track
 from app.deploy.settings import REPO_ROOT, deploy_cfg
 from app.services import app_service
 from app.store import anchor as anchor_mod
+from app.store import categories
 from app.store import packages
 
 logger = logging.getLogger(__name__)
 
-# 商店固定分类（规格 2026-11-19 §4.8）：后端常量单源，前端 storeCategories.js 同源镜像。
+# 商店分类的种子清单（规格 2026-11-19 §4.8）：ADR-0061 §4 之后它的真源搬进了
+# changelog/V20261120_02_store_category_dict.sql 播的 store_category 字典表，运行期校验走
+# app/store/categories.py。这份常量只留作字典种子的对照物（测试也按它核字典初始状态）。
 STORE_CATEGORIES = ("效率工具", "数据管理", "内容展示", "演示样例", "其他")
 DEFAULT_CATEGORY = "其他"
-
-
-def normalize_category(value: str | None) -> str:
-    """缺省/空串落「其他」；不在枚举内一律 400（上架最便宜的闸，先于所有权与五道闸门）。"""
-    cat = (value or "").strip() or DEFAULT_CATEGORY
-    if cat not in STORE_CATEGORIES:
-        raise DeployError(f"分类不存在：{cat}（可选：{'/'.join(STORE_CATEGORIES)}）", status=400)
-    return cat
 
 
 def store_root(cfg: dict) -> Path:
@@ -54,7 +49,9 @@ async def latest_release(sf, slug: str) -> dict | None:
 async def create_release(sf, *, app_id: int, title: str, summary: str,
                          actor_id: int, category: str | None = None) -> dict:
     """上架当前在服 prod 版本。返回 app_release 行（含 id/anchor/fingerprint）。"""
-    category = normalize_category(category)
+    # 上架最便宜的闸（规格 §4.8）：先于所有权与五道闸门，错分类直接 400。
+    # 校验对象是 store_category 字典（ADR-0061 §4），不再是本文件的常量元组。
+    category = await categories.normalize(sf, category)
     app = await app_service.get_app(sf, app_id)
     slug = app["slug"]
     version = app.get("current_version")

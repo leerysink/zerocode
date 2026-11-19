@@ -285,8 +285,9 @@ async def test_admin_releases_仅创始人且含下架全量行(two_auth_clients
     await _insert_release(sf, slug="adm", version="b0", status="withdrawn", creator=bob_id)
     assert (await bob.get("/api/store/admin/releases")).status_code == 403
     rows = (await alice.get("/api/store/admin/releases")).json()
-    assert [r["version"] for r in rows] == ["b1", "b0"]
-    assert [r["status"] for r in rows] == ["published", "withdrawn"]
+    # 列表按 id 倒序（端点的既定契约）：后插的 b0 在前，不是按插入序
+    assert [r["version"] for r in rows] == ["b0", "b1"]
+    assert [r["status"] for r in rows] == ["withdrawn", "published"]
     assert rows[0]["install_count"] == 0 and rows[0]["preview_url"] == ""
     assert rows[0]["publisher"] == "bob"
     only = (await alice.get("/api/store/admin/releases?status=withdrawn")).json()
@@ -316,3 +317,162 @@ async def test_下架重新上架所有者与创始人代管(two_auth_clients):
     # 创始人重新上架自己的 withdrawn
     assert (await alice.post(f"/api/store/releases/{rid_a}/republish")).status_code == 200
     assert (await bob.post("/api/store/releases/999999/republish")).status_code == 404
+
+
+async def test_运营编辑_创始人改文案落留痕且不新增行(two_auth_clients):
+    """ADR-0061 §1/§2：白名单字段即时生效，留痕两列落库，版本行不增、状态机不动。"""
+    alice, bob = two_auth_clients
+    sf = alice.app.state.session_factory
+    async with sf() as s:
+        ids = dict((await s.execute(text("SELECT nickname, id FROM actor"))).all())
+    rid = await _insert_release(sf, slug="ops", version="b1", status="published", creator=ids["bob"])
+
+    # 权限先于字段校验：非创始人连白名单内字段也改不动
+    assert (await bob.patch(f"/api/store/releases/{rid}", json={"title": "改一下"})).status_code == 403
+
+    r = await alice.patch(f"/api/store/releases/{rid}",
+                          json={"title": "新标题", "summary": "新简介", "category": "效率工具"})
+    assert r.status_code == 200, r.text
+    assert (r.json()["title"], r.json()["summary"], r.json()["category"]) == \
+        ("新标题", "新简介", "效率工具")
+    assert r.json()["status"] == "published" and r.json()["updated_at"]
+
+    rows = (await alice.get("/api/store/admin/releases")).json()
+    me = next(x for x in rows if x["id"] == rid)
+    assert me["title"] == "新标题" and me["category"] == "效率工具"
+    assert me["editor"] == "alice" and me["publisher"] == "bob" and me["updated_at"]
+    # 编辑不是发布：不新增版本行
+    assert len([x for x in rows if x["slug"] == "ops"]) == 1
+
+    # 已下架行照样能改文案，但状态机不被编辑带动
+    wid = await _insert_release(sf, slug="ops", version="b0", status="withdrawn", creator=ids["bob"])
+    assert (await alice.patch(f"/api/store/releases/{wid}", json={"title": "下架条目改名"})).status_code == 200
+    w = next(x for x in (await alice.get("/api/store/admin/releases")).json() if x["id"] == wid)
+    assert w["status"] == "withdrawn" and w["title"] == "下架条目改名"
+
+
+async def test_运营编辑_白名单外与非法值整请求拒400不留半改(two_auth_clients):
+    """400 要挡在写之前：带一个非法字段的整请求，不能被部分应用。"""
+    alice, _ = two_auth_clients
+    sf = alice.app.state.session_factory
+    async with sf() as s:
+        ids = dict((await s.execute(text("SELECT nickname, id FROM actor"))).all())
+    rid = await _insert_release(sf, slug="opsbad", version="b1", status="published", creator=ids["bob"])
+
+    bad = [{"slug": "x"}, {"version": "v2"}, {"status": "withdrawn"}, {"app_id": 1},
+           {"title": "好标题", "stack": "static"}, {"title": "好标题", "created_by": 1},
+           {}, {"title": "   "}, {"title": "长" * 101}, {"category": "不存在"}]
+    for body in bad:
+        r = await alice.patch(f"/api/store/releases/{rid}", json=body)
+        assert r.status_code == 400, (body, r.status_code, r.text)
+
+    me = next(x for x in (await alice.get("/api/store/admin/releases")).json() if x["id"] == rid)
+    assert me["title"] == "管理页" and me["updated_at"] is None and me["editor"] is None
+
+    # summary 可清空（作者自己不想留简介是合法诉求）
+    assert (await alice.patch(f"/api/store/releases/{rid}", json={"summary": ""})).status_code == 200
+    assert (await alice.patch("/api/store/releases/999999", json={"title": "x"})).status_code == 404
+
+
+async def _actor_ids(client):
+    async with client.app.state.session_factory() as s:
+        return dict((await s.execute(text("SELECT nickname, id FROM actor"))).all())
+
+
+async def test_硬删_无引用可删再删404非创始人403(two_auth_clients):
+    """ADR-0061 §3：没被引用过的版本行才是硬删的对象。"""
+    alice, bob = two_auth_clients
+    sf = alice.app.state.session_factory
+    ids = await _actor_ids(alice)
+    rid = await _insert_release(sf, slug="purge", version="b1", status="published", creator=ids["bob"])
+    assert (await bob.delete(f"/api/store/releases/{rid}")).status_code == 403
+    r = await alice.delete(f"/api/store/releases/{rid}")
+    assert r.status_code == 200, r.text
+    assert r.json()["install_count"] == 0 and r.json()["application_count"] == 0
+    assert (await alice.get("/api/store/admin/releases")).json() == []
+    assert (await alice.delete(f"/api/store/releases/{rid}")).status_code == 404
+
+
+async def test_硬删守卫_申请后继与安装三类引用各自拦住(two_auth_clients):
+    """守卫必须看全三个引用面，且把计数码回给运营看；已下架行同样受约束。"""
+    alice, _ = two_auth_clients
+    sf = alice.app.state.session_factory
+    ids = await _actor_ids(alice)
+    a1 = await _insert_release(sf, slug="refapp", version="b1", status="withdrawn", creator=ids["alice"])
+    b1 = await _insert_release(sf, slug="refkid", version="b1", status="published", creator=ids["alice"])
+    b2 = await _insert_release(sf, slug="refkid", version="b2", status="published", creator=ids["alice"])
+    wid = await sf_execute(sf, "INSERT INTO workspace (name, root_path) "
+                               "VALUES ('硬删源', '/tmp/purge-ws') RETURNING id", {})
+    app_id = await sf_execute(sf, "INSERT INTO app_project (workspace_id, name, slug, scale, stack, "
+                                  "prod_port, dev_port) VALUES (:w, '硬删实例', 'purgeinst', 'small', "
+                                  "'vue3-fastapi', 18411, 18412) RETURNING id", {"w": wid})
+    c1 = await _insert_release(sf, slug="refinst", version="b1", status="published", creator=ids["alice"])
+
+    async with sf() as s:
+        # a1 被人申请过（且已批准＝算一次安装）；b2 是 b1 的后继；c1 被别人装着
+        await s.execute(text("INSERT INTO release_application (release_id, applicant_id, want_name, "
+                             "status) VALUES (:r, :p, 'n1', 'approved')"), {"r": a1, "p": ids["alice"]})
+        await s.execute(text("UPDATE app_release SET prev_release_id = :p WHERE id = :i"),
+                        {"p": b1, "i": b2})
+        await s.execute(text("INSERT INTO app_instance_link (app_id, release_id, baseline_manifest, "
+                             "baseline_hash, owner_actor) VALUES (:ap, :r, '{}'::jsonb, 'bh', :o)"),
+                        {"ap": app_id, "r": c1, "o": ids["alice"]})
+        await s.commit()
+
+    for rid, hint in ((a1, "1 次安装"), (b1, "1 个后继版本"), (c1, "1 个已装实例链接")):
+        r = await alice.delete(f"/api/store/releases/{rid}")
+        assert r.status_code == 409, (rid, r.text)
+        assert hint in r.text, (rid, r.text)
+    # 行都还在：409 不是部分成功
+    assert len((await alice.get("/api/store/admin/releases")).json()) == 4
+
+
+async def test_分类字典_创始人增改停删与兜底锁死(two_auth_clients):
+    """store_category 的写面只对创始人开放，「其他」不可停用不可删除。"""
+    alice, bob = two_auth_clients
+    rows = (await alice.get("/api/store/categories")).json()
+    assert [r["key"] for r in rows][:5] and any(r["key"] == "其他" for r in rows)
+    assert all(r["release_count"] == 0 for r in rows)
+
+    assert (await bob.post("/api/store/categories", json={"key": "模板"})).status_code == 403
+    created = await alice.post("/api/store/categories",
+                               json={"key": "模板", "label": "模板与示例", "sort": 5})
+    assert created.status_code == 201, created.text
+    assert created.json()["enabled"] is True
+    assert (await alice.post("/api/store/categories", json={"key": "模板"})).status_code == 409
+    assert (await alice.post("/api/store/categories", json={"key": "长" * 21})).status_code == 400
+
+    patched = await alice.patch("/api/store/categories/模板", json={"label": "改个名", "sort": 7})
+    assert patched.status_code == 200 and patched.json()["label"] == "改个名"
+    assert (await alice.patch("/api/store/categories/不存在", json={"label": "x"})).status_code == 404
+    assert (await alice.patch("/api/store/categories/其他", json={"enabled": False})).status_code == 400
+    assert (await alice.delete("/api/store/categories/其他")).status_code == 400
+    # 没有条目引用的分类可以真删
+    assert (await alice.delete("/api/store/categories/模板")).status_code == 200
+
+
+async def test_分类字典_写入口只认启用项停用不影响存量(two_auth_clients):
+    """normalize 只认启用项、normalize_filter 认全部：停用 = 退出可选面，不是从报表里消失。"""
+    alice, _ = two_auth_clients
+    sf = alice.app.state.session_factory
+    ids = await _actor_ids(alice)
+    await alice.post("/api/store/categories", json={"key": "看板", "label": "看板", "sort": 15})
+    rid = await _insert_release(sf, slug="catd", version="b1", status="published", creator=ids["alice"])
+
+    assert (await alice.patch(f"/api/store/releases/{rid}",
+                              json={"category": "看板"})).status_code == 200
+    assert (await alice.patch(f"/api/store/releases/{rid}",
+                              json={"category": "没这个分类"})).status_code == 400
+    # 有引用的分类不能删（只能停用）
+    assert (await alice.delete("/api/store/categories/看板")).status_code == 409
+
+    assert (await alice.patch("/api/store/categories/看板", json={"enabled": False})).status_code == 200
+    other = await _insert_release(sf, slug="catd2", version="b1", status="published", creator=ids["alice"])
+    assert (await alice.patch(f"/api/store/releases/{other}",
+                              json={"category": "看板"})).status_code == 400
+    # 但挂着它的条目还改得动标题：停用不该等于锁死编辑
+    assert (await alice.patch(f"/api/store/releases/{rid}",
+                              json={"title": "停用后仍后可编辑"})).status_code == 200
+    # 发现页按停用分类过滤仍返回那一条，label 也仍显示它
+    listed = (await alice.get("/api/store/releases?category=看板")).json()
+    assert [x["id"] for x in listed] == [rid] and listed[0]["category"] == "看板"
