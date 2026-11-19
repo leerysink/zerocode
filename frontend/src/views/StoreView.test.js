@@ -1,9 +1,11 @@
 // @vitest-environment happy-dom
-// Task 12 + Ticket 008：商店页三视图与登录态身份接线；审批收件箱只对创始人（平台管理员）可见。
+// Task 12 + Ticket 008：商店页两视图与登录态身份接线。审批入口已收口运营台（ADR-0062 §7），
+// 本页对任何账号都不再出审批控件。
 // 真 Antd 插件挂载（与 AppsView 的桩件模式不同：商店页无 WS/进度流，交互全在 tabs/modal 上）。
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { flushPromises, mount } from '@vue/test-utils'
 import Antd from 'ant-design-vue'
+import { createPinia, setActivePinia } from 'pinia'
 import StoreView from './StoreView.vue'
 import * as api from '../api'
 
@@ -27,7 +29,10 @@ const applications = [
 ]
 
 function mountView () {
-  return mount(StoreView, { global: { plugins: [Antd] }, attachTo: document.body })
+  // 分类胶囊现在读 storeCategories 字典（ADR-0061 §4），页里用 pinia
+  const pinia = createPinia()
+  setActivePinia(pinia)
+  return mount(StoreView, { global: { plugins: [Antd, pinia] }, attachTo: document.body })
 }
 
 beforeEach(() => {
@@ -48,13 +53,15 @@ describe('StoreView', () => {
     expect(w.findAll('button').some((b) => b.text().includes('申请'))).toBe(true)
   })
 
-  it('已安装的卡片不再给申请按钮，而是给出实例入口', async () => {
+  it('已安装的卡片不再给申请按钮，改给出「打开」实例入口', async () => {
     api.storeReleases.mockResolvedValue({ data: [{ ...releases[0], installed: true,
-      installed_apps: [{ app_id: 7, name: '我的备忘', status_prod: 'running' }] }] })
+      installed_apps: [{ app_id: 7, name: '我的备忘', status_prod: 'running',
+        prod_url: 'https://z.example.com' }] }] })
     const w = mountView()
     await flushPromises()
-    expect(w.text()).toContain('我的备忘')
     expect(w.findAll('button').some((b) => b.text().includes('申请'))).toBe(false)
+    expect(w.find('[data-test="open-btn"]').exists()).toBe(true)
+    w.unmount()
   })
 
   it('卡片展示分类标签与安装量', async () => {
@@ -122,7 +129,7 @@ describe('StoreView', () => {
   it('点卡片封面打开详情抽屉：标题/简介/元数据可见', async () => {
     const w = mountView()
     await flushPromises()
-    await w.find('.zc-cover').trigger('click')
+    await w.find('.zc-entity-cover').trigger('click')
     await flushPromises()
     const drawer = document.querySelector('.ant-drawer-content')
     expect(drawer).toBeTruthy()
@@ -137,7 +144,7 @@ describe('StoreView', () => {
       { ...releases[0], screenshots: ['/s/0', '/s/1'] }] })
     const w = mountView()
     await flushPromises()
-    await w.find('.zc-cover').trigger('click')
+    await w.find('.zc-entity-cover').trigger('click')
     await flushPromises()
     expect(document.querySelector('.zc-shot-img').getAttribute('src')).toBe('/s/0')
     document.querySelector('[data-test="shot-next"]').click()
@@ -150,7 +157,7 @@ describe('StoreView', () => {
     api.storeAddShot.mockResolvedValue({ data: { screenshots: ['/s/new'] } })
     const w = mountView()
     await flushPromises()
-    await w.find('.zc-cover').trigger('click')
+    await w.find('.zc-entity-cover').trigger('click')
     await flushPromises()
     expect(document.querySelector('[data-test="shot-add"]')).toBeTruthy()
     const file = new File([new Uint8Array([137, 80, 78, 71])], 'a.png', { type: 'image/png' })
@@ -164,7 +171,7 @@ describe('StoreView', () => {
     api.storeReleases.mockResolvedValue({ data: [{ ...releases[0], created_by: 999 }] })
     const w2 = mountView()
     await flushPromises()
-    await w2.find('.zc-cover').trigger('click')
+    await w2.find('.zc-entity-cover').trigger('click')
     await flushPromises()
     expect(document.querySelector('[data-test="shot-add"]')).toBeFalsy()
     w2.unmount()
@@ -189,7 +196,7 @@ describe('StoreView', () => {
   it('试用告知：详情抽屉写明试用写入作者测试数据库，且无任何代启入口', async () => {
     const w = mountView()
     await flushPromises()
-    await w.findAll('.zc-cover')[1].trigger('click')   // 图库：dev 停止
+    await w.findAll('.zc-entity-cover')[1].trigger('click')   // 图库：dev 停止
     await flushPromises()
     const drawer = document.querySelector('.ant-drawer-content')
     expect(drawer.textContent).toContain('作者的测试环境')
@@ -219,7 +226,7 @@ describe('StoreView', () => {
     w.unmount()
   })
 
-  it('已装实例打开走 prod_url 新标签；prod 停止置灰', async () => {
+  it('已装实例：卡面「打开」指向第一个在跑的，全部实例进 ☰', async () => {
     api.storeReleases.mockResolvedValue({ data: [{ ...releases[0], installed: true,
       installed_apps: [
         { app_id: 7, name: '我的备忘', status_prod: 'running', prod_url: 'https://x.example.com' },
@@ -228,12 +235,14 @@ describe('StoreView', () => {
     try {
       const w = mountView()
       await flushPromises()
-      const btns = w.findAll('button')
-      const openBtn = btns.find((b) => b.text().includes('打开 我的备忘'))
-      const stoppedBtn = btns.find((b) => b.text().includes('打开 停了'))
-      expect(stoppedBtn.attributes('disabled')).toBeDefined()
-      await openBtn.trigger('click')
+      await w.find('[data-test="open-btn"]').trigger('click')
       expect(openSpy).toHaveBeenCalledWith('https://x.example.com', '_blank')
+      expect(w.findAll('button').some((b) => b.text().includes('申请'))).toBe(false)
+      await w.find('.zc-card-menu-btn').trigger('click')
+      await flushPromises()
+      expect(document.querySelector('[data-test="open-installed-7"]').textContent).toContain('我的备忘')
+      // prod 停止的实例在 ☰ 里也是灭的：能看见有这台，但点不开
+      expect(document.querySelector('[data-test="open-installed-8"]').className).toContain('is-off')
       expect(w.html()).not.toContain('localhost:')
       w.unmount()
     } finally {
@@ -263,32 +272,33 @@ describe('StoreView', () => {
     }
   })
 
-  it('非创始人看不到审批收件箱（审批权收口创始人）', async () => {
+  it('审批入口已收口运营台：商店页只剩两页签，对创始人也不出审批控件', async () => {
+    api.authMe.mockResolvedValue({ data: { id: 1, nickname: '管理员', is_founder: true } })
+    const w = mountView()
+    await flushPromises()
+    const tabs = w.findAll('.ant-tabs-tab').map((t) => t.text())
+    expect(tabs).toEqual(['商店', '我的申请'])
+    expect(w.find('[data-test="tab-review"]').exists()).toBe(false)
+    expect(w.text()).not.toContain('待审批')
+    // 不但不画，连 review 收件箱都不再拉：两处队列各刷各的是这次收口的动因
+    expect(api.storeApplications).not.toHaveBeenCalledWith('review')
+    w.unmount()
+  })
+
+  it('非创始人同样没有审批收件箱（审批权在运营台收口到创始人）', async () => {
     api.authMe.mockResolvedValue({ data: { id: 1, nickname: '普通用户', is_founder: false } })
     const w = mountView()
     await flushPromises()
     expect(w.find('[data-test="tab-review"]').exists()).toBe(false)
+    w.unmount()
   })
 
-  it('创始人看到审批收件箱并可决策', async () => {
-    api.authMe.mockResolvedValue({ data: { id: 1, nickname: '管理员', is_founder: true } })
+  it('页头统计格出在架数、分类数与我已安装数', async () => {
     const w = mountView()
     await flushPromises()
-    expect(w.find('[data-test="tab-review"]').exists()).toBe(true)
-  })
-
-  it('审批：驳回必须填原因才可调接口', async () => {
-    api.authMe.mockResolvedValue({ data: { id: 1, nickname: '管理员', is_founder: true } })
-    const w = mountView()
-    await flushPromises()
-    await w.find('[data-test="tab-review"]').trigger('click')
-    await flushPromises()
-    await w.find('[data-test="reject-btn"]').trigger('click')
-    await flushPromises()
-    expect(api.storeReject).not.toHaveBeenCalled()
-    await w.find('[data-test="reject-reason"]').setValue('名字不合适')
-    await w.find('[data-test="reject-confirm"]').trigger('click')
-    await flushPromises()
-    expect(api.storeReject).toHaveBeenCalledWith(9, '名字不合适')
+    expect(w.find('[data-test="page-stat-on"] b').text()).toBe('2')
+    expect(w.find('[data-test="page-stat-mine"] b').text()).toBe('0')
+    expect(w.find('[data-test="page-stat-cats"] b').text()).not.toBe('')
+    w.unmount()
   })
 })
