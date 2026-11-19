@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 BASE_NAMES = ["list_dir", "read_file", "search", "write_file", "edit_file",
               "delete_file", "move_file", "revert_change",
               "ask_user", "todo_write", "memory_write",
-              "web_fetch", "web_open", "web_step", "web_close", "delegate"]
+              "web_fetch", "web_download", "web_open", "web_step", "web_close", "delegate"]
 # 循环自处理、没有 handler 的工具（delegate 的实现在执行器，与 ask_user 同列）
 LOOP_OWNED = ("ask_user", "clarify_done", "delegate")
 APP_NAMES = ["preview_status", "preview_logs", "preview_restart",
@@ -61,9 +61,15 @@ def test_app_and_clarify_mount_in_a_stable_order():
 def test_confirm_policy_is_registry_metadata():
     assert registry.spec_of("write_file").confirm == "write"
     assert registry.spec_of("edit_file").confirm == "write"
+    assert registry.spec_of("web_download").confirm == "write"
     assert registry.spec_of("db_write").confirm == "always"
     assert registry.spec_of("preview_restart").confirm == "preview_restart"
     assert registry.spec_of("read_file").confirm == "none"
+
+
+def test_web_download_is_a_write_not_in_subrun_readonly_face():
+    assert "web_download" not in registry.SUBRUN_TOOL_NAMES
+    assert "web_fetch" in registry.SUBRUN_TOOL_NAMES
 
 
 def test_every_executable_tool_resolves_a_handler():

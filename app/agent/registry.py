@@ -145,6 +145,14 @@ _WEB_FETCH = _fn(
     ("读取任意公网 URL 的内容（HTML 正文/JSON/文本），返回标题、正文与页面链接；"
      "不执行脚本，需要点击/填表时改用 web_open"),
     {"url": {"type": "string", "description": "完整 http(s) 地址"}}, ["url"])
+_WEB_DOWNLOAD = _fn(
+    "web_download",
+    ("下载任意公网直链的资源（图片/字体/压缩包等，不限类型）到工作区指定路径，流式写盘、不回正文；"
+     "目标已存在则覆盖且不可回滚。先用 web_fetch 读页面拿 links，再逐个下载"),
+    {"url": {"type": "string", "description": "完整 http(s) 直链"},
+     "path": {"type": "string",
+              "description": "相对工作区的目标文件路径，如 frontend/public/images/a.png"}},
+    ["url", "path"])
 
 _DELEGATE = _fn(
     "delegate",
@@ -318,6 +326,10 @@ SPECS: tuple[ToolSpec, ...] = (
     ToolSpec("web_fetch", _WEB_FETCH, "web",
              handler_ref=("app.agent.web_tools", "run_web_tool"),
              pass_name=True, result_policy=WEB_POLICY),
+    # 资源下载（ADR-0054）：与 web_fetch 同组同守卫，差别是字节落盘；确认沿 write_file 档。
+    ToolSpec("web_download", _WEB_DOWNLOAD, "web", confirm=CONFIRM_WRITE,
+             handler_ref=("app.agent.web_tools", "run_web_download"),
+             pass_confirmed=True, result_policy=SMALL_POLICY),
     ToolSpec("web_open", _WEB_OPEN, "web_session",
              handler_ref=("app.agent.browser_session_tools", "run_browser_session_tool"),
              pass_name=True, result_policy=BROWSER_POLICY),

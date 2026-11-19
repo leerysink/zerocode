@@ -21,6 +21,7 @@ import PreviewCard from './PreviewCard.vue'
 import PageInspectCard from './PageInspectCard.vue'
 import BrowserFlowCard from './BrowserFlowCard.vue'
 import WebFetchCard from './WebFetchCard.vue'
+import WebDownloadCard from './WebDownloadCard.vue'
 import ChatPromptRail from './ChatPromptRail.vue'
 
 const props = defineProps({
@@ -49,8 +50,8 @@ const PAGE_TOOL_NAMES = ['preview_page']
 const BROWSER_SESSION_TOOL_NAMES = ['browser_open', 'browser_step', 'browser_close']
 // 公网走查三件套（ADR-0053）：与 browser_* 共用 BrowserFlowCard，卡片内部按名字前缀换措辞。
 const WEB_SESSION_TOOL_NAMES = ['web_open', 'web_step', 'web_close']
-// 联网读取（ADR-0053）：web_fetch 有自己的结果卡（正文/链接/抓取元信息）。
-const WEB_FETCH_TOOL_NAMES = ['web_fetch']
+// 联网读取与资源下载（ADR-0053/0054）：各有自己的结果卡（正文/链接 vs url→path 落盘回执）。
+const WEB_FETCH_TOOL_NAMES = ['web_fetch', 'web_download']
 
 // 渲染前统一归一化：实时事件形状与历史行形状都过这一个函数，组件只认归一化后的字段。
 // 归一化后一次工具调用恒为一条记录（args 与 result 同体），所以「call 行/result 行」的
@@ -105,6 +106,12 @@ function isBrowserCard(m, i) {
 // 与三张卡同一道闸：有结果或仍是最后一条（web_fetch 的进行中卡也走这里）
 function isWebFetchCard(m, i) {
   return isWebFetchTool(m) && !!(m.result || i === view.value.length - 1)
+}
+
+// 资源下载（ADR-0054）：与 web_fetch 同属 web 组名单，但卡片按名字分叉；
+// 模板里排在 WebFetchCard 之前，web_download 不会落进读取卡。
+function isWebDownloadCard(m, i) {
+  return (m.name || '') === 'web_download' && !!(m.result || i === view.value.length - 1)
 }
 
 // 进度只给「消息流最后一条、还没有结果」的那张卡：历史卡片复活进度条会让人以为又在重启
@@ -263,6 +270,7 @@ onBeforeUnmount(cancelFill)
             <!-- 委派卡：delegate 一行里装一批子 run（ADR-0052），先于通用折叠块 -->
             <DelegateCard v-else-if="item.m.name === 'delegate'" :msg="item.m" />
             <PageInspectCard v-else-if="isPageCard(item.m, item.i)" :msg="item.m" :progress="liveProgress(item.m, item.i)" />
+            <WebDownloadCard v-else-if="isWebDownloadCard(item.m, item.i)" :msg="item.m" :progress="liveProgress(item.m, item.i)" />
             <WebFetchCard v-else-if="isWebFetchCard(item.m, item.i)" :msg="item.m" :progress="liveProgress(item.m, item.i)" />
             <BrowserFlowCard v-else-if="isBrowserCard(item.m, item.i)" :msg="item.m" :progress="liveProgress(item.m, item.i)" />
             <PreviewCard v-else-if="isPreviewCard(item.m, item.i)" :msg="item.m" :progress="liveProgress(item.m, item.i)" />

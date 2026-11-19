@@ -15,6 +15,7 @@ import DelegateCard from './DelegateCard.vue'
 import AskUserCard from './AskUserCard.vue'
 import BrowserFlowCard from './BrowserFlowCard.vue'
 import WebFetchCard from './WebFetchCard.vue'
+import WebDownloadCard from './WebDownloadCard.vue'
 import { applyEvent, useChatStore } from '../stores/chat'
 import { DECLINE_ANSWER } from '../stores/messageModel'
 
@@ -580,6 +581,64 @@ describe('web_open / web_step / web_close / web_fetch 在消息流里的渲染',
     const w = mountMessages([{ role: 'tool', name: 'web_fetch', args: { url: 'https://example.com/' } }])
     expect(w.findComponent(WebFetchCard).exists()).toBe(true)
     expect(w.text()).toContain('正在读取网页')
+  })
+})
+
+// ---- 资源下载（ADR-0054）：web_download 走自己的落盘回执卡 ----
+
+describe('web_download 在消息流里的渲染', () => {
+  it('路由到 WebDownloadCard，不落进读取卡或通用折叠块', () => {
+    const w = mountMessages([{ role: 'tool', name: 'web_download',
+      args: { url: 'https://example.com/a.png', path: 'frontend/public/images/a.png' },
+      result: { ok: true, url: 'https://example.com/a.png', path: 'frontend/public/images/a.png',
+                bytes: 2048, status: 200, content_type: 'image/png', existed: false } }])
+    expect(w.findComponent(WebDownloadCard).exists()).toBe(true)
+    expect(w.findComponent(WebFetchCard).exists()).toBe(false)
+    expect(w.findComponent(ToolCallBlock).exists()).toBe(false)
+    expect(w.text()).toContain('frontend/public/images/a.png')
+  })
+
+  it('历史行（tool_name / tool_result）刷新后仍画下载卡', () => {
+    const w = mountMessages([{ role: 'tool', tool_name: 'web_download',
+      tool_result: { ok: true, path: 'a.png', bytes: 9 } }])
+    expect(w.findComponent(WebDownloadCard).exists()).toBe(true)
+    expect(w.text()).toContain('a.png')
+  })
+
+  it('下载中（无结果）画实时态，不画成折叠块', () => {
+    const w = mountMessages([{ role: 'tool', name: 'web_download',
+      args: { url: 'https://example.com/a.png', path: 'a.png' } }])
+    expect(w.findComponent(WebDownloadCard).exists()).toBe(true)
+    expect(w.text()).toContain('正在下载资源')
+  })
+
+  it('失败画原因，覆盖成功画覆盖留痕', () => {
+    const w = mountMessages([{ role: 'tool', name: 'web_download',
+      result: { ok: false, error: '下载失败：HTTP 404' } }])
+    expect(w.text()).toContain('404')
+    const w2 = mountMessages([{ role: 'tool', name: 'web_download',
+      result: { ok: true, path: 'a.png', bytes: 9, existed: true } }])
+    expect(w2.text()).toContain('覆盖')
+  })
+
+  it('待答确认卡用下载文案，参数摘要带 url 与 path', () => {
+    setActivePinia(createPinia())
+    const s = useChatStore()
+    s.messages = [{
+      role: 'assistant', content: '我来下载',
+      tool_args: {
+        tool_calls: [{
+          id: 'c1', type: 'function',
+          function: { name: 'web_download',
+                      arguments: '{"url":"https://example.com/a.png","path":"a.png"}' },
+        }],
+      },
+    }]
+    applyEvent(s, { type: 'confirm_request', tool: 'web_download',
+                    args: { url: 'https://example.com/a.png', path: 'a.png' } })
+    const w = mountMessages(s.messages)
+    expect(w.text()).toContain('下载确认')
+    expect(w.find('.zc-confirm-args').text()).toContain('a.png')
   })
 })
 
