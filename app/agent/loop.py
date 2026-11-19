@@ -17,6 +17,7 @@ from app.agent.browser_tools import build_browser_prompt
 from app.agent.browser_session_tools import (build_browser_session_prompt, close_browser_session,
                                              redact_sensitive_step_args)
 from app.agent.web_tools import build_web_prompt, build_web_session_prompt
+from app.agent.python_tools import build_python_prompt
 from app.agent.db_tools import db_confirm_summary
 from app.agent.prompts import build_app_prompt_blocks, build_clarify_prompt, build_system_prompt
 from app.agent import clarify as _cl
@@ -508,11 +509,12 @@ class AgentRunner:
             preview_prompt = (build_app_prompt_blocks(preview_prompt)
                               + build_browser_prompt() + build_browser_session_prompt())
         # 联网指引**恒**注入（ADR-0053）：web_fetch / web_* 是基础工具（SCOPE_ALWAYS），
-        # 非应用工作区也挂载，指引随之。块顺序在全量视图下是
-        # <app_…> → <preview> → <browser> → <browser_session> → <web> → <web_session>，
+        # 非应用工作区也挂载，指引随之。Python 沙箱同为基础工具（ADR-0056），指引恒注入。
+        # 块顺序在全量视图下是
+        # <app_…> → <preview> → <browser> → <browser_session> → <python_sandbox> → <web> → <web_session>，
         # system 尾部恒锚定 </web_session>（见 test_agent_loop 的提示词顺序断言）。
-        preview_prompt = ((preview_prompt or "") + build_web_prompt()
-                          + build_web_session_prompt())
+        preview_prompt = ((preview_prompt or "") + build_python_prompt()
+                          + build_web_prompt() + build_web_session_prompt())
         # 交互工具的挂载条件与 preview_page 完全一致（规格 §5.1）：只在解析出唯一应用时挂载，
         # 非应用工作区连「调了才发现不能用」的假工具都不给。
         # 挂载由注册表按范围拼装（基础恒在 / 应用 / 澄清），不再在这里手拼几个名单：

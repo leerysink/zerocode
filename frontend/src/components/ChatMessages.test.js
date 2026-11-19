@@ -16,6 +16,7 @@ import AskUserCard from './AskUserCard.vue'
 import BrowserFlowCard from './BrowserFlowCard.vue'
 import WebFetchCard from './WebFetchCard.vue'
 import WebDownloadCard from './WebDownloadCard.vue'
+import RunPythonCard from './RunPythonCard.vue'
 import { applyEvent, useChatStore } from '../stores/chat'
 import { DECLINE_ANSWER } from '../stores/messageModel'
 
@@ -639,6 +640,72 @@ describe('web_download 在消息流里的渲染', () => {
     const w = mountMessages(s.messages)
     expect(w.text()).toContain('下载确认')
     expect(w.find('.zc-confirm-args').text()).toContain('a.png')
+  })
+})
+
+// ---- Python 沙箱（ADR-0056）：run_python 走自己的执行回执卡 ----
+
+describe('run_python 在消息流里的渲染', () => {
+  it('路由到 RunPythonCard，不落进通用折叠块', () => {
+    const w = mountMessages([{ role: 'tool', name: 'run_python',
+      args: { code: 'print(1+1)' },
+      result: { ok: true, exit_code: 0, duration_seconds: 0.3, output: '2' } }])
+    expect(w.findComponent(RunPythonCard).exists()).toBe(true)
+    expect(w.findComponent(ToolCallBlock).exists()).toBe(false)
+    expect(w.text()).toContain('2')
+  })
+
+  it('历史行（tool_name / tool_result）刷新后仍画执行卡', () => {
+    const w = mountMessages([{ role: 'tool', tool_name: 'run_python',
+      tool_result: { ok: true, exit_code: 0, output: 'hello' } }])
+    expect(w.findComponent(RunPythonCard).exists()).toBe(true)
+    expect(w.text()).toContain('hello')
+  })
+
+  it('执行中（无结果）画实时态，不画成折叠块', () => {
+    const w = mountMessages([{ role: 'tool', name: 'run_python', args: { code: 'print(1)' } }])
+    expect(w.findComponent(RunPythonCard).exists()).toBe(true)
+    expect(w.text()).toContain('正在执行 Python 脚本')
+  })
+
+  it('平台失败画原因，脚本非零退出画退出码', () => {
+    const w = mountMessages([{ role: 'tool', name: 'run_python',
+      result: { ok: false, error: 'docker 不可用' } }])
+    expect(w.text()).toContain('docker 不可用')
+    const w2 = mountMessages([{ role: 'tool', name: 'run_python',
+      result: { ok: true, exit_code: 1, output: 'ValueError: boom' } }])
+    expect(w2.text()).toContain('退出码 1')
+    expect(w2.text()).toContain('ValueError')
+  })
+
+  it('产物清单渲染名字与体积，二进制标注未回全文', () => {
+    const w = mountMessages([{ role: 'tool', name: 'run_python',
+      result: { ok: true, exit_code: 0, output: '', artifacts: [
+        { name: 'out.csv', bytes: 8, content: 'a,b' },
+        { name: 'chart.png', bytes: 100 } ] } }])
+    const arts = w.find('[data-test="python-artifacts"]')
+    expect(arts.exists()).toBe(true)
+    expect(arts.text()).toContain('out.csv')
+    expect(arts.text()).toContain('chart.png')
+    expect(arts.text()).toContain('未回全文')
+  })
+
+  it('待答确认卡用执行文案，参数摘要带 code', () => {
+    setActivePinia(createPinia())
+    const s = useChatStore()
+    s.messages = [{
+      role: 'assistant', content: '我来跑脚本',
+      tool_args: {
+        tool_calls: [{
+          id: 'c1', type: 'function',
+          function: { name: 'run_python', arguments: '{"code":"print(1+1)"}' },
+        }],
+      },
+    }]
+    applyEvent(s, { type: 'confirm_request', tool: 'run_python', args: { code: 'print(1+1)' } })
+    const w = mountMessages(s.messages)
+    expect(w.text()).toContain('执行确认')
+    expect(w.find('.zc-confirm-args').text()).toContain('print(1+1)')
   })
 })
 

@@ -948,3 +948,16 @@ prod 栈未运行导致实时指标缺失时的读数口径：CPU 环退成灰�
 
 `delegate` 调用在消息流里渲染的卡片：一行一个子 run（任务名、状态、回执摘要），可展开看该子 run 的步骤。实时态由 `subrun_*` 事件驱动，已答态由消息行（`parent_tool_call_id` / `subrun_index` 归属）重建；批量执行中途刷新靠 hub 补发子 run 快照（与「待答补发」同一机制——待答态在历史里没有行可依）。它是消息流的一部分，不是侧栏面板。
 
+## Python 沙箱（run_python）
+
+平台 Agent 的隔离代码执行能力：模型给一段 Python 脚本，平台在**一次性容器**里跑，回 stdout/stderr 与 scratch 产物清单。它是工具面上第二个被允许的执行载体（第一个是 `run_check` 的平台 preset），红线由此从「无通用命令执行面」修订为「无通用命令执行面，只允许平台写死的 preset 与隔离 Python 沙箱」（ADR-0056）。
+
+触达面固定为最小：
+
+- **工作区只读挂载**，`deploy/` 凭据目录排除（保 M-3 读禁）；脚本读项目文件、写只进独立 scratch 输出区，**不直接写工作区**——产出由模型经 `write_file` 落盘，确认/留痕/回滚围栏原样成立。
+- **不给应用库凭据**（`db_query`/`db_write` 已是受控通道）；无 docker.sock、无平台库凭据、非 root、限资源（同 browser sidecar 范式）。
+- **网络仅公网**，复用 `web_fetch` 同一条 SSRF 判定（私网/本机/容器别名拒绝）。
+- 确认沿 `CONFIRM_WRITE` 档（受 `agent.write_confirm` 控制）；挂载范围 `SCOPE_ALWAYS`（不依赖应用身份）；**不收录子 run 只读白名单**（ADR-0052 章程）。
+
+术语说「Python 沙箱」指那个隔离执行容器与能力，不叫「代码解释器」「code interpreter」；它只跑 Python，名实相符，不预留多语言。它与 `run_check` 的边界：后者跑平台写死的检查 preset、不能传脚本；前者跑模型给的任意脚本、但触达面被沙箱围栏锁死。
+

@@ -33,6 +33,12 @@ class RefMissing(Exception):
     """尽力而为的引用取不到（非 200/网络异常）——调用方按语义跳过，不当失败。"""
 
 
+def is_internal_ip(ip) -> bool:
+    """私网/保留地址判定——URL 闸（reject_internal_host）与沙箱网络层出口过滤共用同一份（ADR-0056）。"""
+    return (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
+            or ip.is_unspecified or ip.is_multicast)
+
+
 def reject_internal_host(host: str | None) -> None:
     """拒内网/保留地址与混淆数字 IP 写法（127.1、2130706433、0x7f000001 等 inet_aton 缩写）。
 
@@ -50,8 +56,7 @@ def reject_internal_host(host: str | None) -> None:
         if parts and all(re.fullmatch(r"0[xX][0-9a-fA-F]+|\d+", p) for p in parts):
             raise GuardError("不允许 IP 缩写/混淆写法")
         return
-    if (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
-            or ip.is_unspecified or ip.is_multicast):
+    if is_internal_ip(ip):
         raise GuardError("不允许指向内网/保留地址")
 
 
