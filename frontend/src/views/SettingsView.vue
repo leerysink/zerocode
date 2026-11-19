@@ -202,6 +202,12 @@ async function save() {
       <main class="zc-set-main">
         <h3 class="zc-sec-title">{{ current.label }}</h3>
         <p class="zc-sec-desc">{{ current.desc }}</p>
+        <!-- 原页签版有一条页首 alert 说明「哪些按账户生效」，分区化后不能丢：
+             用户看不出某项改了会不会影响别人，就会拿它当个人偏好乱调 -->
+        <p v-if="hasForm" class="zc-set-note" data-test="set-note-scope">
+          除标注「账户级、只影响自己」的项外，本页其余项都是平台级配置：保存后对所有账号的会话生效。
+          数值框的上下限与后端夹取区间一致，超出的值后端会回落。
+        </p>
 
         <template v-if="active === 'models'">
           <div class="zc-toolbar">
@@ -394,6 +400,10 @@ async function save() {
 .zc-sec-title { margin: 0; font-size: var(--zc-font-lg); font-weight: 600; color: var(--zc-text); }
 .zc-sec-desc { margin: var(--zc-space-1) 0 var(--zc-space-4); font-size: var(--zc-font-sm);
   color: var(--zc-text-sub); }
+.zc-set-note { margin: 0 0 var(--zc-space-4); padding: var(--zc-space-2) var(--zc-space-3);
+  font-size: var(--zc-font-xs); color: var(--zc-text-sub); line-height: 1.6;
+  background: var(--zc-bg-inset); border-left: 3px solid rgba(var(--zc-primary-rgb), 0.45);
+  border-radius: var(--zc-radius-inner); }
 /* 分组：标题 + 细线替代卡片外壳，组间大留白 */
 .zc-group + .zc-group { margin-top: var(--zc-space-5); }
 .zc-group-title {

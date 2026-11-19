@@ -140,6 +140,21 @@ describe('设置中心形态', () => {
     expect(w.find('[data-test="set-logout"]').exists()).toBe(true)
   })
 
+  it('配置分区顶部保留「平台级 vs 账户级」告知，外观/账号分区不需要', async () => {
+    const w = mountView()
+    await flushPromises()
+    expect(w.find('[data-test="set-note-scope"]').exists()).toBe(false) // 模型库
+    await w.find('[data-test="set-nav-tools"]').trigger('click')
+    await flushPromises()
+    const note = w.find('[data-test="set-note-scope"]')
+    expect(note.text()).toContain('平台级配置')
+    expect(note.text()).toContain('账户级')
+    expect(note.text()).toContain('后端会回落')
+    await w.find('[data-test="set-nav-appearance"]').trigger('click')
+    await flushPromises()
+    expect(w.find('[data-test="set-note-scope"]').exists()).toBe(false)
+  })
+
   it('页头返回按钮沿用 BackButton 固定回对话页', async () => {
     const w = mountView()
     await flushPromises()
