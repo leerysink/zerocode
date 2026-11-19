@@ -1,50 +1,154 @@
-// 设置页与 config store 的接线守卫：模板里写错 store.form.xxx 不会编译失败，
-// 只会让那个输入框静默显示空值、保存时把 undefined 写进库——所以按源码逐个核。
-import { readFileSync } from 'node:fs'
-import { describe, expect, it, vi, beforeEach } from 'vitest'
+// @vitest-environment happy-dom
+// 设置页守卫（009 改造）。旧版模板里手写 store.form.xxx，守卫靠正则扫源码防打错字；
+// 配置行改成 SETTINGS_SECTIONS 数据表后正则扫不到东西了，于是改成直接核那张表——
+// 这是更强的版本：漏项、重复绑定、控件类型拼错、区间倒挂都能在装配期抓到，而不是等用户
+// 发现某个框一直是空的、或保存时把不存在的键写进库。
+import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { flushPromises, mount } from '@vue/test-utils'
+import Antd from 'ant-design-vue'
 import { createPinia, setActivePinia } from 'pinia'
 
-vi.mock('../api', () => ({ getConfig: vi.fn(), putConfig: vi.fn() }))
+global.ResizeObserver = class { observe() {} unobserve() {} disconnect() {} }
 
+vi.mock('../api')
+// ZcPageHeader 里的 BackButton 顶层调 useRouter()：不建真 router，给桩
+const mocks = vi.hoisted(() => ({ router: { push: vi.fn() } }))
+vi.mock('vue-router', () => ({ useRouter: () => mocks.router }))
+
+import SettingsView from './SettingsView.vue'
+// ?raw 而不是 node:fs：happy-dom 环境下 import.meta.url 不是 file: 协议，
+// 源码扫描要跨环境可用就走 Vite 的原始导入
+import TEMPLATE from './SettingsView.vue?raw'
+import { SETTINGS_SECTIONS } from '../utils/settingsSections'
 import { useConfigStore } from '../stores/config'
+import { useThemeStore } from '../stores/theme'
+import { useAuthStore } from '../stores/auth'
 
-const TEMPLATE = readFileSync(new URL('./SettingsView.vue', import.meta.url), 'utf8')
+const STYLE = TEMPLATE.match(/<style scoped>([\s\S]*?)<\/style>/)?.[1] ?? ''
 
-beforeEach(() => setActivePinia(createPinia()))
+const rows = SETTINGS_SECTIONS.flatMap((s) => (s.groups || []).flatMap((g) => g.rows))
+const groupTitles = SETTINGS_SECTIONS.flatMap((s) => (s.groups || []).map((g) => g.title))
 
-describe('设置页字段绑定', () => {
-  const bound = [...TEMPLATE.matchAll(/store\.form\.([A-Za-z0-9_]+)/g)].map((m) => m[1])
+function mountView() {
+  const pinia = createPinia()
+  setActivePinia(pinia)
+  useAuthStore().user = { id: 1, nickname: '创始人', is_founder: true }
+  return mount(SettingsView, { global: { plugins: [Antd, pinia] }, attachTo: document.body })
+}
 
-  it('模板确实绑了这批字段（防空跑通过）', () => {
-    expect(bound.length).toBeGreaterThanOrEqual(25)
+beforeEach(() => {
+  setActivePinia(createPinia())
+  vi.clearAllMocks()
+  document.body.innerHTML = ''
+})
+
+describe('分区表与 config store 的一致性', () => {
+  it('表里的键与 config store 的表单严格一一对应（漏项与多键都会静默出错）', () => {
+    const keyed = rows.map((r) => r.form)
+    expect(keyed.sort()).toEqual(Object.keys(useConfigStore().form).sort())
   })
 
-  it('每个绑定都能在 config store 的表单里找到', () => {
-    const form = useConfigStore().form
-    expect([...new Set(bound)].filter((k) => !(k in form))).toEqual([])
+  it('每个键只绑一次：同一字段绑两个控件会联动，用户看不出自己动了什么', () => {
+    const keyed = rows.map((r) => r.form)
+    expect(new Set(keyed).size).toBe(keyed.length)
   })
 
-  it('「确认策略」组收着两个确认开关，且全页各只绑一次', () => {
-    const group = TEMPLATE.match(/<h3 class="zc-group-title">确认策略<\/h3>[\s\S]*?<\/section>/)?.[0] ?? ''
-    expect(group, '确认开关必须并在同一组里').not.toBe('')
-    for (const field of ['writeConfirm', 'previewConfirmRunning']) {
-      expect(group).toContain(`store.form.${field}`)
-      // 同一字段绑两个 switch 会联动：改一个另一个跟着变，用户看不出自己动了什么
-      expect(bound.filter((k) => k === field)).toHaveLength(1)
+  it('控件类型只认这五种：拼错会渲染出空白行', () => {
+    for (const r of rows) expect(r.type).toSatisfy(
+      (t) => ['switch', 'number', 'text', 'password', 'select'].includes(t))
+  })
+
+  it('数值行都给了下限，且不存在区间倒挂', () => {
+    for (const r of rows.filter((x) => x.type === 'number')) {
+      expect(r.min, r.form).toBeTypeOf('number')
+      if (r.max !== undefined) expect(r.min, r.form).toBeLessThanOrEqual(r.max)
+      if (r.step !== undefined) expect(r.step, r.form).toBeGreaterThan(0)
     }
   })
 
-  it('「运行参数」页签覆盖压缩、预览、浏览器、数据库与记忆五组', () => {
-    for (const tab of ['上下文压缩', '执行与预览', '浏览器检查', '应用数据库工具', '记忆召回']) {
-      expect(TEMPLATE).toContain(tab)
+  it('每行都有中文名（表驱动后没有模板可核对，缺名等于界面上出现空白标签）', () => {
+    for (const r of rows) expect(r.label, r.form).toBeTruthy()
+  })
+
+  it('「确认策略」组收着两个确认开关', () => {
+    const g = SETTINGS_SECTIONS.flatMap((s) => s.groups || [])
+      .find((x) => x.title === '确认策略')
+    expect(g, '确认开关必须并在同一组里').toBeTruthy()
+    expect(g.rows.map((r) => r.form)).toEqual(['writeConfirm', 'previewConfirmRunning'])
+  })
+
+  it('搬迁没丢老分组：压缩、预览、浏览器、数据库与记忆五组都还在', () => {
+    for (const t of ['上下文压缩', '执行与预览', '浏览器检查', '应用数据库工具', '记忆召回']) {
+      expect(groupTitles, t).toContain(t)
     }
-    expect(TEMPLATE).toContain('tab="运行参数"')
+  })
+})
+
+describe('设置中心形态', () => {
+  it('八个分区都在左侧导航里，且切换不碰路由', async () => {
+    const w = mountView()
+    await flushPromises()
+    expect(SETTINGS_SECTIONS).toHaveLength(8)
+    for (const s of SETTINGS_SECTIONS) {
+      expect(w.find(`[data-test="set-nav-${s.key}"]`).text()).toBe(s.label)
+    }
+    await w.find('[data-test="set-nav-runtime"]').trigger('click')
+    await flushPromises()
+    expect(w.text()).toContain('PostgreSQL')
+    expect(mocks.router.push).not.toHaveBeenCalled()
+  })
+
+  it('配置分区有吸底保存条，模型库/外观/账号没有', async () => {
+    const w = mountView()
+    await flushPromises()
+    expect(w.find('[data-test="set-save"]').exists()).toBe(false) // 默认停在模型库
+    await w.find('[data-test="set-nav-behavior"]').trigger('click')
+    await flushPromises()
+    expect(w.find('[data-test="set-save"]').exists()).toBe(true)
+    await w.find('[data-test="set-nav-appearance"]').trigger('click')
+    await flushPromises()
+    expect(w.find('[data-test="set-save"]').exists()).toBe(false)
+  })
+
+  it('模型库行操作：编辑直点，删除收在 ☰ 里', async () => {
+    const w = mountView()
+    await flushPromises()
+    expect(w.find('[data-test="set-model-new"]').exists()).toBe(true)
+    expect(TEMPLATE).toContain('zc-set-menu-btn')
+    expect(TEMPLATE).toContain('removeModel(record)')
+  })
+
+  it('外观分区拨的是 theme store，不是本地副本', async () => {
+    const w = mountView()
+    await flushPromises()
+    await w.find('[data-test="set-nav-appearance"]').trigger('click')
+    await flushPromises()
+    const theme = useThemeStore()
+    const before = theme.theme
+    await w.find('[data-test="set-theme-toggle"]').trigger('click')
+    expect(theme.theme).not.toBe(before)
+    expect(document.documentElement.dataset.theme).toBe(theme.theme)
+  })
+
+  it('账号分区显示昵称与创始人标识，登出走 authLogout', async () => {
+    const w = mountView()
+    await flushPromises()
+    await w.find('[data-test="set-nav-account"]').trigger('click')
+    await flushPromises()
+    expect(w.find('[data-test="set-account-name"]').text()).toBe('创始人')
+    expect(w.text()).toContain('创始人') // 徽标
+    expect(w.find('[data-test="set-logout"]').exists()).toBe(true)
+  })
+
+  it('页头返回按钮沿用 BackButton 固定回对话页', async () => {
+    const w = mountView()
+    await flushPromises()
+    await w.find('.zc-back').trigger('click')
+    expect(mocks.router.push).toHaveBeenCalledWith('/')
   })
 })
 
 describe('设置页视觉纪律', () => {
-  const STYLE = TEMPLATE.match(/<style scoped>([\s\S]*?)<\/style>/)?.[1] ?? ''
-
   it('样式块存在且消费几何 token：无裸 px 字号与圆角', () => {
     expect(STYLE).not.toBe('')
     expect(STYLE).not.toMatch(/font-size:\s*[0-9]/)
