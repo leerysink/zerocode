@@ -43,6 +43,24 @@ _EMPTY_REPLY_NUDGE = (
     "若已经完成，请简要说明结果。"
 )
 
+# 正文非空的「假答完」补催：模型把「接下来要做什么」当最终答复发出（不挂 tool_calls），
+# 空回复补催覆盖不到这种形状（实撞：只发「现在读剩下几个组件的接口，然后按真实资料重写。」，
+# 清单停在 0/11、绿勾收工）。以 todo_state 里未完成的项为信号让它续做；催满仍坚持结束就
+# 放行——用户要求「先讲方案别动手」时要留给模型在正文里交代的余地，别把软停变硬报错。
+# 只建清单、没动过任何工作工具的收尾不算「执行中」（那是方案交付），不补催：用户说
+# 「先拟个计划」时把模型推向执行比停在计划上更糟。
+_STOP_REPLY_RETRIES = 2
+
+def _stop_reply_nudge(unfinished: list[dict]) -> str:
+    items = "；".join(f"[{t.get('status')}] {str(t.get('content') or '')[:80]}"
+                      for t in unfinished[:8])
+    return (
+        "（平台提示）你这条回复只有正文、没有调用任何工具，但任务清单里仍有 "
+        f"{len(unfinished)} 项未完成：{items}。"
+        "不要把「接下来要做什么」当成最终答复：请直接从断点继续执行未完成的任务，"
+        "每完成一步立即 todo_write 更新状态；若确实就此结束，请先在正文里说明原因。"
+    )
+
 def _options_of(raw) -> list:
     """把 options 规整成列表，容忍模型把它**双重编码成 JSON 字符串**。
 
@@ -256,6 +274,14 @@ class AgentRunner:
             await s.execute(text("UPDATE chat_session SET status=:st, updated_at=now() WHERE id=:i"),
                             {"st": status, "i": session_id})
             await s.commit()
+
+    async def _unfinished_todos(self, session_id) -> list[dict]:
+        """todo_state 里未完成的项（pending/in_progress），结构见 tools._handle_todo_write。"""
+        async with self.sf() as s:
+            todos = (await s.execute(text(
+                "SELECT todo_state FROM chat_session WHERE id=:i"), {"i": session_id})).scalar()
+        return [t for t in (todos or [])
+                if isinstance(t, dict) and t.get("status") != "completed"]
 
     async def _history(self, session_id: int, window: int) -> tuple[list[dict], str | None]:
         # 水位过滤（Task 8）：已压缩摘要覆盖 seq≤wm 的旧消息，原文窗口只取 wm 之后。
@@ -550,6 +576,8 @@ class AgentRunner:
         # <=0 = 不限工具轮数（与超时参数 <=0 不限制的约定一致），不再 range(0) 零轮即错
         rounds = itertools.count() if max_rounds <= 0 else range(max_rounds)
         empty_retries = 0
+        stop_retries = 0
+        work_seen = False   # 本次 run 是否动过非 todo 工具（读过/改过 = 真的在执行任务）
         for _round in rounds:
             if cancel.is_set():
                 raise _Cancelled()
@@ -582,6 +610,7 @@ class AgentRunner:
                 raise RuntimeError("模型流结束时没有返回完整消息（缺少 done 事件）")
             if final.get("tool_calls"):
                 empty_retries = 0
+                stop_retries = 0
                 # 凭据遮断（Ticket 010）：三个持久/展示出口（落库、回注、事件推送）共用
                 # 同一份净化后的 tool_calls；工具执行 _dispatch 仍收原始 args——会话历史防
                 # 泄露 ≠ 破坏工具本意，fs_write 之类得能把用户真正要写的凭据落盘。
@@ -636,6 +665,8 @@ class AgentRunner:
                         await self._pair_undispatched(session_id, pairs[idx:])
                         raise _Cancelled()
                     name = exec_tc["function"]["name"]
+                    if name != "todo_write":
+                        work_seen = True
                     try:
                         exec_args = json.loads(exec_tc["function"]["arguments"] or "{}")
                     except json.JSONDecodeError:
@@ -709,6 +740,14 @@ class AgentRunner:
             # 插话紧随其后，再走一轮让模型回应（队列空了就正常收工）
             messages.append({"role": "assistant", "content": final.get("content")})
             if await self._drain_steering(session_id, root, messages):
+                stop_retries = 0
+                continue
+            unfinished = await self._unfinished_todos(session_id)
+            if work_seen and unfinished and stop_retries < _STOP_REPLY_RETRIES:
+                stop_retries += 1
+                logger.warning("会话 %s：模型以正文收尾但任务清单仍有 %s 项未完成，补催 %s/%s",
+                               session_id, len(unfinished), stop_retries, _STOP_REPLY_RETRIES)
+                messages.append({"role": "user", "content": _stop_reply_nudge(unfinished)})
                 continue
             return
         raise RuntimeError(f"已达到最大工具轮数（{max_rounds}）")

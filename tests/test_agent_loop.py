@@ -151,6 +151,84 @@ async def test_legacy_empty_assistant_row_is_not_replayed(test_engine, tmp_path)
 
 
 @pytest.mark.asyncio
+async def test_content_only_stop_with_unfinished_todos_is_nudged(test_engine, tmp_path):
+    """正文非空的收尾也可能是假答完：已经动手、清单却没做完时先补催，别绿勾收工。
+
+    实撞：模型连读多个组件后只发「我已看清结构。现在读剩下几个组件的接口，然后按真实资料
+    重写。」，不挂 tool_calls——正文非空走正常收尾，界面停在任务清单 0/11、无任何报错。
+    """
+    todos_pending = [{"content": "重写视频组件", "status": "pending"},
+                     {"content": "重写终端组件", "status": "in_progress"}]
+    todos_done = [{"content": "重写视频组件", "status": "completed"},
+                  {"content": "重写终端组件", "status": "completed"}]
+    turns = [
+        done(None, [tool_call("t1", "todo_write", todos=todos_pending)]),
+        done(None, [tool_call("w1", "write_file", path="a.txt", content="x")]),
+        done("现在读剩下几个组件的接口，然后按真实资料重写。"),
+        done(None, [tool_call("t2", "todo_write", todos=todos_done)]),
+        done("都改完了"),
+    ]
+    sid = await mk_session(test_engine, tmp_path)
+    sf = make_session_factory(test_engine)
+    llm = ScriptedLLM(turns)
+    rec = Recorder()
+    runner = AgentRunner(sf, llm, cfg_provider(), rec,
+                         lambda *a, **k: asyncio.sleep(0, None), lambda *a, **k: True)
+    status = await runner.run(sid, "开始", asyncio.Event())
+    assert status == "idle"
+    # 补催送达模型：宣告之后的那次调用里带着未完成提示
+    assert any(m["role"] == "user" and "项未完成" in (m.get("content") or "")
+               for m in llm.received[3])
+    # 宣告句保留为普通 assistant 消息（用户能在历史里看见），最终答复也落库
+    async with sf() as s:
+        rows = (await s.execute(sql(
+            "SELECT content FROM message WHERE session_id=:i AND role='assistant' ORDER BY seq"),
+            {"i": sid})).scalars().all()
+    assert "现在读剩下几个组件的接口，然后按真实资料重写。" in rows
+    assert rows[-1] == "都改完了"
+
+
+@pytest.mark.asyncio
+async def test_content_only_stop_after_plan_only_is_not_nudged(test_engine, tmp_path):
+    # 只建了清单、没动过任何工作工具的收尾 = 方案交付（用户要「先别动手」），不补催硬推执行
+    turns = [
+        done(None, [tool_call("t1", "todo_write",
+                              todos=[{"content": "改页面", "status": "pending"}])]),
+        done("计划如上，等你确认后再动手。"),
+    ]
+    sid = await mk_session(test_engine, tmp_path)
+    sf = make_session_factory(test_engine)
+    llm = ScriptedLLM(turns)
+    rec = Recorder()
+    runner = AgentRunner(sf, llm, cfg_provider(), rec,
+                         lambda *a, **k: asyncio.sleep(0, None), lambda *a, **k: True)
+    status = await runner.run(sid, "先拟个计划", asyncio.Event())
+    assert status == "idle"
+    assert len(llm.received) == 2   # 收尾后没有再催出第三轮
+
+
+@pytest.mark.asyncio
+async def test_content_only_stop_nudge_is_capped(test_engine, tmp_path):
+    # 催满仍坚持结束就放行：软停不能变硬报错（用户要求「先讲方案别动手」时模型会交代）
+    turns = [
+        done(None, [tool_call("t1", "todo_write",
+                              todos=[{"content": "改页面", "status": "pending"}])]),
+        done(None, [tool_call("w1", "write_file", path="a.txt", content="x")]),
+        done("我先说方案。"),
+        done("方案如上，暂不执行。"),
+        done("就到这里。"),
+    ]
+    sid, status, evs, sf = await run_once(test_engine, tmp_path, turns)
+    assert status == "idle"
+    assert not [e for e in evs if e["type"] == "error"]
+    async with sf() as s:
+        rows = (await s.execute(sql(
+            "SELECT content FROM message WHERE session_id=:i AND role='assistant' ORDER BY seq"),
+            {"i": sid})).scalars().all()
+    assert rows[-1] == "就到这里。"
+
+
+@pytest.mark.asyncio
 async def test_write_file_flow(test_engine, tmp_path):
     turns = [done(None, [tool_call("c1", "write_file", path="a.txt", content="hi")]), done("写好了")]
     sid, status, evs, sf = await run_once(test_engine, tmp_path, turns)
