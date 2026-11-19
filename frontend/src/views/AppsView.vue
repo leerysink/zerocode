@@ -6,7 +6,7 @@ import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { message, Modal } from 'ant-design-vue'
 import {
   AppstoreOutlined, ClockCircleOutlined, CloudUploadOutlined, CopyOutlined, DashboardOutlined,
-  DatabaseOutlined, DeleteOutlined, EditOutlined,
+  DatabaseOutlined, DeleteOutlined, DisconnectOutlined, EditOutlined,
   EyeOutlined, FolderOpenOutlined, HistoryOutlined, LogoutOutlined, MenuOutlined, MobileOutlined,
   PlayCircleOutlined, PoweroffOutlined, ProfileOutlined, RedoOutlined, ReloadOutlined,
   RocketOutlined, ShareAltOutlined, ShopOutlined,
@@ -15,8 +15,8 @@ import {
   addAppShare, appUrls, appMetricsSummary, approvePublishRequest, authMe, createApp,
   createPublishRequest, deleteApp, devReset, devRestart, devStart, devStatus, devStop,
   getAppShare, leaveAppShare, listApps, listSharedApps, listUsers, openFolder, prodStart,
-  prodStop, rejectPublishRequest, releaseToStore, removeAppShare, renameApp, validateAppSlug,
-  withdrawPublishRequest,
+  prodStop, rejectPublishRequest, releaseToStore, removeAppShare, renameApp, storeAddShot,
+  storeLink, storeUninstall, storeUnlink, storeUpgrade, storeFork, validateAppSlug, withdrawPublishRequest,
 } from '../api'
 import { fmtBytes, fmtPct } from '../utils/metricsFormat'
 import PublishHistory from '../components/PublishHistory.vue'
@@ -29,6 +29,7 @@ import { copyText } from '../utils/clipboard'
 import DeployLogPanel from '../components/DeployLogPanel.vue'
 import BackButton from '../components/BackButton.vue'
 import { openWorkspaceFilesPage, resolveOpenFolderMode } from '../utils/openFolder'
+import { STORE_CATEGORIES, DEFAULT_STORE_CATEGORY } from '../utils/storeCategories'
 import { canPublish } from '../utils/publishableStacks'
 import { isMobileApp } from '../utils/mobileApp'
 import { useConfigStore } from '../stores/config'
@@ -45,7 +46,7 @@ const pub = reactive({ open: false, app: null, mode: 'publish', version: null, a
 const hist = reactive({ open: false, app: null })
 const mon = reactive({ open: false, app: null })
 const mob = reactive({ open: false, app: null })
-const rel = reactive({ open: false, app: null, title: '', summary: '' })
+const rel = reactive({ open: false, app: null, title: '', summary: '', category: DEFAULT_STORE_CATEGORY, shots: [] })
 const urlsCache = reactive({})
 // 复制失败时的就地兜底：{ key, url }，key 是失败发生的那一处（`card:<id>` / 'preview'）
 const copyFail = reactive({ key: '', url: '' })
@@ -594,12 +595,14 @@ async function copyProdUrl(a) {
 // ---------- M3-a 商店：发布到商店（只认真实在服的 prod 版本，闸门在后端） ----------
 const canReleaseToStore = (a) => canPublish(a) && !!a.current_version && !a.store
 function openRelease(a) {
-  Object.assign(rel, { app: a, title: a.name, summary: '', open: true })
+  Object.assign(rel, { app: a, title: a.name, summary: '', category: DEFAULT_STORE_CATEGORY, shots: [], open: true })
 }
+function onPickRelShots(e) { rel.shots = Array.from(e.target.files || []) }
 async function doRelease() {
   if (!rel.app) return
   try {
-    await releaseToStore(rel.app.id, { title: rel.title.trim() || rel.app.name, summary: rel.summary })
+    const created = await releaseToStore(rel.app.id, { title: rel.title.trim() || rel.app.name, summary: rel.summary, category: rel.category })
+    for (const f of rel.shots) await storeAddShot(created.data.id, f)
     message.success('已上架商店，可在侧栏「商店」页看到')
     rel.open = false
     await load()
@@ -607,6 +610,89 @@ async function doRelease() {
     const d = e?.response?.data?.detail
     message.error(typeof d === 'string' ? d : '上架失败')
   }
+}
+
+// ---------- 011 商店实例手动升级（M3-a §6.4）：取 link 判可升级 → 确认 → 202 受理 ----------
+async function openUpgrade(a) {
+  let info
+  try {
+    info = (await storeLink(a.id)).data
+  } catch (e) {
+    message.error('取升级信息失败')
+    return
+  }
+  if (!info.upgradable) {
+    if (info.channel === 'detached') { fork.app = a; fork.open = true }
+    else message.info('已是最新版本')
+    return
+  }
+  Modal.confirm({
+    title: `升级「${a.name}」到 ${info.latest_release.version}？`,
+    content: '升级会先在数据克隆上预演，再切换程序；升级中会有几秒不可访问。失败会自动退回旧版程序。',
+    okText: '升级', cancelText: '取消',
+    onOk: async () => {
+      try {
+        await storeUpgrade(a.id, info.latest_release.id)
+        message.success('升级已受理，进度见查看日志')
+        await load()
+      } catch (e) {
+        const d = e?.response?.data?.detail
+        message.error(typeof d === 'string' ? d : '升级未受理')
+      }
+    },
+  })
+}
+
+// ---------- 012 fork 问人（M3-a §6.5）：保留定制 / 丢弃定制回官方 ----------
+const fork = reactive({ open: false, app: null })
+async function doFork(choice) {
+  if (!fork.app) return
+  try {
+    await storeFork(fork.app.id, choice)
+    message.success(choice === 'keep_custom' ? '已保留定制，不再接收升级' : '已回到官方版，数据保留')
+    fork.open = false
+    await load()
+  } catch (e) {
+    const d = e?.response?.data?.detail
+    message.error(typeof d === 'string' ? d : '操作失败')
+  }
+}
+
+// ---------- 007/008 商店实例退出：解绑（保留应用）/ 卸载（全删，高危） ----------
+function openUnlink(a) {
+  Modal.confirm({
+    title: `解绑商店实例「${a.name}」？`,
+    content: '断开与商店版本的绑定：不再接收升级，商店角标消失。容器、数据库、源码与会话全部保留，应用转为普通自有应用。',
+    okText: '解绑', okType: 'danger', cancelText: '取消',
+    onOk: async () => {
+      try {
+        await storeUnlink(a.id)
+        message.success('已解绑，应用转为普通自有应用')
+        await load()
+      } catch (e) {
+        const d = e?.response?.data?.detail
+        message.error(typeof d === 'string' ? d : '解绑失败')
+      }
+    },
+  })
+}
+function openUninstall(a) {
+  Modal.confirm({
+    title: `卸载商店实例「${a.name}」？`,
+    content: '将停止预览与正式环境、删除两个数据库（dev/prod）、删除源码目录、删除会话记录。此操作不可恢复。',
+    okText: '卸载', okType: 'danger', cancelText: '取消',
+    onOk: async () => {
+      try {
+        const res = await storeUninstall(a.id)
+        if (res.data?.warnings?.length) message.warning('卸载完成，停栈有告警：' + res.data.warnings.join('；'))
+        else message.success('已卸载')
+        await load()
+      } catch (e) {
+        const d = e?.response?.data?.detail
+        message.error(typeof d === 'string' ? d : '卸载失败')
+      }
+    },
+  })
 }
 </script>
 
@@ -644,7 +730,10 @@ async function doRelease() {
         <template #title>
           <span class="zc-dot" :style="{ background: statusColor(a.status_dev) }" />
           <span class="zc-card-name">{{ a.name }}</span>
-          <a-tag v-if="a.store" class="zc-store-tag">来自商店</a-tag>
+          <a-tag v-if="a.store" class="zc-store-tag"
+                 :color="a.store.channel === 'detached' ? 'orange' : undefined">
+            {{ a.store.channel === 'detached' ? '已定制' : `来自商店 ${a.store.release_version || ''}` }}
+          </a-tag>
           <a-tag class="zc-card-tag">{{ a.scale === 'large' ? '大型' : '小型' }} · {{ a.stack }}</a-tag>
         </template>
         <template #extra>
@@ -659,6 +748,13 @@ async function doRelease() {
                        点击上，而它们本来各自带一次确认框，收在这里是对的。 -->
                   <div class="zc-app-menu-item zc-menu-share" @click.stop="openShare(a)">
                     <share-alt-outlined /> 共享管理
+                  </div>
+                  <div v-if="a.store" class="zc-app-menu-item zc-menu-unlink" @click.stop="openUnlink(a)">
+                    <disconnect-outlined /> 解绑商店
+                  </div>
+                  <div v-if="a.store" class="zc-app-menu-item zc-app-menu-danger zc-menu-uninstall"
+                       @click.stop="openUninstall(a)">
+                    <delete-outlined /> 卸载实例
                   </div>
                   <div class="zc-app-menu-item zc-menu-reset" @click.stop="resetDev(a)"><redo-outlined /> 重建 dev</div>
                   <div class="zc-app-menu-item zc-app-menu-danger zc-menu-del" @click.stop="openDelete(a)">
@@ -776,6 +872,9 @@ async function doRelease() {
             <mobile-outlined /><span class="zc-tb-label">移动端</span></button>
           <button v-if="canReleaseToStore(a)" type="button" class="zc-tb-item zc-menu-release" @click.stop="openRelease(a)">
             <shop-outlined /><span class="zc-tb-label">发布到商店</span></button>
+          <button v-if="a.store" type="button"
+                  class="zc-tb-item zc-menu-upgrade" @click.stop="openUpgrade(a)">
+            <cloud-upload-outlined /><span class="zc-tb-label">升级</span></button>
         </div>
       </a-card>
     </div>
@@ -1024,12 +1123,30 @@ async function doRelease() {
 
     <a-modal v-model:open="rel.open" title="发布到商店" ok-text="上架" destroy-on-close @ok="doRelease">
       <a-input v-model:value="rel.title" placeholder="商店展示名称" />
+      <a-select v-model:value="rel.category" style="width: 100%; margin-top: 8px">
+        <a-select-option v-for="c in STORE_CATEGORIES" :key="c" :value="c">{{ c }}</a-select-option>
+      </a-select>
       <a-textarea v-model:value="rel.summary" placeholder="一句话简介（可选）" :rows="3"
                   style="margin-top: 8px" />
+      <input data-test="rel-shots" type="file" accept="image/png,image/jpeg" multiple
+             style="margin-top: 8px" @change="onPickRelShots" />
+      <p class="zc-modal-tip">可选上传至多 5 张截图（PNG/JPEG，单张不超过 2MB）。</p>
       <p class="zc-modal-tip">
         上架的是当前正式在服版本 {{ rel.app?.current_version ? `（${rel.app.current_version}）` : '' }}，
         含真实执行过的数据变更序列；获批者会得到独立代码与独立数据库的实例。
       </p>
+    </a-modal>
+
+    <a-modal v-model:open="fork.open" title="实例已定制" :footer="null" destroy-on-close>
+      <p class="zc-modal-tip">该实例的代码或数据序列已偏离官方版本，无法直接升级。请选择：</p>
+      <a-space direction="vertical" style="width: 100%">
+        <a-button data-test="fork-keep" block @click="doFork('keep_custom')">
+          保留我的定制（不再升级）
+        </a-button>
+        <a-button data-test="fork-reset" block danger @click="doFork('reset_to_official')">
+          丢弃定制，回到官方版（保留数据）
+        </a-button>
+      </a-space>
     </a-modal>
 
     <a-modal v-model:open="rename.open" title="重命名应用" ok-text="保存" destroy-on-close

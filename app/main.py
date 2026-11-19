@@ -94,6 +94,12 @@ async def _deploy_startup(app: FastAPI) -> None:
                                     notify=app.state.deploy_hub.publish)
     except Exception:
         logger.exception("prod 启动对账失败（Docker 未就绪？）")
+    # M3-b（§6.6/§7）：商店残留影子库清理 + 受管实例代码分叉对账。非致命。
+    try:
+        from app.store import reconcile as store_reconcile
+        await store_reconcile.reconcile_store(app.state.session_factory)
+    except Exception:
+        logger.exception("商店启动对账失败")
 
 
 def create_app(database_url: str | None = None) -> FastAPI:

@@ -18,6 +18,18 @@ from app.store import packages
 
 logger = logging.getLogger(__name__)
 
+# 商店固定分类（规格 2026-11-19 §4.8）：后端常量单源，前端 storeCategories.js 同源镜像。
+STORE_CATEGORIES = ("效率工具", "数据管理", "内容展示", "演示样例", "其他")
+DEFAULT_CATEGORY = "其他"
+
+
+def normalize_category(value: str | None) -> str:
+    """缺省/空串落「其他」；不在枚举内一律 400（上架最便宜的闸，先于所有权与五道闸门）。"""
+    cat = (value or "").strip() or DEFAULT_CATEGORY
+    if cat not in STORE_CATEGORIES:
+        raise DeployError(f"分类不存在：{cat}（可选：{'/'.join(STORE_CATEGORIES)}）", status=400)
+    return cat
+
 
 def store_root(cfg: dict) -> Path:
     raw = cfg.get("store.root") or ""
@@ -40,8 +52,9 @@ async def latest_release(sf, slug: str) -> dict | None:
 
 
 async def create_release(sf, *, app_id: int, title: str, summary: str,
-                         actor_id: int) -> dict:
+                         actor_id: int, category: str | None = None) -> dict:
     """上架当前在服 prod 版本。返回 app_release 行（含 id/anchor/fingerprint）。"""
+    category = normalize_category(category)
     app = await app_service.get_app(sf, app_id)
     slug = app["slug"]
     version = app.get("current_version")
@@ -107,15 +120,15 @@ async def create_release(sf, *, app_id: int, title: str, summary: str,
         async with sf() as s:
             r = (await s.execute(text(
                 "INSERT INTO app_release (app_id, slug, version, title, summary, stack, anchor, "
-                "fingerprint, prev_release_id, created_by) VALUES (:a, :sl, :v, :ti, :su, :st, "
-                "CAST(:an AS JSONB), :fp, :pv, :cb) "
+                "fingerprint, prev_release_id, category, created_by) VALUES (:a, :sl, :v, :ti, :su, :st, "
+                "CAST(:an AS JSONB), :fp, :pv, :cat, :cb) "
                 "RETURNING id, app_id, slug, version, title, summary, stack, anchor, "
-                "fingerprint, prev_release_id, status, created_at"),
+                "fingerprint, prev_release_id, category, status, created_at"),
                 {"a": app_id, "sl": slug, "v": version, "ti": manifest_extra["title"],
                  "su": manifest_extra["summary"], "st": app["stack"],
                  "an": json.dumps(hist, ensure_ascii=False),
                  "fp": anchor_mod.fingerprint(hist),
-                 "pv": prev["id"] if prev else None, "cb": actor_id})).mappings().first()
+                 "pv": prev["id"] if prev else None, "cat": category, "cb": actor_id})).mappings().first()
             await s.commit()
         rel = dict(r)
         rel["package_dir"] = str(pkg)

@@ -14,6 +14,8 @@ const mocks = vi.hoisted(() => ({
     appUrls: vi.fn(), publishApp: vi.fn(), rollbackApp: vi.fn(),
     appRecords: vi.fn(), deleteRecord: vi.fn(), systemNics: vi.fn(), putConfig: vi.fn(),
     releaseToStore: vi.fn(), renameApp: vi.fn(), deleteApp: vi.fn(), openFolder: vi.fn(),
+    storeAddShot: vi.fn(), storeUnlink: vi.fn(), storeUninstall: vi.fn(),
+    storeLink: vi.fn(), storeUpgrade: vi.fn(), storeFork: vi.fn(),
     appMetricsCurrent: vi.fn(), appMobile: vi.fn(), uploadMobileApk: vi.fn(),
     appMetricsSummary: vi.fn(),
     listSharedApps: vi.fn(), listUsers: vi.fn(), getAppShare: vi.fn(),
@@ -337,6 +339,12 @@ const STORE_STUBS = {
   'a-textarea': { name: 'a-textarea', props: ['value'], render() {
     return h('textarea', { class: 'stub-textarea', value: this.value,
       onInput: (e) => this.$emit('update:value', e.target.value) }) } },
+  'a-select': { name: 'a-select', props: ['value'], render() {
+    return h('select', { class: 'stub-select', value: this.value,
+      onChange: (e) => this.$emit('update:value', e.target.value) },
+    this.$slots.default?.()) } },
+  'a-select-option': { name: 'a-select-option', props: ['value'], render() {
+    return h('option', { value: this.value }, this.$slots.default?.()) } },
 }
 
 async function mountStoreView() {
@@ -354,6 +362,14 @@ describe('AppsView 商店接线', () => {
     expect(cards[0].text()).not.toContain('来自商店')
   })
 
+  it('已定制（detached）实例角标显示「已定制」', async () => {
+    mocks.api.listApps.mockResolvedValue({ data: STORE_APPS.map((a) =>
+      a.id === 3 ? { ...a, store: { ...a.store, channel: 'detached' } } : a) })
+    const wrapper = mount(AppsView, { global: { stubs: STORE_STUBS } })
+    await flushPromises()
+    expect(wrapper.findAll('.stub-card')[2].text()).toContain('已定制')
+  })
+
   it('入口闸门：发布过的非商店应用 ☰ 菜单里有「发布到商店」；没发布过/商店实例没有', async () => {
     const wrapper = await mountStoreView()
     const has = (i) => wrapper.findAll('.stub-card')[i].find('.zc-menu-release').exists()
@@ -363,7 +379,7 @@ describe('AppsView 商店接线', () => {
     expect(has(3)).toBe(true)    // 大型栈（vue3-springboot）同样可上架
   })
 
-  it('发布到商店：菜单项点开弹窗提交调 releaseToStore(appId, {title, summary})', async () => {
+  it('发布到商店：弹窗分类默认「其他」，改选后提交带上分类', async () => {
     mocks.api.releaseToStore.mockResolvedValue({ data: { id: 9 } })
     const wrapper = await mountStoreView()
     await wrapper.findAll('.stub-card')[0].find('.zc-menu-release').trigger('click')
@@ -371,9 +387,104 @@ describe('AppsView 商店接线', () => {
     expect(modal.exists()).toBe(true)
     await modal.find('.stub-input').setValue('甲商店版')
     await modal.find('.stub-textarea').setValue('简介文本')
+    expect(modal.find('.stub-select').element.value).toBe('其他')
+    await modal.find('.stub-select').setValue('数据管理')
     await wrapper.find('.stub-modal-ok').trigger('click')
     await flushPromises()
-    expect(mocks.api.releaseToStore).toHaveBeenCalledWith(1, { title: '甲商店版', summary: '简介文本' })
+    expect(mocks.api.releaseToStore).toHaveBeenCalledWith(1,
+      { title: '甲商店版', summary: '简介文本', category: '数据管理' })
+  })
+
+  it('上架弹窗可选截图：上架成功后按返回 id 逐张上传', async () => {
+    mocks.api.releaseToStore.mockResolvedValue({ data: { id: 9 } })
+    mocks.api.storeAddShot.mockResolvedValue({ data: { screenshots: [] } })
+    const wrapper = await mountStoreView()
+    await wrapper.findAll('.stub-card')[0].find('.zc-menu-release').trigger('click')
+    const modal = wrapper.find('.stub-modal')
+    const f1 = new File([new Uint8Array([137, 80, 78, 71])], 'a.png', { type: 'image/png' })
+    const f2 = new File([new Uint8Array([255, 216, 255])], 'b.jpg', { type: 'image/jpeg' })
+    const input = modal.find('[data-test="rel-shots"]')
+    Object.defineProperty(input.element, 'files', { value: [f1, f2], configurable: true })
+    await input.trigger('change')
+    await wrapper.find('.stub-modal-ok').trigger('click')
+    await flushPromises()
+    expect(mocks.api.storeAddShot).toHaveBeenCalledTimes(2)
+    expect(mocks.api.storeAddShot).toHaveBeenCalledWith(9, f1)
+    expect(mocks.api.storeAddShot).toHaveBeenCalledWith(9, f2)
+  })
+
+  it('商店实例 ☰ 有解绑/卸载，普通应用没有', async () => {
+    const wrapper = await mountStoreView()
+    const cards = wrapper.findAll('.stub-card')
+    expect(cards[2].find('.zc-menu-unlink').exists()).toBe(true)
+    expect(cards[2].find('.zc-menu-uninstall').exists()).toBe(true)
+    expect(cards[0].find('.zc-menu-unlink').exists()).toBe(false)
+    expect(cards[0].find('.zc-menu-uninstall').exists()).toBe(false)
+  })
+
+  it('解绑：danger 确认后调 storeUnlink', async () => {
+    mocks.api.storeUnlink.mockResolvedValue({ data: { ok: true } })
+    const wrapper = await mountStoreView()
+    await wrapper.findAll('.stub-card')[2].find('.zc-menu-unlink').trigger('click')
+    expect(mocks.antd.Modal.confirm).toHaveBeenCalled()
+    const cfg = mocks.antd.Modal.confirm.mock.calls[0][0]
+    expect(cfg.okType).toBe('danger')
+    expect(cfg.content).toContain('保留')
+    await cfg.onOk()
+    expect(mocks.api.storeUnlink).toHaveBeenCalledWith(3)
+  })
+
+  it('卸载：确认文案列明四后果，确认后调 storeUninstall', async () => {
+    mocks.api.storeUninstall.mockResolvedValue({ data: { ok: true, warnings: [] } })
+    const wrapper = await mountStoreView()
+    await wrapper.findAll('.stub-card')[2].find('.zc-menu-uninstall').trigger('click')
+    const cfg = mocks.antd.Modal.confirm.mock.calls[0][0]
+    expect(cfg.okType).toBe('danger')
+    expect(cfg.content).toContain('数据库')
+    expect(cfg.content).toContain('源码目录')
+    expect(cfg.content).toContain('会话记录')
+    expect(cfg.content).toContain('不可恢复')
+    await cfg.onOk()
+    expect(mocks.api.storeUninstall).toHaveBeenCalledWith(3)
+  })
+
+  it('升级：商店实例有入口，取 link 判可升级后确认调 storeUpgrade', async () => {
+    mocks.api.storeLink.mockResolvedValue({ data: { upgradable: true, latest_release: { id: 9, version: 'b2' } } })
+    mocks.api.storeUpgrade.mockResolvedValue({ data: { ok: true } })
+    const wrapper = await mountStoreView()
+    const btn = wrapper.findAll('.stub-card')[2].find('.zc-menu-upgrade')
+    expect(btn.exists()).toBe(true)
+    await btn.trigger('click')
+    await flushPromises()
+    expect(mocks.api.storeLink).toHaveBeenCalledWith(3)
+    const cfg = mocks.antd.Modal.confirm.mock.calls[0][0]
+    expect(cfg.content).toContain('几秒不可访问')
+    await cfg.onOk()
+    expect(mocks.api.storeUpgrade).toHaveBeenCalledWith(3, 9)
+  })
+
+  it('升级：已是最新不弹确认', async () => {
+    mocks.api.storeLink.mockResolvedValue({ data: { upgradable: false, latest_release: null } })
+    const wrapper = await mountStoreView()
+    await wrapper.findAll('.stub-card')[2].find('.zc-menu-upgrade').trigger('click')
+    await flushPromises()
+    expect(mocks.antd.Modal.confirm).not.toHaveBeenCalled()
+    expect(mocks.api.storeUpgrade).not.toHaveBeenCalled()
+  })
+
+  it('fork 问人：已定制实例点升级弹选择，丢弃定制调 storeFork reset', async () => {
+    mocks.api.storeLink.mockResolvedValue({ data: { channel: 'detached', upgradable: false } })
+    mocks.api.storeFork.mockResolvedValue({ data: { ok: true, channel: 'managed' } })
+    const wrapper = await mountStoreView()
+    await wrapper.findAll('.stub-card')[2].find('.zc-menu-upgrade').trigger('click')
+    await flushPromises()
+    const keep = wrapper.find('[data-test="fork-keep"]')
+    const reset = wrapper.find('[data-test="fork-reset"]')
+    expect(keep.exists()).toBe(true)
+    expect(reset.exists()).toBe(true)
+    await reset.trigger('click')
+    await flushPromises()
+    expect(mocks.api.storeFork).toHaveBeenCalledWith(3, 'reset_to_official')
   })
 })
 

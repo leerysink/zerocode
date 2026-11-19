@@ -78,20 +78,183 @@ async def test_release_endpoint_requires_identity_and_publish(anon_client):
 
 
 async def test_store_releases_lists_published(client, monkeypatch):
-    """列表不触发 Docker：直接往 app_release 插行，验形状与 withdrawn 过滤。"""
+    """列表不触发 Docker：直接往 app_release 插行，验形状与 withdrawn 过滤。
+
+    001：分类与安装量——列表回 category 与 install_count（approved 计数），不再有 updated_count。
+    """
     sf = client.app.state.session_factory
     from sqlalchemy import text
     async with sf() as s:
         aid = (await s.execute(text("SELECT id FROM actor LIMIT 1"))).scalar()
-        for version, status in (("b1", "published"), ("b0", "withdrawn")):
+        for version, status, category in (("b1", "published", "数据管理"),
+                                          ("b0", "withdrawn", "其他")):
             await s.execute(text(
                 "INSERT INTO app_release (app_id, slug, version, title, stack, anchor, "
-                "fingerprint, status, created_by) VALUES (0, 'demo', :v, '演示应用', "
-                "'vue3-fastapi', '[]'::jsonb, :f, :st, :a)"),
-                {"v": version, "f": "fp" + version, "st": status, "a": aid})
+                "fingerprint, status, category, created_by) VALUES (0, 'demo', :v, '演示应用', "
+                "'vue3-fastapi', '[]'::jsonb, :f, :st, :cat, :a)"),
+                {"v": version, "f": "fp" + version, "st": status, "cat": category, "a": aid})
         await s.commit()
     r = await client.get("/api/store/releases")
     assert r.status_code == 200
     body = r.json()
     assert [x["version"] for x in body] == ["b1"], "下架版本不得出现在商店列表"
-    assert body[0]["title"] == "演示应用" and "updated_count" in body[0]
+    assert body[0]["title"] == "演示应用"
+    assert body[0]["category"] == "数据管理"
+    assert body[0]["install_count"] == 0
+    assert "updated_count" not in body[0]
+
+
+async def test_install_count_只数批准安装(client):
+    """安装量＝被批准安装的次数：pending/rejected/cancelled 一律不计。"""
+    sf = client.app.state.session_factory
+    async with sf() as s:
+        aid = (await s.execute(text("SELECT id FROM actor LIMIT 1"))).scalar()
+        rid = (await s.execute(text(
+            "INSERT INTO app_release (app_id, slug, version, title, stack, anchor, "
+            "fingerprint, status, created_by) VALUES (0, 'demo2', 'b1', '计数应用', "
+            "'vue3-fastapi', '[]'::jsonb, 'fp-c1', 'published', :a) RETURNING id"),
+            {"a": aid})).scalar()
+        for st in ("pending", "approved", "approved", "rejected", "cancelled"):
+            await s.execute(text(
+                "INSERT INTO release_application (release_id, applicant_id, want_name, status) "
+                "VALUES (:r, :a, '实例', :st)"), {"r": rid, "a": aid, "st": st})
+        await s.commit()
+    body = (await client.get("/api/store/releases")).json()
+    assert body[0]["install_count"] == 2
+
+
+async def test_上架非法分类最先拒400(client):
+    """分类校验在所有权/五道闸门之前（最便宜的闸先打）：错分类直接 400，不泄漏后续闸门。"""
+    r = await client.post("/api/apps/999999/release",
+                          json={"title": "x", "category": "不存在的分类"})
+    assert r.status_code == 400
+    assert "分类" in r.text
+
+
+async def test_搜索分类过滤与排序(client):
+    """q 命中标题或简介；category 精确过滤；sort=installs 按安装量降序，非法分类 400。"""
+    sf = client.app.state.session_factory
+    async with sf() as s:
+        aid = (await s.execute(text("SELECT id FROM actor LIMIT 1"))).scalar()
+        r1 = (await s.execute(text(
+            "INSERT INTO app_release (app_id, slug, version, title, summary, stack, anchor, "
+            "fingerprint, status, category, created_by) VALUES (0, 'srchA', 'b1', '陌如玉', "
+            "'桌面备忘', 'vue3-fastapi', '[]'::jsonb, 'fp-a', 'published', '数据管理', :a) "
+            "RETURNING id"), {"a": aid})).scalar()
+        r2 = (await s.execute(text(
+            "INSERT INTO app_release (app_id, slug, version, title, summary, stack, anchor, "
+            "fingerprint, status, category, created_by) VALUES (0, 'srchB', 'b1', '图库', "
+            "'相册与备忘录', 'vue3-fastapi', '[]'::jsonb, 'fp-b', 'published', '内容展示', :a) "
+            "RETURNING id"), {"a": aid})).scalar()
+        await s.execute(text(
+            "INSERT INTO release_application (release_id, applicant_id, want_name, status) "
+            "VALUES (:r, :a, '实例', 'approved')"), {"r": r1, "a": aid})
+        await s.commit()
+
+    async def titles(**params):
+        r = await client.get("/api/store/releases", params=params)
+        assert r.status_code == 200, r.text
+        return [x["title"] for x in r.json()]
+
+    assert await titles() == ["图库", "陌如玉"], "默认最新在前（id 降序）"
+    assert await titles(q="桌面") == ["陌如玉"], "命中简介"
+    assert await titles(q="备忘") == ["图库", "陌如玉"], "标题与简介都参与"
+    assert await titles(category="内容展示") == ["图库"]
+    assert await titles(sort="installs") == ["陌如玉", "图库"], "安装量降序"
+    bad = await client.get("/api/store/releases", params={"category": "不存在的分类"})
+    assert bad.status_code == 400
+
+
+async def test_在线试用随来源应用dev状态(client):
+    """试用闸门＝来源应用 status_dev===running（ADR-0057）；地址是 dev 预览地址；prod 不参与。"""
+    from app.deploy.settings import preview_base_host
+    sf = client.app.state.session_factory
+    async with sf() as s:
+        aid = (await s.execute(text("SELECT id FROM actor LIMIT 1"))).scalar()
+        wid = (await s.execute(text(
+            "INSERT INTO workspace (name, root_path) VALUES ('试用源', '/tmp/trial-ws-x') "
+            "RETURNING id"))).scalar()
+        app_id = (await s.execute(text(
+            "INSERT INTO app_project (workspace_id, name, slug, scale, stack, prod_port, dev_port, "
+            "status_dev, status_prod) VALUES (:w, '试用源', 'trialapp', 'small', 'vue3-fastapi', "
+            "18401, 18301, 'stopped', 'running') RETURNING id"), {"w": wid})).scalar()
+        await s.execute(text(
+            "INSERT INTO app_release (app_id, slug, version, title, stack, anchor, "
+            "fingerprint, status, created_by) VALUES (:ap, 'trialapp', 'b1', '试用应用', "
+            "'vue3-fastapi', '[]'::jsonb, 'fp-t', 'published', :a)"),
+            {"ap": app_id, "a": aid})
+        await s.commit()
+
+    async def item():
+        body = (await client.get("/api/store/releases")).json()
+        return next(x for x in body if x["slug"] == "trialapp")
+
+    it = await item()
+    assert it["trial_available"] is False and it["trial_url"] == ""
+    async with sf() as s:
+        await s.execute(text("UPDATE app_project SET status_dev='running' WHERE id=:i"),
+                        {"i": app_id})
+        await s.commit()
+    it = await item()
+    assert it["trial_available"] is True
+    assert it["trial_url"] == f"http://{preview_base_host()}:18301"
+    async with sf() as s:   # prod 停掉不影响试用（试用只认 dev）
+        await s.execute(text("UPDATE app_project SET status_prod='stopped' WHERE id=:i"),
+                        {"i": app_id})
+        await s.commit()
+    assert (await item())["trial_available"] is True
+
+
+async def test_撤回路由接线(client):
+    """POST /applications/{aid}/cancel：本人 pending → cancelled；重复撤 409。"""
+    sf = client.app.state.session_factory
+    async with sf() as s:
+        aid = (await s.execute(text("SELECT id FROM actor LIMIT 1"))).scalar()
+        rid = (await s.execute(text(
+            "INSERT INTO app_release (app_id, slug, version, title, stack, anchor, "
+            "fingerprint, status, created_by) VALUES (0, 'cancelapp', 'b1', '撤回应用', "
+            "'vue3-fastapi', '[]'::jsonb, 'fp-x', 'published', :a) RETURNING id"),
+            {"a": aid})).scalar()
+        await s.commit()
+    a = await client.post("/api/store/applications",
+                          json={"release_id": int(rid), "want_name": "我的实例"})
+    assert a.status_code == 201, a.text
+    aid = a.json()["id"]
+    r = await client.post(f"/api/store/applications/{aid}/cancel")
+    assert r.status_code == 200 and r.json()["status"] == "cancelled"
+    assert (await client.post(f"/api/store/applications/{aid}/cancel")).status_code == 409
+
+
+async def test_已装实例打开地址走投影(client, monkeypatch):
+    """installed_apps 带 prod_url：SSL 开＝网关子域名，关＝host:prod_port（nics.app_url 单点）。"""
+    from app.deploy import nics
+    from app.deploy.settings import preview_base_host
+    sf = client.app.state.session_factory
+    async with sf() as s:
+        aid = (await s.execute(text("SELECT id FROM actor LIMIT 1"))).scalar()
+        wid = (await s.execute(text(
+            "INSERT INTO workspace (name, root_path) VALUES ('实例源', '/tmp/inst-ws-x') "
+            "RETURNING id"))).scalar()
+        app_id = (await s.execute(text(
+            "INSERT INTO app_project (workspace_id, name, slug, scale, stack, prod_port, dev_port, "
+            "status_prod) VALUES (:w, '实例', 'instapp', 'small', 'vue3-fastapi', "
+            "18402, 18302, 'running') RETURNING id"), {"w": wid})).scalar()
+        rid = (await s.execute(text(
+            "INSERT INTO app_release (app_id, slug, version, title, stack, anchor, "
+            "fingerprint, status, created_by) VALUES (:ap, 'instapp', 'b1', '实例应用', "
+            "'vue3-fastapi', '[]'::jsonb, 'fp-i', 'published', :a) RETURNING id"),
+            {"ap": app_id, "a": aid})).scalar()
+        await s.execute(text(
+            "INSERT INTO app_instance_link (app_id, release_id, baseline_manifest, baseline_hash, "
+            "owner_actor) VALUES (:ap, :r, '{}'::jsonb, 'bh', :a)"),
+            {"ap": app_id, "r": rid, "a": aid})
+        await s.commit()
+
+    async def inst():
+        body = (await client.get("/api/store/releases")).json()
+        return next(x for x in body if x["slug"] == "instapp")["installed_apps"][0]
+
+    monkeypatch.setenv("ZEROCODE_SSL_ENABLE", "true")
+    assert (await inst())["prod_url"] == f"https://instapp.{nics.GATEWAY_DOMAIN}"
+    monkeypatch.setenv("ZEROCODE_SSL_ENABLE", "false")
+    assert (await inst())["prod_url"] == f"http://{preview_base_host()}:18402"

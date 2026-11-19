@@ -122,9 +122,9 @@ def actor(sf):
     return _mk
 
 
-async def _do_release(sf, app_id, actor_id, *, title="演示应用", summary="简介"):
+async def _do_release(sf, app_id, actor_id, *, title="演示应用", summary="简介", category=None):
     return await release.create_release(sf, app_id=app_id, title=title, summary=summary,
-                                        actor_id=actor_id)
+                                        category=category, actor_id=actor_id)
 
 
 async def test_happy_path_writes_package_and_row(sf, store_root, images_ok, actor):
@@ -132,6 +132,7 @@ async def test_happy_path_writes_package_and_row(sf, store_root, images_ok, acto
              "V20260920_02_b.sql": "ALTER TABLE a ADD c text;\n"}
     app = await _make_app(sf, sql_files=files)
     rel = await _do_release(sf, app["id"], await actor())
+    assert rel["category"] == "其他", "不传分类落缺省「其他」"
     assert [e["filename"] for e in rel["anchor"]] == sorted(files)   # 锚点=有序成功集
     pkg = packages.package_path(store_root, app["slug"], rel["version"])
     assert (pkg / "manifest.json").is_file()
@@ -231,3 +232,15 @@ async def test_empty_anchor_rejected(sf, store_root, images_ok, actor):
     app = await _make_app(sf, sql_files={})
     with pytest.raises(DeployError):
         await _do_release(sf, app["id"], await actor())
+
+
+async def test_分类随版本落库(sf, store_root, images_ok, actor):
+    """传入的平台固定分类随 app_release 落库并回读。"""
+    app = await _make_app(sf, sql_files={"V20260920_01_init.sql": "CREATE TABLE a(id int);\n"})
+    rel = await _do_release(sf, app["id"], await actor(), category="数据管理")
+    assert rel["category"] == "数据管理"
+    body = await release.latest_release(sf, app["slug"])
+    async with sf() as s:
+        lr = (await s.execute(text("SELECT category FROM app_release WHERE slug=:s"),
+                              {"s": app["slug"]})).scalar()
+    assert body and lr == "数据管理"

@@ -70,7 +70,7 @@ async def mark_interrupted(sf) -> int:
         res = await s.execute(text(
             "UPDATE deploy_record SET status='failed', step='interrupted', finished_at=now(), "
             "error='平台重启中断' WHERE status='running' "
-            "AND kind IN ('publish','rollback','install','release')"))
+            "AND kind IN ('publish','rollback','install','release','upgrade')"))
         await s.commit()
         return res.rowcount
 

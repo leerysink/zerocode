@@ -102,3 +102,34 @@ async def test_withdrawn_release_refuses_new_application(sf, seed):
     with pytest.raises(DeployError):
         await apps_svc.create(sf, release_id=seed["release_id"],
                               applicant_id=seed["stranger"]["id"], want_name="我要")
+
+
+async def test_申请人可撤回pending且收件箱不再出现(sf, seed):
+    a = await apps_svc.create(sf, release_id=seed["release_id"],
+                              applicant_id=seed["stranger"]["id"], want_name="我要")
+    done = await apps_svc.cancel(sf, app_id=a["id"], actor_id=seed["stranger"]["id"])
+    assert done["status"] == "cancelled"
+    review = await apps_svc.list_box(sf, box="review", actor_id=seed["founder"]["id"],
+                                     is_founder=True)
+    assert a["id"] not in [x["id"] for x in review]
+    with pytest.raises(DeployError) as e:
+        await apps_svc.cancel(sf, app_id=a["id"], actor_id=seed["stranger"]["id"])
+    assert e.value.status == 409
+
+
+async def test_他人不可撤回(sf, seed):
+    a = await apps_svc.create(sf, release_id=seed["release_id"],
+                              applicant_id=seed["stranger"]["id"], want_name="我要")
+    with pytest.raises(DeployError) as e:
+        await apps_svc.cancel(sf, app_id=a["id"], actor_id=seed["publisher"]["id"])
+    assert e.value.status == 403
+
+
+async def test_已决单不可撤回(sf, seed):
+    a = await apps_svc.create(sf, release_id=seed["release_id"],
+                              applicant_id=seed["stranger"]["id"], want_name="我要")
+    await apps_svc.decide(sf, app_id=a["id"], approver_id=seed["founder"]["id"],
+                          approver_is_founder=True, approve=True, reason="")
+    with pytest.raises(DeployError) as e:
+        await apps_svc.cancel(sf, app_id=a["id"], actor_id=seed["stranger"]["id"])
+    assert e.value.status == 409

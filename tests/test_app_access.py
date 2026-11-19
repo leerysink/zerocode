@@ -83,7 +83,7 @@ def _stub_docker(monkeypatch):
     async def _batch(request, slug, env, statements):
         return [{"index": i, "status": "ok"} for i in range(len(statements))]
 
-    async def _create_release(sf, *, app_id, title, summary, actor_id):
+    async def _create_release(sf, *, app_id, title, summary, actor_id, category=None):
         return {"id": 1, "app_id": app_id, "title": title}
 
     monkeypatch.setattr(eng_mod, "cleanup_orphans", _noop)

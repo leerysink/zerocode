@@ -8,12 +8,16 @@
 拦成 401 并把 actor 挂上 request.state；匿名 identify 建号端点已退役，前端的 401 统一
 由 axios 拦截器引导到登录页，不再弹昵称框。
 """
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy import text
 from app.deploy.errors import DeployError
+from app.deploy.settings import preview_url
 from app.store import release as release_svc
 from app.store import applications as apps_svc
+from app.store import links
+from app.store import shots
 
 router = APIRouter(prefix="/api/store")
 apps_ext = APIRouter(prefix="/api/apps")
@@ -40,45 +44,104 @@ async def me(actor: dict = Actor):
 
 
 @router.get("/releases")
-async def list_releases(request: Request, actor: dict = Actor):
+async def list_releases(request: Request, actor: dict = Actor,
+                        q: str = "", category: str = "", sort: str = "latest"):
     """商店列表：每个 slug 只露最新 published 版本（申请人不需要翻历史）。
 
     installed 标记按当前 actor 的实例算：装过的版本卡片上显示「已安装」而非再给一个申请按钮。
+    q 命中标题/简介（ILIKE）；category 精确过滤（空＝全部，非法 400）；sort=installs 按安装量降序。
     """
+    if sort not in ("latest", "installs"):
+        raise _http(DeployError("sort 只支持 latest|installs", status=400))
     sf = request.app.state.session_factory
+    where = ["r.status = 'published'",
+             "r.id = (SELECT max(id) FROM app_release WHERE slug = r.slug "
+             "AND status = 'published')"]
+    params: dict = {}
+    if q.strip():
+        where.append("(r.title ILIKE :q OR COALESCE(r.summary, '') ILIKE :q)")
+        params["q"] = f"%{q.strip()}%"
+    if category:
+        try:
+            params["cat"] = release_svc.normalize_category(category)
+        except DeployError as e:
+            raise _http(e)
+        where.append("COALESCE(r.category, '其他') = :cat")
+    order = "install_count DESC, r.id DESC" if sort == "installs" else "r.id DESC"
     async with sf() as s:
         rows = (await s.execute(text(
-            "SELECT r.id, r.app_id, r.slug, r.version, r.title, r.summary, r.stack, "
+            "SELECT r.id, r.app_id, r.slug, r.version, r.title, r.summary, r.stack, r.category, "
+            "r.screenshots, r.created_by, "
             "r.fingerprint, r.created_at, a.nickname AS publisher, "
+            "src.status_dev AS src_status_dev, src.dev_port AS src_dev_port, "
             "(SELECT count(*) FROM release_application q WHERE q.release_id = r.id "
-            " AND q.status <> 'cancelled') AS applied_count "
+            " AND q.status = 'approved') AS install_count "
             "FROM app_release r "
             "LEFT JOIN actor a ON a.id = r.created_by "
-            "WHERE r.status = 'published' "
-            "AND r.id = (SELECT max(id) FROM app_release WHERE slug = r.slug "
-            "            AND status = 'published') "
-            "ORDER BY r.id DESC"))).mappings().all()
+            "LEFT JOIN app_project src ON src.id = r.app_id "
+            f"WHERE {' AND '.join(where)} ORDER BY {order}"), params)).mappings().all()
         mine = (await s.execute(text(
-            "SELECT l.release_id, p.id AS app_id, p.name, p.status_prod, p.prod_port AS port "
+            "SELECT l.release_id, p.id AS app_id, p.name, p.slug, p.status_prod, p.prod_port AS port "
             "FROM app_instance_link l JOIN app_project p ON p.id = l.app_id "
             "WHERE l.owner_actor = :a"), {"a": actor["id"]})).mappings().all()
     installed = {}
+    from app.deploy import nics
     for m in mine:
-        installed.setdefault(m["release_id"], []).append(dict(m))
+        d = dict(m)
+        d["prod_url"] = nics.app_url({"slug": d["slug"], "prod_port": d["port"]})
+        installed.setdefault(d["release_id"], []).append(d)
     out = []
     for r in rows:
         d = dict(r)
         d["created_at"] = d["created_at"].isoformat() if d.get("created_at") else None
         d["installed_apps"] = installed.get(d["id"], [])
         d["installed"] = bool(d["installed_apps"])
-        d["updated_count"] = int(d.pop("applied_count"))   # 历史字段名保留给前端角标语义
+        d["install_count"] = int(d["install_count"])   # 批准安装次数（卸载不回扣）
+        d["screenshots"] = shots.shot_urls(d["id"], d["screenshots"])
+        # 在线试用（ADR-0057）：只认来源应用 dev 栈 running，地址复用 preview_url 投影
+        dev_port = d.pop("src_dev_port")
+        trial_on = d.pop("src_status_dev") == "running" and bool(dev_port)
+        d["trial_available"] = trial_on
+        d["trial_url"] = preview_url(dev_port) if trial_on else ""
         out.append(d)
     return out
+
+
+@router.post("/releases/{release_id}/screenshots", status_code=201)
+async def add_screenshot(request: Request, release_id: int,
+                         file: UploadFile = File(...), actor: dict = Actor):
+    sf = request.app.state.session_factory
+    try:
+        data = await file.read(shots.MAX_BYTES + 1)
+        return await shots.add_shot(sf, release_id=release_id, actor_id=actor["id"], data=data)
+    except DeployError as e:
+        raise _http(e)
+
+
+@router.delete("/releases/{release_id}/screenshots/{index}")
+async def del_screenshot(request: Request, release_id: int, index: int, actor: dict = Actor):
+    sf = request.app.state.session_factory
+    try:
+        return await shots.remove_shot(sf, release_id=release_id, actor_id=actor["id"], index=index)
+    except DeployError as e:
+        raise _http(e)
+
+
+@router.get("/releases/{release_id}/screenshots/{index}")
+async def get_screenshot(request: Request, release_id: int, index: int):
+    """登录守卫内的文件读（全局 guard 已挡匿名）；不挂公共静态目录。"""
+    sf = request.app.state.session_factory
+    try:
+        p = await shots.shot_path(sf, release_id=release_id, index=index)
+    except DeployError as e:
+        raise _http(e)
+    return FileResponse(p)
 
 
 class ReleaseIn(BaseModel):
     title: str
     summary: str = ""
+    category: str | None = None
 
 
 @apps_ext.post("/{app_id}/release", status_code=201)
@@ -91,14 +154,64 @@ async def publish_to_store(request: Request, app_id: int, body: ReleaseIn,
     sf = request.app.state.session_factory
     from app.services import app_service
     try:
+        # 分类校验是全链最便宜的闸（规格 §4.8）：先于所有权与五道闸门，错分类直接 400
+        category = release_svc.normalize_category(body.category)
         # 上架仅所有者（规格 2026-11-16 §5.4）：release 服务按 id 直取应用，判权必须在这里先过接缝
         _app, role = await app_service.get_app_for_user(sf, app_id, actor["id"])
         app_service.require_owner(role)
         return await release_svc.create_release(
             sf, app_id=app_id, title=body.title, summary=body.summary,
-            actor_id=actor["id"])
+            category=category, actor_id=actor["id"])
     except DeployError as e:
         raise _http(e)
+
+
+class UpgradeIn(BaseModel):
+    to_release_id: int
+
+
+class ForkIn(BaseModel):
+    choice: str
+
+
+@apps_ext.post("/{app_id}/store/fork")
+async def fork_store_instance(request: Request, app_id: int, body: ForkIn, actor: dict = Actor):
+    """fork 问人（M3-a §6.5）：保留定制（detached）或丢弃定制回官方（库保留）。"""
+    from app.api.apps import _reject_if_task_running
+    from app.services import app_service
+    from app.store import baseline
+    sf = request.app.state.session_factory
+    try:
+        _reject_if_task_running(request, app_id)
+        app, role = await app_service.get_app_for_user(sf, app_id, actor["id"])
+        app_service.require_owner(role)
+        if not app.get("store"):
+            raise DeployError("该应用不是商店实例", status=404)
+        return await baseline.resolve_fork(sf, app, body.choice)
+    except DeployError as e:
+        raise _http(e)
+
+
+@apps_ext.post("/{app_id}/store/upgrade", status_code=202)
+async def upgrade_store_instance(request: Request, app_id: int, body: UpgradeIn,
+                                 actor: dict = Actor):
+    """手动升级（M3-a §6.4）：受理即 202，进度走 deploy WS；同应用单任务闸门。"""
+    from app.api.apps import _spawn, _reject_if_task_running
+    from app.services import app_service
+    from app.store import upgrade
+    sf = request.app.state.session_factory
+    hub = request.app.state.deploy_hub
+    try:
+        _reject_if_task_running(request, app_id)
+        app, role = await app_service.get_app_for_user(sf, app_id, actor["id"])
+        app_service.require_owner(role)
+        if not app.get("store"):
+            raise DeployError("该应用不是商店实例", status=404)
+        _spawn(request, app_id, lambda: upgrade.run_upgrade(
+            sf, app=app, to_release_id=body.to_release_id, notify=hub.publish))
+    except DeployError as e:
+        raise _http(e)
+    return {"ok": True}
 
 
 @router.post("/releases/{release_id}/withdraw")
@@ -182,18 +295,51 @@ async def reject(request: Request, aid: int, body: DecideIn, actor: dict = Actor
         raise _http(e)
 
 
+@router.post("/applications/{aid}/cancel", status_code=200)
+async def cancel_application(request: Request, aid: int, actor: dict = Actor):
+    sf = request.app.state.session_factory
+    try:
+        return await apps_svc.cancel(sf, app_id=aid, actor_id=actor["id"])
+    except DeployError as e:
+        raise _http(e)
+
+
 @router.get("/link/{app_id}")
 async def store_link(request: Request, app_id: int, actor: dict = Actor):
     """单实例的商店绑定详情。get_app 对不存在的应用抛 DeployError(404)，这里必须接住
     换成 HTTP 404（无全局 handler，漏接就是 500）。"""
     sf = request.app.state.session_factory
     from app.services import app_service
+    from app.store import baseline
     try:
         app, role = await app_service.get_app_for_user(sf, app_id, actor["id"])
         app_service.require_owner(role)   # 商店绑定不对被共享者开放（规格 §5.4 仅 owner）
         if not app.get("store"):
             raise DeployError("该应用不是商店实例", status=404)
+        return await baseline.upgrade_info(sf, app)
     except DeployError as e:
         raise _http(e)
-    # M3-b 的「可升级版本」在此接口补出，本期先给当前绑定与通道
-    return {"app_id": app_id, **app["store"], "upgradable": False}
+
+
+@router.post("/link/{app_id}/unlink")
+async def unlink_instance(request: Request, app_id: int, actor: dict = Actor):
+    """解绑：断 link + 清 origin，应用转普通自有（内容全留）。"""
+    from app.api.apps import _reject_if_task_running
+    sf = request.app.state.session_factory
+    try:
+        _reject_if_task_running(request, app_id)
+        return await links.unlink(sf, app_id=app_id, actor_id=actor["id"])
+    except DeployError as e:
+        raise _http(e)
+
+
+@router.delete("/link/{app_id}")
+async def uninstall_instance(request: Request, app_id: int, actor: dict = Actor):
+    """卸载：停栈 → 删库 → 删记录 → 删目录（高危，前端走 danger 确认）。"""
+    from app.api.apps import _reject_if_task_running
+    sf = request.app.state.session_factory
+    try:
+        _reject_if_task_running(request, app_id)
+        return await links.uninstall(sf, app_id=app_id, actor_id=actor["id"])
+    except DeployError as e:
+        raise _http(e)

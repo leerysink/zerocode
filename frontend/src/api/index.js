@@ -155,7 +155,7 @@ export const systemNics = () => http.get('/system/nics')
 
 // ---- 应用商店 M3-a（上架 / 申请审批）----
 // Ticket 008 身份合流：identify/storeMe 已退役，身份一律走 /api/auth/me（authMe）。
-export const storeReleases = () => http.get('/store/releases')
+export const storeReleases = (params) => http.get('/store/releases', { params })
 export const storeWithdraw = (id) => http.post(`/store/releases/${id}/withdraw`)
 export const storeApplications = (box = 'mine') => http.get('/store/applications', { params: { box } })
 export const storeMyReleases = () => http.get('/store/applications', { params: { box: 'review' } })
@@ -164,8 +164,21 @@ export const storeApply = (releaseId, wantName) =>
 export const storeApprove = (id) => http.post(`/store/applications/${id}/approve`, { approve: true })
 export const storeReject = (id, reason) =>
   http.post(`/store/applications/${id}/reject`, { approve: false, reason })
+export const storeCancel = (id) => http.post(`/store/applications/${id}/cancel`)
 export const releaseToStore = (appId, data) => http.post(`/apps/${appId}/release`, data)
 export const storeLink = (appId) => http.get(`/store/link/${appId}`)
+export const storeUnlink = (appId) => http.post(`/store/link/${appId}/unlink`)
+export const storeUninstall = (appId) => http.delete(`/store/link/${appId}`)
+export const storeUpgrade = (appId, toReleaseId) =>
+  http.post(`/apps/${appId}/store/upgrade`, { to_release_id: toReleaseId })
+export const storeFork = (appId, choice) => http.post(`/apps/${appId}/store/fork`, { choice })
+export const storeAddShot = (releaseId, file) => {
+  const fd = new FormData()
+  fd.append('file', file)
+  return http.post(`/store/releases/${releaseId}/screenshots`, fd)
+}
+export const storeDelShot = (releaseId, index) =>
+  http.delete(`/store/releases/${releaseId}/screenshots/${index}`)
 
 // ---- 登录体系（Ticket 002 / ADR-0003：actor 即登录用户）----
 export const authRegister = (data) => http.post('/auth/register', data) // {nickname, password}

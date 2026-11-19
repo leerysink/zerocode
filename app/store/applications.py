@@ -125,3 +125,22 @@ async def mark_failed(session_factory, app_id: int, error: str) -> dict:
             "WHERE id=:i"), {"i": app_id, "e": error[:500]})
         await s.commit()
     return await get(session_factory, app_id)
+
+
+async def cancel(session_factory, *, app_id: int, actor_id: int) -> dict:
+    """申请人撤回（沿用发布申请「申请人可撤回」惯例）：仅本人、仅 pending → cancelled。"""
+    async with session_factory() as s:
+        row = (await s.execute(text(
+            "SELECT q.id, q.status, q.applicant_id FROM release_application q "
+            "WHERE q.id = :i FOR UPDATE"), {"i": app_id})).mappings().first()
+        if not row:
+            raise DeployError("申请单不存在", status=404)
+        if row["applicant_id"] != actor_id:
+            raise DeployError("只能撤回自己的申请", status=403)
+        if row["status"] not in OPEN:
+            raise DeployError(f"申请已处理（{row['status']}），不可撤回", status=409)
+        await s.execute(text(
+            "UPDATE release_application SET status='cancelled', updated_at=now() WHERE id=:i"),
+            {"i": app_id})
+        await s.commit()
+    return await get(session_factory, app_id)
