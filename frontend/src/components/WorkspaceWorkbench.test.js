@@ -6,6 +6,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { h } from 'vue'
 import { mount, flushPromises, enableAutoUnmount } from '@vue/test-utils'
+import { createPinia } from 'pinia'
 
 vi.mock('../api', () => ({
   listDir: vi.fn(), readFile: vi.fn(), saveFile: vi.fn(),
@@ -46,7 +47,7 @@ vi.mock('./workbench/FileIcon.vue', async () => {
 import { listDir, readFile, saveFile } from '../api'
 import { message } from 'ant-design-vue'
 import { tabsStorageKey } from '../utils/workbenchTabs'
-import { THEME_KEY } from '../utils/theme'
+import { THEME_KEY, CONSOLE_THEME_KEY } from '../utils/theme'
 import WorkspaceWorkbench from './WorkspaceWorkbench.vue'
 
 enableAutoUnmount(afterEach)
@@ -141,7 +142,7 @@ const fixture = (ws, path) => Promise.resolve(ls(path, LAYERS[path] || []))
 async function mountWb(props = {}) {
   const wrapper = mount(WorkspaceWorkbench, {
     props: { workspaceId: 7, workspaceName: '演示工作区', ...props },
-    global: { stubs: STUBS },
+    global: { stubs: STUBS, plugins: [createPinia()] },
   })
   await flushPromises()
   return wrapper
@@ -882,35 +883,42 @@ describe('WorkspaceWorkbench 视觉收官（图标 / 主题 / 状态栏）', () 
     expect(icons.filter(([p]) => p === 'a.md')).toHaveLength(2)
   })
 
-  it('默认深色：根节点 data-theme=dark，编辑器同步 dark', async () => {
+  it('默认浅色（全局口径）：根节点 data-theme=light，编辑器同步 light', async () => {
     const wrapper = await mountWb()
 
-    expect(root(wrapper).attributes('data-theme')).toBe('dark')
-    expect(editor(wrapper).props('theme')).toBe('dark')
+    expect(root(wrapper).attributes('data-theme')).toBe('light')
+    expect(editor(wrapper).props('theme')).toBe('light')
   })
 
-  it('点状态栏主题按钮切浅色：立即生效、写入存储、再点回深色', async () => {
+  it('点状态栏主题按钮拨全局偏好：立即生效、写新键、编辑器同步，再点回浅色', async () => {
     const wrapper = await mountWb()
+
+    await wrapper.find('.zc-wb-theme-toggle').trigger('click')
+    expect(root(wrapper).attributes('data-theme')).toBe('dark')
+    expect(localStorage.getItem(CONSOLE_THEME_KEY)).toBe('dark')
+    expect(localStorage.getItem(THEME_KEY)).toBe(null) // 旧键不再被写
+    expect(editor(wrapper).props('theme')).toBe('dark')
 
     await wrapper.find('.zc-wb-theme-toggle').trigger('click')
     expect(root(wrapper).attributes('data-theme')).toBe('light')
-    expect(localStorage.getItem(THEME_KEY)).toBe('light')
+    expect(localStorage.getItem(CONSOLE_THEME_KEY)).toBe('light')
     expect(editor(wrapper).props('theme')).toBe('light')
-
-    await wrapper.find('.zc-wb-theme-toggle').trigger('click')
-    expect(root(wrapper).attributes('data-theme')).toBe('dark')
-    expect(localStorage.getItem(THEME_KEY)).toBe('dark')
-    expect(editor(wrapper).props('theme')).toBe('dark')
   })
 
-  it('挂载时应用已存的浅色主题；坏值一律回落深色', async () => {
-    localStorage.setItem(THEME_KEY, 'light')
-    const light = await mountWb()
-    expect(root(light).attributes('data-theme')).toBe('light')
+  it('挂载时应用已存的全局深色；坏值回落浅色；旧键显式值经继承生效', async () => {
+    localStorage.setItem(CONSOLE_THEME_KEY, 'dark')
+    const dark = await mountWb()
+    expect(root(dark).attributes('data-theme')).toBe('dark')
 
-    localStorage.setItem(THEME_KEY, 'blue')
+    localStorage.clear()
+    localStorage.setItem(CONSOLE_THEME_KEY, 'blue')
     const bad = await mountWb()
-    expect(root(bad).attributes('data-theme')).toBe('dark')
+    expect(root(bad).attributes('data-theme')).toBe('light')
+
+    localStorage.clear()
+    localStorage.setItem(THEME_KEY, 'dark')
+    const inherited = await mountWb()
+    expect(root(inherited).attributes('data-theme')).toBe('dark')
   })
 
   it('状态栏显示语言、Ln/Col、编码与 EOL，无选区时不显示选中数', async () => {

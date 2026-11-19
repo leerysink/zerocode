@@ -102,26 +102,26 @@ const open = ref(false)
   border-left: 3px solid var(--zc-border);
   border-radius: 8px;
   padding: 8px 12px;
-  background: #fbfcfd;
+  background: var(--zc-bg-card-soft);
 }
 .zc-preview.is-ok {
-  border-left-color: #52a06b;
-  background: #f6fbf7;
+  border-left-color: var(--zc-success-bright);
+  background: var(--zc-success-bg);
 }
 .zc-preview.is-warn {
-  border-left-color: #d99a3c;
-  background: #fdfaf3;
+  border-left-color: var(--zc-warning-bright);
+  background: var(--zc-warning-bg);
 }
 .zc-preview.is-error {
-  border-left-color: #c4636a;
-  background: #fdeeee;
+  border-left-color: var(--zc-danger-bright);
+  background: var(--zc-danger-bg);
 }
 .zc-preview.is-info {
   border-left-color: var(--zc-primary);
-  background: #f4f8fd;
+  background: var(--zc-bg-info);
 }
 .zc-preview.is-muted {
-  border-left-color: #b6bfca;
+  border-left-color: var(--zc-neutral-rail);
 }
 .zc-preview-head {
   display: flex;
@@ -136,7 +136,7 @@ const open = ref(false)
 .zc-preview-tool {
   font-size: 11px;
   color: var(--zc-text-sub);
-  background: rgba(91, 122, 157, 0.08);
+  background: rgba(var(--zc-primary-rgb), 0.08);
   border-radius: 4px;
   padding: 1px 6px;
 }
@@ -173,7 +173,7 @@ const open = ref(false)
   max-height: 240px;
   overflow: auto;
   list-style: none;
-  background: #f6f8fa;
+  background: var(--zc-bg-code);
   border: 1px solid var(--zc-border);
   border-radius: 6px;
   font-family: ui-monospace, SFMono-Regular, Consolas, 'Courier New', monospace;

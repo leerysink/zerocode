@@ -157,17 +157,17 @@ function isPicked(label) {
 .zc-ask {
   width: 100%;
   max-width: 640px;
-  background: #fff;
+  background: var(--zc-bg-card);
   border: 1px solid var(--zc-border);
   border-left: 3px solid var(--zc-primary);
   border-radius: 8px;
   padding: 12px 14px;
-  box-shadow: 0 1px 4px rgba(47, 58, 71, 0.05);
+  box-shadow: 0 1px 4px rgba(var(--zc-shadow-rgb), 0.05);
 }
 /* 已答态：整卡退到背景里，左边框转灰——它是留痕，不是待办 */
 .zc-ask.is-answered {
   border-left-color: var(--zc-border);
-  background: #fafbfc;
+  background: var(--zc-bg-option);
   box-shadow: none;
 }
 .zc-ask-state {
@@ -203,7 +203,7 @@ function isPicked(label) {
   color: var(--zc-text-sub);
 }
 .zc-ask-cancel:hover {
-  color: #a05a5a;
+  color: var(--zc-danger-text);
 }
 .zc-ask-decline {
   color: var(--zc-text-sub);
@@ -232,7 +232,7 @@ function isPicked(label) {
 .zc-ask-free-answer {
   margin-top: 6px;
   padding: 6px 10px;
-  background: #fff;
+  background: var(--zc-bg-card);
   border: 1px solid var(--zc-border);
   border-radius: 6px;
   color: var(--zc-text);

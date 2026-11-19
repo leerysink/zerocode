@@ -17,7 +17,7 @@ const props = defineProps({
   loading: { type: Boolean, default: false },
   error: { type: String, default: '' },
   readOnly: { type: Boolean, default: false },
-  theme: { type: String, default: 'dark' },
+  theme: { type: String, default: 'light' },
   openPaths: { type: Array, default: () => [] },
 })
 

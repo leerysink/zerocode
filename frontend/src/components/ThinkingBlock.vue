@@ -32,7 +32,7 @@ watch(() => props.streaming, (v) => { if (v) open.value = true })
   width: 100%;
   text-align: left;
   border: none;
-  background: rgba(91, 122, 157, 0.06);
+  background: rgba(var(--zc-primary-rgb), 0.06);
   color: var(--zc-text-sub);
   font-size: 12px;
   padding: 6px 10px;
@@ -52,7 +52,7 @@ watch(() => props.streaming, (v) => { if (v) open.value = true })
   white-space: pre-wrap;
   word-break: break-word;
   color: var(--zc-text-sub);
-  background: #fff;
+  background: var(--zc-bg-card);
 }
 @keyframes zc-think-blink {
   50% { opacity: 0.45; }

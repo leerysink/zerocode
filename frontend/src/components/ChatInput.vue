@@ -294,7 +294,7 @@ function requestCompact() {
   flex: 0 0 auto;
   padding: 10px 28px 14px;
   border-top: 1px solid var(--zc-border);
-  background: #fff;
+  background: var(--zc-bg-card);
 }
 .zc-input-meta {
   display: flex;
@@ -321,10 +321,10 @@ function requestCompact() {
   left: 0;
   right: 0;
   bottom: calc(100% + 4px);
-  background: #fff;
+  background: var(--zc-bg-card);
   border: 1px solid var(--zc-border);
   border-radius: 8px;
-  box-shadow: 0 4px 16px rgba(47, 58, 71, 0.12);
+  box-shadow: 0 4px 16px rgba(var(--zc-shadow-rgb), 0.12);
   overflow: hidden;
   z-index: 20;
 }
@@ -334,7 +334,7 @@ function requestCompact() {
   cursor: pointer;
 }
 .zc-mention-item.is-active {
-  background: rgba(91, 122, 157, 0.1);
+  background: rgba(var(--zc-primary-rgb), 0.1);
 }
 .zc-model-select {
   min-width: 180px;
@@ -355,7 +355,7 @@ function requestCompact() {
 }
 /* 执行中被拦下的一次性提示：低饱和暖色，只点状态，不抢错误级的红 */
 .zc-input-hint.is-busy {
-  color: #a17c5b;
+  color: var(--zc-warning-brown);
 }
 .zc-input-buttons {
   display: flex;
@@ -369,19 +369,19 @@ function requestCompact() {
 .zc-input.is-dragover { outline: 2px dashed var(--zc-primary); outline-offset: -4px; }
 .zc-attachments { margin-bottom: 8px; }
 .zc-attach-warn {
-  margin-bottom: 6px; font-size: 12px; color: #a17c5b;
+  margin-bottom: 6px; font-size: 12px; color: var(--zc-warning-brown);
 }
 .zc-attach-list { display: flex; flex-wrap: wrap; gap: 8px; }
 .zc-attach-item {
   position: relative; width: 56px; height: 56px; border-radius: 6px;
-  overflow: hidden; background: #f4f6f9;
+  overflow: hidden; background: var(--zc-bg-attach);
 }
 .zc-attach-thumb { width: 56px; height: 56px; object-fit: cover; display: block; }
-.zc-attach-spin { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; background: rgba(255,255,255,.6); }
+.zc-attach-spin { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; background: var(--zc-overlay-light); }
 .zc-attach-remove { position: absolute; top: 0; right: 0; min-width: 18px; height: 18px; padding: 0; line-height: 18px; }
 .zc-attach-fail {
   position: absolute; inset: 0; display: flex; flex-direction: column;
-  align-items: center; justify-content: center; background: rgba(253,238,238,.92);
+  align-items: center; justify-content: center; background: rgba(var(--zc-danger-bg-rgb), .92);
 }
 .zc-attach-size {
   position: absolute; left: 2px; bottom: 2px; font-size: 10px;

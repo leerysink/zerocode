@@ -373,7 +373,7 @@ onBeforeUnmount(cancelFill)
 .zc-notice-text {
   font-size: 12px;
   color: var(--zc-text-sub);
-  background: rgba(91, 122, 157, 0.06);
+  background: rgba(var(--zc-primary-rgb), 0.06);
   border-radius: 999px;
   padding: 3px 12px;
 }
@@ -385,7 +385,7 @@ onBeforeUnmount(cancelFill)
 /* user 浅蓝气泡 */
 .zc-bubble {
   max-width: 72%;
-  background: #e8f1fb;
+  background: var(--zc-bg-bubble);
   border-radius: 10px 10px 2px 10px;
   padding: 8px 12px;
   font-size: 14px;
@@ -424,8 +424,8 @@ onBeforeUnmount(cancelFill)
   padding: 1px 6px;
   border-radius: 8px;
   font-size: 11px;
-  color: #a17c5b;
-  background: rgba(161, 124, 91, 0.1);
+  color: var(--zc-warning-brown);
+  background: rgba(var(--zc-brown-rgb), 0.1);
   white-space: nowrap;
 }
 
@@ -434,15 +434,15 @@ onBeforeUnmount(cancelFill)
   align-items: center;
   gap: 4px;
   max-width: 72%;
-  background: #fdeeee;
-  border: 1px solid #f2d8d8;
+  background: var(--zc-danger-bg);
+  border: 1px solid var(--zc-danger-border-soft);
   border-radius: 8px;
   padding: 8px 12px;
 }
 .zc-error-text {
   flex: 1;
   min-width: 0;
-  color: #a05a5a;
+  color: var(--zc-danger-text);
   font-size: 13px;
   line-height: 1.7;
   white-space: pre-wrap;
@@ -483,13 +483,13 @@ onBeforeUnmount(cancelFill)
 .zc-md :deep(code) {
   font-family: ui-monospace, SFMono-Regular, Consolas, 'Courier New', monospace;
   font-size: 13px;
-  background: rgba(91, 122, 157, 0.08);
+  background: rgba(var(--zc-primary-rgb), 0.08);
   border-radius: 4px;
   padding: 1px 5px;
 }
 .zc-md :deep(pre) {
   margin: 8px 0;
-  background: #f6f8fa;
+  background: var(--zc-bg-code);
   border: 1px solid var(--zc-border);
   border-radius: 6px;
   padding: 10px 12px;

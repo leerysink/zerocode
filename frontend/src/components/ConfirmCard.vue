@@ -75,14 +75,14 @@ const bodyText = computed(() => (pending.value ? props.msg.confirmSummary || '' 
 .zc-confirm {
   width: 100%;
   max-width: 640px;
-  background: #fdfaf3;
-  border: 1px solid #ecdfc4;
+  background: var(--zc-warning-bg);
+  border: 1px solid var(--zc-warning-border);
   border-radius: 8px;
   padding: 12px 14px;
 }
 /* 已答态：留痕而非待办，配色退到中性灰，不再用待确认的暖黄 */
 .zc-confirm.is-decided {
-  background: #fafbfc;
+  background: var(--zc-bg-option);
   border-color: var(--zc-border);
 }
 .zc-confirm-head {
@@ -90,7 +90,7 @@ const bodyText = computed(() => (pending.value ? props.msg.confirmSummary || '' 
   align-items: center;
   gap: 8px;
   font-weight: 500;
-  color: #8a6d3b;
+  color: var(--zc-warning-deep);
 }
 .zc-confirm.is-decided .zc-confirm-head {
   color: var(--zc-text-sub);
@@ -98,19 +98,19 @@ const bodyText = computed(() => (pending.value ? props.msg.confirmSummary || '' 
 .zc-confirm-tool {
   font-size: 12px;
   font-weight: 400;
-  background: rgba(138, 109, 59, 0.1);
+  background: rgba(var(--zc-warn-deep-rgb), 0.1);
   border-radius: 4px;
   padding: 1px 8px;
 }
 .zc-confirm.is-decided .zc-confirm-tool {
-  background: rgba(47, 58, 71, 0.06);
+  background: rgba(var(--zc-text-rgb), 0.06);
 }
 .zc-confirm-args {
   margin: 10px 0 0;
   max-height: 200px;
   overflow: auto;
-  background: #fff;
-  border: 1px solid #ecdfc4;
+  background: var(--zc-bg-card);
+  border: 1px solid var(--zc-warning-border);
   border-radius: 6px;
   padding: 8px 10px;
   font-family: ui-monospace, SFMono-Regular, Consolas, 'Courier New', monospace;

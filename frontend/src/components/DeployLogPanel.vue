@@ -195,14 +195,14 @@ defineExpose({ refresh, handleEvent, connect, disconnect, lines, status, note, l
 /* 素雅低饱和：深灰底 + 灰蓝/灰绿/灰红，长时间盯着不刺眼；等宽字体保证日志对齐 */
 .zc-dlog { display: flex; flex-direction: column; height: 100%; gap: 8px; }
 .zc-dlog-bar { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
-.zc-dlog-mode { font-size: 12px; color: #8b95a1; }
-.zc-dlog-note { margin: 0; font-size: 12px; color: #c08a3e; }
+.zc-dlog-mode { font-size: 12px; color: var(--zc-text-weak); }
+.zc-dlog-note { margin: 0; font-size: 12px; color: var(--zc-warning); }
 .zc-dlog-body {
   flex: 1; overflow: auto; background: #23272e; border-radius: 6px; padding: 10px 12px;
   font-family: ui-monospace, Consolas, Menlo, monospace; font-size: 12px; line-height: 1.7;
   max-height: calc(100vh - 200px);
 }
-.zc-dlog-empty { color: #9aa0a6; margin: 0; }
+.zc-dlog-empty { color: var(--zc-neutral); margin: 0; }
 .zc-dlog-line { margin: 0; white-space: pre-wrap; word-break: break-all; color: #d8dade; }
 .zc-dlog-ts { color: #7c8590; margin-right: 8px; }
 .zc-dlog-svc { color: #8b95a1; margin-right: 8px; }

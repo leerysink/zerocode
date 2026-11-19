@@ -231,23 +231,23 @@ async function start() {
                color: var(--zc-text-sub); }
 .zc-steps li.st-running { color: var(--zc-text); }
 .zc-steps li.st-ok { color: var(--zc-text); }
-.zc-steps li.st-failed { color: #b96a6a; }
+.zc-steps li.st-failed { color: var(--zc-danger); }
 .zc-step-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%;
-               background: #d3d6db; margin: 0 4px; }
+               background: var(--zc-step-line); margin: 0 4px; }
 .zc-pub-fold { margin: 8px 0; font-size: 12px; color: var(--zc-text-sub); }
 .zc-pub-fold summary { cursor: pointer; user-select: none; }
-.zc-pub-tail { max-height: 200px; overflow-y: auto; background: #f7f8fa; border-radius: 4px;
+.zc-pub-tail { max-height: 200px; overflow-y: auto; background: var(--zc-bg-inset); border-radius: 4px;
                padding: 8px 10px; font-family: Consolas, monospace; font-size: 11px;
                white-space: pre-wrap; word-break: break-all; }
-.zc-pub-done { color: #5b8a72; font-weight: 600; margin: 10px 0 4px; }
+.zc-pub-done { color: var(--zc-success); font-weight: 600; margin: 10px 0 4px; }
 .zc-pub-url { display: inline-block; font-size: 17px; font-weight: 600; color: var(--zc-primary);
               text-decoration: none; word-break: break-all; }
 .zc-pub-nourl { margin: 6px 0; padding: 8px 10px; font-size: 12px; color: var(--zc-text-sub);
-                background: #f7f8fa; border: 1px solid #e6e8eb; border-radius: 4px; }
+                background: var(--zc-bg-inset); border: 1px solid var(--zc-border-soft); border-radius: 4px; }
 .zc-pub-nourl code { font-family: Consolas, monospace; }
-.zc-pub-fail { background: #fdf3f2; border: 1px solid #eadcdb; color: #b96a6a; border-radius: 4px;
+.zc-pub-fail { background: var(--zc-danger-bg-alt); border: 1px solid var(--zc-danger-border); color: var(--zc-danger); border-radius: 4px;
                padding: 8px 10px; font-size: 12px; white-space: pre-wrap; word-break: break-all; }
-.zc-pub-destr { margin: 6px 0 10px; padding-left: 20px; font-size: 12px; color: #b96a6a; }
+.zc-pub-destr { margin: 6px 0 10px; padding-left: 20px; font-size: 12px; color: var(--zc-danger); }
 .zc-pub-destr li { margin: 2px 0; }
 .zc-pub-foot { margin-top: 14px; text-align: right; }
 </style>

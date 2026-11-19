@@ -417,26 +417,26 @@ function rowVerdict(item) {
   border-left: 3px solid var(--zc-border);
   border-radius: 8px;
   padding: 10px 12px;
-  background: #fbfcfd;
+  background: var(--zc-bg-card-soft);
 }
 .zc-page.is-ok {
-  border-left-color: #52a06b;
-  background: #f6fbf7;
+  border-left-color: var(--zc-success-bright);
+  background: var(--zc-success-bg);
 }
 .zc-page.is-warn {
-  border-left-color: #d99a3c;
-  background: #fdfaf3;
+  border-left-color: var(--zc-warning-bright);
+  background: var(--zc-warning-bg);
 }
 .zc-page.is-error {
-  border-left-color: #c4636a;
-  background: #fdeeee;
+  border-left-color: var(--zc-danger-bright);
+  background: var(--zc-danger-bg);
 }
 .zc-page.is-info {
   border-left-color: var(--zc-primary);
-  background: #f4f8fd;
+  background: var(--zc-bg-info);
 }
 .zc-page.is-muted {
-  border-left-color: #b6bfca;
+  border-left-color: var(--zc-neutral-rail);
 }
 .zc-page-head {
   display: flex;
@@ -452,32 +452,32 @@ function rowVerdict(item) {
 .zc-page-tool {
   font-size: 11px;
   color: var(--zc-text-sub);
-  background: rgba(91, 122, 157, 0.08);
+  background: rgba(var(--zc-primary-rgb), 0.08);
   border-radius: 4px;
   padding: 1px 6px;
 }
 .zc-page-badge {
   font-size: 11px;
-  color: #a17c5b;
-  background: rgba(161, 124, 91, 0.12);
+  color: var(--zc-warning-brown);
+  background: rgba(var(--zc-brown-rgb), 0.12);
   border-radius: 999px;
   padding: 1px 8px;
 }
 /* 「点不动」红、「断言没过」琥珀：两本账在徽标这一层也不许同色 */
 .zc-page-badge.is-action {
-  color: #a05a5a;
-  background: rgba(196, 99, 106, 0.14);
+  color: var(--zc-danger-text);
+  background: rgba(var(--zc-danger-bright-rgb), 0.14);
 }
 /* 琥珀这一档必须自己写死，不能只靠 `.zc-page-badge` 的基础色继承：基础色哪天被改成红，
    「两种失败糊成一个红」就会静默通过全部测试（测试比的是 class 名与文案，比不出继承链）。
    色值与基础色同源，取自 PageInspectCard 既有的琥珀，不引入新色相。 */
 .zc-page-badge.is-expect {
-  color: #a17c5b;
-  background: rgba(161, 124, 91, 0.12);
+  color: var(--zc-warning-brown);
+  background: rgba(var(--zc-brown-rgb), 0.12);
 }
 .zc-page-badge.is-pass {
-  color: #52a06b;
-  background: rgba(82, 160, 107, 0.12);
+  color: var(--zc-success-bright);
+  background: rgba(var(--zc-success-bright-rgb), 0.12);
 }
 .zc-page-link {
   margin-left: auto;
@@ -512,18 +512,18 @@ function rowVerdict(item) {
   word-break: break-word;
 }
 .zc-page-verdict.is-action {
-  color: #a05a5a;
+  color: var(--zc-danger-text);
 }
 .zc-page-verdict.is-expect {
-  color: #a17c5b;
+  color: var(--zc-warning-brown);
 }
 .zc-page-dialog {
   margin-top: 8px;
   padding: 8px 10px;
   font-size: 12.5px;
   line-height: 1.7;
-  color: #a17c5b;
-  background: rgba(217, 154, 60, 0.1);
+  color: var(--zc-warning-brown);
+  background: rgba(var(--zc-amber-bright-rgb), 0.1);
   border-radius: 6px;
 }
 .zc-page-dialog-msg {
@@ -551,7 +551,7 @@ function rowVerdict(item) {
   max-height: 220px;
   overflow: auto;
   list-style: none;
-  background: #fff;
+  background: var(--zc-bg-card);
   border: 1px solid var(--zc-border);
   border-radius: 6px;
   font-family: ui-monospace, SFMono-Regular, Consolas, 'Courier New', monospace;
@@ -571,13 +571,13 @@ function rowVerdict(item) {
 }
 /* 未捕获异常整条是「这一步把页面点崩了」的证据，沿用既有那支红，不新增色值 */
 .zc-page-list li.is-error {
-  color: #a05a5a;
+  color: var(--zc-danger-text);
 }
 .zc-page-level {
   flex: none;
   font-size: 10px;
   text-transform: uppercase;
-  color: #a05a5a;
+  color: var(--zc-danger-text);
 }
 .zc-page-method {
   flex: none;
@@ -588,7 +588,7 @@ function rowVerdict(item) {
   color: var(--zc-text-sub);
 }
 .zc-page-status.is-bad {
-  color: #a05a5a;
+  color: var(--zc-danger-text);
 }
 .zc-page-url {
   min-width: 0;
@@ -597,8 +597,8 @@ function rowVerdict(item) {
 .zc-page-flag {
   flex: none;
   font-size: 10px;
-  color: #a17c5b;
-  background: rgba(161, 124, 91, 0.12);
+  color: var(--zc-warning-brown);
+  background: rgba(var(--zc-brown-rgb), 0.12);
   border-radius: 4px;
   padding: 0 5px;
 }
@@ -632,7 +632,7 @@ function rowVerdict(item) {
   color: var(--zc-text-sub);
 }
 .zc-page-counts .is-bad {
-  color: #a05a5a;
+  color: var(--zc-danger-text);
   font-weight: 500;
 }
 .zc-page-report {
@@ -641,7 +641,7 @@ function rowVerdict(item) {
   list-style: none;
   border: 1px solid var(--zc-border);
   border-radius: 6px;
-  background: #fff;
+  background: var(--zc-bg-card);
   font-size: 12px;
 }
 .zc-page-report-row {
@@ -671,17 +671,17 @@ function rowVerdict(item) {
 }
 /* 逐行分色沿用徽标那一对：点不动红、断言没过琥珀，推进了保持中性 */
 .zc-page-report-row.is-action .zc-page-verdict-text {
-  color: #a05a5a;
+  color: var(--zc-danger-text);
 }
 .zc-page-report-row.is-expect .zc-page-verdict-text {
-  color: #a17c5b;
+  color: var(--zc-warning-brown);
 }
 .zc-page-hint {
   margin-top: 8px;
   font-size: 12.5px;
   line-height: 1.7;
   color: var(--zc-text);
-  background: rgba(91, 122, 157, 0.06);
+  background: rgba(var(--zc-primary-rgb), 0.06);
   border-radius: 6px;
   padding: 8px 10px;
   white-space: pre-wrap;

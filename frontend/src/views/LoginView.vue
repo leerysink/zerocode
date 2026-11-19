@@ -82,7 +82,7 @@ async function submit() {
 .login-subtitle {
   margin: 4px 0 20px;
   text-align: center;
-  color: rgba(0, 0, 0, 0.45);
+  color: var(--zc-text-faint);
   font-size: 13px;
 }
 .login-error {

@@ -24,10 +24,10 @@ const LIVE = ['running', 'unhealthy']
 // 指标清单：分组、配色（走卡片 --accent，曲线/圆点/网格同色）、格式化器。
 // cpu/memory 来自 docker stats（Ticket 004），db_size 来自 PG（005），workspace_size 来自文件系统（001）。
 const METRICS = [
-  { key: 'cpu', label: 'CPU 占用', fmt: 'pct', color: '#5b7a9d', group: 'runtime', runtime: true },
-  { key: 'memory', label: '内存占用', fmt: 'bytes', color: '#5b8a72', group: 'runtime', runtime: true },
-  { key: 'db_size', label: '数据库磁盘', fmt: 'bytes', color: '#c08a3e', group: 'storage' },
-  { key: 'workspace_size', label: '工作区磁盘', fmt: 'bytes', color: '#8a7ba6', group: 'storage' },
+  { key: 'cpu', label: 'CPU 占用', fmt: 'pct', color: 'var(--zc-primary)', group: 'runtime', runtime: true },
+  { key: 'memory', label: '内存占用', fmt: 'bytes', color: 'var(--zc-success)', group: 'runtime', runtime: true },
+  { key: 'db_size', label: '数据库磁盘', fmt: 'bytes', color: 'var(--zc-warning)', group: 'storage' },
+  { key: 'workspace_size', label: '工作区磁盘', fmt: 'bytes', color: 'var(--zc-purple)', group: 'storage' },
 ]
 // cpu 按百分比、其余按字节；fmt==='pct' 之外一律走字节格式化。
 const fmtOf = (m) => (m.fmt === 'pct' ? fmtPct : fmtBytes)
@@ -218,8 +218,8 @@ async function switchWindow(w) {
 .zc-window-tab { border: 0; background: transparent; border-radius: 6px; padding: 3px 12px;
                  font-size: 12px; cursor: pointer; color: var(--zc-text-sub); transition: all 0.15s; }
 .zc-window-tab:hover { color: var(--zc-primary); }
-.zc-window-tab.active { background: #fff; color: var(--zc-primary); font-weight: 600;
-                        box-shadow: 0 1px 3px rgba(47, 58, 71, 0.10); }
+.zc-window-tab.active { background: var(--zc-bg-card); color: var(--zc-primary); font-weight: 600;
+                        box-shadow: 0 1px 3px rgba(var(--zc-shadow-rgb), 0.10); }
 
 /* 分组标题 + 2 列卡片网格 */
 .zc-metric-group { display: flex; flex-direction: column; gap: 10px; }
@@ -228,8 +228,8 @@ async function switchWindow(w) {
 
 /* 单卡：浅色浮起，顶部一条指标主色描边强化辨识 */
 .zc-metric-card { position: relative; display: flex; flex-direction: column; gap: 8px;
-                  padding: 14px 16px 12px; background: #fff; border: 1px solid var(--zc-border);
-                  border-radius: 12px; box-shadow: 0 1px 4px rgba(47, 58, 71, 0.05); overflow: hidden; }
+                  padding: 14px 16px 12px; background: var(--zc-bg-card); border: 1px solid var(--zc-border);
+                  border-radius: 12px; box-shadow: 0 1px 4px rgba(var(--zc-shadow-rgb), 0.05); overflow: hidden; }
 .zc-metric-card::before { content: ''; position: absolute; left: 0; top: 0; width: 100%; height: 3px;
                           background: var(--accent); opacity: 0.85; }
 .zc-card-top { display: flex; align-items: center; gap: 8px; }
@@ -252,7 +252,7 @@ async function switchWindow(w) {
 .zc-grid { stroke: var(--zc-border); stroke-width: 1; }
 .zc-chart-line { fill: none; stroke: currentColor; stroke-width: 1.6;
                  stroke-linejoin: round; stroke-linecap: round; vector-effect: non-scaling-stroke; }
-.zc-chart-cursor { fill: currentColor; stroke: #fff; stroke-width: 1.5; }
+.zc-chart-cursor { fill: currentColor; stroke: var(--zc-chart-cursor-stroke); stroke-width: 1.5; }
 .zc-chart-axis { display: flex; justify-content: space-between; font-size: 10px; color: var(--zc-text-sub); }
 .zc-chart-blank { font-size: 11px; color: var(--zc-text-sub); text-align: center; padding: 18px 0;
                   background: var(--zc-bg); border-radius: 6px; }

@@ -152,10 +152,10 @@ function sparkPath(points, w = 100, h = 26) {
 // 平均 CPU 只计采到值的活应用：一个都没采到写 —，写 0.0 % 会被读成「很闲」。
 const STAT_CELLS = [
   { key: 'total', label: '应用' },
-  { key: 'running', label: '运行中', color: '#5b8a72' },
+  { key: 'running', label: '运行中', color: 'var(--zc-success)' },
   { key: 'busy', label: '进行中', color: 'var(--zc-primary)' },
-  { key: 'stopped', label: '已停止', color: '#9aa0a6' },
-  { key: 'bad', label: '异常', color: '#b96a6a' },
+  { key: 'stopped', label: '已停止', color: 'var(--zc-neutral)' },
+  { key: 'bad', label: '异常', color: 'var(--zc-danger)' },
   { key: 'cpuText', label: '平均 CPU' },
 ]
 const stats = computed(() => {
@@ -232,8 +232,8 @@ async function submit() {
 }
 
 const statusColor = (s) => ({
-  running: '#5b8a72', stopped: '#9aa0a6', starting: '#5b7a9d',
-  publishing: '#5b7a9d', error: '#b96a6a', unhealthy: '#c08a3e',
+  running: 'var(--zc-success)', stopped: 'var(--zc-neutral)', starting: 'var(--zc-primary)',
+  publishing: 'var(--zc-primary)', error: 'var(--zc-danger)', unhealthy: 'var(--zc-warning)',
 }[s || 'stopped'])
 const statusText = (s) => ({
   running: '运行中', stopped: '已停止', starting: '启动中…',
@@ -992,7 +992,7 @@ async function doRelease() {
       <p v-if="copyFail.key === 'preview'" class="zc-line zc-copy-manual">{{ copyFail.url }}</p>
       <iframe v-if="preview.status === 'running' && preview.url"
               :key="preview.nonce" :src="preview.url"
-              style="width: 100%; height: calc(100vh - 160px); border: 1px solid #e5e7eb; border-radius: 4px" />
+              style="width: 100%; height: calc(100vh - 160px); border: 1px solid var(--zc-border-alt); border-radius: 4px" />
       <a-empty v-else description="预览未启动——点卡片上的「启动预览」，或稍候刷新" />
     </a-drawer>
 
@@ -1054,17 +1054,17 @@ async function doRelease() {
 /* 页头总控区：一条淡主色渐变把「标题 + 计数 + 状态分布」兜成整块，与下面的卡片彻底分层
    （ADR-0048 D）。渐变收在 .13→.02，再浓就要盖过卡片里的仪表带了。 */
 .zc-hero { margin-bottom: 16px; padding: 14px 16px 12px; border: 1px solid var(--zc-border); border-radius: 10px;
-           background: linear-gradient(105deg, rgba(91, 122, 157, 0.13), rgba(91, 122, 157, 0.02) 58%,
-                                         rgba(196, 154, 68, 0.05)); }
+           background: linear-gradient(105deg, rgba(var(--zc-primary-rgb), 0.13), rgba(var(--zc-primary-rgb), 0.02) 58%,
+                                         rgba(var(--zc-amber-rgb), 0.05)); }
 .zc-head { display: flex; justify-content: space-between; align-items: center; }
 .zc-head-left { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .zc-head h2 { margin: 0; font-size: 22px; font-weight: 600; color: var(--zc-text); white-space: nowrap; }
 .zc-hero-count { flex-shrink: 0; padding: 2px 9px; border-radius: 10px; font-size: 12px; font-weight: 500;
-                 line-height: 1.5; color: var(--zc-primary); background: rgba(91, 122, 157, 0.12);
+                 line-height: 1.5; color: var(--zc-primary); background: rgba(var(--zc-primary-rgb), 0.12);
                  font-variant-numeric: tabular-nums; }
 /* 返回做成描边 chip：住在渐变里时，裸文字链接的存在感比不过 22px 标题 */
 .zc-hero .zc-back { padding: 2px 10px 2px 7px; border: 1px solid var(--zc-border); border-radius: 14px;
-                    background: #fff; }
+                    background: var(--zc-bg-card); }
 .zc-stats { display: flex; flex-wrap: wrap; gap: 8px 22px; margin-top: 12px; }
 .zc-stat { display: flex; flex-direction: column; gap: 2px; min-width: 52px; }
 .zc-stat-value { font-size: 18px; font-weight: 600; line-height: 1.1; color: inherit;
@@ -1080,25 +1080,25 @@ async function doRelease() {
 .zc-line.sub { color: var(--zc-text-sub); }
 /* 复制失败后的兜底地址：单击即整段选中（user-select: all），等宽 + 折行保证长域名可读 */
 .zc-copy-manual { user-select: all; cursor: text; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-                  word-break: break-all; background: rgba(91, 122, 157, 0.08); border-radius: 4px; padding: 2px 6px; }
+                  word-break: break-all; background: rgba(var(--zc-primary-rgb), 0.08); border-radius: 4px; padding: 2px 6px; }
 /* 环境动作行：两段各一颗胶囊——状态点 + 字母名 + 两个图标动作，整条约 250px，稳稳落在一行。
    分组靠胶囊外壳，不再靠中间竖线；中文全称退到 title 与按钮气泡。 */
 .zc-acts { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
 .zc-env-group { display: inline-flex; align-items: center; gap: 4px; height: 30px; padding: 0 5px 0 10px;
-                border: 1px solid var(--zc-border); border-radius: 15px; background: #fff;
+                border: 1px solid var(--zc-border); border-radius: 15px; background: var(--zc-bg-card);
                 transition: border-color 0.15s, box-shadow 0.15s; }
-.zc-env-group:hover { box-shadow: 0 1px 5px rgba(47, 58, 71, 0.08); }
-.zc-env-dev { border-color: rgba(91, 122, 157, 0.30); }
-.zc-env-prod { border-color: rgba(196, 154, 68, 0.34); }
+.zc-env-group:hover { box-shadow: 0 1px 5px rgba(var(--zc-shadow-rgb), 0.08); }
+.zc-env-dev { border-color: rgba(var(--zc-primary-rgb), 0.30); }
+.zc-env-prod { border-color: rgba(var(--zc-amber-rgb), 0.34); }
 .zc-env-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
 .zc-env-name { margin-inline-end: 2px; font-size: 11px; font-weight: 600; line-height: 1; letter-spacing: 0.04em; }
 .zc-env-dev .zc-env-name { color: var(--zc-primary); }
-.zc-env-prod .zc-env-name { color: #9a7b3f; }
+.zc-env-prod .zc-env-name { color: var(--zc-warning-text); }
 .zc-env-btn { position: relative; display: inline-flex; align-items: center; justify-content: center;
               width: 27px; height: 26px; padding: 0; border: 1px solid transparent; border-radius: 7px;
               background: none; color: var(--zc-text-sub); font-size: 14px; line-height: 1; cursor: pointer;
               transition: color 0.15s, background 0.15s, border-color 0.15s; }
-.zc-env-btn:hover { color: var(--zc-primary); background: rgba(91, 122, 157, 0.10); }
+.zc-env-btn:hover { color: var(--zc-primary); background: rgba(var(--zc-primary-rgb), 0.10); }
 .zc-env-btn:focus-visible { outline: 2px solid var(--zc-primary); outline-offset: 1px; }
 .zc-env-btn:disabled { color: var(--zc-text-sub); cursor: not-allowed; opacity: 0.45; }
 /* 发布是这段里唯一有后果的动作，常驻主色（置灰时由 :disabled 接管） */
@@ -1106,7 +1106,7 @@ async function doRelease() {
 .zc-spin { display: block; margin: 60px auto; }
 .zc-pick { border: 1px solid var(--zc-border); border-radius: 6px; padding: 10px 14px; margin-bottom: 10px;
            cursor: pointer; display: flex; flex-direction: column; gap: 4px; }
-.zc-pick.on { border-color: var(--zc-primary); background: rgba(91, 122, 157, 0.08); }
+.zc-pick.on { border-color: var(--zc-primary); background: rgba(var(--zc-primary-rgb), 0.08); }
 .zc-pick span { color: var(--zc-text-sub); font-size: 12px; }
 .zc-wizard-foot { display: flex; justify-content: flex-end; margin-top: 16px; }
 .zc-tip { color: var(--zc-text-sub); font-size: 12px; margin: 8px 0 0; }
@@ -1118,13 +1118,13 @@ async function doRelease() {
 .zc-card-menu-btn { flex-shrink: 0; font-size: 16px; line-height: 1; padding: 3px 4px; cursor: pointer;
                     opacity: 0.7; transition: opacity 0.15s; color: var(--zc-text-sub); }
 .zc-card-menu-btn:hover { opacity: 1; color: var(--zc-primary); }
-.zc-app-menu { background: #fff; border-radius: 6px; box-shadow: 0 6px 16px rgba(0, 0, 0, 0.12);
+.zc-app-menu { background: var(--zc-bg-card); border-radius: 6px; box-shadow: 0 6px 16px rgba(0, 0, 0, 0.12);
                padding: 4px 0; min-width: 148px; }
 .zc-app-menu-item { padding: 6px 14px; font-size: 13px; color: var(--zc-text); cursor: pointer;
                     white-space: nowrap; display: flex; align-items: center; gap: 8px; }
-.zc-app-menu-item:hover { background: rgba(91, 122, 157, 0.08); }
-.zc-app-menu-danger { color: #b96a6a; }
-.zc-app-menu-danger:hover { background: #fdf3f2; }
+.zc-app-menu-item:hover { background: rgba(var(--zc-primary-rgb), 0.08); }
+.zc-app-menu-danger { color: var(--zc-danger); }
+.zc-app-menu-danger:hover { background: var(--zc-danger-bg-alt); }
 .zc-menu-db { text-decoration: none; }
 .zc-modal-warn { margin: 0 0 6px; color: var(--zc-text); font-size: 13px; }
 /* 资源监控弹框标题：应用名 + 右侧一枚按状态着色的小徽标 */
@@ -1138,14 +1138,14 @@ async function doRelease() {
 .zc-metric-card::before { content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
                           background: var(--zc-rail, var(--zc-border)); border-radius: 8px 0 0 8px;
                           transition: background 0.25s ease; }
-.zc-metric-card:hover { transform: translateY(-2px); border-color: rgba(91, 122, 157, 0.45);
-                        box-shadow: 0 8px 24px rgba(47, 58, 71, 0.10); }
+.zc-metric-card:hover { transform: translateY(-2px); border-color: rgba(var(--zc-primary-rgb), 0.45);
+                        box-shadow: 0 8px 24px rgba(var(--zc-shadow-rgb), 0.10); }
 .zc-metric-card :deep(.ant-card-body) { padding: 14px 18px 12px; }
 
 /* 仪表带三段：环定宽、曲线吃掉剩余、读数靠右且不被压缩 */
 .zc-band { display: grid; grid-template-columns: 72px minmax(0, 1fr) auto; gap: 14px; align-items: center;
            margin: 4px 0 12px; padding: 10px 12px; border: 1px solid var(--zc-border); border-radius: 8px;
-           background: linear-gradient(180deg, rgba(91, 122, 157, 0.055), rgba(91, 122, 157, 0.015)); }
+           background: linear-gradient(180deg, rgba(var(--zc-primary-rgb), 0.055), rgba(var(--zc-primary-rgb), 0.015)); }
 .zc-gauge { position: relative; width: 72px; height: 72px; }
 .zc-ring { display: block; width: 100%; height: 100%; }
 .zc-ring-track { fill: none; stroke: var(--zc-border); stroke-width: 3; }
@@ -1167,17 +1167,17 @@ async function doRelease() {
 .zc-spark-svg path { fill: none; stroke-width: 1.6; stroke-linejoin: round; stroke-linecap: round;
                      /* preserveAspectRatio=none 会把横向拉扁，非缩放描边才不会让 CPU 线比内存线粗 */
                      vector-effect: non-scaling-stroke; }
-.zc-spark-cpu .zc-spark-svg path { stroke: #5b7a9d; }
-.zc-spark-mem .zc-spark-svg path { stroke: #5b8a72; }
+.zc-spark-cpu .zc-spark-svg path { stroke: var(--zc-primary); }
+.zc-spark-mem .zc-spark-svg path { stroke: var(--zc-success); }
 .zc-spark-none { font-size: 11px; color: var(--zc-text-sub); opacity: 0.7; }
 
 .zc-stores { display: flex; flex-direction: column; gap: 5px; font-size: 11px; line-height: 1.2;
              color: var(--zc-text-sub); white-space: nowrap; }
 .zc-stores span { display: flex; justify-content: space-between; gap: 10px; }
 .zc-stores b { font-weight: 600; color: var(--zc-text); font-variant-numeric: tabular-nums; }
-.zc-metric-mem { color: #4a7263; }
-.zc-metric-db { color: #9a7333; }
-.zc-metric-ws { color: #6f6290; }
+.zc-metric-mem { color: var(--zc-success-deep); }
+.zc-metric-db { color: var(--zc-warning-readout); }
+.zc-metric-ws { color: var(--zc-purple-deep); }
 
 /* 工具条常驻：一排图标动作直接摊在卡底。「悬停才出现」已经废掉——看不见就等于不存在。
    overflow 一律 visible，否则文字气泡被裁一半。 */
@@ -1185,15 +1185,15 @@ async function doRelease() {
               margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--zc-border); }
 .zc-tb-item { position: relative; display: inline-flex; align-items: center; justify-content: center;
               width: 30px; height: 28px; padding: 0; border: 1px solid var(--zc-border); border-radius: 6px;
-              background: #fff; color: var(--zc-text-sub); font-size: 14px; line-height: 1; cursor: pointer;
+              background: var(--zc-bg-card); color: var(--zc-text-sub); font-size: 14px; line-height: 1; cursor: pointer;
               transition: color 0.15s, border-color 0.15s, background 0.15s, transform 0.15s; }
 .zc-tb-item:hover { color: var(--zc-primary); border-color: var(--zc-primary);
-                    background: rgba(91, 122, 157, 0.08); transform: translateY(-1px); }
+                    background: rgba(var(--zc-primary-rgb), 0.08); transform: translateY(-1px); }
 .zc-tb-item:focus-visible { outline: 2px solid var(--zc-primary); outline-offset: 1px; }
 /* 标签：只靠 opacity 隐藏，不进 a11y 树的是「看不见」而非「不存在」——
    它同时是按钮的 accessible name 和悬停气泡的正文，砍掉就等于只剩一堆无名图标。 */
 .zc-tb-label { position: absolute; bottom: calc(100% + 6px); left: 50%; z-index: 3;
-               padding: 5px 8px; border-radius: 4px; background: rgba(47, 58, 71, 0.92); color: #fff;
+               padding: 5px 8px; border-radius: 4px; background: var(--zc-tooltip-bg); color: var(--zc-tooltip-text);
                font-size: 12px; line-height: 1; white-space: nowrap; opacity: 0; pointer-events: none;
                transform: translateX(-50%) translateY(2px);
                transition: opacity 0.14s ease, transform 0.14s ease; }
@@ -1206,11 +1206,11 @@ async function doRelease() {
 .zc-shared-title { display: flex; align-items: center; gap: 8px; margin: 0 0 14px;
                    font-size: 15px; font-weight: 600; color: var(--zc-text); }
 .zc-shared-count { min-width: 20px; padding: 0 7px; border-radius: 10px;
-                   background: rgba(91, 122, 157, 0.12); color: var(--zc-primary);
+                   background: rgba(var(--zc-primary-rgb), 0.12); color: var(--zc-primary);
                    font-size: 12px; font-weight: 600; line-height: 20px; text-align: center; }
 .zc-share-owner-tag { margin-inline-start: 8px; font-weight: 400; vertical-align: middle;
-                      color: var(--zc-primary); background: rgba(91, 122, 157, 0.08);
-                      border-color: rgba(91, 122, 157, 0.30); }
+                      color: var(--zc-primary); background: rgba(var(--zc-primary-rgb), 0.08);
+                      border-color: rgba(var(--zc-primary-rgb), 0.30); }
 .zc-share-add { display: flex; gap: 10px; margin: 4px 0 16px; }
 .zc-share-members { list-style: none; margin: 0; padding: 0; border: 1px solid var(--zc-border);
                     border-radius: 8px; overflow: hidden; }
@@ -1224,10 +1224,10 @@ async function doRelease() {
 .zc-pending-badge { display: inline-flex; }
 /* 被共享者卡上的驳回理由行：常驻到下一次申请，toast 刷新就没了的理由不算数 */
 .zc-reject-reason { margin: 6px 0 0; padding: 4px 8px; border-radius: 4px; font-size: 12px;
-                    color: #b96a6a; background: #fdf3f2; }
+                    color: var(--zc-danger); background: var(--zc-danger-bg-alt); }
 /* 共享管理弹框的待审区块：申请人 + 时间 + 驳回理由输入 + 两个决策动作 */
-.zc-share-pending { margin: 0 0 16px; padding: 10px 12px; border: 1px solid rgba(196, 154, 68, 0.34);
-                    border-radius: 8px; background: rgba(196, 154, 68, 0.06); }
+.zc-share-pending { margin: 0 0 16px; padding: 10px 12px; border: 1px solid rgba(var(--zc-amber-rgb), 0.34);
+                    border-radius: 8px; background: rgba(var(--zc-amber-rgb), 0.06); }
 .zc-share-pending-head { display: flex; align-items: center; gap: 6px; margin: 0;
                          font-size: 13px; color: var(--zc-text); }
 .zc-share-pending-nick { font-weight: 600; }
