@@ -32,7 +32,14 @@ const RUNNING_TITLE = {
   browser_open: '正在打开浏览器会话…',
   browser_step: '正在执行浏览器步骤…',
   browser_close: '正在收口浏览器会话…',
+  web_open: '正在打开公网页面…',
+  web_step: '正在执行公网页面步骤…',
+  web_close: '正在收口公网走查…',
 }
+// 预览会话（browser_*）与公网会话（web_*，ADR-0053）共用这张卡：同一种「走一步」的形状，
+// 差别只在名字与「打开页面」链接的措辞，判定统一按模式集合判，不再逐个名字比相等。
+const OPEN_NAMES = ['browser_open', 'web_open']
+const CLOSE_NAMES = ['browser_close', 'web_close']
 // 动作名说人话：徽标与文案要一眼看出「这一步对谁做了什么」，而不必记住 click/fill 的枚举。
 // `open` 只有收口报告的行里会出现（browser_open 的结果不带 action 回显）。
 const ACTION_TEXT = {
@@ -53,6 +60,9 @@ const LIST_FOLD = 8
 
 const result = computed(() => props.msg.result ?? props.msg.tool_result ?? null)
 const name = computed(() => props.msg.name ?? props.msg.tool_name ?? 'browser_step')
+const isOpen = computed(() => OPEN_NAMES.includes(name.value))
+const isClose = computed(() => CLOSE_NAMES.includes(name.value))
+const isWeb = computed(() => name.value.startsWith('web_'))
 const actionFailed = computed(() => result.value?.ok === false)
 const expectFailed = computed(() => result.value?.ok === true && result.value?.passed === false)
 const expectPassed = computed(() => result.value?.ok === true && result.value?.passed === true)
@@ -79,7 +89,7 @@ const tone = computed(() => {
   if (r.cancelled) return 'muted'
   if (r.ok === false) return r.status && r.status !== 'running' ? 'muted' : 'error'
   if (r.passed === false) return 'warn'
-  if (name.value === 'browser_close') {
+  if (isClose.value) {
     return (closeFailed.value || closeActionFailureShown.value) ? 'warn' : 'ok'
   }
   if (r.timed_out || issues.value) return 'warn'
@@ -90,15 +100,15 @@ const title = computed(() => {
   const r = result.value
   if (!r) return RUNNING_TITLE[name.value] || '正在操作浏览器…'
   if (r.cancelled) return '已停止等待'
-  if (name.value === 'browser_close') return '本次走查收口'
+  if (isClose.value) return '本次走查收口'
   if (r.ok === false) {
     if (r.session_gone) return '浏览器会话已结束'
     if (r.status && r.status !== 'running') return '预览未就绪'
     if (notExecuted.value) return '这一步没执行'
-    return name.value === 'browser_open' ? '浏览器会话没打开' : '这一步点不动'
+    return isOpen.value ? '浏览器会话没打开' : '这一步点不动'
   }
   if (r.passed === false) return '走通了，但断言没过'
-  if (name.value === 'browser_open') return '浏览器会话已打开'
+  if (isOpen.value) return '浏览器会话已打开'
   return r.passed === true ? '这一步走完了，断言也过了' : '这一步走完了'
 })
 
@@ -115,10 +125,10 @@ const badge = computed(() => {
     return { cls: 'is-action', text: notExecuted.value ? '未执行' : '动作失败' }
   }
   if (r.passed === false) return { cls: 'is-expect', text: '断言没过' }
-  if (name.value === 'browser_close' && closeActionFailed.value) {
+  if (isClose.value && closeActionFailed.value) {
     return { cls: 'is-action', text: `点不动 ${closeActionFailed.value} 步` }
   }
-  if (name.value === 'browser_close' && closeFailed.value) {
+  if (isClose.value && closeFailed.value) {
     return { cls: 'is-expect', text: `断言没过 ${closeFailed.value} 步` }
   }
   return null
@@ -147,7 +157,7 @@ const targetName = computed(() => {
 // `browser/session_core.py::REF_RE` 管，这里再抄一份形状正则就是第三处判据——漏改的一侧
 // 不会红任何测试，症状是历史行安静地退回裸打印。口径与后端 `is_sensitive_ref_or_unknown`
 // 一致：`/` 开头的是 navigate 的路径，其余一律当句柄。
-const isNavigatePath = (t) => t.startsWith('/')
+const isNavigatePath = (t) => t.startsWith('/') || t.startsWith('http://') || t.startsWith('https://')
 const handleLabel = (t) => (isNavigatePath(t) ? t : `句柄 ${t}`)
 const stepLabel = computed(() => {
   if (!result.value || (!action.value && !target.value)) return ''
@@ -185,7 +195,7 @@ const shownInteractive = computed(() => {
 })
 // 说的是「什么时候的清单」：step 那张是动作之后的新快照，open 那张是会话建立时的首屏。
 // 含糊写「最新清单」会让人以为上一张卡上的句柄还活着——那正是 US-09 那次失败的形状。
-const interactiveCaption = computed(() => (name.value === 'browser_open'
+const interactiveCaption = computed(() => (isOpen.value
   ? '会话建立时的首屏清单'
   : '这一步之后的新清单，旧句柄全部作废'))
 
@@ -201,7 +211,7 @@ const closeFailed = computed(() => Number(result.value?.steps_failed || 0))
 // `ok:false` 行，两张嘴说反话。照本组件对 `steps_used` 的 `!== undefined` 守卫写：缺字段就不画。
 const closeActionFailed = computed(() => (result.value?.steps_action_failed === undefined
   ? null : Number(result.value.steps_action_failed || 0)))
-const report = computed(() => (name.value === 'browser_close' ? result.value?.report || [] : []))
+const report = computed(() => (isClose.value ? result.value?.report || [] : []))
 // M-3 同族的另一张嘴：tone。缺 `steps_action_failed` 的旧历史行里 closeActionFailed 是 null，
 // 而 null 是 falsy，`tone` 那行就把整卡判成 'ok'（绿色），同一张卡正文里却摆着红色的 `ok:false`
 // report 行——文案上一轮收了，卡片头还在说「一切正常」。缺字段时回落到 report 本身：
@@ -279,7 +289,7 @@ function rowVerdict(item) {
       <span class="zc-page-tool">{{ name }}</span>
       <span v-if="badge" class="zc-page-badge" :class="badge.cls" data-test="badge-fail">{{ badge.text }}</span>
       <span v-else-if="passBadge" class="zc-page-badge is-pass" data-test="badge-pass">{{ passBadge }}</span>
-      <a v-if="url" class="zc-page-link" :href="url" target="_blank" rel="noopener">打开预览</a>
+      <a v-if="url" class="zc-page-link" :href="url" target="_blank" rel="noopener">{{ isWeb ? '打开页面' : '打开预览' }}</a>
     </div>
 
     <div v-if="!result" class="zc-page-loading">{{ loadingLine }}</div>
@@ -371,7 +381,7 @@ function rowVerdict(item) {
       </div>
 
       <!-- browser_close 的收口报告：两本账分开报数，report 逐行按同一把尺分色 -->
-      <div v-if="name === 'browser_close'" class="zc-page-section" data-test="close">
+      <div v-if="isClose" class="zc-page-section" data-test="close">
         <div class="zc-page-counts">
           <span>共 {{ result.steps_total ?? 0 }} 步</span>
           <span :class="{ 'is-bad': closeFailed }">断言未过 {{ closeFailed }}</span>

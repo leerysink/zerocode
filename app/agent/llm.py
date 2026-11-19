@@ -21,6 +21,10 @@ BROWSER_TOOL_NAMES = _registry.names("browser")
 BROWSER_EXPECT_SCHEMA = _registry.BROWSER_EXPECT_SCHEMA
 BROWSER_SESSION_TOOLS = _registry.schemas("browser_session")
 BROWSER_SESSION_TOOL_NAMES = _registry.names("browser_session")
+WEB_TOOLS = _registry.schemas("web")
+WEB_TOOL_NAMES = _registry.names("web")
+WEB_SESSION_TOOLS = _registry.schemas("web_session")
+WEB_SESSION_TOOL_NAMES = _registry.names("web_session")
 
 
 def _reasoning_of(delta):

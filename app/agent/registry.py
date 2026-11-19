@@ -41,6 +41,8 @@ BROWSER_POLICY = ResultPolicy(max_chars=32_000, max_items=300, max_str_chars=8_0
 CHECK_POLICY = ResultPolicy(max_chars=16_000, max_items=200, max_str_chars=16_000)
 # 委派的合并回执最多 8 条子任务回执、每条正文 12k 字符：整批一次回来，不能把主上下文淹掉。
 DELEGATE_POLICY = ResultPolicy(max_chars=48_000, max_items=8, max_str_chars=12_000)
+# web_fetch 的正文与链接预算（正文 12k 字符在工具里再裁一道，这里兜结构体上限）。
+WEB_POLICY = ResultPolicy(max_chars=48_000, max_items=100, max_str_chars=16_000)
 
 
 @dataclass(frozen=True)
@@ -137,6 +139,12 @@ _MEMORY_WRITE = _fn(
      "title": {"type": "string", "description": "可选短标题（不超过 200 字），便于检索"},
      "id": {"type": "string", "description": "update/delete 必填：create 返回的字符串 id"}},
     ["op"])
+
+_WEB_FETCH = _fn(
+    "web_fetch",
+    ("读取任意公网 URL 的内容（HTML 正文/JSON/文本），返回标题、正文与页面链接；"
+     "不执行脚本，需要点击/填表时改用 web_open"),
+    {"url": {"type": "string", "description": "完整 http(s) 地址"}}, ["url"])
 
 _DELEGATE = _fn(
     "delegate",
@@ -254,6 +262,33 @@ _BROWSER_STEP = _fn(
     ["action", "target"])
 _BROWSER_CLOSE = _fn("browser_close", "关闭当前浏览器会话，返回本次路径走查的收口报告")
 
+# 公网走查三件套（2026-11-18 联网能力）：与 browser_* 同一套会话引擎，差别只在目标是任意
+# 公网站点、navigate 要完整地址、不注入应用登录态；身份与地址由模型显式给出。
+_WEB_OPEN = _fn(
+    "web_open",
+    ("在任意公网站点开一个可交互浏览器会话，返回标题、可见文本与可交互元素清单"
+     "（ref 只在最近一次返回内有效）；expect 给了就等首屏满足再返回"),
+    {"url": {"type": "string", "description": "完整 http(s) 地址"},
+     "device": {"type": "string",
+                "description": "视口设备名（Playwright 设备名，如 iPhone 14）；不传为桌面 1280×800"},
+     "expect": BROWSER_EXPECT_SCHEMA,
+     "screenshot": {"type": "boolean",
+                    "description": "是否附首屏截图，默认 false；expect 未通过时自动附一张"}},
+    ["url"])
+_WEB_STEP = _fn(
+    "web_step",
+    ("对当前公网浏览器会话执行一个动作并返回新状态；navigate 的 target 填完整 http(s) 地址；"
+     "expect 给了就由工具判定"),
+    {"action": {"type": "string", "enum": ["click", "fill", "press", "select",
+                                          "scroll_into_view", "navigate"]},
+     "target": {"type": "string",
+                "description": "上一次清单里的 ref；navigate 时填完整 http(s) 地址"},
+     "value": {"type": "string", "description": "fill 的文本 / press 的键名 / select 的选项值"},
+     "expect": BROWSER_EXPECT_SCHEMA,
+     "screenshot": {"type": "boolean", "description": "是否附截图，默认 false"}},
+    ["action", "target"])
+_WEB_CLOSE = _fn("web_close", "关闭当前公网浏览器会话，返回本次走查的收口报告")
+
 
 SPECS: tuple[ToolSpec, ...] = (
     ToolSpec("list_dir", _LIST_DIR, "fs", handler_ref=("app.agent.tools", "_handle_list_dir"),
@@ -278,6 +313,20 @@ SPECS: tuple[ToolSpec, ...] = (
              handler_ref=("app.agent.tools", "_handle_todo_write"), result_policy=SMALL_POLICY),
     ToolSpec("memory_write", _MEMORY_WRITE, "memory",
              handler_ref=("app.agent.tools", "_handle_memory_write"), result_policy=SMALL_POLICY),
+    # 联网（ADR-0053）：基础面恒挂载——非应用工作区也该能读公开网页；web_* 会话工具共用
+    # browser sidecar，但目标是任意公网站点，不依赖应用身份。
+    ToolSpec("web_fetch", _WEB_FETCH, "web",
+             handler_ref=("app.agent.web_tools", "run_web_tool"),
+             pass_name=True, result_policy=WEB_POLICY),
+    ToolSpec("web_open", _WEB_OPEN, "web_session",
+             handler_ref=("app.agent.browser_session_tools", "run_browser_session_tool"),
+             pass_name=True, result_policy=BROWSER_POLICY),
+    ToolSpec("web_step", _WEB_STEP, "web_session",
+             handler_ref=("app.agent.browser_session_tools", "run_browser_session_tool"),
+             pass_name=True, result_policy=BROWSER_POLICY),
+    ToolSpec("web_close", _WEB_CLOSE, "web_session",
+             handler_ref=("app.agent.browser_session_tools", "run_browser_session_tool"),
+             pass_name=True, result_policy=BROWSER_POLICY),
     # 子 run 委派（ADR-0052）：与 ask_user 同列，由会话循环特殊处理（要拿 runner 侧装配），
     # 不走 execute_tool 的 handler 分派；合并回执由执行器显式套 apply_budget。
     ToolSpec("delegate", _DELEGATE, "chat", result_policy=DELEGATE_POLICY),
@@ -357,7 +406,7 @@ def build_tools(*, app: bool = False, clarify: bool = False) -> list[dict]:
 # 子 run 只读白名单（ADR-0052）：按 SPECS 既有顺序过滤挂载。禁：写盘五件、ask_user、
 # clarify_done、todo_write、memory_write、db_write、preview_restart/preview_logs、
 # browser_* 走查，以及 delegate 自身（禁递归——树深恒 1 由工具面保证，不靠提示词）。
-SUBRUN_TOOL_NAMES = ("list_dir", "read_file", "search", "preview_status",
+SUBRUN_TOOL_NAMES = ("list_dir", "read_file", "search", "web_fetch", "preview_status",
                      "db_query", "preview_page", "release_preflight", "db_schema")
 
 

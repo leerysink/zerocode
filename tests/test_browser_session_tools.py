@@ -147,21 +147,21 @@ async def test_session_tool_names_match_the_schema():
     assert [t["function"]["name"] for t in BROWSER_SESSION_TOOLS] == list(BROWSER_SESSION_TOOL_NAMES)
 
 
-async def test_the_ordinal_list_is_the_same_object_as_the_dispatch_list():
-    """工具名单只有一个来源（复查者判 Important）：位次名单不许是抄出来的第二份字面量。
+async def test_the_ordinal_list_is_a_derived_union_of_the_two_schema_lists():
+    """位次名单 = 两套 schema 名单按序拼接（ADR-0053）：不许是抄出来的第二份字面量。
 
-    现状的三份名单：分派闸用 `tools.py` 的 `BROWSER_SESSION_TOOL_NAMES`（定义在 `llm.py`，与 schema
-    同源），handler 里另有三处 `if name == "browser_open" / "browser_step" / "browser_close"`，而
-    位次计数器读的是 `browser_session_tools.SESSION_TOOL_NAMES` 这**第二个字面量**。三份今天内容
-    相同纯属抄写一致，此前没有任何测试钉它们相等。将来加第四个交互工具时，作者必然改 schema、
-    `BROWSER_SESSION_TOOL_NAMES` 与 handler 分支，而漏改这条旧常量**不会红任何测试**——漏的方向
-    正好是「少遮」（新工具改写了清单却不进口径，口令明文落库），是危险方向上的一份漂移点。
-
-    断 `is` 而不是 `==`：内容相同的那份独立字面量正是本条要防的形状，`==` 对它恰好是瞎的。
+    现状的名单：schema 在 `llm.py` 由注册表派生；handler 的三处分派按 `name` 分支；位次计数器读
+    `browser_session_tools.SESSION_TOOL_NAMES`。公网会话加入后它是「预览三件 + 公网三件」的派生
+    并集，写成独立字面量时，将来改名单不会红任何测试——漏的方向正好是「少遮」（web_step 改写了
+    `browser_refs` 却不进口径，口令明文落库），是危险方向上的一份漂移点。
     """
-    from app.agent.llm import BROWSER_SESSION_TOOLS, BROWSER_SESSION_TOOL_NAMES
-    assert bst.SESSION_TOOL_NAMES is BROWSER_SESSION_TOOL_NAMES
-    assert list(bst.SESSION_TOOL_NAMES) == [t["function"]["name"] for t in BROWSER_SESSION_TOOLS]
+    from app.agent.llm import (BROWSER_SESSION_TOOL_NAMES, BROWSER_SESSION_TOOLS,
+                               WEB_SESSION_TOOL_NAMES, WEB_SESSION_TOOLS)
+
+    assert tuple(bst.SESSION_TOOL_NAMES) == (tuple(BROWSER_SESSION_TOOL_NAMES)
+                                             + tuple(WEB_SESSION_TOOL_NAMES))
+    assert list(BROWSER_SESSION_TOOL_NAMES) == [t["function"]["name"] for t in BROWSER_SESSION_TOOLS]
+    assert list(WEB_SESSION_TOOL_NAMES) == [t["function"]["name"] for t in WEB_SESSION_TOOLS]
 
 
 # --------------------------------------------------------------------------- browser_open
@@ -2892,7 +2892,7 @@ async def test_the_tenth_exit_passes_the_same_gates(monkeypatch):
     ctx = Ctx()
     assert (await bst.run_browser_session_tool(ctx, "browser_open", {}))["ok"] is True
 
-    async def boom(_ctx, _args):
+    async def boom(_ctx, _args, **_kw):
         raise RuntimeError("connect http://192.168.65.254:8241/orders failed: password=hunter2 "
                            + "噪声" * 400)
 
@@ -3048,3 +3048,169 @@ async def test_the_auto_closed_hint_and_the_empty_list_hint_do_not_overwrite_eac
     out = await bst.run_browser_session_tool(ctx, "browser_open", {})
     assert out["auto_closed_previous"] is True
     assert "自动关闭" in out["hint"] and "清单为空" in out["hint"]
+
+
+# --------------------------------------------------------------- 公网会话 web_*（ADR-0053）
+# 同一套会话引擎的外部站点模式：目标由模型给、私网字面量在入口当场拒绝、不占预览会话的
+# open 额度、不做 `_connect_url` 那层 host 改写（展示地址就是真实公网地址）。
+
+PUBLIC_URL = "https://example.com/docs?x=1"
+
+
+def _web_open_env(monkeypatch, reply=None):
+    """公网 open 的替身：`_sidecar_open` 记载荷；`fetch_app` 一碰就炸（公网会话不解析应用行）。"""
+    calls = []
+
+    async def boom(*_a, **_k):
+        raise AssertionError("公网会话不该解析应用行")
+
+    async def fake_open(url, **kw):
+        calls.append((url, kw))
+        return reply if reply is not None else _session_ok(url=url), ""
+
+    monkeypatch.setattr(bst, "fetch_app", boom)
+    monkeypatch.setattr(bst, "_sidecar_open", fake_open)
+    return calls
+
+
+def _web_step_env(monkeypatch, replies):
+    seen = []
+
+    async def boom(*_a, **_k):
+        raise AssertionError("公网会话不该解析应用行")
+
+    async def fake_step(sid, payload):
+        seen.append((sid, payload))
+        return replies, ""
+
+    monkeypatch.setattr(bst, "fetch_app", boom)
+    monkeypatch.setattr(bst, "_sidecar_step", fake_step)
+    return seen
+
+
+def _web_ctx():
+    ctx = Ctx()
+    ctx.run_state["browser_session"] = "sid-web"
+    ctx.run_state["browser_display_url"] = PUBLIC_URL
+    ctx.run_state["browser_refs"] = _interactive()
+    return ctx
+
+
+async def test_web_open_sends_the_external_flag_and_the_raw_url(monkeypatch):
+    """公网 open：地址原样发给 sidecar（不做 host 改写），展示地址就是模型给的那条。"""
+    calls = _web_open_env(monkeypatch)
+    ctx = Ctx()
+    out = await bst.run_browser_session_tool(ctx, "web_open", {"url": PUBLIC_URL})
+    assert out["ok"] is True and out["status"] == "external"
+    assert out["url"] == PUBLIC_URL
+    assert calls[0][0] == PUBLIC_URL
+    assert calls[0][1]["external"] is True
+    assert ctx.run_state["browser_log"][0]["target"] == PUBLIC_URL
+    assert ctx.run_state["browser_display_url"] == PUBLIC_URL
+
+
+async def test_web_open_does_not_charge_the_preview_open_quota(monkeypatch):
+    """成本闸是 `agent.browser_max_steps_per_run`（ADR-0053），不占 preview_page 的 open 额度。"""
+    _web_open_env(monkeypatch)
+    ctx = Ctx()
+    ctx.run_state["browser_checks"] = 6          # 预览会话的 open 额度已经用满
+    out = await bst.run_browser_session_tool(ctx, "web_open", {"url": PUBLIC_URL})
+    assert out["ok"] is True
+    assert ctx.run_state.get("browser_checks") == 6   # 一分没涨
+    assert ctx.run_state.get("browser_opens") == 1
+
+
+async def test_web_open_rejects_private_or_malformed_targets_before_the_sidecar(monkeypatch):
+    calls = _web_open_env(monkeypatch)
+    for bad, needle in [("http://127.0.0.1:8080/admin", "非公网"),
+                        ("http://backend:8000/", "内网"),
+                        ("file:///etc/passwd", "http/https"),
+                        ("", "不能为空")]:
+        out = await bst.run_browser_session_tool(Ctx(), "web_open", {"url": bad})
+        assert out["ok"] is False and needle in out["error"], bad
+    assert calls == []
+
+
+async def test_web_open_failure_hint_points_at_web_fetch(monkeypatch):
+    _web_open_env(monkeypatch, reply={"ok": False, "error": "net::ERR_NAME_NOT_RESOLVED"})
+    out = await bst.run_browser_session_tool(Ctx(), "web_open", {"url": PUBLIC_URL})
+    assert out["ok"] is False and "ERR_NAME_NOT_RESOLVED" in out["error"]
+    assert "web_fetch" in out["hint"] and "preview_status" not in out["hint"]
+
+
+async def test_web_open_replaces_a_preview_session_in_the_same_slot(monkeypatch):
+    """两种模式共用 `run_state["browser_session"]` 单槽：换模式 open 先关掉对方，旧 ref 作废。"""
+    deleted = []
+    monkeypatch.setattr(bst, "fetch_app", lambda c: _aget(_app()))
+    monkeypatch.setattr(bst, "_sidecar_open", lambda url, **kw: _aget((_session_ok(), "")))
+    monkeypatch.setattr(bst, "_sidecar_delete", lambda sid: _aget(deleted.append(sid) or True))
+    ctx = Ctx()
+    first = await bst.run_browser_session_tool(ctx, "browser_open", {})
+    assert first["ok"] is True and deleted == []
+
+    async def fake_open(url, **kw):
+        return _session_ok(session_id="sid-web", url=url), ""
+
+    monkeypatch.setattr(bst, "_sidecar_open", fake_open)
+    out = await bst.run_browser_session_tool(ctx, "web_open", {"url": PUBLIC_URL})
+    assert deleted == ["sid-123"]
+    assert ctx.run_state["browser_session"] == "sid-web"
+    assert out["auto_closed_previous"] is True
+
+
+async def test_web_step_navigate_takes_a_full_public_url(monkeypatch):
+    seen = _web_step_env(monkeypatch, _step_data(url="https://example.com/next"))
+    out = await bst.run_browser_session_tool(
+        _web_ctx(), "web_step", {"action": "navigate", "target": "https://example.com/next"})
+    assert seen[0][1]["path"] == "https://example.com/next"
+    assert seen[0][1]["ref"] == ""
+    assert out["ok"] is True and out["status"] == "external"
+    assert out["url"] == "https://example.com/next"
+
+
+async def test_web_step_navigate_rejects_a_private_url_before_the_sidecar(monkeypatch):
+    seen = _web_step_env(monkeypatch, _step_data())
+    out = await bst.run_browser_session_tool(
+        _web_ctx(), "web_step", {"action": "navigate", "target": "http://10.0.0.5/admin"})
+    assert out["ok"] is False and "非公网" in out["error"]
+    assert out["steps_charged"] is False and out["steps_left"] > 0
+    assert seen == []
+
+
+async def test_web_step_session_gone_points_at_web_open(monkeypatch):
+    """sidecar 的会话级文案写死「重新 browser_open」；公网会话里那个工具不存在，必须整句换掉。"""
+    _web_step_env(monkeypatch, {"ok": False, "session_gone": True,
+                                "error": "浏览器会话已结束，请重新 browser_open"})
+    ctx = _web_ctx()
+    out = await bst.run_browser_session_tool(ctx, "web_step",
+                                             {"action": "click", "target": "e1"})
+    assert out["ok"] is False and out["session_gone"] is True
+    assert out["steps_charged"] is False
+    assert "web_open" in out["error"] and "browser_open" not in out["error"]
+    assert ctx.run_state.get("browser_session") is None
+
+
+async def test_web_close_report_uses_the_web_tool_name(monkeypatch):
+    deleted = []
+    monkeypatch.setattr(bst, "_sidecar_delete", lambda sid: _aget(deleted.append(sid) or True))
+    ctx = _web_ctx()
+    ctx.run_state["browser_open_declared_expect"] = True
+    out = await bst.run_browser_session_tool(ctx, "web_close", {})
+    assert out["ok"] is True and out["closed"] is True
+    assert deleted == ["sid-web"] and ctx.run_state.get("browser_session") is None
+    assert "web_open 声明过断言" in out["hint"]
+
+
+def test_a_public_url_is_not_an_unknown_handle():
+    """参数侧遮断：navigate 的公网地址不是句柄，不能落进「未知即遮」把 fill 以外的东西遮掉。"""
+    assert bst.is_sensitive_ref_or_unknown([], "https://example.com/x") is False
+    assert bst.is_sensitive_ref_or_unknown([], "r7kqmbt") is True
+
+
+def test_web_step_fill_is_masked_on_the_param_side_too():
+    """`web_step` 与 `browser_step` 同宿位次口径：公网登录框的口令同样不许明文进消息历史。"""
+    refs = [{"ref": "e2", "role": "textbox", "name": "密码", "sensitive": True}]
+    calls = [_tool_call("web_step", action="fill", target="e2", value="hunter2")]
+    out, hits = bst.redact_sensitive_step_args(calls, refs)
+    assert hits == 1
+    assert "hunter2" not in json.dumps(out, ensure_ascii=False)

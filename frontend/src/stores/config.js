@@ -34,6 +34,8 @@ const FIELD_TO_KEY = {
   browserExpectTimeoutMs: 'agent.browser_expect_timeout_ms',
   browserSettleMs: 'agent.browser_settle_ms',
   browserInteractiveMax: 'agent.browser_interactive_max',
+  // ---- 联网工具（agent.web_*；公网走查的步数沿用 agent.browser_max_steps_per_run，ADR-0053）----
+  webMaxFetchesPerRun: 'agent.web_max_fetches_per_run',
   // ---- 数据库工具（agent.db_rows_*，区间见 db_tools.py）----
   dbRowsLimit: 'agent.db_rows_limit',
   dbRowsAssertMax: 'agent.db_rows_assert_max',
@@ -77,6 +79,7 @@ export const useConfigStore = defineStore('config', {
       browserExpectTimeoutMs: 3000, // 500..8000
       browserSettleMs: 1200, // 0..5000
       browserInteractiveMax: 40, // 1..200
+      webMaxFetchesPerRun: 20, // 0..200，0=不限；与 web_tools.py 的 DEFAULT_MAX_FETCHES 同值
       dbRowsLimit: 200, // 10..1000
       dbRowsAssertMax: 200, // 1..1000
       memoryEnabled: true,

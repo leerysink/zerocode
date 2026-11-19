@@ -515,3 +515,68 @@ describe('BrowserFlowCard', () => {
     expect(transport.text()).toContain('这一步点不动')
   })
 })
+
+describe('BrowserFlowCard 公网会话 web_*（ADR-0053）', () => {
+  it('web_open 与 browser_open 共用同一张卡，但链接说「打开页面」而不是「打开预览」', () => {
+    const w = mountCard({
+      name: 'web_open',
+      result: { ok: true, session: 'opened', status: 'external',
+                url: 'https://example.com/docs?x=1', title: '示例站', text: '正文',
+                interactive: [] },
+    })
+    expect(w.text()).toContain('示例站')
+    const link = w.find('.zc-page-link')
+    expect(link.attributes('href')).toBe('https://example.com/docs?x=1')
+    expect(link.text()).toBe('打开页面')
+  })
+
+  it('web_step 的 navigate 目标是完整公网地址：按路径渲染，不当成句柄', () => {
+    const w = mountCard({
+      name: 'web_step',
+      result: { ok: true, action: 'navigate', target: 'https://example.com/next', passed: null },
+    })
+    expect(w.find('.zc-page-step').text()).toContain('跳转 https://example.com/next')
+    expect(w.find('.zc-page-step').text()).not.toContain('句柄')
+  })
+
+  it('web_close 的收口报告与 browser_close 同形：两本账照旧分色', () => {
+    const w = mountCard({
+      name: 'web_close',
+      result: {
+        ok: true, steps_total: 2, steps_failed: 1, steps_action_failed: 0,
+        hint: '以下断言未通过：1',
+        report: [
+          { seq: 0, action: 'open', target: 'https://example.com/', ok: true, passed: null },
+          { seq: 1, action: 'click', target: 'e1', target_name: '登录', ok: true, passed: false,
+            note: '页面文本未包含「欢迎」' },
+        ],
+      },
+    })
+    expect(w.text()).toContain('本次走查收口')
+    const rows = w.findAll('[data-test="report-row"]')
+    expect(rows).toHaveLength(2)
+    expect(rows[1].classes()).toContain('is-expect')
+  })
+
+  it('运行中的 web_* 有各自的实时文案，不落「正在操作浏览器…」兜底', () => {
+    expect(mountCard({ name: 'web_open' }).text()).toContain('正在打开公网页面')
+    expect(mountCard({ name: 'web_step' }).text()).toContain('正在执行公网页面步骤')
+    expect(mountCard({ name: 'web_close' }).text()).toContain('正在收口公网走查')
+  })
+
+  it('web_step 的本地拒绝与会话已结束沿用 browser_step 的分档', () => {
+    const rejected = mountCard({
+      name: 'web_step',
+      result: { ok: false, error: '还没有浏览器会话，先 web_open', steps_charged: false },
+    })
+    expect(rejected.text()).toContain('这一步没执行')
+    expect(rejected.find('[data-test="badge-fail"]').text()).toBe('未执行')
+    const gone = mountCard({
+      name: 'web_step',
+      result: { ok: false, error: '浏览器会话已结束，请重新 web_open', session_gone: true,
+                action: 'click', target: 'e1', steps_charged: false },
+    })
+    expect(gone.text()).toContain('浏览器会话已结束')
+    expect(gone.text()).not.toContain('这一步没执行')
+  })
+})

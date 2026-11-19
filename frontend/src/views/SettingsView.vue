@@ -402,6 +402,14 @@ async function save() {
           </a-form>
         </a-card>
 
+        <a-card title="联网工具" class="zc-card">
+          <a-form layout="vertical">
+            <a-form-item label="网页读取次数上限（次/任务）" extra="web_fetch 每次任务最多抓几个页面，0=不限，最大 200；公网走查的步数沿用上面的交互步数上限">
+              <a-input-number v-model:value="store.form.webMaxFetchesPerRun" :min="0" :max="200" style="width: 180px" />
+            </a-form-item>
+          </a-form>
+        </a-card>
+
         <a-card title="应用数据库工具" class="zc-card">
           <a-form layout="vertical">
             <a-form-item label="查询结果行数上限" extra="返回给模型的行数，10..1000">

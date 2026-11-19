@@ -58,6 +58,9 @@ class Session:
     # 的「页面打开失败」就成了失真文案——真相是被自家巡检杀的。
     # 放宽不是豁免：超出 `OPEN_BUDGET_SECONDS` 的 `opening` 会话照旧回收（裁定 R-43）。
     opening: bool = False
+    # 外部站点模式（ADR-0053）：目标是任意公网站点，来源校验换成「私网拒绝」而不是 host 白名单，
+    # navigate 收完整 http(s) 地址（`origin` 对这类会话不参与导航拼接）。
+    external: bool = False
 
 
 SESSIONS: dict[str, Session] = {}

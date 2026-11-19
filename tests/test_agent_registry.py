@@ -13,7 +13,8 @@ from app.agent import registry
 ROOT = Path(__file__).resolve().parents[1]
 BASE_NAMES = ["list_dir", "read_file", "search", "write_file", "edit_file",
               "delete_file", "move_file", "revert_change",
-              "ask_user", "todo_write", "memory_write", "delegate"]
+              "ask_user", "todo_write", "memory_write",
+              "web_fetch", "web_open", "web_step", "web_close", "delegate"]
 # 循环自处理、没有 handler 的工具（delegate 的实现在执行器，与 ask_user 同列）
 LOOP_OWNED = ("ask_user", "clarify_done", "delegate")
 APP_NAMES = ["preview_status", "preview_logs", "preview_restart",
@@ -86,6 +87,8 @@ def test_llm_aliases_are_derived_from_the_registry():
     assert tuple(llm.DB_TOOL_NAMES) == registry.names("db")
     assert tuple(llm.BROWSER_TOOL_NAMES) == registry.names("browser")
     assert tuple(llm.BROWSER_SESSION_TOOL_NAMES) == registry.names("browser_session")
+    assert tuple(llm.WEB_TOOL_NAMES) == registry.names("web")
+    assert tuple(llm.WEB_SESSION_TOOL_NAMES) == registry.names("web_session")
     assert llm.CLARIFY_TOOL_NAMES == registry.names("clarify")
     assert tuple(t["function"]["name"] for t in llm.PREVIEW_TOOLS) == registry.names("preview")
     assert tuple(t["function"]["name"] for t in llm.DB_TOOLS) == registry.names("db")
@@ -95,14 +98,17 @@ def test_llm_aliases_are_derived_from_the_registry():
 
 
 def test_browser_session_names_stay_the_same_object():
-    """browser_session_tools 的位次名单读的是这份元组本身；复制一份字面量会静默漂移。"""
+    """browser_session_tools 的位次名单读的是注册表派生的两份元组；复制一份字面量会静默漂移。"""
     from app.agent import browser_session_tools as bst
     from app.agent import llm
 
-    assert bst.SESSION_TOOL_NAMES is llm.BROWSER_SESSION_TOOL_NAMES
+    assert bst.SESSION_TOOL_NAMES == (tuple(llm.BROWSER_SESSION_TOOL_NAMES)
+                                      + tuple(llm.WEB_SESSION_TOOL_NAMES))
 
 
 def test_frontend_tool_name_lists_match_registry_groups():
     assert _js_list("PREVIEW_TOOL_NAMES") == list(registry.names("preview"))
     assert _js_list("PAGE_TOOL_NAMES") == list(registry.names("browser"))
     assert _js_list("BROWSER_SESSION_TOOL_NAMES") == list(registry.names("browser_session"))
+    assert _js_list("WEB_SESSION_TOOL_NAMES") == list(registry.names("web_session"))
+    assert _js_list("WEB_FETCH_TOOL_NAMES") == list(registry.names("web"))

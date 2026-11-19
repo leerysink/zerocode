@@ -20,6 +20,7 @@ import TodoCard from './TodoCard.vue'
 import PreviewCard from './PreviewCard.vue'
 import PageInspectCard from './PageInspectCard.vue'
 import BrowserFlowCard from './BrowserFlowCard.vue'
+import WebFetchCard from './WebFetchCard.vue'
 import ChatPromptRail from './ChatPromptRail.vue'
 
 const props = defineProps({
@@ -46,6 +47,10 @@ const PAGE_TOOL_NAMES = ['preview_page']
 // 名单与后端 llm.BROWSER_SESSION_TOOL_NAMES 同名同序（这里刻意不 import 后端常量，前端拿不到），
 // 增删交互工具时两处一起改——名字对不上的后果是卡片落回通用折叠块，不会静默出错。
 const BROWSER_SESSION_TOOL_NAMES = ['browser_open', 'browser_step', 'browser_close']
+// 公网走查三件套（ADR-0053）：与 browser_* 共用 BrowserFlowCard，卡片内部按名字前缀换措辞。
+const WEB_SESSION_TOOL_NAMES = ['web_open', 'web_step', 'web_close']
+// 联网读取（ADR-0053）：web_fetch 有自己的结果卡（正文/链接/抓取元信息）。
+const WEB_FETCH_TOOL_NAMES = ['web_fetch']
 
 // 渲染前统一归一化：实时事件形状与历史行形状都过这一个函数，组件只认归一化后的字段。
 // 归一化后一次工具调用恒为一条记录（args 与 result 同体），所以「call 行/result 行」的
@@ -61,7 +66,12 @@ function isPageTool(m) {
 }
 
 function isBrowserTool(m) {
-  return BROWSER_SESSION_TOOL_NAMES.includes(m.name || '')
+  const name = m.name || ''
+  return BROWSER_SESSION_TOOL_NAMES.includes(name) || WEB_SESSION_TOOL_NAMES.includes(name)
+}
+
+function isWebFetchTool(m) {
+  return WEB_FETCH_TOOL_NAMES.includes(m.name || '')
 }
 
 // 只读旁观（Ticket 008）：被共享者的待答卡只展示，不提供任何可点的出口
@@ -90,6 +100,11 @@ function isPageCard(m, i) {
 // 刷新后同一件事又画两张。三张卡的闸门写成同一形状，将来只有一处语义要改。
 function isBrowserCard(m, i) {
   return isBrowserTool(m) && !!(m.result || i === view.value.length - 1)
+}
+
+// 与三张卡同一道闸：有结果或仍是最后一条（web_fetch 的进行中卡也走这里）
+function isWebFetchCard(m, i) {
+  return isWebFetchTool(m) && !!(m.result || i === view.value.length - 1)
 }
 
 // 进度只给「消息流最后一条、还没有结果」的那张卡：历史卡片复活进度条会让人以为又在重启
@@ -236,7 +251,7 @@ onBeforeUnmount(cancelFill)
           </div>
           <!-- tool：ask_user 渲染提问卡；需确认的调用渲染确认卡（待答可交互／已答只读留痕）；
                todo_write 渲染任务卡；preview_* 渲染预览卡；preview_page 渲染检查卡；
-               browser_open/step/close 渲染步骤流卡（三张卡都要过「有结果或仍是最后一条」那道闸）；
+               web_fetch 渲染联网读取卡；browser_* / web_* 渲染步骤流卡（都要过「有结果或仍是最后一条」那道闸）；
                其余落回通用折叠块。
                字段一律是归一化后的 name/args/result，实时与历史同形（见 messageModel.js）。 -->
           <div v-else-if="item.m.role === 'tool'" class="zc-msg is-tool">
@@ -248,6 +263,7 @@ onBeforeUnmount(cancelFill)
             <!-- 委派卡：delegate 一行里装一批子 run（ADR-0052），先于通用折叠块 -->
             <DelegateCard v-else-if="item.m.name === 'delegate'" :msg="item.m" />
             <PageInspectCard v-else-if="isPageCard(item.m, item.i)" :msg="item.m" :progress="liveProgress(item.m, item.i)" />
+            <WebFetchCard v-else-if="isWebFetchCard(item.m, item.i)" :msg="item.m" :progress="liveProgress(item.m, item.i)" />
             <BrowserFlowCard v-else-if="isBrowserCard(item.m, item.i)" :msg="item.m" :progress="liveProgress(item.m, item.i)" />
             <PreviewCard v-else-if="isPreviewCard(item.m, item.i)" :msg="item.m" :progress="liveProgress(item.m, item.i)" />
             <!-- 会话 id 兜空串：null 会撞在 [Number,String] 的 props 校验上刷一屏警告，

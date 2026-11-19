@@ -17,7 +17,7 @@ import warnings
 from browser.inspect_core import (allow_request, build_session_script, clean_text, is_ip_literal,
                                   is_private_host, origin_string, parse_allowed_hosts,
                                   pick_connect_ip, rewrite_url_host, shape_result,
-                                  validate_target)
+                                  validate_target, validate_web_target)
 from browser.session_core import (INTERACTIVE_JS, INTERACTIVE_JS_SCAN_MAX, REF_RE, REF_TOKEN_POOL,
                                   REF_TOKEN_SPACE)
 
@@ -648,3 +648,103 @@ async def test_inspect_in_context_screenshot_failure_is_a_readable_error():
     assert out["timed_out"] is False
     assert set(out) == {"ok", "error", "timed_out", "elapsed_ms"}
     assert page.screenshot_calls == [{"type": "png", "full_page": False}]
+
+
+# ---------------------------------------------------------------------------
+# 外部站点模式（ADR-0053）：放行口径从「目标 origin」换成「任意公网 host」，
+# 本机/私网/容器地址两道闸（字面量 + 首跳 DNS）都要挡住。
+# ---------------------------------------------------------------------------
+
+def test_validate_web_target_accepts_public_http_and_https():
+    for url in ("https://example.com/docs?x=1", "http://example.org/a/b"):
+        got, err = validate_web_target(url)
+        assert err == "" and got == url
+
+
+def test_validate_web_target_rejects_private_and_malformed_targets():
+    for url, needle in [
+            ("file:///etc/passwd", "http/https"),
+            ("http://user:pass@example.com/", "用户名或密码"),
+            ("http://localhost:8080/", "内网"),
+            ("http://host.docker.internal:8200/", "内网"),
+            ("http://backend:8000/", "内网"),
+            ("http://zerocode-backend:8100/api", "内网"),
+            ("http://127.0.0.1/", "内网"),
+            ("http://10.0.0.5/", "内网"),
+            ("http://[::1]/", "内网"),
+            ("http://169.254.169.254/latest/meta-data/", "内网"),
+            ("http://example.com:bad/", "端口非法"),
+            ("", "不能为空"), (None, "不能为空")]:
+        got, err = validate_web_target(url)
+        assert got is None and needle in err, url
+
+
+def test_allow_request_external_mode_swaps_origin_pinning_for_public_only():
+    target = "https://example.com/"
+    # 跨站重定向与 CDN 子资源是外部站点的常态：外部模式放行任意公网 host
+    assert allow_request(target, "https://other.example.net/page",
+                         is_main_navigation=True, external=True)
+    assert allow_request(target, "https://cdn.other.example/lib.js",
+                         is_main_navigation=False, external=True)
+    # 同一对地址在应用模式下主文档被 origin 钉死——这个差异是口径本身，不许被「顺手统一」抹掉
+    assert not allow_request(target, "https://other.example.net/page",
+                             is_main_navigation=True)
+    for private in ("http://127.0.0.1:5433/", "http://10.1.2.3/x",
+                    "http://localhost/", "http://zerocode-backend:8100/api",
+                    "http://169.254.169.254/latest/meta-data/"):
+        assert not allow_request(target, private, is_main_navigation=False, external=True), private
+        assert not allow_request(target, private, is_main_navigation=True, external=True), private
+
+
+async def test_attach_listeners_external_mode_allows_cross_site_navigation():
+    """外部站点的主文档跨域名跳转是常态：不能沿用应用模式的「主文档只许目标 origin」。"""
+    page = _Page()
+    collectors = await attach_listeners(page, "https://example.com/", external=True)
+    on_route = page.handlers["route"]
+
+    cross = _Route(_Req("https://other.example.net/page", navigation=True,
+                        frame=page.main_frame))
+    await on_route(cross)
+    private = _Route(_Req("http://10.1.2.3/internal", resource_type="xhr"))
+    await on_route(private)
+
+    assert cross.actions == ["continue"]
+    assert private.actions == ["abort"]
+    assert collectors.blocked_urls == {"http://10.1.2.3/internal"}
+
+
+class _FakeDnsLoop:
+    def __init__(self, infos=None, exc=None):
+        self.infos = infos or []
+        self.exc = exc
+
+    async def getaddrinfo(self, *_a, **_kw):
+        if self.exc is not None:
+            raise self.exc
+        return self.infos
+
+
+def _dns_addr(ip):
+    return (socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, 443))
+
+
+async def test_public_dns_error_blocks_any_private_resolution(monkeypatch):
+    loop = _FakeDnsLoop([_dns_addr("93.184.216.34"), _dns_addr("10.0.0.5")])
+    monkeypatch.setattr(_sidecar, "asyncio",
+                        types.SimpleNamespace(get_running_loop=lambda: loop))
+    err = await _sidecar._public_dns_error("https://example.com/")
+    assert "10.0.0.5" in err and "example.com" in err
+
+
+async def test_public_dns_error_passes_public_and_resolution_failures(monkeypatch):
+    """解析失败放行（没有可连地址时让浏览器自己报错）；IP 字面量不走 DNS。"""
+    loop = _FakeDnsLoop([_dns_addr("93.184.216.34")])
+    monkeypatch.setattr(_sidecar, "asyncio",
+                        types.SimpleNamespace(get_running_loop=lambda: loop))
+    assert await _sidecar._public_dns_error("https://example.com/") == ""
+
+    monkeypatch.setattr(_sidecar, "asyncio", types.SimpleNamespace(
+        get_running_loop=lambda: _FakeDnsLoop(exc=socket.gaierror("no dns"))))
+    assert await _sidecar._public_dns_error("https://no-such.example/") == ""
+
+    assert await _sidecar._public_dns_error("http://93.184.216.34/") == ""

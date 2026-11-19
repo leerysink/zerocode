@@ -5,6 +5,12 @@
 这里有了活页面，所以后端必须负责收口，否则 sidecar 会在 1g 内存上限里攒出僵尸 context
 （ADR-0037 后果第 2 条）。
 
+同一套会话引擎也服务公网走查（ADR-0053）：`web_open` / `web_step` / `web_close` 是同三个操作的
+外部站点模式（`external=True`）。目标换成模型给的任意 http(s) 公网地址，私网与本机由
+`normalize_web_url` 与 sidecar 两道闸拒绝；不解析应用行、不占预览检查额度、不做
+`_connect_url` 那层 host 改写，因此返回的 url 就是真实公网地址（无需 netloc 清洗）。
+两种模式共用 `run_state["browser_session"]` 单槽：重复 open 会自动关掉另一种模式的会话。
+
 刻意不 import `app.agent.tools`（ToolContext / ToolError）：tools.py 在分派分支里惰性 import 本模块，
 反向依赖会成环。handler 只读 ctx 的字段。
 """
@@ -17,9 +23,10 @@ import httpx
 
 from app.agent.browser_tools import (_checks_left, _clean, _error, _int_cfg, _redact,
                                      browser_service_url, browser_target_host, normalize_path)
-from app.agent.llm import BROWSER_SESSION_TOOL_NAMES
+from app.agent.llm import BROWSER_SESSION_TOOL_NAMES, WEB_SESSION_TOOL_NAMES
 from app.agent.preview_tools import fetch_app
 from app.agent.redact import contains_redaction_marker, rewrite_tool_calls_args
+from app.agent.web_tools import normalize_web_url
 from app.services import browser_shot_service as shots
 from app.services.memory_service import REDACTED_TEMPLATE
 
@@ -28,8 +35,10 @@ logger = logging.getLogger(__name__)
 # 工具名单只有一个来源：分派闸（`tools.py` 读 `BROWSER_SESSION_TOOL_NAMES`）、schema 与这里的位次口径
 # 必须是同一份。这里以前是**第二个字面量**，三份今天内容相同纯属抄写一致，而加第四个交互工具时漏改
 # 这一条不会红任何测试——漏的方向正好是「少遮」（新工具改写了清单却不进口径，口令明文落库）。
+# 公网模式（ADR-0053）的 `web_open` / `web_step` / `web_close` 与 browser_* 同宿一套会话引擎、
+# 同样覆写 `browser_refs`，位次与 value 遮断必须一视同仁，所以这里取两者的并集。
 # 不成环：`llm.py` 只 import openai，不 import 本模块，也不 import `app.agent.tools`。
-SESSION_TOOL_NAMES = BROWSER_SESSION_TOOL_NAMES
+SESSION_TOOL_NAMES = BROWSER_SESSION_TOOL_NAMES + WEB_SESSION_TOOL_NAMES
 # 上限与规格 §10 一一对应，漂了会在配置里静默生效，所以有一个测试把它们钉在这里。
 DEFAULT_MAX_STEPS = 12              # agent.browser_max_steps_per_run（<=0 不限）
 DEFAULT_INTERACTIVE_MAX = 40        # 交互清单条数上限（与 session_core 的同名默认值一致）
@@ -52,6 +61,7 @@ ERROR_MAX_CHARS = 300
 TARGET_MAX_CHARS = 120
 VALUE_MAX_CHARS = 200               # 落库的 fill 值：够模型回看自己填了什么，不是一整段表单
 URL_PATH_MAX_CHARS = 300            # 与 normalize_path 的 path 上限同口径，展示侧不再放大
+URL_DISPLAY_MAX = 500               # 公网会话的展示地址上限：整条地址进模型上下文，截断要留出信息量
 LIST_ITEM_MAX = 40
 LIST_ITEM_CHARS = 1000
 PAGE_ERRORS_MAX = 10                # 未捕获异常条数上限，与 inspect_core 的同名预算同值
@@ -287,7 +297,7 @@ async def _post_json(url: str, payload: dict, *, timeout_s: int,
 
 async def _sidecar_open(target_url: str, *, timeout_s: int, expect: dict | None,
                         interactive_max: int = DEFAULT_INTERACTIVE_MAX,
-                        device: str = "") -> tuple[dict | None, str]:
+                        device: str = "", external: bool = False) -> tuple[dict | None, str]:
     """`POST /sessions`。返回 `(状态体, 错误原因)`，两者恰好一个非空——调用方不必再判 status_code。"""
     # interactive_max 必须透传：sidecar 的 OpenRequest/StepRequest 认这个字段，规格 §10 也承诺了它，
     # 载荷里少了它就是一个无人读的死配置（清单条数直接决定进模型上下文的 token 量）。
@@ -296,6 +306,9 @@ async def _sidecar_open(target_url: str, *, timeout_s: int, expect: dict | None,
     # 视口只在显式给的时候进载荷；缺省时请求体与旧行为逐字节相同（桌面 1280×800）。
     if device:
         payload["device"] = device
+    # 外部站点模式同理只在 True 时进载荷：预览会话的请求体保持与旧 sidecar 逐字节兼容。
+    if external:
+        payload["external"] = True
     return await _post_json(f"{browser_service_url()}/sessions", payload,
                             timeout_s=timeout_s + HTTP_TIMEOUT_MARGIN,
                             timeout_reason="浏览器会话打开超时")
@@ -529,31 +542,57 @@ def _resolve_preview(app) -> tuple[dict | None, dict | None]:
     return {"status": status, "display_base": display_base, "dev_port": int(dev_port)}, None
 
 
-async def _open(ctx, args: dict) -> dict:
-    """开一个会话并把它绑在 run_state 上：模型手上只有走查状态，没有 session_id（ADR-0037）。"""
-    info, reject = _resolve_preview(await fetch_app(ctx))
-    if reject is not None:
-        return reject
-    status = info["status"]
-    display_base = info["display_base"]
-    dev_port = info["dev_port"]
+async def _open(ctx, args: dict, *, external: bool = False) -> dict:
+    """开一个会话并把它绑在 run_state 上：模型手上只有走查状态，没有 session_id（ADR-0037）。
 
-    # 额度判定在自动关旧**之前**（裁定 R-24）：一次被拒绝的调用不许留下副作用，这是仓库自己的
-    # 既有不变式——`app/deploy/engine.py::start_dev` 把 `preflight_docker()` 排在任何状态变更之前，
-    # `app/agent/preview_tools.py::_restart` 也照这个顺序。先关再拒的话，模型看到的是「我没做成
-    # 任何事，但我手上的会话没了」，下一步只能重开，而重开又要再花一次额度，形成它解释不了的死循环。
-    left = _checks_left(ctx)              # 沿用 preview_page 的 open 额度（规格 §10 第一行）
+    `external=True` 是公网会话（`web_open`，ADR-0053）：目标地址由模型给，形状与私网字面量先过
+    `normalize_web_url`，DNS 解析与逐请求的私网拒绝由 sidecar 负责；不解析应用行、不占预览检查
+    额度、不做 host 改写，展示地址就是真实公网地址。
+    """
+    open_tool = "web_open" if external else "browser_open"
     old_sid = str(ctx.run_state.get("browser_session") or "")
-    if left == 0:
-        # 旧会话在这个分支里仍然活着，所以文案指向它：可以继续 step，也可以 close 收口。
-        if old_sid:
-            return _error("本次任务已打开浏览器会话达到上限；当前会话还在，可继续 browser_step，"
-                          "或先用 browser_close 收口（额度不退还）", checks_left=0)
-        return _error("本次任务已打开浏览器会话达到上限，请先用 browser_close 收口",
-                      checks_left=0)
-    path, err = normalize_path(args.get("path"))
-    if err:
-        return _error(err, status=status, url=display_base)
+    if external:
+        url, err = normalize_web_url(args.get("url"))
+        if err:
+            return _error(err)
+        status = "external"
+        display_base = ""
+        target_url = url
+        display_url = url[:URL_DISPLAY_MAX]
+        # 公网会话没有 `_connect_url` 那层 host 改写，sidecar 报出的就是真实地址：
+        # netloc 清洗在这里是恒等变换，成对记录只为让 `_crash_reason` 的口径保持一致。
+        display_netloc = target_netloc = _netloc(url)
+        log_target = display_url
+    else:
+        info, reject = _resolve_preview(await fetch_app(ctx))
+        if reject is not None:
+            return reject
+        status = info["status"]
+        display_base = info["display_base"]
+        dev_port = info["dev_port"]
+
+        # 额度判定在自动关旧**之前**（裁定 R-24）：一次被拒绝的调用不许留下副作用，这是仓库自己的
+        # 既有不变式——`app/deploy/engine.py::start_dev` 把 `preflight_docker()` 排在任何状态变更之前，
+        # `app/agent/preview_tools.py::_restart` 也照这个顺序。先关再拒的话，模型看到的是「我没做成
+        # 任何事，但我手上的会话没了」，下一步只能重开，而重开又要再花一次额度，形成它解释不了的死循环。
+        # 公网会话不占这个额度：它的成本闸是 `agent.browser_max_steps_per_run`（ADR-0053）。
+        left = _checks_left(ctx)              # 沿用 preview_page 的 open 额度（规格 §10 第一行）
+        if left == 0:
+            # 旧会话在这个分支里仍然活着，所以文案指向它：可以继续 step，也可以 close 收口。
+            if old_sid:
+                return _error("本次任务已打开浏览器会话达到上限；当前会话还在，可继续 browser_step，"
+                              "或先用 browser_close 收口（额度不退还）", checks_left=0)
+            return _error("本次任务已打开浏览器会话达到上限，请先用 browser_close 收口",
+                          checks_left=0)
+        path, err = normalize_path(args.get("path"))
+        if err:
+            return _error(err, status=status, url=display_base)
+        display_url = display_base.rstrip("/") + path
+        target_url = f"http://{browser_target_host()}:{dev_port}{path}"
+        # 两份 netloc：sidecar 自由文本里出现的内部 host:port 一律换回展示地址（裁定 R-22）。
+        display_netloc = _netloc(display_base)
+        target_netloc = _netloc(target_url)
+        log_target = path
 
     # 一个 run 只保留一个会话（规格 §7）：重复 open 先 DELETE 前一个，否则那个 context 永远没人关，
     # 而 sidecar 的 `ZEROCODE_BROWSER_MAX_SESSIONS` 默认只有 2——第三次 open 直接撞 409，还要等
@@ -561,6 +600,7 @@ async def _open(ctx, args: dict) -> dict:
     # 自己先 close：模型多一次往返才能自愈，而关会话没有副作用、不丢用户数据。
     # 位置在所有拒绝出口之后、真正的 open 之前：这里关掉旧的、紧接着开新的，中间不再有「拒绝了但
     # 已经动手」的分支；而 open 本身失败（sidecar 满 / 导航失败）时旧会话确实已腾出位置，属既成事实。
+    # 公网会话与预览会话共用这同一个槽（ADR-0053）：换模式 open 也先关掉对方，旧 ref 一概作废。
     closed_previous = False
     if old_sid:
         await _sidecar_delete(old_sid)
@@ -569,14 +609,9 @@ async def _open(ctx, args: dict) -> dict:
     # 「本 run 开过几个会话」与「被替换掉几个」是两个数（遗留 #1）：前者是 open 的成功次数，
     # 后者只数「新会话接管了旧会话的位置」。open→close→open 这条路径上后者是 0 而前者是 2，
     # 拿 `replaced + 1` 冒充开过的会话数会在收口报告里说出一句低估的假话。
-    reopened_hint = ("；上一个浏览器会话已关闭，现在没有可用会话，需要重新 browser_open"
+    reopened_hint = (f"；上一个浏览器会话已关闭，现在没有可用会话，需要重新 {open_tool}"
                      if closed_previous else "")
 
-    display_url = display_base.rstrip("/") + path
-    target_url = f"http://{browser_target_host()}:{dev_port}{path}"
-    # 两份 netloc：sidecar 自由文本里出现的内部 host:port 一律换回展示地址（裁定 R-22）。
-    display_netloc = _netloc(display_base)
-    target_netloc = _netloc(target_url)
     _remember_netlocs(ctx, target_netloc, display_netloc)
     timeout_s = _int_cfg(ctx.cfg, "agent.browser_timeout_seconds",
                          DEFAULT_OPEN_TIMEOUT_SECONDS, OPEN_TIMEOUT_MIN, OPEN_TIMEOUT_MAX)
@@ -590,7 +625,7 @@ async def _open(ctx, args: dict) -> dict:
     data, sidecar_err = await _sidecar_open(target_url, timeout_s=timeout_s,
                                             expect=args.get("expect"),
                                             interactive_max=interactive_max,
-                                            device=device)
+                                            device=device, external=external)
     if data is None:
         # 发现项 F-4：这条出口此前只过裸 `scrub_known_host`，没有凭据遮断也没有裁剪——
         # 「清洗闸有三处旁路」里最直白的一处，因为它就在 `_open` 里、离其它出口一步之遥。
@@ -608,12 +643,15 @@ async def _open(ctx, args: dict) -> dict:
         error_text, _hits, _cut = _sidecar_text(data.get("error"), ERROR_MAX_CHARS,
                                                 target_netloc=target_netloc,
                                                 display_netloc=display_netloc)
+        retry_hint = ("可先用 web_fetch 确认该地址可访问，再重试" if external
+                      else "可先用 preview_status / preview_logs 确认预览确实可用")
         return {"ok": False, "error": error_text,
                 "status": status, "url": display_url,
                 "session_gone": bool(data.get("session_gone")),
-                "hint": ("可先用 preview_status / preview_logs 确认预览确实可用" + reopened_hint)}
+                "hint": retry_hint + reopened_hint}
 
-    ctx.run_state["browser_checks"] = int(ctx.run_state.get("browser_checks", 0) or 0) + 1
+    if not external:
+        ctx.run_state["browser_checks"] = int(ctx.run_state.get("browser_checks", 0) or 0) + 1
     ctx.run_state["browser_opens"] = int(ctx.run_state.get("browser_opens") or 0) + 1
     # 替换计数只在**新会话确实建成**之后涨（遗留 #3）：旧会话被 DELETE 是既成事实（靠 reopened_hint
     # 说出口），但「被这次 open 替换掉」的含义是新会话接管了它的位置——open 失败时位置是空出来的，
@@ -629,6 +667,8 @@ async def _open(ctx, args: dict) -> dict:
     # refs 存 sidecar 的原始清单（不是给模型看的裁剪版）：Task 5 的 sensitive `fill` 遮断
     # 要按 ref 查 sensitive，裁剪版少了判定所需的字段。
     ctx.run_state["browser_refs"] = list(data.get("interactive") or [])
+    # 当前页的展示地址（公网会话的 step 用它取 netloc 与失败回退；预览会话只是顺带保持新鲜）。
+    ctx.run_state["browser_display_url"] = display_url
     # 收口报告的 url 同样用 display_url（裁定 R-16）：这份日志会进 browser_close 的返回值。
     # replaced_sessions 顺手写进 open 那一条（裁定 R-25）：browser_log 恰好在这一次 open 被重置，
     # 所以活下来的这条自然带上整个 run 的替换数——收口报告因此能自己说清它覆盖的是哪个会话。
@@ -646,7 +686,7 @@ async def _open(ctx, args: dict) -> dict:
     # 「页面文本未包含『订单列表』」——首屏没等到文案正是本功能的立项场景（规格 US-06），
     # 收口报告与步骤卡上那一行却什么都没说。这里复用模型这一步看到的已清洗文本，不另调一次
     # `_sidecar_text`（两处各写一遍迟早分家）。通过的那一条不写：`_shape_state` 给的是空串。
-    entry = {"seq": 0, "action": "open", "target": path,
+    entry = {"seq": 0, "action": "open", "target": log_target,
              # open 声明过 expect 时把真结论记进账（裁定 R-42）：改前这一条恒
              # None，`_close` 的两本账因此完全看不见 open 的断言——「只在 open 上
              # 声明 expect」的 run 会被说成「未声明任何断言」（真机复现见
@@ -838,14 +878,14 @@ def is_sensitive_ref(refs, ref: str) -> bool:
 # 它的形状正则活在那一侧、用于 `selector_for` 拼选择器前的那道闸。这里以前是**第二个字面量**
 # （`^e\d+$`），于是「改令牌形状」成了一次跨进程的锁步同步：漏改的这一侧不会红任何测试，
 # 症状却是未知句柄从此不遮（判据是「像不像句柄」，形状一变就全部判成「不是句柄」→ 放行）——
-# 正是 C-1 那条 Critical 防线的静默失效方向。以 `/` 开头的是 navigate 的路径，其余一律当句柄，
-# 令牌格式将来再怎么变都不影响这条线。
+# 正是 C-1 那条 Critical 防线的静默失效方向。以 `/` 开头的（或公网模式下的完整 http(s) 地址）
+# 是 navigate 的目的地，其余一律当句柄，令牌格式将来再怎么变都不影响这条线。
 NAVIGATE_PATH_PREFIX = "/"
 
 
 def _is_navigate_target(target: str) -> bool:
-    """这个 target 是 navigate 的 path 吗（path 恒以单个 `/` 开头，见 `normalize_path`）。"""
-    return target.startswith(NAVIGATE_PATH_PREFIX)
+    """这个 target 是 navigate 的目的地吗（预览会话是 path，公网会话是完整 http(s) 地址）。"""
+    return target.startswith(NAVIGATE_PATH_PREFIX) or target.startswith(("http://", "https://"))
 
 
 def _ref_is_listed(refs, ref: str) -> bool:
@@ -1033,7 +1073,21 @@ def _last_logged_url(ctx) -> str:
     return ""
 
 
-async def _step(ctx, args: dict) -> dict:
+def _step_display_url(ctx, data: dict, display_base: str) -> str:
+    """这一步的展示地址：预览会话折成「展示 base + path」（裁定 R-16），公网会话就是真实地址。
+
+    `display_base` 为空即公网会话（`_open` 里两者同源）：没有 `_connect_url` 的 host 改写，
+    `data["url"]` 本身就是可展示的公网地址，同样落进 `browser_display_url` 供下一步取 netloc。
+    """
+    raw = data.get("url")
+    if not raw:
+        return _last_logged_url(ctx)
+    url = _display_url_for(display_base, raw) if display_base else str(raw)[:URL_DISPLAY_MAX]
+    ctx.run_state["browser_display_url"] = url
+    return url
+
+
+async def _step(ctx, args: dict, *, external: bool = False) -> dict:
     """US-02 / US-03：在绑定的会话里执行一个动作，回一份与 open 同形的新状态。
 
     拒绝出口全部排在 `_sidecar_step` 之前且不写 run_state——同 `_open` 的裁定 R-24
@@ -1041,12 +1095,18 @@ async def _step(ctx, args: dict) -> dict:
     非 navigate 少了 target、应用/预览不可用，五条都是「什么都没发生」，模型手上的会话照旧。
     前四条与传输失败那条都显式带 `steps_charged: false`（「预览不可用」走 `_resolve_preview`
     那份与 open 共用的形状，那里没有步数概念）：按字段读的前端遇到缺字段就会当成第三种状态。
+
+    `external=True`（`web_step`，ADR-0053）只换两件事：navigate 的 target 是完整 http(s) 地址
+    （过 `normalize_web_url`，私网/本机字面量当场拒绝），以及不再解析应用行——展示地址与
+    netloc 直接取会话自己上一步回报的公网地址。
     """
+    open_tool = "web_open" if external else "browser_open"
+    close_tool = "web_close" if external else "browser_close"
     sid = str(ctx.run_state.get("browser_session") or "")
     if not sid:
-        return _error("还没有浏览器会话，先 browser_open", steps_charged=False)
+        return _error(f"还没有浏览器会话，先 {open_tool}", steps_charged=False)
     if _steps_left(ctx) == 0:
-        return _error("本 run 步数已用完，请 browser_close 收口", steps_left=0,
+        return _error(f"本 run 步数已用完，请 {close_tool} 收口", steps_left=0,
                       steps_charged=False)
 
     # `.strip()` 不是美观问题：模型常写出 `"click "`，带尾空格的 action 会在 sidecar 那一侧
@@ -1056,21 +1116,37 @@ async def _step(ctx, args: dict) -> dict:
     # value 不做清洗也不裁剪：它是要真的填进表单的数据，裁剪会把口令尾部吃掉。
     value = str(args.get("value") or "")
     if action == "navigate":
-        path, err = normalize_path(target)
-        if err:
-            return _error(err, steps_charged=False, steps_left=_steps_left(ctx))
-        payload_ref, payload_path = "", path
+        if external:
+            url, err = normalize_web_url(target)
+            if err:
+                return _error(err, steps_charged=False, steps_left=_steps_left(ctx))
+            payload_ref, payload_path = "", url
+        else:
+            path, err = normalize_path(target)
+            if err:
+                return _error(err, steps_charged=False, steps_left=_steps_left(ctx))
+            payload_ref, payload_path = "", path
     else:
         if not target:
             return _error(f"{action or '该动作'} 需要 target：上一次清单里的 ref",
                           steps_charged=False, steps_left=_steps_left(ctx))
         payload_ref, payload_path = target, ""
 
-    info, reject = _resolve_preview(await fetch_app(ctx))
-    if reject is not None:
-        return reject
-    display_netloc = _netloc(info["display_base"])
-    target_netloc = _netloc(f"http://{browser_target_host()}:{info['dev_port']}")
+    if external:
+        # 公网会话没有应用行可对：netloc 取会话自己上一步回报的地址，清洗是恒等变换
+        # （成对记录只为让异常兜底 `_crash_reason` 的口径与预览会话一致）。
+        status = "external"
+        display_base = ""
+        display_netloc = target_netloc = _netloc(
+            str(ctx.run_state.get("browser_display_url") or payload_path or ""))
+    else:
+        info, reject = _resolve_preview(await fetch_app(ctx))
+        if reject is not None:
+            return reject
+        status = info["status"]
+        display_base = info["display_base"]
+        display_netloc = _netloc(display_base)
+        target_netloc = _netloc(f"http://{browser_target_host()}:{info['dev_port']}")
     _remember_netlocs(ctx, target_netloc, display_netloc)
 
     # sensitive 判定用**动作之前**那份清单（`browser_refs` = 上一次返回给模型的清单）：
@@ -1105,9 +1181,14 @@ async def _step(ctx, args: dict) -> dict:
         # 会话真的没了就解绑：留着它，每一步都会重新去打那个已经不存在的 id，
         # 而模型每次拿到的都是同一句「会话已结束」——扣额度又不做任何事（US-12）。
         ctx.run_state["browser_session"] = None
+        fallback = f"浏览器会话已结束，请重新 {open_tool}"
+        if external:
+            # sidecar 的会话级报错文案写死「重新 browser_open」；公网会话里那个工具不存在，
+            # 模型照抄会撞未知工具，所以这里整句换成对应模式的说法。
+            data = {**data, "error": fallback}
         return _step_failure(ctx, data, target_netloc=target_netloc,
                              display_netloc=display_netloc, charged=False, session_gone=True,
-                             fallback="浏览器会话已结束，请重新 browser_open", **echo)
+                             fallback=fallback, **echo)
     if data.get("ok") is not True:
         # 动作层面的失败也按 sidecar 的读数记账（规格 §5.2：Agent 确实发起了一次动作就该记账）。
         # 只涨成功路径的账会让 `steps_left` 长期虚高，而 `steps_charged` 与步数账必须一起动。
@@ -1134,8 +1215,7 @@ async def _step(ctx, args: dict) -> dict:
                               **({"target_name": echo["target_name"]}
                                  if echo.get("target_name") else {}),
                               "ok": False, "error": failure["error"], "passed": None,
-                              "url": (_display_url_for(info["display_base"], data["url"])
-                                      if data.get("url") else _last_logged_url(ctx))})
+                              "url": _step_display_url(ctx, data, display_base)})
         return await _attach_shot(ctx, sid, args, data, failure,
                                   sensitive_fill=sensitive_fill)
 
@@ -1143,7 +1223,7 @@ async def _step(ctx, args: dict) -> dict:
     if steps_charged:
         _charge_step(ctx)
     ctx.run_state["browser_refs"] = list(data.get("interactive") or [])
-    display_url = _display_url_for(info["display_base"], data.get("url"))
+    display_url = _step_display_url(ctx, data, display_base)
     entry = {"action": action, "target": echo["target"],
              # 动作之前那份清单里的元素名一并进账（M-6）：`_close` 的报告项据此把「这一行是
              # 谁」写给读报告的人——按规格 §6.2 那些 ref 早就作废，只留句柄就是噪声。
@@ -1158,7 +1238,7 @@ async def _step(ctx, args: dict) -> dict:
         entry.update({"value": "" if sensitive else _redact(value, VALUE_MAX_CHARS)[0],
                       "value_redacted": sensitive})
 
-    result = _shape_state(ctx, data, opened=False, url=display_url, status=info["status"],
+    result = _shape_state(ctx, data, opened=False, url=display_url, status=status,
                           target_netloc=target_netloc, display_netloc=display_netloc)
     result["steps_charged"] = steps_charged
     # 断言未通过的那一步，`note` 也要进账（裁定 R-31 第 2 条）：改前只有「点不动」带 `error`，
@@ -1173,12 +1253,14 @@ async def _step(ctx, args: dict) -> dict:
                               sensitive_fill=sensitive_fill)
 
 
-async def _close(ctx, _args: dict) -> dict:
+async def _close(ctx, _args: dict, *, external: bool = False) -> dict:
     """US-07：收口报告说事实——走了几步（含点不动的步）、几步断言失败、几步点不动、失败在哪步、
     覆盖第几个会话。断言账（`steps_failed`）与动作账（`steps_action_failed`）各报各的数。
 
-    断言那本账从 R-42 起也覆盖 browser_open 上声明的 expect：那一句同样是本 run 做过的判定，
-    看不见它就会把「断言没过」说成「未声明任何断言」。"""
+    断言那本账从 R-42 起也覆盖 open 上声明的 expect：那一句同样是本 run 做过的判定，
+    看不见它就会把「断言没过」说成「未声明任何断言」。`external` 只影响文案里的工具名
+    （公网会话要说 `web_open`，模型手上没有 `browser_open`）。"""
+    open_tool = "web_open" if external else "browser_open"
     sid = str(ctx.run_state.get("browser_session") or "")
     steps = list(ctx.run_state.get("browser_log") or [])
     if sid:
@@ -1241,7 +1323,7 @@ async def _close(ctx, _args: dict) -> dict:
     elif declared:
         hint = "所有已声明的断言均通过"
     elif open_declared:
-        hint = "browser_open 声明过断言，但这次没拿到它的判定结论（结论要自己读页面文本判断）"
+        hint = f"{open_tool} 声明过断言，但这次没拿到它的判定结论（结论要自己读页面文本判断）"
     else:
         hint = "本次走查未声明任何断言（各步只做了动作，结论要自己读页面文本判断）"
     if action_failed:
@@ -1275,15 +1357,16 @@ async def close_browser_session(ctx) -> None:
 
 
 async def run_browser_session_tool(ctx, name: str, args: dict) -> dict:
-    """三个交互工具的统一入口；任何失败都作为带原因的正常结果返回，绝不抛 ToolError。"""
+    """六个交互工具的统一入口（预览会话 browser_* / 公网会话 web_*，ADR-0053）；
+    任何失败都作为带原因的正常结果返回，绝不抛 ToolError。"""
     args = args if isinstance(args, dict) else {}
     try:
-        if name == "browser_open":
-            return await _open(ctx, args)
-        if name == "browser_step":
-            return await _step(ctx, args)
-        if name == "browser_close":
-            return await _close(ctx, args)
+        if name in ("browser_open", "web_open"):
+            return await _open(ctx, args, external=name == "web_open")
+        if name in ("browser_step", "web_step"):
+            return await _step(ctx, args, external=name == "web_step")
+        if name in ("browser_close", "web_close"):
+            return await _close(ctx, args, external=name == "web_close")
         return _error(f"未知浏览器会话工具: {name}")
     except Exception as e:  # noqa: BLE001
         logger.exception("浏览器会话工具 %s 执行异常", name)

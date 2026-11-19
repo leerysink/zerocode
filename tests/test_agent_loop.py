@@ -757,6 +757,7 @@ async def test_no_preview_tools_without_app_row(test_engine, tmp_path):
     assert not any(n.startswith("preview_") for n in names)
     assert not any(n.startswith("db_") for n in names)
     assert not any(n.startswith("browser_") for n in names)   # 交互工具同闸（规格 §5.1）
+    assert "web_fetch" in names and "web_open" in names        # 公网工具不依赖应用身份
     assert "release_preflight" not in names and "sqlchange_status" not in names
     assert "run_check" not in names
     assert "<preview>" not in llm.received[0][0]["content"]
@@ -765,6 +766,9 @@ async def test_no_preview_tools_without_app_row(test_engine, tmp_path):
     assert "<database>" not in llm.received[0][0]["content"]
     assert "<browser>" not in llm.received[0][0]["content"]
     assert "<browser_session>" not in llm.received[0][0]["content"]
+    # 联网指引反过来恒在：web_fetch / web_* 是基础工具，非应用工作区也挂载（ADR-0053）
+    assert "<web>" in llm.received[0][0]["content"]
+    assert "<web_session>" in llm.received[0][0]["content"]
 
 
 @pytest.mark.asyncio
@@ -786,6 +790,9 @@ async def test_duplicate_workspace_binding_fails_closed_with_note(test_engine, t
     assert "<database>" not in llm.received[0][0]["content"]
     assert "<browser>" not in llm.received[0][0]["content"]
     assert "<browser_session>" not in llm.received[0][0]["content"]
+    # 联网指引反过来恒在：web_fetch / web_* 是基础工具，非应用工作区也挂载（ADR-0053）
+    assert "<web>" in llm.received[0][0]["content"]
+    assert "<web_session>" in llm.received[0][0]["content"]
     assert "绑定了多个应用" in llm.received[0][0]["content"]
 
 
@@ -797,7 +804,8 @@ async def test_preview_prompt_follows_the_stack(test_engine, tmp_path):
     await mk_runner(sf, llm, Recorder()).run(sid, "改个后端", asyncio.Event())
     c = llm.received[0][0]["content"]
     assert "必须 preview_restart" in c and "uvicorn" not in c     # 按栈差异化，不串味
-    assert c.rstrip().endswith("</browser_session>")              # 块在 system 尾部（契约/技能之后）
+    assert c.rstrip().endswith("</web_session>")                  # 联网指引恒在 system 尾部（ADR-0053）
+    assert "</browser_session>" in c and "<web>" in c             # 联网块跟在走查块之后
     assert "</preview>" in c and "<browser>" in c                 # 浏览器指引跟在预览块之后
     assert "</browser>" in c and "<browser_session>" in c         # 交互指引跟在快检指引之后
 

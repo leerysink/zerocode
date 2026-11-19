@@ -298,10 +298,12 @@ def test_build_subrun_tools_whitelist_order_and_scopes():
     for banned in ("delegate", "write_file", "edit_file", "delete_file", "move_file",
                    "revert_change", "ask_user", "clarify_done", "todo_write",
                    "memory_write", "db_write", "preview_restart", "preview_logs",
-                   "browser_open", "browser_step", "browser_close"):
+                   "browser_open", "browser_step", "browser_close",
+                   "web_open", "web_step", "web_close"):
         assert banned not in names
+    # 非应用工作区只剩 fs 三件套 + web_fetch：联网读取是无状态的，与应用身份无关（ADR-0053）
     assert [t["function"]["name"] for t in registry.build_subrun_tools(app=False)] == [
-        "list_dir", "read_file", "search"]
+        "list_dir", "read_file", "search", "web_fetch"]
 
 
 @pytest.mark.asyncio

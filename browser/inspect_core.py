@@ -18,7 +18,9 @@ URL_MAX = 500
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 _CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
-_PRIVATE_SUFFIXES = (".internal", ".local", ".localhost")
+_PRIVATE_SUFFIXES = (".internal", ".local", ".localhost", ".home.arpa", ".docker.internal")
+_PRIVATE_HOSTS = {"localhost", "host.docker.internal", "gateway.docker.internal",
+                  "backend", "browser", "gateway", "pg", "postgres", "redis", "db"}
 _CONTAINER_PREFIXES = ("zerocode-",)
 
 
@@ -71,6 +73,37 @@ def build_session_script(token, origin: str = "") -> str:
             f'    localStorage.setItem("token", {_js_literal(token)});\n'
             "  } catch (e) {}\n"
             "})();")
+
+
+def validate_web_target(url: str) -> tuple[str | None, str]:
+    """校验外部站点模式的目标 URL（ADR-0053）：任意 host，但必须过本机/私网字面量闸。
+
+    DNS 解析闸在 `app.py` 的请求路由里（要 await，纯函数层做不了）；这里只挡形状与
+    「一眼就是内网」的地址，让大部分错误在建立会话之前就给出人话原因。
+    """
+    if not isinstance(url, str) or not url.strip():
+        return None, "url 不能为空"
+    raw = url.strip()
+    if len(raw) > 2000:
+        return None, "url 过长（最多 2000 字符）"
+    try:
+        parts = urlsplit(raw)
+    except ValueError:
+        return None, "url 无法解析"
+    if parts.scheme not in ("http", "https"):
+        return None, "url 只支持 http/https"
+    if not parts.hostname:
+        return None, "url 缺少 host"
+    if parts.username or parts.password:
+        return None, "url 不能包含用户名或密码"
+    try:
+        parts.port
+    except ValueError:
+        return None, "url 端口非法"
+    host = parts.hostname.lower().rstrip(".")
+    if is_private_host(host):
+        return None, f"拒绝访问内网或本机地址: {host}"
+    return raw, ""
 
 
 def validate_target(url: str, allowed_hosts: tuple[str, ...] = DEFAULT_ALLOWED_HOSTS) -> tuple[str | None, str]:
@@ -149,12 +182,22 @@ def rewrite_url_host(url: str, host: str) -> str:
     return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
 
 
+def is_public_ip(value: str) -> bool:
+    """解析结果是不是公网地址：只放行 global unicast，其余（私网/回环/链路本地/
+    保留/组播/未指定/共享地址段）一律拒绝。"""
+    try:
+        ip = ipaddress.ip_address(str(value).split("%", 1)[0])
+    except ValueError:
+        return False
+    return ip.is_global
+
+
 def is_private_host(host: str) -> bool:
-    """私网 / 本机 / 容器别名判定；用于阻断页面子资源对内网和平台的探测。"""
+    """私网 / 本机 / 容器别名判定；用于阻断页面子资源与外部站点请求对内网和平台的探测。"""
     name = (host or "").lower().strip("[]").rstrip(".")
     if not name:
         return True
-    if name in ("localhost",) or name.endswith(_PRIVATE_SUFFIXES):
+    if name in _PRIVATE_HOSTS or name.endswith(_PRIVATE_SUFFIXES):
         return True
     if name.startswith(_CONTAINER_PREFIXES):
         return True
@@ -162,21 +205,25 @@ def is_private_host(host: str) -> bool:
         ip = ipaddress.ip_address(name)
     except ValueError:
         return False
-    return (ip.is_private or ip.is_loopback or ip.is_link_local
-            or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+    return not ip.is_global
 
 
-def allow_request(target_url: str, request_url: str, *, is_main_navigation: bool) -> bool:
+def allow_request(target_url: str, request_url: str, *, is_main_navigation: bool,
+                  external: bool = False) -> bool:
     """一次网络请求是否放行。
 
-    - 主文档：只允许目标 origin（页面重定向到别的 host 一律阻断）；
-    - 子资源：同源放行；公网 http(s) 放行；私网/本机/容器地址阻断；
+    - 应用模式（external=False）：主文档只允许目标 origin（页面重定向到别的 host 一律阻断）；
+      子资源同源放行，其余公网 http(s) 放行，私网/本机/容器地址阻断；
+    - 外部站点模式（external=True，ADR-0053）：主文档与子资源都允许任意公网 host
+      （跨站重定向是外部站点的常态），私网/本机/容器地址仍然阻断；
     - data/blob/about 等非网络协议不经过这里（由调用方直接 continue）。
     """
     target = origin_of(target_url)
     req = origin_of(request_url)
     if req is None:
         return True
+    if external:
+        return not is_private_host(req[1])
     if is_main_navigation:
         return target is not None and req == target
     if target is not None and req == target:

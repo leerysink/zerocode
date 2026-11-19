@@ -2,8 +2,9 @@
 
 独立容器运行（ADR-0031）：不持有 docker.sock、不注入平台库凭据、非 root、只读根文件系统。
 两条调用面：一次性检查（`/healthz` + `/inspect`，`preview_page` 用）和有状态的会话服务
-（`/sessions*`，Agent 交互走查用）。目标 URL 由后端构造并校验，本服务只接受 host 命中允许
-清单的 http(s) 地址；一次性检查每次新建 BrowserContext 用完即关，会话则把干净 context 留在
+（`/sessions*`，Agent 交互走查用）。会话分两种模式（ADR-0053）：应用预览只接受 host 命中
+允许清单的 http(s) 地址（`browser_*`）；外部站点模式接受任意公网地址、私网与本机一律拒绝
+（`web_*`）。一次性检查每次新建 BrowserContext 用完即关，会话则把干净 context 留在
 本进程内存里（规格 §6.1/§6.2）——两者都不复用宿主浏览器的 cookie 与登录态。
 """
 import asyncio
@@ -18,8 +19,9 @@ from pydantic import BaseModel
 from playwright.async_api import async_playwright
 
 from .inspect_core import (allow_request, build_session_script, clean_text, host_of,
-                           is_ip_literal, origin_of, origin_string, parse_allowed_hosts,
-                           pick_connect_ip, rewrite_url_host, shape_result, validate_target)
+                           is_ip_literal, is_public_ip, origin_of, origin_string,
+                           parse_allowed_hosts, pick_connect_ip, rewrite_url_host,
+                           shape_result, validate_target, validate_web_target)
 from .session_core import (INTERACTIVE_JS, INTERACTIVE_MAX_DEFAULT, can_open, new_ref_tokens,
                            shape_interactive)
 from .sessions import (ACTIONS, SESSIONS, SETTLE_MS_MAX, STEP_TIMEOUT_MS_DEFAULT,
@@ -48,6 +50,19 @@ DESKTOP_VIEWPORT = {"viewport": {"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEI
 # 给模型的错误说明长度：Playwright 的原文带着整段选择器与调用栈提示，全量进上下文只是噪声。
 ERROR_TEXT_MAX = 300
 SESSION_GONE_MESSAGE = "浏览器会话已结束，请重新 browser_open"
+SESSION_ABORTED_MESSAGE = "浏览器会话异常终止，请重新 browser_open"
+# 外部站点模式（ADR-0053）的同一句话：指引里的工具名必须指向模型真正持有的那把（web_open），
+# 说成 browser_open 会让它去调一个在非应用工作区根本不存在的工具。
+WEB_SESSION_GONE_MESSAGE = "浏览器会话已结束，请重新 web_open"
+WEB_SESSION_ABORTED_MESSAGE = "浏览器会话异常终止，请重新 web_open"
+
+
+def _gone_message(s: Session) -> str:
+    return WEB_SESSION_GONE_MESSAGE if s.external else SESSION_GONE_MESSAGE
+
+
+def _aborted_message(s: Session) -> str:
+    return WEB_SESSION_ABORTED_MESSAGE if s.external else SESSION_ABORTED_MESSAGE
 SESSION_FULL_MESSAGE = "浏览器服务已满（活会话达上限），请等前一个走查结束"
 # 「上一轮的句柄」与「这个元素点不动」必须是两句话（规格 §5.3 的两行）：前者要模型去新清单里
 # 换一个 ref，后者要它去看遮挡。形状非法与「形状合法但页面上查不到」是同一件事的两种命中方式，
@@ -81,7 +96,12 @@ class InspectRequest(BaseModel):
 
 
 class OpenRequest(BaseModel):
-    """`POST /sessions` 的请求体（规格 §6.1）。`expect` 是「首屏等到这句话出现再回」。"""
+    """`POST /sessions` 的请求体（规格 §6.1）。`expect` 是「首屏等到这句话出现再回」。
+
+    `external=True` 是外部站点模式（ADR-0053）：目标换成任意公网站点，校验走
+    `validate_web_target`（私网一律拒绝）而不是 host 白名单，也不做 `_connect_url` 的
+    host→IP 改写、不注入应用登录脚本。
+    """
 
     url: str
     timeout_ms: int = DEFAULT_TIMEOUT_MS
@@ -89,6 +109,7 @@ class OpenRequest(BaseModel):
     settle_ms: int = 0
     interactive_max: int = INTERACTIVE_MAX_DEFAULT
     device: str = ""
+    external: bool = False
 
 
 class StepRequest(BaseModel):
@@ -284,6 +305,30 @@ async def _connect_url(url: str) -> str:
     return rewrite_url_host(url, ip) if ip else url
 
 
+async def _public_dns_error(url: str) -> str:
+    """外部站点首跳的 DNS 闸（ADR-0053）：解析结果必须全部是公网地址。
+
+    会话路由层（`allow_request` 的 external 分支）只能看见 URL 字面 host，挡不住
+    「公网域名解析到内网」。真正发请求前在这里解析一次，任一结果非公网即拒绝。
+    解析失败放行——没有可连的地址时浏览器会给出自己的网络错误，别在这里制造新失败模式。
+    DNS rebinding 的残余风险（本进程解析一次、Chromium 再解析一次）登记在 ADR-0053 后果。
+    """
+    host = host_of(url)
+    origin = origin_of(url)
+    if not host or origin is None or is_ip_literal(host):
+        return ""
+    try:
+        info = await asyncio.get_running_loop().getaddrinfo(
+            host, origin[2], type=socket.SOCK_STREAM)
+    except (socket.gaierror, OSError, UnicodeError):
+        return ""
+    for entry in info or []:
+        addr = entry[4][0] if len(entry) > 4 and entry[4] else ""
+        if addr and not is_public_ip(addr):
+            return f"拒绝访问内网或本机地址: {host}（解析到 {addr}）"
+    return ""
+
+
 async def _inspect(url: str, wait_ms: int, timeout_ms: int,
                    session_token: str | None = None,
                    context_options: dict | None = None) -> dict:
@@ -329,8 +374,12 @@ class Collectors:
                 "failed": list(self.failed), "dialog": self.dialog}
 
 
-async def attach_listeners(page, connect_url: str) -> Collectors:
+async def attach_listeners(page, connect_url: str, external: bool = False) -> Collectors:
     """挂上放行与收集监听。
+
+    `external=True`（ADR-0053）：主文档与子资源都允许任意公网 host（跨站重定向是外部站点的
+    常态），私网/本机/容器地址仍由 `allow_request` 阻断——应用模式的「主文档只许目标 origin」
+    换成「不许私网」，两条口径都在 `inspect_core.allow_request` 里各写一处。
 
     console 条目刻意只有 `level` / `text`（不带 `url`）：`session_core.new_only` 用
     「有没有 url」区分 console 条目与失败请求条目，补一个 url 字段会让 console 静默按
@@ -344,7 +393,8 @@ async def attach_listeners(page, connect_url: str) -> Collectors:
             await route.continue_()
             return
         is_main = request.is_navigation_request() and request.frame == page.main_frame
-        if allow_request(connect_url, request.url, is_main_navigation=is_main):
+        if allow_request(connect_url, request.url, is_main_navigation=is_main,
+                         external=external):
             await route.continue_()
             return
         c.blocked_urls.add(request.url)
@@ -482,10 +532,20 @@ async def open_session(req: OpenRequest):
     """开一个有状态会话：干净 context → 打开目标页 → 回首轮完整状态。
 
     不复用宿主浏览器的任何登录态（US-18）：context 每次新建，cookie 跟着它一起生灭。
+    两种模式（ADR-0053）：应用预览走 host 白名单 + `_connect_url` 改写；外部站点走
+    `validate_web_target` + DNS 闸，地址原样交给浏览器。
     """
-    url, err = validate_target(req.url, ALLOWED_HOSTS)
-    if err:
-        raise HTTPException(400, err)
+    if req.external:
+        url, err = validate_web_target(req.url)
+        if err:
+            raise HTTPException(400, err)
+        dns_err = await _public_dns_error(url)
+        if dns_err:
+            raise HTTPException(400, dns_err)
+    else:
+        url, err = validate_target(req.url, ALLOWED_HOSTS)
+        if err:
+            raise HTTPException(400, err)
     if _browser is None:
         raise HTTPException(503, "浏览器尚未就绪")
     context_options, device_err = resolve_device_options(req.device)
@@ -494,7 +554,9 @@ async def open_session(req: OpenRequest):
     if not can_open(len(SESSIONS), max_sessions()):
         raise HTTPException(409, SESSION_FULL_MESSAGE)
     timeout_ms = _clamp(req.timeout_ms, DEFAULT_TIMEOUT_MS, 10000, TIMEOUT_MS_MAX)
-    connect_url = await _connect_url(url)
+    # 外部站点的地址原样使用：`_connect_url` 的 host→IP 改写是为了绕开 Vite 的
+    # allowedHosts，对公网站点只会把 DNS 名换成 IP、破坏 SNI 与虚拟主机。
+    connect_url = url if req.external else await _connect_url(url)
     # 建 context → 开页 → 挂监听这三步必须在同一个 try 里（裁定 R-44）：后两步抛异常时那个
     # context 既没进 `SESSIONS` 也没被关——`_abandon` 原本只挂在第二道 `can_open` 那一支，而巡检
     # 永远看不见不在注册表里的东西。默认上限 2、mem_limit 1g，两次就攒满且不随 TTL 消失。
@@ -504,13 +566,14 @@ async def open_session(req: OpenRequest):
         options = {"locale": "zh-CN", **dict(context_options or DESKTOP_VIEWPORT)}
         context = await _browser.new_context(**options)
         page = await context.new_page()
-        collectors = await attach_listeners(page, connect_url)
+        collectors = await attach_listeners(page, connect_url, external=req.external)
     except Exception as e:  # noqa: BLE001
         if context is not None:
             await _abandon(context)
         return {"ok": False, "error": f"页面打开失败: {_short(e)}", "session_gone": True}
     s = Session(session_id=new_session_id(), context=context, page=page,
-                origin=origin_url(connect_url), collectors=collectors)
+                origin=origin_url(connect_url), collectors=collectors,
+                external=req.external)
     # 上限的二次判定与登记之间没有任何 await：单线程事件循环里这一对是原子的。缺了它，
     # 两个并发 open 会在同一刻都读到「还差一个」，然后一起往 mem_limit 1g 里塞第三个 context。
     if not can_open(len(SESSIONS), max_sessions()):
@@ -691,15 +754,27 @@ async def _action_failure(s: Session, limit: int, started: float, error: str,
 
 async def _do_navigate(s: Session, req: StepRequest, limit: int, timeout_ms: int,
                        started: float) -> dict:
-    """同源导航：path 必须是单个 `/` 开头的相对路径，拼出来必然落在会话 origin 上（US-17）。"""
-    url = navigation_url(s.origin, req.path)
-    if url is None:
-        charge(s)
-        # 这一步没导航成，但增量账照样要消费掉：不消费就是把此刻落在页面上的错误
-        # 留给下一步去认领（裁定 R-45 / F-7）。
-        _consume_new_items(s)
-        return {"ok": False, "error": "path 必须是同源相对路径（以 / 开头）",
-                "dialog": take_dialog(s), "steps_charged": True}
+    """导航。应用模式：path 必须是单个 `/` 开头的相对路径，拼出来必然落在会话 origin 上（US-17）；
+    外部站点模式（ADR-0053）：path 是完整 http(s) 地址，校验换成私网拒绝 + 首跳 DNS 闸——
+    任意公网 host 都可以是下一站（站点间跳转是常态），私网仍一律拒绝。"""
+    if s.external:
+        url, err = validate_web_target(req.path)
+        if not err:
+            err = await _public_dns_error(url)
+        if err:
+            charge(s)
+            _consume_new_items(s)
+            return {"ok": False, "error": err,
+                    "dialog": take_dialog(s), "steps_charged": True}
+    else:
+        url = navigation_url(s.origin, req.path)
+        if url is None:
+            charge(s)
+            # 这一步没导航成，但增量账照样要消费掉：不消费就是把此刻落在页面上的错误
+            # 留给下一步去认领（裁定 R-45 / F-7）。
+            _consume_new_items(s)
+            return {"ok": False, "error": "path 必须是同源相对路径（以 / 开头）",
+                    "dialog": take_dialog(s), "steps_charged": True}
     timed_out = False
     try:
         await s.page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
@@ -756,7 +831,7 @@ async def step(sid: str, req: StepRequest):
     except Exception as e:  # noqa: BLE001
         if _page_is_gone(e):
             await drop(sid)
-            return {"ok": False, "error": "浏览器会话异常终止，请重新 browser_open",
+            return {"ok": False, "error": _aborted_message(s),
                     "session_gone": True, "steps_charged": False}
         # 「动作成了、随后读不回」是常态而不是意外：点一下触发 SPA 重新渲染/主文档导航时，
         # evaluate 抛的是「Execution context was destroyed」——既不是 gone 也不是 timeout。
@@ -802,8 +877,7 @@ async def session_screenshot(sid: str):
     except Exception as e:  # noqa: BLE001 - 补图失败不该把已经拿到手的断言结论一起带走
         if _page_is_gone(e):
             await drop(sid)
-            return {"ok": False, "error": "浏览器会话异常终止，请重新 browser_open",
-                    "session_gone": True}
+            return {"ok": False, "error": _aborted_message(s), "session_gone": True}
         return {"ok": False, "error": f"截图失败: {_short(e)}"}
     width, height = _shot_size(shot, s.page)
     return {"ok": True, "screenshot_b64": base64.b64encode(shot).decode("ascii"),

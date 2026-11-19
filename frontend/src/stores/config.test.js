@@ -111,6 +111,7 @@ describe('config store 运行参数与记忆召回', () => {
       previewWaitSeconds: 240, previewLogLines: 80, previewConfirmRunning: true,
       browserMaxPerRun: 6, browserMaxStepsPerRun: 12, browserTimeoutSeconds: 45,
       browserExpectTimeoutMs: 3000, browserSettleMs: 1200, browserInteractiveMax: 40,
+      webMaxFetchesPerRun: 20,
       dbRowsLimit: 200, dbRowsAssertMax: 200,
       memoryEnabled: true, memoryTopK: 5, memoryMinSimilarity: -1, memoryMaxTokens: 600,
     })

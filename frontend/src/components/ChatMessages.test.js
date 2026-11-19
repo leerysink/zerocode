@@ -14,6 +14,7 @@ import ToolCallBlock from './ToolCallBlock.vue'
 import DelegateCard from './DelegateCard.vue'
 import AskUserCard from './AskUserCard.vue'
 import BrowserFlowCard from './BrowserFlowCard.vue'
+import WebFetchCard from './WebFetchCard.vue'
 import { applyEvent, useChatStore } from '../stores/chat'
 import { DECLINE_ANSWER } from '../stores/messageModel'
 
@@ -545,6 +546,40 @@ describe('browser_open / browser_step / browser_close 在消息流里的渲染',
     }])
     expect(page.findComponent(BrowserFlowCard).exists()).toBe(false)
     expect(page.find('.zc-page').exists()).toBe(true)
+  })
+})
+
+// ---- 公网工具（ADR-0053）：web_* 走步骤流卡，web_fetch 走联网读取卡 ----
+
+describe('web_open / web_step / web_close / web_fetch 在消息流里的渲染', () => {
+  it('三个公网走查工具都路由到 BrowserFlowCard', () => {
+    for (const n of ['web_open', 'web_step', 'web_close']) {
+      const w = mountMessages([{ role: 'tool', name: n, result: { ok: true } }])
+      expect(w.findComponent(BrowserFlowCard).exists()).toBe(true)
+      expect(w.findComponent(WebFetchCard).exists()).toBe(false)
+      expect(w.findComponent(ToolCallBlock).exists()).toBe(false)
+    }
+  })
+
+  it('web_fetch 路由到 WebFetchCard，不落进步骤流卡或通用折叠块', () => {
+    const w = mountMessages([{ role: 'tool', name: 'web_fetch',
+      result: { ok: true, url: 'https://example.com/', status: 200, text: '正文', links: [] } }])
+    expect(w.findComponent(WebFetchCard).exists()).toBe(true)
+    expect(w.findComponent(BrowserFlowCard).exists()).toBe(false)
+    expect(w.findComponent(ToolCallBlock).exists()).toBe(false)
+  })
+
+  it('web_fetch 的历史行（tool_name / tool_result）刷新后仍画联网读取卡', () => {
+    const w = mountMessages([{ role: 'tool', tool_name: 'web_fetch',
+      tool_result: { ok: true, url: 'https://example.com/docs', text: '示例正文' } }])
+    expect(w.findComponent(WebFetchCard).exists()).toBe(true)
+    expect(w.text()).toContain('示例正文')
+  })
+
+  it('web_fetch 读取中（无结果）画实时态，不画成折叠块', () => {
+    const w = mountMessages([{ role: 'tool', name: 'web_fetch', args: { url: 'https://example.com/' } }])
+    expect(w.findComponent(WebFetchCard).exists()).toBe(true)
+    expect(w.text()).toContain('正在读取网页')
   })
 })
 
