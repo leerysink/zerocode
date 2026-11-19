@@ -1,5 +1,5 @@
 // @vitest-environment happy-dom
-// 商店管理页：创始人门禁、三列卡片、状态 tab、下架/重新上架/预览、审批队列与分类总览。
+// 商店管理（运营台）：创始人门禁、三列等高卡、状态 tab、☰ 编辑/详情/下架、审批队列与分类总览。
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { flushPromises, mount } from '@vue/test-utils'
 import Antd from 'ant-design-vue'
@@ -44,11 +44,25 @@ beforeEach(() => {
   api.storeApplications.mockResolvedValue({ data: review })
   api.storeWithdraw.mockResolvedValue({ data: { ok: true } })
   api.storeRepublish.mockResolvedValue({ data: { ok: true } })
+  api.storeUpdateRelease.mockResolvedValue({ data: { ok: true } })
+  api.storePurgeRelease.mockResolvedValue({ data: { ok: true } })
+  api.storeAddShot.mockResolvedValue({ data: { ok: true } })
+  api.storeDelShot.mockResolvedValue({ data: { ok: true } })
   api.storeApprove.mockResolvedValue({ data: { ok: true } })
   api.storeReject.mockResolvedValue({ data: { ok: true } })
 })
 
 describe('StoreAdminView', () => {
+  // ☰ 的菜单项渲染在 body 的浮层里，须经浮层点，wrapper.find 取不到
+  async function clickMenu (w, testId, index = 0) {
+    await w.findAll('.zc-sadm-menu-btn')[index].trigger('click')
+    await flushPromises()
+    const item = document.querySelector(`[data-test="${testId}"]`)
+    expect(item, `菜单项 ${testId} 未出现`).toBeTruthy()
+    item.click()
+    await flushPromises()
+  }
+
   it('非创始人：门禁空态，不拉管理列表', async () => {
     const w = mountView({ id: 2, is_founder: false })
     await flushPromises()
@@ -70,25 +84,57 @@ describe('StoreAdminView', () => {
     expect(w.find('[data-test="adm-tab-withdrawn"]').text()).toContain('1')
   })
 
-  it('状态 tab 切换收窄卡片', async () => {
+  it('状态 tab 切换收窄卡片；☰ 按状态给下架或重新上架', async () => {
     const w = mountView()
     await flushPromises()
     await w.find('[data-test="adm-tab-withdrawn"]').trigger('click')
     expect(w.findAll('[data-test="adm-card"]')).toHaveLength(1)
-    expect(w.find('[data-test="adm-republish"]').exists()).toBe(true)
-    expect(w.find('[data-test="adm-withdraw"]').exists()).toBe(false)
+    await clickMenu(w, 'adm-republish')
+    expect(api.storeRepublish).toHaveBeenCalledWith(2)
+    // 已下架行不给「下架」项（状态互斥，不是靠 disabled 糊过去）
+    expect(document.querySelector('[data-test="adm-withdraw"]')).toBeNull()
   })
 
-  it('下架调接口并重取；重新上架同理', async () => {
+  it('下架：走 ☰ 菜单调接口并重取列表', async () => {
     const w = mountView()
     await flushPromises()
-    await w.find('[data-test="adm-withdraw"]').trigger('click')
-    await flushPromises()
+    await clickMenu(w, 'adm-withdraw')
     expect(api.storeWithdraw).toHaveBeenCalledWith(1)
-    await w.find('[data-test="adm-tab-withdrawn"]').trigger('click')
-    await w.find('[data-test="adm-republish"]').trigger('click')
+    expect(api.storeAdminReleases).toHaveBeenCalledTimes(2)
+  })
+
+  it('详情抽屉：身份字段只读、未在服预览禁用、可转编辑、截图可删', async () => {
+    api.storeAdminReleases.mockResolvedValue({
+      data: [{ ...releases[0], application_count: 3,
+               screenshots: ['http://t/store/releases/1/shot.png'] }],
+    })
+    const w = mountView()
     await flushPromises()
-    expect(api.storeRepublish).toHaveBeenCalledWith(2)
+    await w.find('[data-test="adm-detail-open"]').trigger('click')
+    await flushPromises()
+    const drawer = document.querySelector('.ant-drawer-content')
+    expect(drawer.textContent).toContain('标识 slug')
+    expect(drawer.textContent).toContain('test1')
+    expect(drawer.textContent).toContain('3 条申请')
+    expect(drawer.textContent).toContain('未被编辑')
+    expect(drawer.querySelector('[data-test="adm-detail-preview"]').disabled).toBe(false)
+    drawer.querySelector('[data-test="adm-shot-del"]').click()
+    await flushPromises()
+    expect(api.storeDelShot).toHaveBeenCalledWith(1, 0)
+    drawer.querySelector('[data-test="adm-detail-edit"]').click()
+    await flushPromises()
+    expect(document.querySelector('.ant-modal-content').textContent).toContain('编辑「测试应用一」')
+  })
+
+  it('详情抽屉：preview_url 为空时打开预览禁用并说明原因', async () => {
+    api.storeAdminReleases.mockResolvedValue({ data: [releases[1]] })
+    const w = mountView()
+    await flushPromises()
+    await w.find('[data-test="adm-detail-open"]').trigger('click')
+    await flushPromises()
+    const btn = document.querySelector('[data-test="adm-detail-preview"]')
+    expect(btn.disabled).toBe(true)
+    expect(btn.getAttribute('title')).toContain('未在服')
   })
 
   it('预览：有地址开窗，无地址禁用', async () => {
@@ -124,14 +170,47 @@ describe('StoreAdminView', () => {
     expect(api.storeApprove).toHaveBeenCalledWith(9)
   })
 
-  it('分类管理：固定枚举的在架/版本总览', async () => {
+  it('分类管理：读字典出条目数，改名调序走 PATCH，新增走 POST', async () => {
+    api.storeCategories.mockResolvedValue({ data: [
+      { key: '效率工具', label: '效率工具', sort: 10, enabled: true,
+        release_count: 2, published_count: 1 },
+      { key: '其他', label: '其他', sort: 90, enabled: true, release_count: 0, published_count: 0 },
+    ] })
     const w = mountView()
     await flushPromises()
     await w.find('[data-test="adm-cat-open"]').trigger('click')
     await flushPromises()
     const modal = document.querySelector('.ant-modal-content')
-    expect(modal.textContent).toContain('1 在架 / 2 版本')
-    expect(modal.textContent).toContain('平台固定枚举')
+    expect(modal.textContent).toContain('1 / 2')       // 在架 / 版本
+    const label = modal.querySelector('[data-test="cat-label"]')
+    label.value = '效率与备忘'
+    label.dispatchEvent(new Event('input', { bubbles: true }))
+    await flushPromises()
+    modal.querySelector('[data-test="cat-save"]').click()
+    await flushPromises()
+    expect(api.storePatchCategory).toHaveBeenCalledWith('效率工具', {
+      label: '效率与备忘', sort: 10,
+    })
+    // 「其他」是兜底：不能停用也不能删
+    const rows = modal.querySelectorAll('.zc-sadm-cat-row2')
+    const other = rows[rows.length - 1]
+    expect(other.querySelector('[data-test="cat-enabled"]').disabled).toBe(true)
+    expect(other.querySelector('[data-test="cat-del"]').disabled).toBe(true)
+  })
+
+  it('分类停用：调 PATCH 带 enabled=false；被拒时把后端的解释原样给运营看', async () => {
+    api.storeCategories.mockResolvedValue({ data: [
+      { key: '看板', label: '看板', sort: 15, enabled: true, release_count: 3, published_count: 3 },
+    ] })
+    api.storePatchCategory.mockRejectedValue({ response: { data: { detail: '分类不存在或已停用：看板' } } })
+    const w = mountView()
+    await flushPromises()
+    await w.find('[data-test="adm-cat-open"]').trigger('click')
+    await flushPromises()
+    const modal = document.querySelector('.ant-modal-content')
+    modal.querySelector('[data-test="cat-enabled"]').click()
+    await flushPromises()
+    expect(api.storePatchCategory).toHaveBeenCalledWith('看板', { enabled: false })
   })
 
   it('页头：返回固定回对话页，统计格按当前数据出数', async () => {
@@ -161,5 +240,55 @@ describe('StoreAdminView', () => {
     await flushPromises()
     expect(w2.find('[data-test="empty-loading"]').exists()).toBe(false)
     expect(w2.find('[data-test="empty-state"]').text()).toContain('还没有应用上架')
+  })
+
+  it('运营编辑：☰ 开弹框回填当前值，保存只发白名单三字段', async () => {
+    const w = mountView()
+    await flushPromises()
+    await w.find('.zc-sadm-menu-btn').trigger('click')
+    await flushPromises()
+    const item = document.querySelector('[data-test="adm-edit"]')
+    expect(item).toBeTruthy()
+    item.click()
+    await flushPromises()
+    const modal = document.querySelector('.ant-modal-content')
+    expect(modal.textContent).toContain('编辑「测试应用一」')
+    const title = modal.querySelector('[data-test="adm-edit-title"]')
+    expect(title.value).toBe('测试应用一')
+    title.value = '改过的标题'
+    title.dispatchEvent(new Event('input', { bubbles: true }))
+    await flushPromises()
+    modal.querySelector('.ant-btn-primary').click()
+    await flushPromises()
+    expect(api.storeUpdateRelease).toHaveBeenCalledWith(1, {
+      title: '改过的标题', summary: 'Vue 3 + Node.js', category: '效率工具',
+    })
+    // 保存成功后重新拉列表，让留痕与文案从服务端真值回来
+    expect(api.storeAdminReleases).toHaveBeenCalledTimes(2)
+  })
+
+  it('运营编辑：标题清空则不发请求；有留痕的行渲染「已由 X 编辑」副行', async () => {
+    const w = mountView()
+    await flushPromises()
+    await w.find('.zc-sadm-menu-btn').trigger('click')
+    await flushPromises()
+    document.querySelector('[data-test="adm-edit"]').click()
+    await flushPromises()
+    const modal = document.querySelector('.ant-modal-content')
+    const title = modal.querySelector('[data-test="adm-edit-title"]')
+    title.value = '   '
+    title.dispatchEvent(new Event('input', { bubbles: true }))
+    await flushPromises()
+    modal.querySelector('.ant-btn-primary').click()
+    await flushPromises()
+    expect(api.storeUpdateRelease).not.toHaveBeenCalled()
+
+    api.storeAdminReleases.mockResolvedValue({
+      data: [{ ...releases[0], updated_at: '2026-11-20T02:00:00', editor: '创始人' }],
+    })
+    const w2 = mountView()
+    await flushPromises()
+    expect(w2.find('[data-test="adm-edited"]').exists()).toBe(true)
+    expect(w2.find('[data-test="adm-edited"]').text()).toContain('已由 创始人 编辑')
   })
 })

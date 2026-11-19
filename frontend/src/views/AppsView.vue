@@ -29,10 +29,11 @@ import { copyText } from '../utils/clipboard'
 import DeployLogPanel from '../components/DeployLogPanel.vue'
 import BackButton from '../components/BackButton.vue'
 import { openWorkspaceFilesPage, resolveOpenFolderMode } from '../utils/openFolder'
-import { STORE_CATEGORIES, DEFAULT_STORE_CATEGORY } from '../utils/storeCategories'
+import { DEFAULT_STORE_CATEGORY } from '../utils/storeCategories'
 import { canPublish } from '../utils/publishableStacks'
 import { isMobileApp } from '../utils/mobileApp'
 import { useConfigStore } from '../stores/config'
+import { useCategoryStore } from '../stores/categories'
 
 const apps = ref([])
 // 「共享给我」（规格 2026-11-16 §5.3）：独立区块、不混排；页头统计只算自有应用
@@ -58,6 +59,8 @@ const shareM = reactive({ open: false, app: null, members: [], users: [], pick: 
                           pendingReq: null, rejectReason: '', loading: false, busy: false })
 const openingFolder = ref(false)
 const cfg = useConfigStore()
+// 上架弹窗的分类下拉读字典（ADR-0061 §4），不再用写死的镜像数组
+const cats = useCategoryStore()
 // 仪表带数据：整页一次批量取（appMetricsSummary），按 app_id 贴回卡片。
 // window 只认后端回的那个值——曲线口径有两处写法时，前端这处迟早过期。
 const msum = reactive({ window: '1h', items: [] })
@@ -100,6 +103,7 @@ async function load(silent = false) {
 // 要么状态变钝。
 onMounted(() => {
   load()
+  cats.load()
   loadSummary()
   timer = setInterval(() => load(true), 5000)
   metricsTimer = setInterval(loadSummary, 30000)
@@ -1124,7 +1128,7 @@ function openUninstall(a) {
     <a-modal v-model:open="rel.open" title="发布到商店" ok-text="上架" destroy-on-close @ok="doRelease">
       <a-input v-model:value="rel.title" placeholder="商店展示名称" />
       <a-select v-model:value="rel.category" style="width: 100%; margin-top: 8px">
-        <a-select-option v-for="c in STORE_CATEGORIES" :key="c" :value="c">{{ c }}</a-select-option>
+        <a-select-option v-for="c in cats.enabledKeys" :key="c" :value="c">{{ c }}</a-select-option>
       </a-select>
       <a-textarea v-model:value="rel.summary" placeholder="一句话简介（可选）" :rows="3"
                   style="margin-top: 8px" />

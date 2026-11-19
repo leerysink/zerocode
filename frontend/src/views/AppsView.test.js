@@ -33,6 +33,17 @@ vi.mock('../api', () => mocks.api)
 vi.mock('ant-design-vue', () => mocks.antd)
 // AppsView 顶层调 useConfigStore()：无 pinia 会挂载即抛，这里给一个只读桩
 vi.mock('../stores/config', () => ({ useConfigStore: () => mocks.cfg }))
+// 上架弹窗的分类改读字典 store（ADR-0061 §4）：同 config 的给法，桩一个只读面，
+// 分类清单沿用原来的 5 项，所以下面的选项断言不用动
+vi.mock('../stores/categories', () => ({
+  useCategoryStore: () => ({
+    items: [],
+    enabled: [],
+    enabledKeys: ['效率工具', '数据管理', '内容展示', '演示样例', '其他'],
+    labelOf: (k) => k || '其他',
+    load: () => Promise.resolve(),
+  }),
+}))
 
 import AppsView from './AppsView.vue'
 

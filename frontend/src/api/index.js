@@ -159,6 +159,10 @@ export const storeReleases = (params) => http.get('/store/releases', { params })
 export const storeAdminReleases = (params) => http.get('/store/admin/releases', { params })
 export const storeWithdraw = (id) => http.post(`/store/releases/${id}/withdraw`)
 export const storeRepublish = (id) => http.post(`/store/releases/${id}/republish`)
+// 运营编辑（ADR-0061 §1）：仅创始人，字段面固定 title/summary/category
+export const storeUpdateRelease = (id, body) => http.patch(`/store/releases/${id}`, body)
+// 硬删（ADR-0061 §3）：只对无引用行开放，有引用后端回 409 与计数
+export const storePurgeRelease = (id) => http.delete(`/store/releases/${id}`)
 export const storeApplications = (box = 'mine') => http.get('/store/applications', { params: { box } })
 export const storeMyReleases = () => http.get('/store/applications', { params: { box: 'review' } })
 export const storeApply = (releaseId, wantName) =>
@@ -181,6 +185,13 @@ export const storeAddShot = (releaseId, file) => {
 }
 export const storeDelShot = (releaseId, index) =>
   http.delete(`/store/releases/${releaseId}/screenshots/${index}`)
+// 分类字典（ADR-0061 §4）：key 是中文，进路径前必须编码
+export const storeCategories = () => http.get('/store/categories')
+export const storeCreateCategory = (body) => http.post('/store/categories', body)
+export const storePatchCategory = (key, body) =>
+  http.patch(`/store/categories/${encodeURIComponent(key)}`, body)
+export const storeDeleteCategory = (key) =>
+  http.delete(`/store/categories/${encodeURIComponent(key)}`)
 
 // ---- 登录体系（Ticket 002 / ADR-0003：actor 即登录用户）----
 export const authRegister = (data) => http.post('/auth/register', data) // {nickname, password}
