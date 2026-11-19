@@ -7,7 +7,7 @@
 // 补全在这里只是把 CompletionContext 翻成 (doc, caret) 再原样交出去——「该补表名还是列名、
 // 表名从哪一段抠、缓存什么时候失效」全部在 utils/sqlCompletion.js，那里才是要被测的部分。
 import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { EditorState } from '@codemirror/state'
+import { EditorState, Compartment } from '@codemirror/state'
 import { EditorView } from '@codemirror/view'
 import { HighlightStyle, syntaxHighlighting } from '@codemirror/language'
 import { tags as t } from '@lezer/highlight'
@@ -21,6 +21,8 @@ const props = defineProps({
   // utils/sqlCompletion.createCompletionContext 的产物。必须是**引用稳定**的对象：
   // 扩展链只在 onMounted 建一次，切 env / 表清单变化都靠调用方原地 setEnv/setTables。
   completion: { type: Object, default: null },
+  // 全局控制台主题（ADR-0055）：切主题经 compartment 热重配置，不重建实例、不丢光标/选区/撤销栈。
+  theme: { type: String, default: 'light' },
 })
 const emit = defineEmits(['update:modelValue', 'execute', 'format'])
 
@@ -56,6 +58,26 @@ const consoleTheme = EditorView.theme({
   '.cm-operator, .cm-punctuation': { color: '#5c6875' },
 }, { dark: false })
 
+// 深色变体：色值与 db-admin.less 的 --zc-db-* 深色块同口径（panel/chrome/accent/ok/warn）。
+const consoleThemeDark = EditorView.theme({
+  '&': { backgroundColor: '#1e242c', fontSize: '13px' },
+  '&.cm-focused': { outline: 'none' },
+  '.cm-content': { caretColor: '#82a8d0', padding: '8px 0' },
+  '.cm-cursor, .cm-dropCursor': { borderLeftColor: '#82a8d0' },
+  '.cm-selectionBackground, &.cm-focused .cm-selectionBackground, .cm-content ::selection': { backgroundColor: '#2a3644' },
+  '.cm-activeLine': { backgroundColor: '#232a33' },
+  '.cm-gutters': { backgroundColor: '#232a33', color: '#93a1b0', border: 'none', borderRight: '1px solid #313a45' },
+  '.cm-keyword': { color: '#82a8d0', fontWeight: '600' },
+  '.cm-def, .cm-variableName, .cm-type': { color: '#d5dce4' },
+  '.cm-string, .cm-string2': { color: '#6fc98f' },
+  '.cm-number, .cm-atom': { color: '#d9a85a' },
+  '.cm-comment': { color: '#93a1b0', fontStyle: 'italic' },
+  '.cm-operator, .cm-punctuation': { color: '#a2adba' },
+}, { dark: true })
+
+const themeCompartment = new Compartment()
+const themeFor = (theme) => (theme === 'dark' ? consoleThemeDark : consoleTheme)
+
 // 快捷键只在编辑器内生效（US-02 / US-10 验收 3：焦点在页面上其他控件时不误触发）。
 // 走 keymap 而不是 window keydown：CM 自己消化按键，Enter 换行、Ctrl+F 搜索这些默认行为不受影响，
 // 也不用操心组件卸载后监听器漏摘。「做什么」由控制台决定（拆分、确认、格式化取段），这里只报事件。
@@ -90,7 +112,7 @@ onMounted(() => {
         EditorView.lineWrapping,
         editorKeymap,
         autocompletion({ override: [sqlCompletionSource] }),
-        consoleTheme,
+        themeCompartment.of(themeFor(props.theme)),
         EditorView.updateListener.of((u) => {
           if (u.docChanged) emit('update:modelValue', u.state.doc.toString())
         }),
@@ -112,6 +134,12 @@ watch(() => props.modelValue, (val) => {
   const next = val ?? ''
   if (cur === next) return
   view.dispatch({ changes: { from: 0, to: cur.length, insert: next } })
+})
+
+// 主题热切：只重配置 theme 槽，文档/选区/撤销栈原样（US-11）。
+watch(() => props.theme, (theme) => {
+  if (!view) return
+  view.dispatch({ effects: themeCompartment.reconfigure(themeFor(theme)) })
 })
 
 defineExpose({

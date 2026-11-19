@@ -126,13 +126,13 @@ async function remove(r) {
 
 <style scoped>
 .zc-rdot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 6px; }
-.zc-rdot.dot-success { background: #5b8a72; }
-.zc-rdot.dot-failed, .zc-rdot.dot-interrupted { background: #b96a6a; }
-.zc-rdot.dot-running { background: #5b7a9d; }
+.zc-rdot.dot-success { background: var(--zc-success); }
+.zc-rdot.dot-failed, .zc-rdot.dot-interrupted { background: var(--zc-danger); }
+.zc-rdot.dot-running { background: var(--zc-primary); }
 .zc-rec-detail { margin-top: 12px; border: 1px solid var(--zc-border); border-radius: 6px;
                  padding: 10px 14px; font-size: 12px; }
 .zc-rec-detail p { margin: 0 0 6px; }
-.zc-rec-detail pre { background: #f7f8fa; border-radius: 4px; padding: 8px 10px; margin: 0;
+.zc-rec-detail pre { background: var(--zc-bg-inset); border-radius: 4px; padding: 8px 10px; margin: 0;
                      font-size: 11px; white-space: pre-wrap; word-break: break-all;
                      max-height: 200px; overflow-y: auto; }
 .zc-rec-close { float: right; cursor: pointer; color: var(--zc-text-sub); }

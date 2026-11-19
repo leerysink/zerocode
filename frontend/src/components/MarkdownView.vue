@@ -4,7 +4,7 @@
 // 共享同一实例（单例）；<script setup> 内不重复 new MarkdownIt。
 import MarkdownIt from 'markdown-it'
 import hljs from 'highlight.js/lib/common'
-import 'highlight.js/styles/github.css'
+import '../styles/markdown.less' // 主题感知版 github 配色（US-12），取代 github.css 全局副作用
 
 const md = new MarkdownIt({
   html: false,

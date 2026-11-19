@@ -5,6 +5,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { h } from 'vue'
 import { flushPromises, mount } from '@vue/test-utils'
+import { createPinia } from 'pinia'
 
 const mocks = vi.hoisted(() => ({
   route: { params: {} },
@@ -103,7 +104,7 @@ const STUBS = {
 
 async function mountView({ id = '933', memoryId = '12' } = {}) {
   mocks.route.params = { id, memoryId }
-  const wrapper = mount(MemoryDetailView, { global: { stubs: STUBS } })
+  const wrapper = mount(MemoryDetailView, { global: { stubs: STUBS, plugins: [createPinia()] } })
   await flushPromises()
   return wrapper
 }
@@ -287,5 +288,18 @@ describe('MemoryDetailView 删除', () => {
     expect(mocks.replace).not.toHaveBeenCalled()
     expect(wrapper.find('.zc-memd-note').text()).toContain('暂无记忆')
     expect(wrapper.find('.zc-mil-empty').exists()).toBe(true)
+  })
+})
+
+describe('MemoryDetailView 主题别名入口', () => {
+  it('默认浅色（全局口径），点主题按钮拨全局偏好并记在新键', async () => {
+    const wrapper = await mountView()
+    expect(wrapper.find('.zc-memd').attributes('data-theme')).toBe('light')
+
+    await wrapper.find('.zc-memd-theme-toggle').trigger('click')
+
+    expect(wrapper.find('.zc-memd').attributes('data-theme')).toBe('dark')
+    expect(localStorage.getItem('zc.console.theme.v1')).toBe('dark')
+    expect(localStorage.getItem('zc.workbench.theme.v1')).toBe(null)
   })
 })

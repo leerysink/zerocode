@@ -388,7 +388,7 @@ async function doDelete() {
 /* 拖动中的那一组：抬起来一点，跟其它行拉开层次（换位是实时提交的，不补位移动画） */
 .zc-group.is-dragging .zc-group-head {
   background: var(--zc-sidebar-bg);
-  box-shadow: 0 2px 10px rgba(47, 58, 71, 0.16);
+  box-shadow: 0 2px 10px rgba(var(--zc-shadow-rgb), 0.16);
 }
 .zc-group-head {
   display: flex;
@@ -465,7 +465,7 @@ async function doDelete() {
   background: var(--zc-bg);
 }
 .zc-app-menu-danger {
-  color: #b96a6a;
+  color: var(--zc-danger);
 }
 .zc-session {
   display: flex;
@@ -481,7 +481,7 @@ async function doDelete() {
   background: var(--zc-bg);
 }
 .zc-session.active {
-  background: rgba(91, 122, 157, 0.12);
+  background: rgba(var(--zc-primary-rgb), 0.12);
   color: var(--zc-primary);
 }
 .zc-title {
@@ -502,13 +502,13 @@ async function doDelete() {
   color: var(--zc-primary);
 }
 .zc-session-status.is-waiting {
-  color: #d9a12a;
+  color: var(--zc-status-waiting);
 }
 .zc-session-status.is-completed {
-  color: #3f9d5a;
+  color: var(--zc-status-done);
 }
 .zc-session-status.is-failed {
-  color: #c25b5b;
+  color: var(--zc-status-failed);
 }
 .zc-time {
   color: var(--zc-text-sub);
@@ -522,7 +522,7 @@ async function doDelete() {
   color: var(--zc-text-sub);
 }
 .zc-del:hover {
-  color: #b96a6a;
+  color: var(--zc-danger);
 }
 .zc-session:hover .zc-del {
   opacity: 1;

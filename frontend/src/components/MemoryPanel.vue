@@ -341,7 +341,7 @@ onMounted(load)
   border-radius: 4px;
   padding: 8px;
   margin-bottom: 6px;
-  background: #fff;
+  background: var(--zc-bg-card);
 }
 .zc-mem-item-head {
   display: flex;

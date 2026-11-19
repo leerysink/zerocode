@@ -71,19 +71,19 @@ const toolName = computed(() => props.msg.name ?? props.msg.tool_name ?? 'web_do
   border-left: 3px solid var(--zc-border);
   border-radius: 8px;
   padding: 10px 12px;
-  background: #fbfcfd;
+  background: var(--zc-bg-card-soft);
 }
 .zc-page.is-ok {
-  border-left-color: #52a06b;
-  background: #f6fbf7;
+  border-left-color: var(--zc-success-bright);
+  background: var(--zc-success-bg);
 }
 .zc-page.is-error {
-  border-left-color: #c4636a;
-  background: #fdeeee;
+  border-left-color: var(--zc-danger-bright);
+  background: var(--zc-danger-bg);
 }
 .zc-page.is-info {
   border-left-color: var(--zc-primary);
-  background: #f4f8fd;
+  background: var(--zc-bg-info);
 }
 .zc-page-head {
   display: flex;
@@ -99,7 +99,7 @@ const toolName = computed(() => props.msg.name ?? props.msg.tool_name ?? 'web_do
 .zc-page-tool {
   font-size: 11px;
   color: var(--zc-text-sub);
-  background: rgba(91, 122, 157, 0.08);
+  background: rgba(var(--zc-primary-rgb), 0.08);
   border-radius: 4px;
   padding: 1px 6px;
 }
@@ -130,7 +130,7 @@ const toolName = computed(() => props.msg.name ?? props.msg.tool_name ?? 'web_do
   margin-top: 8px;
   font-size: 13px;
   line-height: 1.7;
-  color: #a05a5a;
+  color: var(--zc-danger-text);
   white-space: pre-wrap;
   word-break: break-word;
 }

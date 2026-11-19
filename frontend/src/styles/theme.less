@@ -1,12 +1,219 @@
+/* 控制台主题变量（ADR-0055）：浅色值与换肤前逐字节一致，深色值供 :root[data-theme='dark'] 换值。
+   架构：基础变量 + RGB 三元组（rgba(var(--zc-*-rgb), α) 的 α 留调用点）+ 语义实色 + 表面/边框族。
+   豁免清单与逐文件映射见 .scratch/console-theme/variable-map.md。 */
 :root {
+  color-scheme: light;
+  /* 基础六件（001 票既有） */
   --zc-primary: #5b7a9d;
   --zc-bg: #f5f7fa;
   --zc-sidebar-bg: #fbfcfe;
   --zc-border: #e5eaf0;
   --zc-text: #2f3a47;
   --zc-text-sub: #8a97a5;
+
+  /* RGB 三元组：tint/阴影用，α 留调用点 */
+  --zc-primary-rgb: 91, 122, 157;
+  --zc-text-rgb: 47, 58, 71;
+  --zc-shadow-rgb: 47, 58, 71;
+  --zc-success-rgb: 91, 138, 114;
+  --zc-success-bright-rgb: 82, 160, 107;
+  --zc-success-soft-rgb: 122, 167, 122;
+  --zc-danger-rgb: 185, 106, 106;
+  --zc-danger-text-rgb: 160, 90, 90;
+  --zc-danger-bright-rgb: 196, 99, 106;
+  --zc-danger-bg-rgb: 253, 238, 238;
+  --zc-amber-rgb: 196, 154, 68;
+  --zc-amber-bright-rgb: 217, 154, 60;
+  --zc-brown-rgb: 161, 124, 91;
+  --zc-warn-text-rgb: 154, 123, 62;
+  --zc-warn-deep-rgb: 138, 109, 59;
+
+  /* 表面族 */
+  --zc-bg-card: #fff;
+  --zc-bg-card-soft: #fbfcfd;
+  --zc-bg-inset: #f7f8fa;
+  --zc-bg-code: #f6f8fa;
+  --zc-bg-option: #fafbfc;
+  --zc-bg-attach: #f4f6f9;
+  --zc-bg-bubble: #e8f1fb;
+  --zc-bg-info: #f4f8fd;
+  --zc-success-bg: #f6fbf7;
+  --zc-warning-bg: #fdfaf3;
+  --zc-danger-bg: #fdeeee;
+  --zc-danger-bg-alt: #fdf3f2;
+  --zc-diff-add-bg: #edf6ed;
+  --zc-diff-del-bg: #fbf0f0;
+  --zc-overlay-light: rgba(255, 255, 255, 0.6);
+  --zc-tooltip-bg: rgba(47, 58, 71, 0.92);
+  --zc-tooltip-text: #fff;
+
+  /* 语义实色：成功/危险/警告各档（低饱和设计语言，深浅值成对） */
+  --zc-success: #5b8a72;
+  --zc-success-bright: #52a06b;
+  --zc-success-soft: #7aa77a;
+  --zc-success-deep: #4a7263;
+  --zc-danger: #b96a6a;
+  --zc-danger-bright: #c4636a;
+  --zc-danger-text: #a05a5a;
+  --zc-warning: #c08a3e;
+  --zc-warning-bright: #d99a3c;
+  --zc-warning-brown: #a17c5b;
+  --zc-warning-text: #9a7b3f;
+  --zc-warning-text-alt: #9a7b3e;
+  --zc-warning-deep: #8a6d3b;
+  --zc-warning-deep-alt: #8a6b3f;
+  --zc-warning-readout: #9a7333;
+  --zc-warning-orange: #b06a3e;
+  --zc-diff-add-text: #47705a;
+  --zc-ok-text: #3f6b52;
+  --zc-done-text: #4f7d4f;
+  --zc-status-waiting: #d9a12a;
+  --zc-status-done: #3f9d5a;
+  --zc-status-failed: #c25b5b;
+  --zc-neutral: #9aa0a6;
+  --zc-text-weak: #8b95a1;
+  --zc-text-faint: rgba(0, 0, 0, 0.45);
+  --zc-purple: #8a7ba6;
+  --zc-purple-deep: #6f6290;
+
+  /* 边框族 */
+  --zc-border-alt: #e5e7eb;
+  --zc-border-soft: #e6e8eb;
+  --zc-danger-border: #eadcdb;
+  --zc-danger-border-soft: #f2d8d8;
+  --zc-warning-border: #ecdfc4;
+  --zc-neutral-rail: #b6bfca;
+  --zc-step-line: #d3d6db;
+
+  /* 图表 */
+  --zc-chart-cursor-stroke: #fff;
+}
+:root[data-theme='dark'] {
+  color-scheme: dark;
+  --zc-primary: #5b7a9d;
+  --zc-bg: #171c22;
+  --zc-sidebar-bg: #1e242c;
+  --zc-border: #313a45;
+  --zc-text: #d5dce4;
+  --zc-text-sub: #8a97a5;
+
+  --zc-primary-rgb: 91, 122, 157;
+  --zc-text-rgb: 213, 220, 228;
+  --zc-shadow-rgb: 0, 0, 0;
+  --zc-success-rgb: 111, 175, 143;
+  --zc-success-bright-rgb: 111, 201, 143;
+  --zc-success-soft-rgb: 143, 201, 143;
+  --zc-danger-rgb: 224, 138, 138;
+  --zc-danger-text-rgb: 224, 138, 138;
+  --zc-danger-bright-rgb: 224, 138, 138;
+  --zc-danger-bg-rgb: 58, 30, 30;
+  --zc-amber-rgb: 217, 168, 90;
+  --zc-amber-bright-rgb: 224, 179, 90;
+  --zc-brown-rgb: 217, 168, 118;
+  --zc-warn-text-rgb: 217, 179, 106;
+  --zc-warn-deep-rgb: 201, 163, 95;
+
+  --zc-bg-card: #1e242c;
+  --zc-bg-card-soft: #232a33;
+  --zc-bg-inset: #1a2028;
+  --zc-bg-code: #1a2028;
+  --zc-bg-option: #232a33;
+  --zc-bg-attach: #2a323c;
+  --zc-bg-bubble: #2a3644;
+  --zc-bg-info: #222c38;
+  --zc-success-bg: #1e2b22;
+  --zc-warning-bg: #2b261c;
+  --zc-danger-bg: #33201f;
+  --zc-danger-bg-alt: #332422;
+  --zc-diff-add-bg: #1e3a24;
+  --zc-diff-del-bg: #3a1e1e;
+  --zc-overlay-light: rgba(23, 28, 34, 0.6);
+  --zc-tooltip-bg: rgba(213, 220, 228, 0.92);
+  --zc-tooltip-text: #171c22;
+
+  --zc-success: #6faf8f;
+  --zc-success-bright: #6fc98f;
+  --zc-success-soft: #8fc98f;
+  --zc-success-deep: #7fbf9f;
+  --zc-danger: #e08a8a;
+  --zc-danger-bright: #e08a8a;
+  --zc-danger-text: #e08a8a;
+  --zc-warning: #d9a85a;
+  --zc-warning-bright: #e0b35a;
+  --zc-warning-brown: #d9a876;
+  --zc-warning-text: #d9b36a;
+  --zc-warning-text-alt: #d9b36a;
+  --zc-warning-deep: #c9a35f;
+  --zc-warning-deep-alt: #c9a35f;
+  --zc-warning-readout: #d9a85a;
+  --zc-warning-orange: #e09a6a;
+  --zc-diff-add-text: #7ec699;
+  --zc-ok-text: #7ec699;
+  --zc-done-text: #8fc98f;
+  --zc-status-waiting: #e0b35a;
+  --zc-status-done: #6fc98f;
+  --zc-status-failed: #e08a8a;
+  --zc-neutral: #8a97a5;
+  --zc-text-weak: #93a1b0;
+  --zc-text-faint: rgba(255, 255, 255, 0.45);
+  --zc-purple: #b3a3d6;
+  --zc-purple-deep: #a393d6;
+
+  --zc-border-alt: #313a45;
+  --zc-border-soft: #313a45;
+  --zc-danger-border: #5a3a38;
+  --zc-danger-border-soft: #5a3a38;
+  --zc-warning-border: #5a4a2e;
+  --zc-neutral-rail: #4a5560;
+  --zc-step-line: #3a4450;
+
+  --zc-chart-cursor-stroke: #1e242c;
 }
 body { background: var(--zc-bg); color: var(--zc-text); }
+
+/* antd 静态浮层（message / notification / Modal.confirm）自建渲染根，不吃 config-provider
+   的 darkAlgorithm——但它们挂在 body 下，仍是 html[data-theme] 后代，按选择器覆写收敛。
+   声明式 a-modal/a-drawer 走 provider token，不在此列（confirm 专属 .ant-modal-confirm 避免误伤）。 */
+:root[data-theme='dark'] .ant-message .ant-message-notice-content {
+  background: var(--zc-bg-card);
+  color: var(--zc-text);
+  box-shadow: 0 6px 16px rgba(var(--zc-shadow-rgb), 0.32);
+}
+:root[data-theme='dark'] .ant-notification .ant-notification-notice {
+  background: var(--zc-bg-card);
+  box-shadow: 0 6px 16px rgba(var(--zc-shadow-rgb), 0.32);
+}
+:root[data-theme='dark'] .ant-notification .ant-notification-notice-message {
+  color: var(--zc-text);
+}
+:root[data-theme='dark'] .ant-notification .ant-notification-notice-description {
+  color: var(--zc-text-sub);
+}
+:root[data-theme='dark'] .ant-notification .ant-notification-notice-close {
+  color: var(--zc-text-sub);
+}
+:root[data-theme='dark'] .ant-modal-confirm .ant-modal-content {
+  background: var(--zc-bg-card);
+  box-shadow: 0 12px 32px rgba(var(--zc-shadow-rgb), 0.4);
+}
+:root[data-theme='dark'] .ant-modal-confirm .ant-modal-confirm-title {
+  color: var(--zc-text);
+}
+:root[data-theme='dark'] .ant-modal-confirm .ant-modal-confirm-content {
+  color: var(--zc-text);
+}
+:root[data-theme='dark'] .ant-modal-confirm .ant-modal-close {
+  color: var(--zc-text-sub);
+}
+:root[data-theme='dark'] .ant-modal-confirm .ant-btn-default:not(:disabled) {
+  background: var(--zc-bg-card);
+  border-color: var(--zc-border);
+  color: var(--zc-text);
+}
+:root[data-theme='dark'] .ant-modal-confirm .ant-btn-default:not(:disabled):hover {
+  border-color: var(--zc-primary);
+  color: var(--zc-primary);
+}
 
 /* 侧栏拖拽调宽期间：指针移出热区也保持 col-resize、不选中正文，宽度实时跟手不补动画 */
 body.zc-panel-resizing,

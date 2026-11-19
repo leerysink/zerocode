@@ -4,6 +4,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { Comment, h } from 'vue'
 import { flushPromises, mount } from '@vue/test-utils'
+import { createPinia } from 'pinia'
 
 const mocks = vi.hoisted(() => ({
   api: { dbTables: vi.fn(), dbTableSchema: vi.fn(), dbTableData: vi.fn(), dbSqlExec: vi.fn(), dbSqlBatch: vi.fn(), dbAudit: vi.fn(), getApp: vi.fn() },
@@ -70,14 +71,14 @@ beforeEach(() => {
 })
 
 it('挂载拉表并渲染树节点', async () => {
-  const w = mount(DbAdminView, { global: { stubs: STUBS } })
+  const w = mount(DbAdminView, { global: { plugins: [createPinia()], stubs: STUBS } })
   await flushPromises()
   expect(mocks.api.dbTables).toHaveBeenCalledWith('1', 'dev')
   expect(w.find('.zc-tree-node').text()).toContain('widgets')
 })
 
 it('切到 prod 重新拉表并显示警示条', async () => {
-  const w = mount(DbAdminView, { global: { stubs: STUBS } })
+  const w = mount(DbAdminView, { global: { plugins: [createPinia()], stubs: STUBS } })
   await flushPromises()
   await w.findAll('.zc-db-env button')[1].trigger('click')
   await flushPromises()
@@ -112,7 +113,7 @@ const gridTable = {
 }
 
 const mountGrid = (extraStubs = {}) => mount(DbAdminView, {
-  global: { stubs: { ...STUBS, 'a-table': gridTable, ...extraStubs } },
+  global: { plugins: [createPinia()], stubs: { ...STUBS, 'a-table': gridTable, ...extraStubs } },
 })
 
 /** 选默认表 → 点第 rowIndex 行的行末编辑按钮。 */
@@ -357,7 +358,7 @@ describe('Ticket 010 数据网格行末编辑列与弹框', () => {
 
 // ---------- Ticket 002: 查询控制台接线（SQL 执行用例已迁往 SqlConsole.test.js）----------
 it('查询页签挂 SqlConsole 并把 appId/env/tables 透传', async () => {
-  const w = mount(DbAdminView, { global: { stubs: STUBS } })
+  const w = mount(DbAdminView, { global: { plugins: [createPinia()], stubs: STUBS } })
   await flushPromises()
   const console_ = w.findComponent(SqlConsole)
   expect(console_.exists()).toBe(true)
@@ -367,7 +368,7 @@ it('查询页签挂 SqlConsole 并把 appId/env/tables 透传', async () => {
 })
 
 it('边界：切到 prod 后 SqlConsole 收到的是 prod', async () => {
-  const w = mount(DbAdminView, { global: { stubs: STUBS } })
+  const w = mount(DbAdminView, { global: { plugins: [createPinia()], stubs: STUBS } })
   await flushPromises()
   await w.findAll('.zc-db-env button')[1].trigger('click')
   await flushPromises()
@@ -376,7 +377,7 @@ it('边界：切到 prod 后 SqlConsole 收到的是 prod', async () => {
 
 it('打开审计抽屉拉操作历史', async () => {
   mocks.api.dbAudit.mockResolvedValue({ data: { items: [{ id: 1, op_type: 'select', status: 'success', env: 'dev' }] } })
-  const w = mount(DbAdminView, { global: { stubs: STUBS } })
+  const w = mount(DbAdminView, { global: { plugins: [createPinia()], stubs: STUBS } })
   await flushPromises()
   await w.find('.zc-db-audit-btn').trigger('click')
   await flushPromises()
@@ -387,7 +388,7 @@ it('打开审计抽屉拉操作历史', async () => {
 // ---------- Ticket 004: 审计过滤 + 顶栏刷新 ----------
 it('审计抽屉按环境过滤重拉', async () => {
   mocks.api.dbAudit.mockResolvedValue({ data: { items: [] } })
-  const w = mount(DbAdminView, { global: { stubs: STUBS } })
+  const w = mount(DbAdminView, { global: { plugins: [createPinia()], stubs: STUBS } })
   await flushPromises()
   await w.find('.zc-db-audit-btn').trigger('click')
   await flushPromises()
@@ -400,7 +401,7 @@ it('审计抽屉按环境过滤重拉', async () => {
 })
 
 it('顶栏刷新重拉当前表数据', async () => {
-  const w = mount(DbAdminView, { global: { stubs: STUBS } })
+  const w = mount(DbAdminView, { global: { plugins: [createPinia()], stubs: STUBS } })
   await flushPromises()
   await w.find('.zc-tree-node').trigger('click')
   await flushPromises()
@@ -427,7 +428,7 @@ const bodyCellTable = {
 
 describe('DbAdminView 样式轮边界', () => {
   it('状态栏：未选表说「未选择表」而不是「共 0 行」', async () => {
-    const w = mount(DbAdminView, { global: { stubs: STUBS } })
+    const w = mount(DbAdminView, { global: { plugins: [createPinia()], stubs: STUBS } })
     await flushPromises()
     expect(w.find('.zc-db-status').text()).toContain('未选择表')
     expect(w.find('.zc-db-status').text()).toContain('表 1 张')
@@ -435,7 +436,7 @@ describe('DbAdminView 样式轮边界', () => {
   })
 
   it('状态栏：选中表后带表名与行列信息', async () => {
-    const w = mount(DbAdminView, { global: { stubs: STUBS } })
+    const w = mount(DbAdminView, { global: { plugins: [createPinia()], stubs: STUBS } })
     await flushPromises()
     await w.find('.zc-tree-node').trigger('click')
     await flushPromises()
@@ -444,7 +445,7 @@ describe('DbAdminView 样式轮边界', () => {
 
   it('边界：选中表但 total 为 0 时仍是表名口径（共 0 行），不误报未选择', async () => {
     mocks.api.dbTableData.mockResolvedValue({ data: { columns: ['id'], rows: [], total: 0, truncated: false } })
-    const w = mount(DbAdminView, { global: { stubs: STUBS } })
+    const w = mount(DbAdminView, { global: { plugins: [createPinia()], stubs: STUBS } })
     await flushPromises()
     await w.find('.zc-tree-node').trigger('click')
     await flushPromises()
@@ -454,7 +455,7 @@ describe('DbAdminView 样式轮边界', () => {
 
   it('边界：库内一张表都没有时左树走空态，不渲染空树', async () => {
     mocks.api.dbTables.mockResolvedValue({ data: { tables: [] } })
-    const w = mount(DbAdminView, { global: { stubs: STUBS } })
+    const w = mount(DbAdminView, { global: { plugins: [createPinia()], stubs: STUBS } })
     await flushPromises()
     expect(w.find('.zc-db-left-empty').text()).toContain('该库暂无表')
     expect(w.find('.zc-db-tree').exists()).toBe(false)
@@ -463,7 +464,7 @@ describe('DbAdminView 样式轮边界', () => {
   })
 
   it('边界：prod 才给根节点挂 is-prod 警示类，dev 不染色', async () => {
-    const w = mount(DbAdminView, { global: { stubs: STUBS } })
+    const w = mount(DbAdminView, { global: { plugins: [createPinia()], stubs: STUBS } })
     await flushPromises()
     expect(w.find('.zc-db.is-prod').exists()).toBe(false)
     await w.findAll('.zc-db-env button')[1].trigger('click')
@@ -474,7 +475,7 @@ describe('DbAdminView 样式轮边界', () => {
   it('边界：行号列跨页连续，第 2 页首行是 51 而不是 1', async () => {
     mocks.api.dbTableData.mockResolvedValue({ data: { columns: ['id'], rows: [{ id: 51 }], total: 120, truncated: false } })
     let gridCols = null
-    const w = mount(DbAdminView, { global: { stubs: {
+    const w = mount(DbAdminView, { global: { plugins: [createPinia()], stubs: {
       ...STUBS,
       'a-table': {
         props: ['columns', 'pagination'],
@@ -506,7 +507,7 @@ describe('DbAdminView 样式轮边界', () => {
       { id: 3, ts: '刚刚', env: 'dev', op_type: 'select', status: 'unknown',
         duration_ms: 12, target_table: '', sql_text: 'SELECT 1', error: '' },
     ] } })
-    const w = mount(DbAdminView, { global: { stubs: { ...STUBS, 'a-table': bodyCellTable } } })
+    const w = mount(DbAdminView, { global: { plugins: [createPinia()], stubs: { ...STUBS, 'a-table': bodyCellTable } } })
     await flushPromises()
     await w.find('.zc-db-audit-btn').trigger('click')
     await flushPromises()
@@ -534,7 +535,7 @@ describe('DbAdminView 样式轮边界', () => {
 
   it('边界：审计空结果集只渲染表头不报错，也不塞一条假记录', async () => {
     mocks.api.dbAudit.mockResolvedValue({ data: { items: [] } })
-    const w = mount(DbAdminView, { global: { stubs: { ...STUBS, 'a-table': bodyCellTable } } })
+    const w = mount(DbAdminView, { global: { plugins: [createPinia()], stubs: { ...STUBS, 'a-table': bodyCellTable } } })
     await flushPromises()
     await w.find('.zc-db-audit-btn').trigger('click')
     await flushPromises()
@@ -545,7 +546,7 @@ describe('DbAdminView 样式轮边界', () => {
   // 类名一旦被误删，表现是「静默回到全局旧主色」而不是报错，所以必须有断言钉住。
   it('边界：portal 出去的抽屉与两个下拉都带着样式类，不带就等于样式漏了', async () => {
     mocks.api.dbAudit.mockResolvedValue({ data: { items: [] } })
-    const w = mount(DbAdminView, { global: { stubs: STUBS } })
+    const w = mount(DbAdminView, { global: { plugins: [createPinia()], stubs: STUBS } })
     await flushPromises()
     await w.find('.zc-db-audit-btn').trigger('click')
     await flushPromises()
@@ -557,7 +558,7 @@ describe('DbAdminView 样式轮边界', () => {
   })
 
   it('边界：没开抽屉时不渲染过滤器，也没有残留的下拉样式类', async () => {
-    const w = mount(DbAdminView, { global: { stubs: STUBS } })
+    const w = mount(DbAdminView, { global: { plugins: [createPinia()], stubs: STUBS } })
     await flushPromises()
     expect(w.find('.zc-db-audit-env').exists()).toBe(false)
     expect(w.find('.zc-db-audit-op').exists()).toBe(false)
@@ -625,7 +626,7 @@ describe('DB 操作台样式单源 db-admin.less', () => {
 describe('DbAdminView 被共享者只读（Ticket 006）', () => {
   it('角色来自应用详情：协作者显示只读横幅，所有者不显示', async () => {
     mocks.api.getApp.mockResolvedValue({ data: { id: 1, role: 'collaborator' } })
-    const w = mount(DbAdminView, { global: { stubs: STUBS } })
+    const w = mount(DbAdminView, { global: { plugins: [createPinia()], stubs: STUBS } })
     await flushPromises()
 
     expect(mocks.api.getApp).toHaveBeenCalledWith('1')
@@ -633,7 +634,7 @@ describe('DbAdminView 被共享者只读（Ticket 006）', () => {
     expect(w.find('.zc-db-ro-banner').text()).toContain('共享只读')
 
     mocks.api.getApp.mockResolvedValue({ data: { id: 1, role: 'owner' } })
-    const own = mount(DbAdminView, { global: { stubs: STUBS } })
+    const own = mount(DbAdminView, { global: { plugins: [createPinia()], stubs: STUBS } })
     await flushPromises()
     expect(own.find('.zc-db-ro-banner').exists()).toBe(false)
   })
@@ -660,7 +661,7 @@ describe('DbAdminView 被共享者只读（Ticket 006）', () => {
     mocks.api.dbSqlBatch.mockRejectedValue({
       response: { data: { detail: '共享只读：仅允许 SELECT' } },
     })
-    const w = mount(DbAdminView, { global: { stubs: STUBS } })
+    const w = mount(DbAdminView, { global: { plugins: [createPinia()], stubs: STUBS } })
     await flushPromises()
 
     await w.findComponent(SqlConsole).vm.submit(['UPDATE widgets SET name = 1'])

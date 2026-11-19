@@ -7,8 +7,9 @@
 // 语句级失败与 skipped 归 003、假分号归 004、多页签归 005；006 的选区优先与格式化
 // 也只测到“控制台拿到的选区”这一层：CodeMirror 里的真实 keydown 归浏览器实测。
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
-import { h } from 'vue'
+import { h, nextTick } from 'vue'
 import { enableAutoUnmount, flushPromises, mount } from '@vue/test-utils'
+import { createPinia } from 'pinia'
 
 const mocks = vi.hoisted(() => ({
   api: { dbSqlBatch: vi.fn(), dbTableSchema: vi.fn() },
@@ -19,6 +20,7 @@ vi.mock('../api', () => mocks.api)
 vi.mock('ant-design-vue', () => ({ ...mocks.antd, default: { message: mocks.antd.message, Modal: mocks.antd.Modal } }))
 
 import SqlConsole from './SqlConsole.vue'
+import { useThemeStore } from '../stores/theme'
 import { format } from 'sql-formatter'
 import { FORMAT_OPTIONS } from '../utils/sqlFormat'
 import { MAX_TABS, TABS_VERSION, tabsKey } from '../utils/sqlTabsStore'
@@ -46,7 +48,7 @@ let stubSel = { text: '', from: 0, to: 0 }
 let stubReplace = []
 const EDITOR_STUB = {
   name: 'SqlEditor',
-  props: ['modelValue'],
+  props: ['modelValue', 'theme'],
   emits: ['update:modelValue', 'execute', 'format'],
   render() {
     return h('textarea', { class: 'zc-sql-editor', value: this.modelValue ?? '',
@@ -114,7 +116,7 @@ const STUBS = {
 function mountConsole(props = {}, stubs = {}) {
   return mount(SqlConsole, {
     props: { appId: '1', env: 'dev', tables: [{ name: 'widgets' }], ...props },
-    global: { stubs: { ...STUBS, ...stubs } },
+    global: { stubs: { ...STUBS, ...stubs }, plugins: [createPinia()] },
   })
 }
 
@@ -1520,5 +1522,17 @@ describe('SqlConsole 补全接线（Ticket 008A / US-15）', () => {
     }
     const w = mountConsole({}, { SqlEditor: CAPTURE })
     expect(w.findComponent(CAPTURE).props('completion')).toBe(w.vm.completion)
+  })
+})
+
+describe('SqlConsole 主题接线', () => {
+  it('SqlEditor 收全局主题 prop，store 翻转即跟随（US-11 接线层）', async () => {
+    const w = mountConsole()
+    await flushPromises()
+    const editor = w.findComponent({ name: 'SqlEditor' })
+    expect(editor.props('theme')).toBe('light')
+    useThemeStore().toggle()
+    await nextTick()
+    expect(editor.props('theme')).toBe('dark')
   })
 })

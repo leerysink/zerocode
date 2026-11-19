@@ -22,6 +22,7 @@ import { message, Modal } from 'ant-design-vue'
 import { CloseOutlined, PlayCircleOutlined, PlusOutlined } from '@ant-design/icons-vue'
 import { dbSqlBatch, dbTableSchema } from '../api'
 import SqlEditor from './SqlEditor.vue'
+import { useThemeStore } from '../stores/theme'
 import { splitSqlStatements } from '../utils/sqlSplit'
 import { planExecution } from '../utils/sqlClassify'
 import { createCompletionContext } from '../utils/sqlCompletion'
@@ -33,6 +34,8 @@ const props = defineProps({
   env: { type: String, required: true },
   tables: { type: Array, default: () => [] },
 })
+
+const themeStore = useThemeStore()
 
 // ---- 补全上下文（Ticket 008A / US-15）
 // 只造一次、引用永久稳定：SqlEditor 的扩展链在 onMounted 里一次建好，换环境时另造一个
@@ -368,7 +371,7 @@ defineExpose({
     <div v-if="saveBlocked" class="zc-sql-storage-warn" role="alert">
       本地存储已满或不可用，本次不再自动保存；页签里的脚本仍在，请自行复制备份。
     </div>
-    <SqlEditor ref="editorRef" v-model="text" :completion="completion" class="zc-sql-input"
+    <SqlEditor ref="editorRef" v-model="text" :completion="completion" :theme="themeStore.theme" class="zc-sql-input"
                @execute="run" @format="formatSql" />
     <div class="zc-sql-tools">
       <a-button class="zc-sql-run" type="primary" :disabled="busy" title="Ctrl+Enter" @click="run"><play-circle-outlined />执行</a-button>
