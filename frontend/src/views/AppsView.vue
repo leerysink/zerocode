@@ -1191,7 +1191,14 @@ function openUninstall(a) {
 .zc-stat-value { font-size: 18px; font-weight: 600; line-height: 1.1; color: inherit;
                  font-variant-numeric: tabular-nums; }
 .zc-stat-label { font-size: 11px; color: var(--zc-text-sub); }
-.zc-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(480px, 1fr)); gap: 14px; }
+/* 三列等高（ADR-0062 §6）：与商店页、运营台同一口径。原先 minmax(480px,1fr) 的宽卡只属于
+   这一页，四页并排看仍是两副面孔。卡变窄后仪表带与工具条各自靠 minmax(0,1fr)/flex-wrap 自保。 */
+.zc-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--zc-space-4); align-items: stretch; }
+.zc-grid > .zc-card { display: flex; flex-direction: column; min-width: 0; }
+.zc-grid > .zc-card :deep(.ant-card-body) { flex: 1; display: flex; flex-direction: column; }
+@media (max-width: 1280px) { .zc-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 760px) { .zc-grid { grid-template-columns: 1fr; } }
 .zc-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 8px; flex-shrink: 0; }
 /* 标题行拉成 flex：状态点固定、应用名可省略号、规格标签贴着名字（antd 的 .ant-card-head-title 里） */
 .zc-card :deep(.ant-card-head-title) { display: flex; align-items: center; overflow: hidden; }
