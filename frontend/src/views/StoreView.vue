@@ -286,15 +286,15 @@ function gotoApps () { window.location.href = '/apps' }
 .zc-cat-tag { cursor: pointer; }
 .zc-store-toolbar { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
 .zc-store-pager { margin-top: 12px; text-align: right; }
-.zc-cover { cursor: pointer; height: 140px; overflow: hidden; background: #f0f2f5;
+.zc-cover { cursor: pointer; height: 140px; overflow: hidden; background: var(--zc-bg-cover);
   display: flex; align-items: center; justify-content: center; }
 .zc-cover-img { width: 100%; height: 100%; object-fit: cover; }
-.zc-cover-placeholder { font-size: 40px; color: #bfbfbf; }
+.zc-cover-placeholder { font-size: 40px; color: var(--zc-cover-placeholder); }
 .zc-shot-viewer { text-align: center; }
 .zc-shot-img { max-width: 100%; max-height: 280px; border-radius: 6px; }
 .zc-shot-nav { display: flex; align-items: center; justify-content: center; gap: 10px; margin-top: 8px; }
 .zc-shot-empty { height: 160px; display: flex; align-items: center; justify-content: center;
-  background: #f0f2f5; border-radius: 6px; }
+  background: var(--zc-bg-cover); border-radius: 6px; }
 .zc-shot-admin { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 6px; }
 .zc-store-summary { margin: 8px 0 12px; }
 .zc-store-tip { color: rgba(0, 0, 0, 0.55); font-size: 13px; }
