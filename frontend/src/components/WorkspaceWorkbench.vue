@@ -2,7 +2,7 @@
 // 工作区工作台（ADR-0022）：左边懒加载文件树，顶部页签，右侧编辑区，底部状态栏。
 // 树沿用 WorkspaceExplorer 的实现纪律：世代号丢弃迟到响应、受控 loadedKeys 回写、展开失败不记缓存。
 // 页签与文件缓冲都按「路径」收口：同一路径只有一个页签；关闭激活页签取右邻，没有右邻取左邻。
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { message } from 'ant-design-vue'
 import { ReloadOutlined } from '@ant-design/icons-vue'
 import { listDir, readFile, saveFile } from '../api'
@@ -10,7 +10,7 @@ import {
   ancestorsOf, attachChildren, buildBreadcrumb, deepestPath, findNode, toTreeNodes,
 } from '../utils/fsNav'
 import {
-  closeTab, decodeTabs, encodeTabs, openTab, tabsStorageKey,
+  closeTab, decodeTabs, encodeTabs, openTab, tabCloseSet, tabsStorageKey,
 } from '../utils/workbenchTabs'
 import { isReadOnlyPath } from '../utils/fileTypes'
 import { nextTheme, readWorkbenchTheme, writeWorkbenchTheme } from '../utils/theme'
@@ -143,6 +143,13 @@ function onBeforeUnload(e) {
 
 onMounted(() => {
   window.addEventListener('beforeunload', onBeforeUnload)
+  document.addEventListener('click', onDocClick)
+  document.addEventListener('keydown', onDocKeydown)
+  window.addEventListener('resize', measureOverflow)
+  if (typeof ResizeObserver !== 'undefined') {
+    resizeObs = new ResizeObserver(() => measureOverflow())
+    if (tabsViewport.value) resizeObs.observe(tabsViewport.value)
+  }
 })
 
 async function loadRoot() {
@@ -281,6 +288,7 @@ function onContent(value) {
 // 切页签后先回到 1,1，等 Monaco 把该文件恢复出的光标位置报上来再覆盖
 watch(active, () => {
   cursor.value = { line: 1, column: 1, selected: 0 }
+  closeTabMenu()
 })
 
 function onCursor(c) {
@@ -439,6 +447,108 @@ function cancelDiscard() {
   closePrompt.value = ''
 }
 
+// 页签右键菜单：锚定被右键的页签（与激活项无关），按光标定位；点外部 / Esc / 切页签关闭
+const tabMenu = ref({ open: false, x: 0, y: 0, path: '' })
+const menuIndex = computed(() => tabs.value.findIndex((t) => t.path === tabMenu.value.path))
+const canCloseLeft = computed(() => menuIndex.value > 0)
+const canCloseRight = computed(() => menuIndex.value >= 0 && menuIndex.value < tabs.value.length - 1)
+const canCloseOthers = computed(() => tabs.value.length > 1)
+
+function openTabMenu(event, path) {
+  tabMenu.value = { open: true, x: event.clientX, y: event.clientY, path }
+}
+function closeTabMenu() {
+  if (tabMenu.value.open) tabMenu.value = { ...tabMenu.value, open: false }
+}
+
+// 批量关闭：一次弹框列出所有未保存文件，确认后一起丢弃；锚点在 左/右/其他 动作后必然存活，激活项被关时落到它
+const bulkPrompt = ref(null) // { paths, anchor, dirtyNames }
+
+function requestBulkClose(anchor, action) {
+  const paths = tabCloseSet(tabs.value, anchor, action)
+  if (!paths.length) return
+  const dirtyNames = paths.filter((p) => files.value[p]?.dirty).map((p) => baseName(p))
+  if (dirtyNames.length) {
+    bulkPrompt.value = { paths, anchor, dirtyNames }
+    return
+  }
+  applyBulkClose(paths, anchor)
+}
+
+function applyBulkClose(paths, anchor) {
+  const set = new Set(paths)
+  const activeClosed = set.has(active.value)
+  for (const p of paths) dropFile(p)
+  tabs.value = tabs.value.filter((t) => !set.has(t.path))
+  if (!activeClosed) return
+  const next = tabs.value.some((t) => t.path === anchor) ? anchor : (tabs.value[0]?.path || '')
+  if (next) selectTab(next)
+  else {
+    active.value = ''
+    selectedKeys.value = []
+  }
+}
+
+function confirmBulkClose() {
+  const p = bulkPrompt.value
+  bulkPrompt.value = null
+  if (p) applyBulkClose(p.paths, p.anchor)
+}
+function cancelBulkClose() {
+  bulkPrompt.value = null
+}
+
+function onTabMenuAction(action) {
+  const path = tabMenu.value.path
+  closeTabMenu()
+  if (action === 'current') requestClose(path)
+  else requestBulkClose(path, action)
+}
+
+function onDocClick() {
+  closeTabMenu()
+  closeMore()
+}
+function onDocKeydown(e) {
+  if (e.key === 'Escape') {
+    closeTabMenu()
+    closeMore()
+  }
+}
+
+// 页签溢出：视口裁剪不出滚动条，放不下的靠「更多」下拉兜底。下拉列出全部页签，点名激活并滚入可视区。
+const tabsViewport = ref(null)
+const hasOverflow = ref(false)
+const moreOpen = ref(false)
+let resizeObs = null
+
+function measureOverflow() {
+  const el = tabsViewport.value
+  hasOverflow.value = !!el && el.scrollWidth > el.clientWidth + 1
+}
+function closeMore() {
+  moreOpen.value = false
+}
+function toggleMore() {
+  moreOpen.value = !moreOpen.value
+}
+function pickFromMore(path) {
+  closeMore()
+  selectTab(path)
+}
+// 渲染后重测溢出，并把激活页签滚入可视区（视口 overflow:hidden 仍可程序化滚动）
+function afterTabsRender() {
+  measureOverflow()
+  const el = tabsViewport.value?.querySelector('.zc-wb-tab.is-active')
+  el?.scrollIntoView?.({ inline: 'nearest', block: 'nearest' })
+}
+watch([tabs, active], () => nextTick(afterTabsRender))
+watch(tabsViewport, (el, prev) => {
+  if (!resizeObs) return
+  if (prev) resizeObs.unobserve(prev)
+  if (el) resizeObs.observe(el)
+})
+
 function go(crumb, index) {
   if (index === crumbs.value.length - 1) return
   focusPath.value = crumb.path
@@ -485,6 +595,10 @@ const baseName = (path) => String(path).split('/').pop() || String(path)
 
 onBeforeUnmount(() => {
   window.removeEventListener('beforeunload', onBeforeUnload)
+  document.removeEventListener('click', onDocClick)
+  document.removeEventListener('keydown', onDocKeydown)
+  window.removeEventListener('resize', measureOverflow)
+  resizeObs?.disconnect()
   if (savedTimer) clearTimeout(savedTimer)
 })
 
@@ -553,17 +667,37 @@ watch(() => props.workspaceId, async () => {
 
     <section class="zc-wb-main">
       <div v-if="tabs.length" class="zc-wb-tabs">
-        <div
-          v-for="t in tabs"
-          :key="t.path"
-          :class="['zc-wb-tab', t.path === active ? 'is-active' : '']"
-          :title="t.path"
-          @click="selectTab(t.path)"
-        >
-          <FileIcon class="zc-wb-tab-icon" :path="t.path" />
-          <span class="zc-wb-tab-title">{{ baseName(t.path) }}</span>
-          <span v-if="files[t.path]?.dirty" class="zc-wb-dirty" aria-label="未保存" />
-          <button class="zc-wb-tab-close" type="button" aria-label="关闭" @click.stop="requestClose(t.path)">×</button>
+        <div ref="tabsViewport" class="zc-wb-tabs-viewport">
+          <div
+            v-for="t in tabs"
+            :key="t.path"
+            :class="['zc-wb-tab', t.path === active ? 'is-active' : '']"
+            :title="t.path"
+            @click="selectTab(t.path)"
+            @contextmenu.prevent="openTabMenu($event, t.path)"
+          >
+            <FileIcon class="zc-wb-tab-icon" :path="t.path" />
+            <span class="zc-wb-tab-title">{{ baseName(t.path) }}</span>
+            <span v-if="files[t.path]?.dirty" class="zc-wb-dirty" aria-label="未保存" />
+            <button class="zc-wb-tab-close" type="button" aria-label="关闭" @click.stop="requestClose(t.path)">×</button>
+          </div>
+        </div>
+        <div v-if="hasOverflow" class="zc-wb-more-wrap">
+          <button class="zc-wb-more" type="button" aria-label="更多页签" @click.stop="toggleMore">更多 ▾</button>
+          <div v-if="moreOpen" class="zc-wb-more-menu" @click.stop>
+            <div
+              v-for="t in tabs"
+              :key="t.path"
+              :class="['zc-wb-more-item', t.path === active ? 'is-active' : '']"
+              :title="t.path"
+              @click="pickFromMore(t.path)"
+            >
+              <FileIcon class="zc-wb-more-icon" :path="t.path" />
+              <span class="zc-wb-more-name">{{ baseName(t.path) }}</span>
+              <span v-if="files[t.path]?.dirty" class="zc-wb-dirty" aria-label="未保存" />
+              <button class="zc-wb-more-close" type="button" aria-label="关闭" @click.stop="requestClose(t.path)">×</button>
+            </div>
+          </div>
         </div>
       </div>
 
@@ -621,6 +755,36 @@ watch(() => props.workspaceId, async () => {
         <a-button danger class="zc-wb-conflict-overwrite" @click="overwriteConflict">覆盖</a-button>
       </template>
     </a-modal>
+
+    <a-modal
+      :open="!!bulkPrompt"
+      title="未保存的改动"
+      class="zc-wb-bulk-modal"
+      @cancel="cancelBulkClose"
+    >
+      <p class="zc-wb-bulk-text">以下 {{ bulkPrompt?.dirtyNames.length || 0 }} 个文件有未保存的改动，关闭后会丢弃这些改动：</p>
+      <ul class="zc-wb-bulk-list">
+        <li v-for="n in bulkPrompt?.dirtyNames || []" :key="n">{{ n }}</li>
+      </ul>
+      <template #footer>
+        <a-button class="zc-wb-bulk-cancel" @click="cancelBulkClose">取消</a-button>
+        <a-button danger class="zc-wb-bulk-discard" @click="confirmBulkClose">关闭并丢弃</a-button>
+      </template>
+    </a-modal>
+
+    <div
+      v-if="tabMenu.open"
+      class="zc-wb-tab-menu"
+      :style="{ left: tabMenu.x + 'px', top: tabMenu.y + 'px' }"
+      @click.stop
+      @contextmenu.prevent
+    >
+      <button type="button" class="zc-wb-tab-menu-item zc-wb-tab-menu-current" @click="onTabMenuAction('current')">关闭当前</button>
+      <button type="button" class="zc-wb-tab-menu-item zc-wb-tab-menu-others" :disabled="!canCloseOthers" @click="onTabMenuAction('others')">关闭其他</button>
+      <button type="button" class="zc-wb-tab-menu-item zc-wb-tab-menu-left" :disabled="!canCloseLeft" @click="onTabMenuAction('left')">关闭左侧</button>
+      <button type="button" class="zc-wb-tab-menu-item zc-wb-tab-menu-right" :disabled="!canCloseRight" @click="onTabMenuAction('right')">关闭右侧</button>
+      <button type="button" class="zc-wb-tab-menu-item zc-wb-tab-menu-all" @click="onTabMenuAction('all')">关闭全部</button>
+    </div>
   </div>
 </template>
 
@@ -734,11 +898,87 @@ watch(() => props.workspaceId, async () => {
   flex: 0 0 auto;
   display: flex;
   align-items: stretch;
-  overflow-x: auto;
-  overflow-y: hidden;
-  white-space: nowrap;
   border-bottom: 1px solid var(--zc-border);
   background: var(--zc-sidebar-bg);
+}
+.zc-wb-tabs-viewport {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: stretch;
+  overflow: hidden;
+  white-space: nowrap;
+}
+.zc-wb-more-wrap {
+  position: relative;
+  flex: none;
+  display: flex;
+  align-items: stretch;
+}
+.zc-wb-more {
+  border: 0;
+  border-left: 1px solid var(--zc-border);
+  background: var(--zc-sidebar-bg);
+  color: var(--zc-text-sub);
+  font-size: 12px;
+  padding: 0 10px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.zc-wb-more:hover {
+  color: var(--zc-text);
+}
+.zc-wb-more-menu {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  z-index: 1000;
+  min-width: 200px;
+  max-width: 320px;
+  max-height: 320px;
+  overflow: auto;
+  padding: 4px;
+  border: 1px solid var(--zc-border);
+  border-radius: 6px;
+  background: var(--zc-sidebar-bg);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.28);
+}
+.zc-wb-more-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 8px;
+  border-radius: 4px;
+  font-size: 12px;
+  color: var(--zc-text-sub);
+  cursor: pointer;
+}
+.zc-wb-more-item:hover {
+  background: rgba(127, 127, 127, 0.14);
+  color: var(--zc-text);
+}
+.zc-wb-more-item.is-active {
+  color: var(--zc-text);
+  background: rgba(22, 119, 255, 0.14);
+}
+.zc-wb-more-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.zc-wb-more-close {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 0 2px;
+}
+.zc-wb-more-close:hover {
+  color: var(--zc-text);
 }
 .zc-wb-tab {
   display: inline-flex;
@@ -785,6 +1025,52 @@ watch(() => props.workspaceId, async () => {
 .zc-wb-close-text {
   margin: 0;
   font-size: 13px;
+}
+.zc-wb-bulk-text {
+  margin: 0 0 8px;
+  font-size: 13px;
+}
+.zc-wb-bulk-list {
+  margin: 0;
+  padding-left: 18px;
+  max-height: 200px;
+  overflow: auto;
+  font-size: 13px;
+  color: var(--zc-text-sub);
+}
+
+/* 页签右键菜单：fixed 定位不吃 .zc-wb 的 overflow 裁剪，主题变量仍按 DOM 继承 */
+.zc-wb-tab-menu {
+  position: fixed;
+  z-index: 1100;
+  min-width: 132px;
+  padding: 4px;
+  border: 1px solid var(--zc-border);
+  border-radius: 6px;
+  background: var(--zc-sidebar-bg);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.28);
+  display: flex;
+  flex-direction: column;
+}
+.zc-wb-tab-menu-item {
+  border: 0;
+  background: transparent;
+  color: var(--zc-text);
+  text-align: left;
+  font-size: 12px;
+  line-height: 20px;
+  padding: 5px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.zc-wb-tab-menu-item:hover:not(:disabled) {
+  background: var(--zc-primary, #1677ff);
+  color: #fff;
+}
+.zc-wb-tab-menu-item:disabled {
+  color: var(--zc-text-sub);
+  opacity: 0.5;
+  cursor: default;
 }
 
 /* ant-design 默认吃全局浅色 token，深色主题下把树与按钮拉回工作台配色 */

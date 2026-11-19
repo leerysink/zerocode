@@ -37,6 +37,19 @@ export function closeTab(tabs, path, active) {
   return { tabs: next, active: neighborAfterClose(list, path) ?? '' }
 }
 
+// 右键批量关闭的目标集合（按原顺序返回路径）：left/right 取锚点一侧，others 取除锚点外全部，
+// all 取全部与锚点无关；锚点不存在时 left/right/others 为空。current 走单页签 closeTab，不在此列。
+export function tabCloseSet(tabs, anchor, action) {
+  const list = tabs || []
+  if (action === 'all') return list.map((t) => t.path)
+  const i = list.findIndex((t) => t.path === anchor)
+  if (i === -1) return []
+  if (action === 'left') return list.slice(0, i).map((t) => t.path)
+  if (action === 'right') return list.slice(i + 1).map((t) => t.path)
+  if (action === 'others') return list.filter((_, k) => k !== i).map((t) => t.path)
+  return []
+}
+
 export function setDirty(tabs, path, dirty) {
   const list = tabs || []
   const i = list.findIndex((t) => t.path === path)

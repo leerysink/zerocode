@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import {
   closeTab, decodeTabs, encodeTabs, getTab, hasDirty, neighborAfterClose,
-  openTab, setDirty, tabsStorageKey,
+  openTab, setDirty, tabCloseSet, tabsStorageKey,
 } from './workbenchTabs'
 
 const tabsOf = (paths) => paths.map((path) => ({ path, dirty: false }))
@@ -68,6 +68,48 @@ describe('closeTab 与激活邻居', () => {
     expect(r.tabs).toEqual([])
     expect(r.active).toBe('')
     expect(neighborAfterClose(tabsOf(['a.md']), 'a.md')).toBeNull()
+  })
+})
+
+describe('tabCloseSet 批量关闭目标集合', () => {
+  const tabs = tabsOf(['a.md', 'b.md', 'c.md', 'd.md'])
+
+  it('left：只取锚点左侧的页签，按原顺序', () => {
+    expect(tabCloseSet(tabs, 'c.md', 'left')).toEqual(['a.md', 'b.md'])
+  })
+
+  it('right：只取锚点右侧的页签，按原顺序', () => {
+    expect(tabCloseSet(tabs, 'b.md', 'right')).toEqual(['c.md', 'd.md'])
+  })
+
+  it('others：取除锚点外的全部', () => {
+    expect(tabCloseSet(tabs, 'b.md', 'others')).toEqual(['a.md', 'c.md', 'd.md'])
+  })
+
+  it('all：取全部，与锚点无关', () => {
+    expect(tabCloseSet(tabs, 'c.md', 'all')).toEqual(['a.md', 'b.md', 'c.md', 'd.md'])
+    expect(tabCloseSet(tabs, '', 'all')).toEqual(['a.md', 'b.md', 'c.md', 'd.md'])
+  })
+
+  it('锚点在首/尾/独占时对应集合为空', () => {
+    expect(tabCloseSet(tabs, 'a.md', 'left')).toEqual([])
+    expect(tabCloseSet(tabs, 'd.md', 'right')).toEqual([])
+    expect(tabCloseSet(tabsOf(['a.md']), 'a.md', 'others')).toEqual([])
+  })
+
+  it('锚点不存在：left/right/others 一律空（all 仍取全部）', () => {
+    expect(tabCloseSet(tabs, 'nope.md', 'left')).toEqual([])
+    expect(tabCloseSet(tabs, 'nope.md', 'right')).toEqual([])
+    expect(tabCloseSet(tabs, 'nope.md', 'others')).toEqual([])
+    expect(tabCloseSet(tabs, 'nope.md', 'all')).toEqual(['a.md', 'b.md', 'c.md', 'd.md'])
+  })
+
+  it('空列表 / 未知动作一律空，且不改传入数组', () => {
+    expect(tabCloseSet([], 'a.md', 'all')).toEqual([])
+    expect(tabCloseSet(tabs, 'b.md', 'bogus')).toEqual([])
+    const snapshot = paths(tabs)
+    tabCloseSet(tabs, 'b.md', 'others')
+    expect(paths(tabs)).toEqual(snapshot)
   })
 })
 

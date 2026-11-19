@@ -393,6 +393,268 @@ describe('WorkspaceWorkbench 页签', () => {
   })
 })
 
+describe('WorkspaceWorkbench 页签右键菜单与批量关闭', () => {
+  const menu = (wrapper) => wrapper.find('.zc-wb-tab-menu')
+  const menuItem = (wrapper, action) => wrapper.find(`.zc-wb-tab-menu-${action}`)
+  const rightClick = async (wrapper, index) => {
+    await wrapper.findAll('.zc-wb-tab')[index].trigger('contextmenu', { clientX: 120, clientY: 60 })
+    await flushPromises()
+  }
+  const clickMenu = async (wrapper, action) => {
+    await menuItem(wrapper, action).trigger('click')
+    await flushPromises()
+  }
+  const activate = async (wrapper, index) => {
+    await wrapper.findAll('.zc-wb-tab')[index].trigger('click')
+    await flushPromises()
+  }
+  // 页签顺序：a.md、src/inner.txt、src/lib/deep.txt，激活项落在最后的 deep.txt
+  const threeTabs = async (wrapper) => {
+    await select(wrapper, 'a.md')
+    await expand(wrapper, 'src')
+    await select(wrapper, 'src/inner.txt')
+    await expand(wrapper, 'src/lib')
+    await select(wrapper, 'src/lib/deep.txt')
+  }
+
+  it('右键页签弹出菜单，含五项关闭动作', async () => {
+    const wrapper = await mountWb()
+    await threeTabs(wrapper)
+    await rightClick(wrapper, 1)
+
+    expect(menu(wrapper).exists()).toBe(true)
+    expect(wrapper.findAll('.zc-wb-tab-menu-item')).toHaveLength(5)
+  })
+
+  it('关闭当前：关掉右键的那一个（非激活项也按锚点）', async () => {
+    const wrapper = await mountWb()
+    await threeTabs(wrapper)
+    await rightClick(wrapper, 1)
+    await clickMenu(wrapper, 'current')
+
+    expect(tabTitles(wrapper)).toEqual(['a.md', 'deep.txt'])
+    expect(menu(wrapper).exists()).toBe(false)
+  })
+
+  it('关闭其他：只留锚点，激活项被关时落到锚点', async () => {
+    const wrapper = await mountWb()
+    await threeTabs(wrapper)
+    await rightClick(wrapper, 1)
+    await clickMenu(wrapper, 'others')
+
+    expect(tabTitles(wrapper)).toEqual(['inner.txt'])
+    expect(editor(wrapper).props('path')).toBe('src/inner.txt')
+  })
+
+  it('关闭左侧：只关锚点左边，激活项在右侧则不动', async () => {
+    const wrapper = await mountWb()
+    await threeTabs(wrapper)
+    await rightClick(wrapper, 1)
+    await clickMenu(wrapper, 'left')
+
+    expect(tabTitles(wrapper)).toEqual(['inner.txt', 'deep.txt'])
+    expect(editor(wrapper).props('path')).toBe('src/lib/deep.txt')
+  })
+
+  it('关闭右侧：只关锚点右边，激活项被关时落到锚点', async () => {
+    const wrapper = await mountWb()
+    await threeTabs(wrapper)
+    await rightClick(wrapper, 1)
+    await clickMenu(wrapper, 'right')
+
+    expect(tabTitles(wrapper)).toEqual(['a.md', 'inner.txt'])
+    expect(editor(wrapper).props('path')).toBe('src/inner.txt')
+  })
+
+  it('关闭全部：清空页签与激活项', async () => {
+    const wrapper = await mountWb()
+    await threeTabs(wrapper)
+    await rightClick(wrapper, 1)
+    await clickMenu(wrapper, 'all')
+
+    expect(tabTitles(wrapper)).toEqual([])
+    expect(editor(wrapper).props('path')).toBe('')
+  })
+
+  it('禁用态：首项禁左、尾项禁右、单页签禁其他', async () => {
+    const wrapper = await mountWb()
+    await threeTabs(wrapper)
+
+    await rightClick(wrapper, 0)
+    expect(menuItem(wrapper, 'left').attributes('disabled')).toBeDefined()
+    expect(menuItem(wrapper, 'right').attributes('disabled')).toBeUndefined()
+
+    await rightClick(wrapper, 2)
+    expect(menuItem(wrapper, 'right').attributes('disabled')).toBeDefined()
+    expect(menuItem(wrapper, 'left').attributes('disabled')).toBeUndefined()
+  })
+
+  it('单页签：左/右/其他都禁用', async () => {
+    const wrapper = await mountWb()
+    await select(wrapper, 'a.md')
+    await rightClick(wrapper, 0)
+
+    expect(menuItem(wrapper, 'left').attributes('disabled')).toBeDefined()
+    expect(menuItem(wrapper, 'right').attributes('disabled')).toBeDefined()
+    expect(menuItem(wrapper, 'others').attributes('disabled')).toBeDefined()
+  })
+
+  it('点击菜单外部或按 Esc 关闭菜单', async () => {
+    const wrapper = await mountWb()
+    await threeTabs(wrapper)
+
+    await rightClick(wrapper, 1)
+    expect(menu(wrapper).exists()).toBe(true)
+    document.body.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    await flushPromises()
+    expect(menu(wrapper).exists()).toBe(false)
+
+    await rightClick(wrapper, 1)
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }))
+    await flushPromises()
+    expect(menu(wrapper).exists()).toBe(false)
+  })
+
+  it('批量关闭遇脏：弹一次批量确认列出脏文件，取消保留、确认后一起丢弃', async () => {
+    const wrapper = await mountWb()
+    await threeTabs(wrapper)
+    await activate(wrapper, 0)
+    await markDirty(wrapper) // a.md 脏
+    await activate(wrapper, 1)
+    await markDirty(wrapper) // inner.txt 脏
+
+    await rightClick(wrapper, 2)
+    await clickMenu(wrapper, 'all')
+
+    expect(tabTitles(wrapper)).toEqual(['a.md', 'inner.txt', 'deep.txt'])
+    expect(wrapper.find('.zc-wb-bulk-modal').attributes('data-open')).toBe('true')
+    expect(wrapper.find('.zc-wb-bulk-list').text()).toContain('a.md')
+    expect(wrapper.find('.zc-wb-bulk-list').text()).toContain('inner.txt')
+
+    await wrapper.find('.zc-wb-bulk-cancel').trigger('click')
+    await flushPromises()
+    expect(wrapper.find('.zc-wb-bulk-modal').attributes('data-open')).toBe('false')
+    expect(tabTitles(wrapper)).toEqual(['a.md', 'inner.txt', 'deep.txt'])
+    expect(dirty(wrapper)).toHaveLength(2)
+
+    await rightClick(wrapper, 2)
+    await clickMenu(wrapper, 'all')
+    await wrapper.find('.zc-wb-bulk-discard').trigger('click')
+    await flushPromises()
+    expect(tabTitles(wrapper)).toEqual([])
+    expect(editor(wrapper).props('path')).toBe('')
+  })
+
+  it('批量关闭左侧遇脏也走批量确认，只丢弃左侧脏文件', async () => {
+    const wrapper = await mountWb()
+    await threeTabs(wrapper)
+    await activate(wrapper, 0)
+    await markDirty(wrapper) // a.md 脏
+
+    await rightClick(wrapper, 2) // 锚点 deep.txt，左侧含 a.md、inner.txt
+    await clickMenu(wrapper, 'left')
+    expect(wrapper.find('.zc-wb-bulk-modal').attributes('data-open')).toBe('true')
+
+    await wrapper.find('.zc-wb-bulk-discard').trigger('click')
+    await flushPromises()
+    expect(tabTitles(wrapper)).toEqual(['deep.txt'])
+  })
+})
+
+describe('WorkspaceWorkbench 页签溢出与更多下拉', () => {
+  const moreBtn = (wrapper) => wrapper.find('.zc-wb-more')
+  const moreMenu = (wrapper) => wrapper.find('.zc-wb-more-menu')
+  const moreNames = (wrapper) => wrapper.findAll('.zc-wb-more-item .zc-wb-more-name').map((n) => n.text())
+  const setViewport = async (wrapper, scrollWidth, clientWidth) => {
+    const vp = wrapper.find('.zc-wb-tabs-viewport').element
+    Object.defineProperty(vp, 'scrollWidth', { configurable: true, value: scrollWidth })
+    Object.defineProperty(vp, 'clientWidth', { configurable: true, value: clientWidth })
+    window.dispatchEvent(new Event('resize'))
+    await flushPromises()
+  }
+  const threeTabs = async (wrapper) => {
+    await select(wrapper, 'a.md')
+    await expand(wrapper, 'src')
+    await select(wrapper, 'src/inner.txt')
+    await expand(wrapper, 'src/lib')
+    await select(wrapper, 'src/lib/deep.txt')
+  }
+  const openMore = async (wrapper) => {
+    await moreBtn(wrapper).trigger('click')
+    await flushPromises()
+  }
+
+  it('放不下才出现「更多」按钮，放得下则隐藏', async () => {
+    const wrapper = await mountWb()
+    await select(wrapper, 'a.md')
+    expect(moreBtn(wrapper).exists()).toBe(false)
+
+    await setViewport(wrapper, 800, 300)
+    expect(moreBtn(wrapper).exists()).toBe(true)
+
+    await setViewport(wrapper, 300, 300)
+    expect(moreBtn(wrapper).exists()).toBe(false)
+  })
+
+  it('「更多」下拉列出全部已打开页签并高亮激活项', async () => {
+    const wrapper = await mountWb()
+    await threeTabs(wrapper)
+    await setViewport(wrapper, 800, 300)
+    await openMore(wrapper)
+
+    expect(moreNames(wrapper)).toEqual(['a.md', 'inner.txt', 'deep.txt'])
+    expect(wrapper.find('.zc-wb-more-item.is-active .zc-wb-more-name').text()).toBe('deep.txt')
+  })
+
+  it('点下拉里的文件名激活该页签并收起下拉', async () => {
+    const wrapper = await mountWb()
+    await threeTabs(wrapper)
+    await setViewport(wrapper, 800, 300)
+    await openMore(wrapper)
+
+    await wrapper.findAll('.zc-wb-more-item')[0].trigger('click')
+    await flushPromises()
+
+    expect(editor(wrapper).props('path')).toBe('a.md')
+    expect(moreMenu(wrapper).exists()).toBe(false)
+  })
+
+  it('下拉里每行的关闭按钮只关该页签，不激活它', async () => {
+    const wrapper = await mountWb()
+    await threeTabs(wrapper)
+    await setViewport(wrapper, 800, 300)
+    await openMore(wrapper)
+
+    await wrapper.findAll('.zc-wb-more-close')[1].trigger('click')
+    await flushPromises()
+
+    expect(tabTitles(wrapper)).toEqual(['a.md', 'deep.txt'])
+    expect(editor(wrapper).props('path')).toBe('src/lib/deep.txt')
+  })
+
+  it('下拉里未保存页签带脏点', async () => {
+    const wrapper = await mountWb()
+    await select(wrapper, 'a.md')
+    await markDirty(wrapper)
+    await setViewport(wrapper, 800, 300)
+    await openMore(wrapper)
+
+    expect(wrapper.find('.zc-wb-more-item .zc-wb-dirty').exists()).toBe(true)
+  })
+
+  it('点击外部收起「更多」下拉', async () => {
+    const wrapper = await mountWb()
+    await threeTabs(wrapper)
+    await setViewport(wrapper, 800, 300)
+    await openMore(wrapper)
+    expect(moreMenu(wrapper).exists()).toBe(true)
+
+    document.body.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    await flushPromises()
+    expect(moreMenu(wrapper).exists()).toBe(false)
+  })
+})
+
 describe('WorkspaceWorkbench 编辑与保存', () => {
   it('编辑后页签出现脏圆点；编辑器回报回到干净态后圆点消失', async () => {
     const wrapper = await mountWb()
