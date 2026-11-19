@@ -119,7 +119,9 @@ async def test_base_tools_unchanged_by_preview_feature():
     assert [t["function"]["name"] for t in TOOLS] == [
         "list_dir", "read_file", "search", "write_file", "edit_file",
         "delete_file", "move_file", "revert_change",
-        "ask_user", "todo_write", "memory_write", "delegate"]
+        "ask_user", "todo_write", "memory_write",
+        "web_fetch", "web_download", "web_open", "web_step", "web_close",
+        "delegate"]
 # ---------- ctx 替身：preview_tools 只读字段，不 import ToolContext ----------
 
 class Ctx:
@@ -1174,7 +1176,9 @@ async def test_no_command_execution_tool_exists(tmp_path):
     names = {t["function"]["name"] for t in TOOLS} | set(PREVIEW_TOOL_NAMES)
     assert names == {"list_dir", "read_file", "search", "write_file", "edit_file",
                      "delete_file", "move_file", "revert_change",
-                     "ask_user", "todo_write", "memory_write", "delegate",
+                     "ask_user", "todo_write", "memory_write",
+                     "web_fetch", "web_download", "web_open", "web_step", "web_close",
+                     "delegate",
                      "preview_status", "preview_logs", "preview_restart"}
     for spec in registry.SPECS:
         props = spec.schema["function"]["parameters"].get("properties", {})
