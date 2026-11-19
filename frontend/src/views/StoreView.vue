@@ -161,6 +161,7 @@ function gotoApps () { window.location.href = '/apps' }
         </div>
         <a-empty v-if="!pagedReleases.length"
                  :description="releases.length ? '该分类下暂无应用' : '还没有应用上架'" />
+        <div class="zc-store-grid">
         <a-card v-for="r in pagedReleases" :key="r.id" class="zc-card">
           <template #cover>
             <div class="zc-cover" @click="openDetail(r)">
@@ -192,6 +193,7 @@ function gotoApps () { window.location.href = '/apps' }
             </a-button>
           </a-space>
         </a-card>
+        </div>
         <a-pagination v-if="releases.length > PAGE_SIZE" v-model:current="page"
                       :total="releases.length" :page-size="PAGE_SIZE" :show-size-changer="false"
                       class="zc-store-pager" />
@@ -286,6 +288,15 @@ function gotoApps () { window.location.href = '/apps' }
 .zc-cat-tag { cursor: pointer; }
 .zc-store-toolbar { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
 .zc-store-pager { margin-top: 12px; text-align: right; }
+/* 一行 3 列卡片网格：窄屏降为 2 列 / 1 列；卡片等高，按钮沉底 */
+.zc-store-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px; align-items: stretch; }
+.zc-store-grid .zc-card { display: flex; flex-direction: column; min-width: 0; }
+.zc-store-grid .zc-card :deep(.ant-card-head-title) { white-space: normal; line-height: 1.6; }
+.zc-store-grid .zc-card :deep(.ant-card-body) { flex: 1; display: flex; flex-direction: column; }
+.zc-store-grid .zc-card :deep(.ant-card-body) > .ant-space { margin-top: auto; padding-top: 8px; }
+@media (max-width: 1100px) { .zc-store-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 680px) { .zc-store-grid { grid-template-columns: 1fr; } }
 .zc-cover { cursor: pointer; height: 140px; overflow: hidden; background: var(--zc-bg-cover);
   display: flex; align-items: center; justify-content: center; }
 .zc-cover-img { width: 100%; height: 100%; object-fit: cover; }
@@ -296,7 +307,8 @@ function gotoApps () { window.location.href = '/apps' }
 .zc-shot-empty { height: 160px; display: flex; align-items: center; justify-content: center;
   background: var(--zc-bg-cover); border-radius: 6px; }
 .zc-shot-admin { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 6px; }
-.zc-store-summary { margin: 8px 0 12px; }
+.zc-store-summary { margin: 8px 0 12px; display: -webkit-box; -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical; overflow: hidden; min-height: 40px; }
 .zc-store-tip { color: rgba(0, 0, 0, 0.55); font-size: 13px; }
 .zc-review-row { display: flex; align-items: center; justify-content: space-between;
   padding: 10px 0; border-bottom: 1px solid rgba(0, 0, 0, 0.06); }
