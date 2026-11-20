@@ -1,6 +1,6 @@
 <div align="center">
 
-**[ 在线体验 → 打开演示站 ](http://159.75.185.70:8100/)** ｜ 账号 `tsadmin` / 口令 `tsadmin` ｜ 不用装环境，先逛一遍再决定
+**[ 官网 → www.leerysink.com ](https://www.leerysink.com)** ｜ **[ 在线体验 → 打开演示站 ](http://159.75.185.70:8100/)** ｜ 账号 `tsadmin` / 口令 `tsadmin` ｜ 不用装环境，先逛一遍再决定
 
 # ZeroCode
 
@@ -352,6 +352,6 @@ git push github master:refs/heads/main                        # 每次主仓更�
 
 **ZeroCode —— 让每个有想法的人，都能把软件做出来。**
 
-在线体验 <http://159.75.185.70:8100/>（`tsadmin` / `tsadmin`） · 主仓 <https://gitee.com/leerys/zerocode.git> · GitHub 镜像 <https://github.com/leerysink/zerocode>
+官网 <https://www.leerysink.com> · 在线体验 <http://159.75.185.70:8100/>（`tsadmin` / `tsadmin`） · 主仓 <https://gitee.com/leerys/zerocode.git> · GitHub 镜像 <https://github.com/leerysink/zerocode>
 
 </div>
