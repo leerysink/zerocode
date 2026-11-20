@@ -1174,7 +1174,8 @@ function openUninstall(a) {
 .zc-apps { padding: 20px 24px; height: 100%; overflow-y: auto; box-sizing: border-box; }
 /* 页头总控区：一条淡主色渐变把「标题 + 计数 + 状态分布」兜成整块，与下面的卡片彻底分层
    （ADR-0048 D）。渐变收在 .13→.02，再浓就要盖过卡片里的仪表带了。 */
-.zc-hero { margin-bottom: 16px; padding: 14px 16px 12px; border: 1px solid var(--zc-border); border-radius: 10px;
+.zc-hero { margin-bottom: var(--zc-space-4); padding: var(--zc-space-4);
+           border: 1px solid var(--zc-border); border-radius: var(--zc-radius-card);
            background: linear-gradient(105deg, rgba(var(--zc-primary-rgb), 0.13), rgba(var(--zc-primary-rgb), 0.02) 58%,
                                          rgba(var(--zc-amber-rgb), 0.05)); }
 .zc-head { display: flex; justify-content: space-between; align-items: center; }
@@ -1184,7 +1185,8 @@ function openUninstall(a) {
                  line-height: 1.5; color: var(--zc-primary); background: rgba(var(--zc-primary-rgb), 0.12);
                  font-variant-numeric: tabular-nums; }
 /* 返回做成描边 chip：住在渐变里时，裸文字链接的存在感比不过 22px 标题 */
-.zc-hero .zc-back { padding: 2px 10px 2px 7px; border: 1px solid var(--zc-border); border-radius: 14px;
+.zc-hero .zc-back { padding: var(--zc-space-hair) var(--zc-space-3);
+                    border: 1px solid var(--zc-border); border-radius: var(--zc-radius-pill);
                     background: var(--zc-bg-card); }
 .zc-stats { display: flex; flex-wrap: wrap; gap: 8px 22px; margin-top: 12px; }
 .zc-stat { display: flex; flex-direction: column; gap: 2px; min-width: 52px; }

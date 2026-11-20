@@ -188,7 +188,7 @@ async function save() {
   <div class="zc-settings">
     <zc-page-header title="设置" subtitle="模型、Agent 行为、工具量闸与外观偏好" />
 
-    <div class="zc-set-body">
+    <div class="zc-set-body zc-panel">
       <nav class="zc-set-nav" aria-label="设置分区">
         <button v-for="s in SECTIONS" :key="s.key" type="button"
                 :aria-current="active === s.key ? 'true' : undefined"
@@ -386,9 +386,12 @@ async function save() {
   margin: 0 auto;
   padding: var(--zc-space-5) 0 var(--zc-space-4);
 }
-.zc-set-body { display: flex; align-items: flex-start; gap: var(--zc-space-5); }
+/* 正文整块住进面卡（外壳由全局 .zc-panel 给）：左导航与右分区同卡，两栏之间一条细分隔线 */
+.zc-set-body { display: flex; align-items: flex-start; gap: var(--zc-space-5);
+  padding: var(--zc-space-4); }
 .zc-set-nav { display: flex; flex-direction: column; gap: var(--zc-space-1);
-  flex: 0 0 168px; position: sticky; top: var(--zc-space-4); }
+  flex: 0 0 168px; position: sticky; top: var(--zc-space-4);
+  padding-right: var(--zc-space-3); border-right: 1px solid var(--zc-border-soft); }
 .zc-set-nav-item { text-align: left; border: none; cursor: pointer; padding: 6px 12px;
   border-radius: var(--zc-radius-inner); background: transparent;
   color: var(--zc-text-sub); font-size: var(--zc-font-sm);
@@ -451,6 +454,9 @@ async function save() {
 .zc-set-menu-item.danger:hover { background: var(--zc-danger-bg-alt); }
 @media (max-width: 900px) {
   .zc-set-body { flex-direction: column; }
-  .zc-set-nav { position: static; flex: none; flex-direction: row; flex-wrap: wrap; }
+  /* 堆叠后分隔线从两栏之间挪到两栏之上 */
+  .zc-set-nav { position: static; flex: none; flex-direction: row; flex-wrap: wrap;
+    padding-right: 0; padding-bottom: var(--zc-space-3);
+    border-right: none; border-bottom: 1px solid var(--zc-border-soft); }
 }
 </style>

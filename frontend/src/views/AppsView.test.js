@@ -5,6 +5,7 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
 import { h } from 'vue'
 import { flushPromises, mount } from '@vue/test-utils'
+import TEMPLATE from './AppsView.vue?raw'
 
 const mocks = vi.hoisted(() => ({
   api: {
@@ -1427,5 +1428,28 @@ describe('AppsView 向导仓库地址接线', () => {
     expect(help).toContain('沿用地址里')                    // 空框 = 继承 URL 携带的目录
     expect(help).toMatch(/地址不带目录时才全域扫描/)          // 全域扫描是有条件的，不是留空的默认
     expect(help).not.toMatch(/留空则全域扫描/)
+  })
+})
+
+describe('AppsView hero 几何与面卡口径（整页层级统一）', () => {
+  const style = TEMPLATE.match(/<style scoped>([\s\S]*?)<\/style>/)?.[1] ?? ''
+  const hero = style.match(/\.zc-hero\s*\{([^}]*)\}/)?.[1] ?? ''
+  const chip = style.match(/\.zc-hero \.zc-back\s*\{([^}]*)\}/)?.[1] ?? ''
+
+  it('hero 圆角与留白走 token：与其他页的面卡同一档几何', () => {
+    expect(hero).toContain('border-radius: var(--zc-radius-card)')
+    expect(hero).toMatch(/padding:\s*var\(--zc-space-4\)/)
+    expect(hero).not.toMatch(/padding:[^;]*[0-9]+px/)
+    expect(hero).not.toMatch(/border-radius:\s*[0-9]+px/)
+  })
+
+  it('渐变底保留：应用页仍留一档强调，不并进中性面卡（ADR-0048 D）', () => {
+    expect(hero).toContain('linear-gradient')
+  })
+
+  it('hero 里的返回胶囊几何同样走 token', () => {
+    expect(chip).toContain('border: 1px solid var(--zc-border)')
+    expect(chip).toContain('border-radius: var(--zc-radius-pill)')
+    expect(chip).not.toMatch(/padding:[^;]*[0-9]+px/)
   })
 })

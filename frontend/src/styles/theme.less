@@ -267,3 +267,13 @@ body.zc-folder-dragging * {
   /* 阴影层级：只一层 */
   --zc-shadow-1: 0 1px 2px;
 }
+
+/* 面卡：页头与正文分组的统一容器外壳（描边 + 卡片圆角 + 卡底 + 一层阴影）。
+   容器只在这里定义一份，调用点只管排布——各页抄一份卡面样式必然漂成两副面孔。
+   底色与描边走颜色 token，浅深两套自动跟着换；内边距留给调用点，卡片胖瘦不一是排布差异。 */
+.zc-panel {
+  background: var(--zc-bg-card);
+  border: 1px solid var(--zc-border);
+  border-radius: var(--zc-radius-card);
+  box-shadow: var(--zc-shadow-1) rgba(var(--zc-shadow-rgb), 0.05);
+}

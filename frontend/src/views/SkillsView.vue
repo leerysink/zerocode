@@ -2,11 +2,9 @@
 // 技能管理页（Ticket 001~003 / ADR-0004）：直链 + GitHub 仓库安装 + AI 生成 + 列表 + 启用开关 + 删除。
 // GitHub monorepo 多命中时后端返回 candidates，这里展示可选清单、带 subpath 二次提交。
 // AI 生成是两段式：generate 出草稿（可编辑）→ adopt 落盘落库；人在环，不静默安装。
-// 回退优先浏览器历史、兜底回首页（技能是窄栏一级页）。
 import { computed, onMounted, ref } from 'vue'
-import { useRouter } from 'vue-router'
 import { message, Modal } from 'ant-design-vue'
-import { ArrowLeftOutlined, DeleteOutlined, EyeOutlined, RobotOutlined } from '@ant-design/icons-vue'
+import { DeleteOutlined, EyeOutlined, RobotOutlined } from '@ant-design/icons-vue'
 import {
   adoptSkill, deleteSkill, generateSkill, installSkill, listSkills, patchSkill,
   previewSkill, skillFiles, skillFileContent, skillFileRawUrl,
@@ -14,12 +12,7 @@ import {
 } from '../api'
 import { skillSourceLabel } from '../utils/skillSource'
 import SkillDetailDrawer from '../components/SkillDetailDrawer.vue'
-
-const router = useRouter()
-function goBack() {
-  if (window.history.state?.back) router.back()
-  else router.push('/')
-}
+import ZcPageHeader from '../components/zc/ZcPageHeader.vue'
 
 const skills = ref([])
 const loading = ref(false)
@@ -280,10 +273,7 @@ function removeSkill(record) {
 
 <template>
   <div class="zc-skills">
-    <div class="zc-page-head">
-      <a-button type="text" class="zc-back" @click="goBack"><arrow-left-outlined /> 返回</a-button>
-      <h2 class="zc-page-title">技能</h2>
-    </div>
+    <zc-page-header title="技能" subtitle="从链接安装、用 AI 生成，或管理已装的技能包" />
 
     <a-card class="zc-card" title="从链接安装">
       <div class="zc-install-row">
@@ -352,44 +342,48 @@ function removeSkill(record) {
       </div>
     </a-card>
 
-    <a-table
-      class="zc-card"
-      :data-source="skills"
-      :loading="loading"
-      :columns="columns"
-      row-key="id"
-      :pagination="false"
-      size="small"
-    >
-      <template #bodyCell="{ column, record }">
-        <!-- 名称列：副信息「N 文件 · X KB · 含脚本」（ADR-0061 / ticket 003） -->
-        <template v-if="column.key === 'name'">
-          <div class="zc-skill-name">{{ record.name }}</div>
-          <div class="zc-skill-sub" data-test="skill-subline">{{ subLine(record) }}</div>
-        </template>
-        <!-- 来源列：未知 source_type 原样显示，未来新增类型不必改前端 -->
-        <template v-if="column.key === 'source'">
-          {{ skillSourceLabel(record.source_type) }}
-        </template>
-        <template v-if="column.key === 'enabled'">
-          <a-switch :checked="record.enabled" :loading="toggling === record.id"
-                    :disabled="toggling !== null && toggling !== record.id"
-                    checked-children="启用" un-checked-children="停用"
-                    @change="(v) => toggleEnabled(record, v)" />
-        </template>
-        <template v-if="column.key === 'ops'">
-          <a-button size="small" type="text" data-test="skill-detail-btn" @click="openDetail(record)">
-            <eye-outlined /> 详情
-          </a-button>
-          <a-button size="small" danger type="text" @click="removeSkill(record)">
-            <delete-outlined /> 删除
-          </a-button>
-        </template>
+    <a-card class="zc-card" data-test="skill-list-card" title="技能清单">
+      <template #extra>
+        <span class="zc-count-badge" data-test="skill-count">{{ skills.length }}</span>
       </template>
-      <template #emptyText>
-        <a-empty description="还没有技能" />
-      </template>
-    </a-table>
+      <a-table
+        :data-source="skills"
+        :loading="loading"
+        :columns="columns"
+        row-key="id"
+        :pagination="false"
+        size="small"
+      >
+        <template #bodyCell="{ column, record }">
+          <!-- 名称列：副信息「N 文件 · X KB · 含脚本」（ADR-0061 / ticket 003） -->
+          <template v-if="column.key === 'name'">
+            <div class="zc-skill-name">{{ record.name }}</div>
+            <div class="zc-skill-sub" data-test="skill-subline">{{ subLine(record) }}</div>
+          </template>
+          <!-- 来源列：未知 source_type 原样显示，未来新增类型不必改前端 -->
+          <template v-if="column.key === 'source'">
+            {{ skillSourceLabel(record.source_type) }}
+          </template>
+          <template v-if="column.key === 'enabled'">
+            <a-switch :checked="record.enabled" :loading="toggling === record.id"
+                      :disabled="toggling !== null && toggling !== record.id"
+                      checked-children="启用" un-checked-children="停用"
+                      @change="(v) => toggleEnabled(record, v)" />
+          </template>
+          <template v-if="column.key === 'ops'">
+            <a-button size="small" type="text" data-test="skill-detail-btn" @click="openDetail(record)">
+              <eye-outlined /> 详情
+            </a-button>
+            <a-button size="small" danger type="text" @click="removeSkill(record)">
+              <delete-outlined /> 删除
+            </a-button>
+          </template>
+        </template>
+        <template #emptyText>
+          <a-empty description="还没有技能" />
+        </template>
+      </a-table>
+    </a-card>
 
     <!-- 详情抽屉（只读浏览母本，001/002） -->
     <SkillDetailDrawer
@@ -414,21 +408,21 @@ function removeSkill(record) {
   margin: 0 auto;
   padding: 16px 24px 40px;
 }
-.zc-page-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 12px;
-}
-.zc-back {
-  color: var(--zc-text-sub);
-}
-.zc-page-title {
-  margin: 0;
-  font-size: 18px;
-}
 .zc-card {
   margin-bottom: 16px;
+}
+/* 清单计数徽标：贴在卡片标题行的右侧，读数用等宽数字避免跳动 */
+.zc-count-badge {
+  display: inline-block;
+  min-width: 20px;
+  padding: 0 var(--zc-space-2);
+  border-radius: var(--zc-radius-pill);
+  background: rgba(var(--zc-primary-rgb), 0.12);
+  color: var(--zc-primary);
+  font-size: var(--zc-font-xs);
+  font-weight: 500;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
 }
 .zc-install-row {
   display: flex;

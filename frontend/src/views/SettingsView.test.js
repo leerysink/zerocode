@@ -191,3 +191,25 @@ describe('设置页入口', () => {
     expect(TEMPLATE).not.toContain('/settings/skills')
   })
 })
+
+describe('设置页正文面卡（整页层级统一）', () => {
+  it('左导航与右分区同住一张 zc-panel 卡，不再是铺在页面底色上的裸块', () => {
+    const w = mountView()
+    const body = w.find('.zc-set-body')
+    expect(body.classes()).toContain('zc-panel')
+    expect(body.find('.zc-set-nav').exists()).toBe(true)
+    expect(body.find('.zc-set-main').exists()).toBe(true)
+  })
+
+  it('卡内留 token 内边距，两栏之间一条细分隔线', () => {
+    expect(STYLE).toMatch(/\.zc-set-body\s*\{[^}]*padding:\s*var\(--zc-space-4\)/)
+    expect(STYLE).toMatch(/\.zc-set-nav\s*\{[^}]*border-right:\s*1px solid var\(--zc-border-soft\)/)
+  })
+
+  it('外壳仍只有 zc-panel 一份：正文块不重复抄底色与描边', () => {
+    const rule = STYLE.match(/\.zc-set-body\s*\{([^}]*)\}/)?.[1] ?? ''
+    expect(rule).not.toMatch(/background/)
+    expect(rule).not.toMatch(/(^|[^-])border(-radius)?:/)
+    expect(rule).not.toMatch(/box-shadow/)
+  })
+})

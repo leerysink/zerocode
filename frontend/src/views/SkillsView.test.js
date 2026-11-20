@@ -300,12 +300,38 @@ describe('SkillsView AI 生成卡片', () => {
 })
 
 describe('SkillsView 返回', () => {
-  it('直链进来无浏览器历史：兜底回首页（技能已是窄栏一级页，不再回设置）', async () => {
+  it('返回固定回对话页：四页同一条语义，不再按浏览器历史分叉', async () => {
     window.history.replaceState(null, '')
     const wrapper = await mountView()
     await wrapper.find('.zc-back').trigger('click')
     expect(mocks.router.push).toHaveBeenCalledWith('/')
     expect(mocks.router.back).not.toHaveBeenCalled()
+  })
+})
+
+describe('SkillsView 整页层级统一（页头走薄件 + 清单住进卡片）', () => {
+  const SKILLS = [
+    { id: 1, name: 'pdf', description: 'd', source_type: 'github', enabled: true,
+      file_count: 1, total_bytes: 10, has_scripts: false },
+    { id: 2, name: 'docx', description: 'd', source_type: 'url', enabled: true,
+      file_count: 1, total_bytes: 10, has_scripts: false },
+  ]
+
+  it('页头来自 ZcPageHeader：不再自绘一份页头 markup', async () => {
+    mocks.api.listSkills.mockResolvedValue({ data: [] })
+    const w = await mountView()
+    expect(w.find('[data-test="page-header"]').exists()).toBe(true)
+    expect(w.find('[data-test="page-title"]').text()).toBe('技能')
+  })
+
+  it('技能清单住在一枚带标题的卡里，标题右侧给计数徽标', async () => {
+    mocks.api.listSkills.mockResolvedValue({ data: SKILLS })
+    const w = await mountView()
+    const card = w.find('[data-test="skill-list-card"]')
+    expect(card.exists(), '清单必须在卡片壳里，不能继续是裸表格').toBe(true)
+    expect(card.text()).toContain('技能清单')
+    expect(card.find('[data-test="skill-count"]').text()).toBe('2')
+    expect(card.find('.stub-table').exists()).toBe(true)
   })
 })
 

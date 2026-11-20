@@ -270,7 +270,7 @@ async function reject (row) {
         </template>
       </zc-page-header>
 
-      <div class="zc-sadm-tabs" role="tablist">
+      <div class="zc-sadm-tabs zc-panel" role="tablist" data-test="sadm-tabs">
         <button v-for="t in TABS" :key="t.key" type="button" role="tab"
                 :aria-selected="tab === t.key" :data-test="`adm-tab-${t.key}`"
                 class="zc-sadm-tab" :class="{ on: tab === t.key }" @click="tab = t.key">
@@ -493,7 +493,9 @@ async function reject (row) {
 
 <style scoped>
 .zc-sadm { padding: var(--zc-space-5); }
-.zc-sadm-tabs { display: flex; gap: var(--zc-space-2); margin-bottom: var(--zc-space-4); }
+/* 状态页签条是一张面卡（外壳由全局 .zc-panel 给），卡内是胶囊页签 */
+.zc-sadm-tabs { display: flex; gap: var(--zc-space-2); margin-bottom: var(--zc-space-4);
+  padding: var(--zc-space-2) var(--zc-space-3); }
 .zc-sadm-tab { display: flex; align-items: center; gap: 6px; border: none; cursor: pointer;
   padding: 5px 14px; border-radius: var(--zc-radius-pill); background: transparent;
   color: var(--zc-text-sub); font-size: var(--zc-font-sm); }

@@ -292,3 +292,16 @@ describe('StoreAdminView', () => {
     expect(w2.find('[data-test="adm-edited"]').text()).toContain('已由 创始人 编辑')
   })
 })
+
+describe('StoreAdminView 状态页签面卡（整页层级统一）', () => {
+  it('三个状态页签同住一张面卡，计数徽标在卡内', async () => {
+    const w = mountView()
+    await flushPromises()
+    const tabs = w.find('[data-test="sadm-tabs"]')
+    expect(tabs.exists()).toBe(true)
+    expect(tabs.classes()).toContain('zc-panel')
+    expect(tabs.findAll('[data-test^="adm-tab-"]').length).toBe(3)
+    expect(tabs.findAll('.n').length).toBe(3)
+    w.unmount()
+  })
+})

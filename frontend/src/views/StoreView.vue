@@ -146,19 +146,22 @@ function gotoApps () { window.location.href = '/apps' }
 
     <a-tabs v-model:activeKey="tab">
       <a-tab-pane key="store" tab="商店">
-        <div class="zc-store-toolbar">
-          <a-input v-model:value="q" data-test="store-search" placeholder="搜索标题或简介"
-                   style="width: 220px" @press-enter="onSearch" />
-          <a-button data-test="store-search-btn" @click="onSearch">搜索</a-button>
-          <a-radio-group v-model:value="sort" button-style="solid" size="small" @change="onSort">
-            <a-radio-button value="latest" data-test="sort-latest">最新</a-radio-button>
-            <a-radio-button value="installs" data-test="sort-installs">安装量</a-radio-button>
-          </a-radio-group>
-        </div>
-        <div class="zc-store-filters">
-          <a-tag v-for="c in categories" :key="c" :data-test="`cat-${c}`"
-                 :color="(catFilter === '' && c === '全部') || catFilter === c ? 'blue' : undefined"
-                 class="zc-cat-tag" @click="setCategory(c)">{{ cats.labelOf(c) }}</a-tag>
+        <!-- 搜索/排序与分类胶囊同住一张筛选面卡：裸控件直接铺在页面底色上会和下方卡流脱节 -->
+        <div class="zc-store-filter zc-panel" data-test="store-filter-card">
+          <div class="zc-store-toolbar">
+            <a-input v-model:value="q" data-test="store-search" placeholder="搜索标题或简介"
+                     style="width: 220px" @press-enter="onSearch" />
+            <a-button data-test="store-search-btn" @click="onSearch">搜索</a-button>
+            <a-radio-group v-model:value="sort" button-style="solid" size="small" @change="onSort">
+              <a-radio-button value="latest" data-test="sort-latest">最新</a-radio-button>
+              <a-radio-button value="installs" data-test="sort-installs">安装量</a-radio-button>
+            </a-radio-group>
+          </div>
+          <div class="zc-store-filters">
+            <a-tag v-for="c in categories" :key="c" :data-test="`cat-${c}`"
+                   :color="(catFilter === '' && c === '全部') || catFilter === c ? 'blue' : undefined"
+                   class="zc-cat-tag" @click="setCategory(c)">{{ cats.labelOf(c) }}</a-tag>
+          </div>
         </div>
         <zc-empty-state v-if="loading" loading />
         <zc-empty-state v-else-if="!pagedReleases.length"
@@ -234,15 +237,17 @@ function gotoApps () { window.location.href = '/apps' }
 
       <a-tab-pane key="mine" tab="我的申请">
         <a-empty v-if="!mine.length" description="还没有提过申请" />
-        <a-table v-else :data-source="mine" :pagination="false" row-key="id"
-          :columns="[{ title: '应用', dataIndex: 'title' }, { title: '我起的名字', dataIndex: 'want_name' },
-                     { title: '状态', dataIndex: 'status' }, { title: '说明', dataIndex: 'reason' },
-                     { title: '操作', key: 'op' }]">
-          <template #bodyCell="{ column, record }">
-            <a-button v-if="column.key === 'op' && record.status === 'pending'" size="small"
-                      data-test="cancel-apply" @click="cancelApply(record)">撤回</a-button>
-          </template>
-        </a-table>
+        <a-card v-else class="zc-store-apply" data-test="store-apply-card" title="我的申请">
+          <a-table :data-source="mine" :pagination="false" row-key="id"
+            :columns="[{ title: '应用', dataIndex: 'title' }, { title: '我起的名字', dataIndex: 'want_name' },
+                       { title: '状态', dataIndex: 'status' }, { title: '说明', dataIndex: 'reason' },
+                       { title: '操作', key: 'op' }]">
+            <template #bodyCell="{ column, record }">
+              <a-button v-if="column.key === 'op' && record.status === 'pending'" size="small"
+                        data-test="cancel-apply" @click="cancelApply(record)">撤回</a-button>
+            </template>
+          </a-table>
+        </a-card>
       </a-tab-pane>
     </a-tabs>
 
@@ -301,11 +306,12 @@ function gotoApps () { window.location.href = '/apps' }
    这类硬编码值，换肤时只能靠深色块覆写颜色补，几何也各自为政 */
 .zc-store { padding: var(--zc-space-5); }
 .zc-store-meta { color: var(--zc-text-sub); font-size: var(--zc-font-sm); }
-.zc-store-filters { margin-bottom: var(--zc-space-3); display: flex; flex-wrap: wrap;
-  gap: var(--zc-space-2); }
+/* 筛选面卡：外壳（描边/圆角/卡底）由全局 .zc-panel 给，这里只管卡内节奏 */
+.zc-store-filter { margin-bottom: var(--zc-space-4); padding: var(--zc-space-3) var(--zc-space-4); }
+.zc-store-filters { display: flex; flex-wrap: wrap; gap: var(--zc-space-2); }
 .zc-cat-tag { cursor: pointer; }
 .zc-store-toolbar { display: flex; align-items: center; gap: var(--zc-space-2);
-  margin-bottom: var(--zc-space-3); }
+  margin-bottom: var(--zc-space-2); }
 .zc-store-pager { margin-top: var(--zc-space-3); text-align: right; }
 /* 网格列宽与等高由这里给，卡内节奏在 ZcEntityCard 里 */
 .zc-store-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
