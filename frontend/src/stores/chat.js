@@ -104,6 +104,7 @@ function mergeDelegateReceipt(open, result) {
 function endRunState(store) {
   store.running = false
   store.streamingThinking = ''
+  store.streamingThinkingOpen = false
   store.compacting = false // 压缩失败也是终态：复位压缩按钮 loading
   store.pendingEcho = ''
   store.pendingOutbox = {}
@@ -279,12 +280,21 @@ export function applyEvent(store, ev) {
       store.hint = closed ? '后端已无这次确认/回答的记录（执行已中断或后端重启），卡片已收口' : ''
       break
     }
-    case 'message_done': // 整段回复固化（附带思考留痕）
-      store.messages.push({ role: 'assistant', content: ev.content, reasoning: store.streamingThinking || undefined })
+    case 'message_done': { // 整段回复固化（附带思考留痕）
+      const rec = {
+        role: 'assistant', content: ev.content, reasoning: store.streamingThinking || undefined,
+      }
+      // 展开意图在此刻交棒给这条记录：流式块马上卸载，历史块读它当初始态，
+      // 正读着的人不会被突然折叠（ADR-0065）。
+      // 没点开过就不留键：这个键不落库，历史行永远没有它，多一键就叉开 ADR-0029 的同构。
+      if (store.streamingThinkingOpen) rec.reasoning_open = true
+      store.messages.push(rec)
       store.streamingContent = ''
       store.streamingThinking = ''
+      store.streamingThinkingOpen = false
       store.toolProgress = null // 本轮收口：临时进度不得活到下一条消息
       break
+    }
     case 'reasoning_delta': // 思考流式增量（有才发）
       store.streamingThinking += ev.content
       break
@@ -423,6 +433,7 @@ export const useChatStore = defineStore('chat', {
     running: false,
     todoList: [],
     streamingThinking: '',
+    streamingThinkingOpen: false, // 本轮思考块是否被手工点开：收口时交给固化后的历史块（ADR-0065）
     models: [],
     currentModelId: null,
     effectiveModel: null, // 实际生效模型（含视觉能力）：由会话详情/切换模型的响应回写
@@ -522,6 +533,7 @@ export const useChatStore = defineStore('chat', {
       this.visionSupported = false
       this.streamingContent = ''
       this.streamingThinking = ''
+      this.streamingThinkingOpen = false
       this.compacting = false
       this.hint = ''
       this.rejectedDraft = ''
@@ -637,6 +649,7 @@ export const useChatStore = defineStore('chat', {
       this.pendingEchoId = clientMsgId
       this.streamingContent = ''
       this.streamingThinking = ''
+      this.streamingThinkingOpen = false
       this.hint = ''
       this.rejectedDraft = ''
       this.running = true
@@ -698,6 +711,7 @@ export const useChatStore = defineStore('chat', {
       this.pendingEchoId = ''
       this.running = false
       this.streamingThinking = ''
+      this.streamingThinkingOpen = false
     },
     async retry() {
       // 重发最近一条用户消息；带图的重试必须先重新上传，拿到新附件 ID 再发

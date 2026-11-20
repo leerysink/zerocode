@@ -1003,3 +1003,37 @@ it('缓存命中时不显示加载态（内容已在）', () => {
   expect(w.find('.stub-spin').exists()).toBe(false)
   expect(w.text()).toContain('缓存内容')
 })
+
+// 思考块的接线（ADR-0065）。折叠本身由 ThinkingBlock 自己的测试钉，这里只钉「父层接不接得住」：
+// 用真组件而不是桩——桩在漏接线时照样绿。
+describe('思考块展开态接线', () => {
+  const mountThink = (props) => {
+    setActivePinia(createPinia())
+    return mount(ChatMessages, {
+      props: { hasSession: true, ...props },
+      global: { stubs: { ...STUBS, ThinkingBlock: false } },
+    })
+  }
+  const collapsed = (w) => (w.find('.zc-think-body').attributes('style') || '').includes('display: none')
+
+  it('流式思考默认折叠，点开才把展开态写回 store', async () => {
+    const w = mountThink({ streamingThinking: '先想想' })
+    expect(collapsed(w)).toBe(true)
+    await w.find('.zc-think-head').trigger('click')
+    expect(collapsed(w)).toBe(false)
+    expect(useChatStore().streamingThinkingOpen).toBe(true)
+  })
+
+  it('收口那一刻还开着的话，固化后的历史块接着是展开的', () => {
+    const w = mountThink({
+      messages: [{ role: 'assistant', content: '好了', reasoning: '想', reasoning_open: true }],
+    })
+    expect(collapsed(w)).toBe(false)
+  })
+
+  it('没点开过的历史块折叠，头部给「查看思考」', () => {
+    const w = mountThink({ messages: [{ role: 'assistant', content: '好了', reasoning: '想' }] })
+    expect(collapsed(w)).toBe(true)
+    expect(w.find('.zc-think-head').text()).toContain('查看思考')
+  })
+})

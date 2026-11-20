@@ -1,22 +1,31 @@
 <script setup>
-// 思考内容折叠块：流式形态展开+“思考中…”动画；历史形态默认折叠（点击回看）
+// 思考内容折叠块：流式与历史都默认折叠（流式只显「思考中…」），点开才看正文。
+// 展开态归父层所有：`open` 只是初值，点击后由内部持有并回吐 update:open，
+// 收口时父层把它接到固化后的历史块上，正在读的人才不会被突然折叠打断（ADR-0065）。
 import { ref, watch } from 'vue'
 
 const props = defineProps({
   thinking: { type: String, default: '' },
   streaming: { type: Boolean, default: false },
+  open: { type: Boolean, default: false },
 })
-const open = ref(props.streaming)
-watch(() => props.streaming, (v) => { if (v) open.value = true })
+const emit = defineEmits(['update:open'])
+
+const expanded = ref(props.open)
+watch(() => props.open, (v) => { expanded.value = v })
+function toggle() {
+  expanded.value = !expanded.value
+  emit('update:open', expanded.value)
+}
 </script>
 
 <template>
   <div class="zc-think">
-    <button class="zc-think-head" type="button" @click="open = !open">
+    <button class="zc-think-head" type="button" @click="toggle">
       <span v-if="streaming" class="zc-think-live">思考中…</span>
       <span v-else>查看思考</span>
     </button>
-    <pre v-show="open" class="zc-think-body">{{ thinking }}</pre>
+    <pre v-show="expanded" class="zc-think-body">{{ thinking }}</pre>
   </div>
 </template>
 

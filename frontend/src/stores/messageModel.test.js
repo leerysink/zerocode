@@ -33,6 +33,23 @@ describe('normalizeMessages 历史行', () => {
   })
 })
 
+// 思考块的展开意图（ADR-0065）只活在实时记录上：收口时盖上去，渲染层读它当历史块初值。
+// 历史行永远没有这个键，刷新后一律折叠——所以透传必须「有才传」，不能补出 false。
+describe('reasoning_open 透传', () => {
+  it('实时记录带 true 时渲染记录也带 true', () => {
+    const out = normalizeMessages([
+      { role: 'assistant', content: '好了', reasoning: '想', reasoning_open: true },
+    ])
+    expect(out[0]).toEqual({ role: 'assistant', content: '好了', reasoning: '想', reasoning_open: true })
+  })
+  it('未展开的实时记录与历史行同样不含该键（同构形状不叉开）', () => {
+    const live = normalizeMessages([{ role: 'assistant', content: '好了', reasoning: '想' }])
+    const hist = normalizeMessages([{ id: 1, seq: 1, role: 'assistant', content: '好了', reasoning: '想' }])
+    expect(live).toEqual(hist)
+    expect('reasoning_open' in live[0]).toBe(false)
+  })
+})
+
 // 同一次执行的实时事件流。注意：模型在工具轮里说的「让我看看」此刻还固化不下来
 // （后端要等工具轮补发轮次收口，见 tickets/002），所以这里只比工具记录那一段。
 function liveMessages() {

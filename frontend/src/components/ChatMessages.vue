@@ -257,7 +257,9 @@ onBeforeUnmount(cancelFill)
                空内容但有思考的历史消息也渲染；纯 tool_calls 空内容行仍不渲染） -->
           <div v-else-if="item.m.role === 'assistant' && (item.m.content || item.m.reasoning)" class="zc-msg is-assistant">
             <div class="zc-assistant">
-              <ThinkingBlock v-if="item.m.reasoning" :thinking="item.m.reasoning" />
+              <!-- reasoning_open：这一轮收口时用户还点开着思考块，接过来才不把正在读的人折叠掉 -->
+              <ThinkingBlock v-if="item.m.reasoning" :thinking="item.m.reasoning"
+                             :open="item.m.reasoning_open === true" />
               <MarkdownView v-if="item.m.content" class="zc-md" :content="item.m.content" />
             </div>
           </div>
@@ -300,9 +302,10 @@ onBeforeUnmount(cancelFill)
           </div>
         </template>
 
-        <!-- 流式思考：reasoning_delta 累积期间展示 -->
+        <!-- 流式思考：reasoning_delta 累积期间展示。默认折叠，只显「思考中…」；
+             展开态写回 store，收口时由 message_done 接到固化后的那条记录上（ADR-0065）。 -->
         <div v-if="streamingThinking" class="zc-msg is-assistant">
-          <ThinkingBlock :thinking="streamingThinking" streaming />
+          <ThinkingBlock :thinking="streamingThinking" streaming v-model:open="store.streamingThinkingOpen" />
         </div>
 
         <!-- 流式气泡：streamingContent 非空才渲染（仅此气泡随 token 重算 Markdown） -->

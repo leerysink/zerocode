@@ -17,6 +17,7 @@ vi.mock('../api', async (importOriginal) => ({
 function mk() {
   return {
     messages: [], streamingContent: '', streamingThinking: '', todoList: [],
+    streamingThinkingOpen: false,
     compacting: false, currentSessionId: 1,
     toolProgress: null,
     pendingEcho: '', pendingEchoId: '', pendingOutbox: {}, rejectedDraft: '',
@@ -37,6 +38,24 @@ describe('applyEvent 新事件', () => {
     applyEvent(s, { type: 'message_done', content: '答' })
     expect(s.messages[0]).toEqual({ role: 'assistant', content: '答', reasoning: '想' })
     expect(s.streamingThinking).toBe('')
+  })
+  // 展开态跟着这条记录走：流式块在收口这一刻卸载，接不住它的话，正读着的人会被突然折叠（ADR-0065）。
+  it('message_done 把手工展开的思考接给固化后的那条记录', () => {
+    const s = mk()
+    s.streamingThinking = '想'
+    s.streamingThinkingOpen = true
+    applyEvent(s, { type: 'message_done', content: '答' })
+    expect(s.messages[0]).toEqual({
+      role: 'assistant', content: '答', reasoning: '想', reasoning_open: true,
+    })
+    expect(s.streamingThinkingOpen).toBe(false)
+  })
+  // 这个键只活在实时记录上、不落库：未点开过就不留键，否则实时比历史多一键，同构断言叉开。
+  it('没点开过的思考块不留 reasoning_open 键', () => {
+    const s = mk()
+    s.streamingThinking = '想'
+    applyEvent(s, { type: 'message_done', content: '答' })
+    expect('reasoning_open' in s.messages[0]).toBe(false)
   })
   // 工具轮也发收口之后，一次执行会有多条 assistant 消息：思考留痕必须各归各轮。
   it('多轮执行里思考留痕各归各轮，不串到下一轮', () => {
@@ -462,12 +481,14 @@ describe('tool_progress 与确认卡 summary', () => {
     applyEvent(s, { type: 'confirm_request', tool: 'write_file', args: { path: 'a.txt' } })
     s.running = true
     s.streamingThinking = '半截思考'
+    s.streamingThinkingOpen = true
     s.toolProgress = { name: 'write_file', line: '正在写' }
     s.compacting = true
     applyEvent(s, { type: 'interaction_expired' })
     // 这一帧就是本轮的终态：复位集合必须与 error / status(idle) 完全一致，
     // 少清一项（实测漏了 streamingThinking）页面就永远挂着「思考中…」。
     expect(s.streamingThinking).toBe('')
+    expect(s.streamingThinkingOpen).toBe(false)
     expect(s.toolProgress).toBeNull()
     expect(s.compacting).toBe(false)
     expect(s.running).toBe(false)

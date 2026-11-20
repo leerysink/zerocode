@@ -211,6 +211,9 @@ export function normalizeMessages(list) {
       const rec = { role: 'assistant' }
       put(rec, 'content', raw.content)
       put(rec, 'reasoning', raw.reasoning)
+      // 展开意图只在实时记录上（收口那一刻由 chat.js 盖上来，ADR-0065），历史行永远没有这个键，
+      // 所以刷新后一律折叠。这里「有才传」而不是传 false：补一个键就叉开 ADR-0029 的同构。
+      if (raw.reasoning_open) rec.reasoning_open = true
       out.push(rec)
       // 参数留到后续 tool 行来认领：一次调用可能有多条，按 id 配对而非按顺序
       const calls = callsOf(raw)
