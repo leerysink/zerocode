@@ -140,6 +140,15 @@ GATEWAY_REQUIRED = ("docker-compose.yml", "nginx.conf", "lua/router.lua", "404.h
 BROWSER_REQUIRED = ("Dockerfile", "requirements.txt", "app.py", "inspect_core.py",
                     "session_core.py", "sessions.py", "__init__.py")
 
+# 沙箱镜像（ADR-0066）：run_python/run_shell 的执行环境 + 出口 router。
+# 与 browser 同理逐个列名——漏一个的表现是服务器上镜像构建失败，离根因很远。
+SANDBOX_REQUIRED = ("Dockerfile", "requirements.txt",
+                    "egress/Dockerfile", "egress/entrypoint.sh")
+# 只有这些是「文档/本地入口」，不参与镜像构建，故不进白名单不变式。
+SANDBOX_DOC_NAMES = frozenset({"README.md", "build.bat"})
+SANDBOX_LF_NAMES = frozenset({"Dockerfile", "entrypoint.sh"})
+SANDBOX_LF_SUFFIXES = frozenset({".txt", ".sh", ".yml", ".yaml"})
+
 # 网关 compose 里两个默认值的形态（与平台 compose 的 ${VAR:-打包值} 同一副面孔）：
 # 域名 fallback 换成实际域名，上游 fallback 换成 Linux 可用的 IP。
 # 各自出现 0 次或多次都拒包——前者说明源文件改了形状、替换会静默不生效，后者说明判定域有歧义。
@@ -1071,6 +1080,9 @@ services:
       # 网关路由表：与 gateway 容器共用的宿主目录（见上）。app/deploy/gateway_routes.py
       # 往这里写 {{slug: prod_port}}，网关只读它；写不进去时业务照常，只是域名访问 404。
       ZEROCODE_GATEWAY_ROUTES: {dr}/gateway/routes/routes.json
+      # 沙箱镜像 tag（ADR-0066）：与 compose 里 build 出来的两个 tag 逐字同源。
+      ZEROCODE_SANDBOX_IMAGE: zerocode-sandbox:demo
+      ZEROCODE_SANDBOX_EGRESS_IMAGE: zerocode-sandbox-egress:demo
 {extra_env}
     ports:
       - "${{PLATFORM_PORT:-8100}}:8100"      # 控制台：http://<服务器IP>:8100
@@ -1126,6 +1138,38 @@ services:
     mem_limit: 1g
     cpus: 1.0
     pids_limit: 256
+    networks: [default]
+
+  # 沙箱镜像（ADR-0066）：run_python/run_shell 的一次性执行环境。它**不是常驻服务**——
+  # 平台按需用 docker run 起一次性容器，这里只为「在服务器上把镜像 build 出来」而声明，
+  # 用 profiles 排除出 up。部署须显式 `docker compose build sandbox-image sandbox-egress`。
+  sandbox-image:
+    build:
+      context: ./sandbox
+      dockerfile: Dockerfile
+      args:
+        ZEROCODE_APT_MIRROR: ${{ZEROCODE_APT_MIRROR:-{browser_apt}}}
+        ZEROCODE_PYPI_MIRROR: ${{ZEROCODE_PYPI_MIRROR:-{browser_pypi}}}
+    image: zerocode-sandbox:demo
+    profiles: ["build-only"]
+
+  # 出口 router（ADR-0066 决策 3）：持 NET_ADMIN 把 nft 规则装在自己 netns 里，沙箱以
+  # --network container: 共享它。**宿主防火墙一行不动**。
+  # 挂**目录**不挂文件（同 gateway/routes 的教训）：规则由平台启动时写，单文件 bind mount
+  # 在文件还不存在时会被建成目录，且原子替换后钉在旧 inode 上。router 会等文件出现。
+  sandbox-egress:
+    build:
+      context: ./sandbox/egress
+      dockerfile: Dockerfile
+      args:
+        ZEROCODE_APT_MIRROR: ${{ZEROCODE_APT_MIRROR:-{browser_apt}}}
+    image: zerocode-sandbox-egress:demo
+    container_name: zerocode-sandbox-egress
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - {dr}/data/sandbox_egress:/ruleset:ro
     networks: [default]
 
 volumes:
@@ -1385,9 +1429,9 @@ docker daemon 起不来）、保证发行版 `/etc/wsl.conf` 里 `[boot] systemd
 | 3 腾地方 | 新增模式下机器上已有 `pgdata` 卷：要连库一起重做吗 | 要删得逐字输入 `yes`（老 `--fresh-db` 的去处）。升级模式不问、也永不删卷 |
 | 4 运行参数 | `POSTGRES_USER`、`POSTGRES_PASSWORD`、`PLATFORM_PORT`、`PG_PORT`、`ZEROCODE_PREVIEW_HOST`、PyPI / npm / apt 三个镜像源、要不要起中央网关（答「起」才接着问网关域名与 `ZEROCODE_SSL_ENABLE`） | 口令**只进 `.env`**，不进 `.deploy-answers`；升级时直接回车就沿用 `.env` 里的既有值。`ZEROCODE_PREVIEW_HOST` 的打包默认值是 `localhost`（本机演示用的），脚本发现它没被改就换成探测到的宿主 IP |
 | 5 宿主端口 | 控制台端口（起网关时还有 80/443）被占了怎么办 | 占用者是**容器**才问「stop 它腾地方？」（只 stop 不删，`docker start <名字>` 可恢复）；是**宿主进程**就报 PID 让你自己确认再 kill。脚本不代劳 kill，也不劝你改 `PLATFORM_PORT` 买单 |
-| 6 落盘 | 不问：合并 `.env`、铺包或按升级合并、把答案写进 `.deploy-answers` | 升级模式只镜像 `backend/`、`browser/`、`frontend/` 三棵，八项现场产物一个不碰（§4） |
-| 7 起平台栈 | 不问 | 先核 compose 里声明了 `browser` 服务，再预热 `docker pull` 基础镜像——拉不动就当场停，不等 build 卡二十分钟；起栈一律 `up -d --build`：平台代码与前端 dist 都烘在镜像里，只 `up -d` 会静默停在旧镜像 |
-| 8 重放与自检 | 不问：`bash apply-init.sh`，然后从后端容器实探探针与 sidecar | `compose 里有 browser 服务` 不等于 `Chromium 起得来`，自检探的是 `$ZEROCODE_BROWSER_URL/healthz` |
+| 6 落盘 | 不问：合并 `.env`、铺包或按升级合并、把答案写进 `.deploy-answers` | 升级模式只镜像 `backend/`、`browser/`、`sandbox/`、`frontend/` 四棵，八项现场产物一个不碰（§4） |
+| 7 起平台栈 | 不问 | 先核 compose 里声明了 `browser` 服务，再预热 `docker pull` 基础镜像——拉不动就当场停，不等 build 卡二十分钟；起栈一律 `up -d --build`：平台代码与前端 dist 都烘在镜像里，只 `up -d` 会静默停在旧镜像。**沙箱两个镜像还要显式 build**：`docker compose build sandbox-image sandbox-egress`——`sandbox-image` 带 `profiles: [build-only]`（它不是常驻服务，平台按需 `docker run` 起一次性容器），`up -d --build` **不会**构建它，漏这一步的表现是 `run_python`/`run_shell` 恒回「沙箱镜像未构建」 |
+| 8 重放与自检 | 不问：`bash apply-init.sh`，然后从后端容器实探探针与 sidecar | `compose 里有 browser 服务` 不等于 `Chromium 起得来`，自检探的是 `$ZEROCODE_BROWSER_URL/healthz`。沙箱同理要探两件事：`docker image inspect zerocode-sandbox:demo` 在，且 `zerocode-sandbox-egress` 容器 running——**镜像在但 router 没起**时沙箱会回「出口 router 未在运行」，那是 fail-closed 不是降级 |
 | 9 中央网关 | 升级时问「要按新的 `gateway/docker-compose.yml` 重建吗」 | **不签证书**：`gateway/certs/` 里已有 `gateway.crt` 与 `gateway.key` 就起网关，缺就跳过起网关并指路 `bash gen_ssl.sh`（缺证书的 openresty 是半死状态，比不起难查）；`gateway/certs/`、`gateway/routes/`、`gateway/.env` 是现场产物，不覆盖也不删 |
 
 `.env` 由脚本从包里的 `.env.example` 起步生成、再合并本次答案，既有键与注释一律保留——**不要**
@@ -1719,6 +1763,29 @@ def copy_browser(repo_root: Path, dst: Path) -> int:
     return _count_files(dst)
 
 
+def copy_sandbox(repo_root: Path, dst: Path) -> int:
+    """复制沙箱镜像源码（sandbox/），返回文件数。缺文件直接拒包，理由同 copy_browser。
+
+    `entrypoint.sh` 必须剥 CRLF：shell 脚本带 \\r 会让 `#!/bin/sh\\r` 变成找不到解释器，
+    表现是 router 容器起来即退、沙箱共享 netns 失败——离根因很远。
+    """
+    src = repo_root / "sandbox"
+    missing = [rel for rel in SANDBOX_REQUIRED if not (src / rel).is_file()]
+    if missing:
+        raise BuildError(f"沙箱镜像源码缺 {missing}（{src}）："
+                         f"run_python 与 run_shell 都依赖它，缺文件不出包")
+    if dst.exists():
+        shutil.rmtree(dst)
+    shutil.copytree(src, dst, ignore=_ignore_names(BROWSER_EXCLUDE_DIRS))
+    for path in dst.rglob("*"):
+        if path.is_file() and (path.name in SANDBOX_LF_NAMES
+                               or path.suffix.lower() in SANDBOX_LF_SUFFIXES):
+            raw = path.read_bytes()
+            if b"\r\n" in raw:
+                path.write_bytes(raw.replace(b"\r\n", b"\n"))
+    return _count_files(dst)
+
+
 def _bake_fallback(text: str, token_re: re.Pattern, env_name: str, value: str) -> str:
     """把 compose 里 `${ENV:-任意默认值}` 的默认值换成打包值，命中数不是 1 就拒包。"""
     new, hits = token_re.subn(lambda _m: "${" + env_name + ":-" + value + "}", text)
@@ -2035,6 +2102,7 @@ def _assemble(repo_root: Path, staging: Path, presets, root: str,
     stamp = generated_at or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     backend_files = copy_backend(repo_root, staging / "backend", root, mirrors)
     browser_files = copy_browser(repo_root, staging / "browser")
+    sandbox_files = copy_sandbox(repo_root, staging / "sandbox")
     frontend_files = copy_frontend_dist(dist, staging / "frontend")
     gateway_files = copy_gateway(repo_root, staging / "gateway", gateway_domain)
     preset_files = {p.slug: copy_preset_app(p.src, staging / "apps" / p.slug) for p in presets}
@@ -2070,6 +2138,7 @@ def _assemble(repo_root: Path, staging: Path, presets, root: str,
         "preset_files": preset_files,
         "backend_files": backend_files,
         "browser_files": browser_files,
+        "sandbox_files": sandbox_files,
         "frontend_files": frontend_files,
         "gateway_files": gateway_files,
         "init_sql_bytes": len(init_sql.encode("utf-8")),
@@ -2153,6 +2222,7 @@ def main(argv=None) -> int:
                               or "未注入（全部走官方源）"))
     print(f"  后端          {summary['backend_files']} 个文件（app/ + requirements.txt + Dockerfile）")
     print(f"  浏览器 sidecar {summary['browser_files']} 个文件（browser/；服务名 browser，不发布宿主端口）")
+    print(f"  沙箱镜像 {summary['sandbox_files']} 个文件（sandbox/；run_python/run_shell 执行环境 + 出口 router）")
     print(f"  前端 dist     {summary['frontend_files']} 个文件（构建于 {summary['dist_stamp']}）")
     print(f"  网关配置      {summary['gateway_files']} 个文件（gateway/；certs/ 与运行期 routes.json 不入包）")
     print(f"  init.sql      {summary['init_sql_bytes']:,} 字节（changelog 全量合成 + 预置应用种子）")

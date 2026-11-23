@@ -17,6 +17,7 @@ import BrowserFlowCard from './BrowserFlowCard.vue'
 import WebFetchCard from './WebFetchCard.vue'
 import WebDownloadCard from './WebDownloadCard.vue'
 import RunPythonCard from './RunPythonCard.vue'
+import ImportArtifactCard from './ImportArtifactCard.vue'
 import { applyEvent, useChatStore } from '../stores/chat'
 import { DECLINE_ANSWER } from '../stores/messageModel'
 
@@ -706,6 +707,79 @@ describe('run_python 在消息流里的渲染', () => {
     const w = mountMessages(s.messages)
     expect(w.text()).toContain('执行确认')
     expect(w.find('.zc-confirm-args').text()).toContain('print(1+1)')
+  })
+})
+
+// ---- 沙箱命令面（ADR-0066）：run_shell 与 run_python 共用一张卡，按名字换措辞 ----
+
+describe('run_shell 在消息流里的渲染', () => {
+  it('路由到 RunPythonCard，展示命令行原文与输出', () => {
+    const w = mountMessages([{ role: 'tool', name: 'run_shell',
+      args: { command: 'ls -la /workspace' },
+      result: { ok: true, exit_code: 0, duration_seconds: 0.2, output: 'total 0' } }])
+    expect(w.findComponent(RunPythonCard).exists()).toBe(true)
+    expect(w.findComponent(ToolCallBlock).exists()).toBe(false)
+    expect(w.text()).toContain('ls -la /workspace')
+    expect(w.text()).toContain('total 0')
+  })
+
+  it('历史行（tool_name / tool_result）刷新后仍画执行卡', () => {
+    const w = mountMessages([{ role: 'tool', tool_name: 'run_shell',
+      tool_result: { ok: true, exit_code: 0, output: 'hello' } }])
+    expect(w.findComponent(RunPythonCard).exists()).toBe(true)
+    expect(w.text()).toContain('hello')
+  })
+
+  it('执行中（无结果）画实时态命令措辞', () => {
+    const w = mountMessages([{ role: 'tool', name: 'run_shell', args: { command: 'ls' } }])
+    expect(w.text()).toContain('正在执行命令')
+  })
+
+  it('待答确认卡用执行文案，参数摘要带命令行', () => {
+    setActivePinia(createPinia())
+    const s = useChatStore()
+    s.messages = [{
+      role: 'assistant', content: '我来看目录',
+      tool_args: {
+        tool_calls: [{
+          id: 'c1', type: 'function',
+          function: { name: 'run_shell', arguments: '{"command":"ls -la /workspace"}' },
+        }],
+      },
+    }]
+    applyEvent(s, { type: 'confirm_request', tool: 'run_shell', args: { command: 'ls -la /workspace' } })
+    const w = mountMessages(s.messages)
+    expect(w.text()).toContain('执行确认')
+    expect(w.find('.zc-confirm-args').text()).toContain('ls -la /workspace')
+  })
+})
+
+// ---- 产物导入（ADR-0066 决策 7）：落盘回执 + 不可回滚提示 ----
+
+describe('import_artifact 在消息流里的渲染', () => {
+  it('路由到 ImportArtifactCard，展示落盘路径与不可回滚提示', () => {
+    const w = mountMessages([{ role: 'tool', name: 'import_artifact',
+      args: { name: '报告.docx', path: 'out/报告.docx' },
+      result: { ok: true, path: 'out/报告.docx', bytes: 20480,
+        notice: '二进制产物未存原文，不可回滚；如需撤销请用 delete_file' } }])
+    expect(w.findComponent(ImportArtifactCard).exists()).toBe(true)
+    expect(w.findComponent(ToolCallBlock).exists()).toBe(false)
+    expect(w.text()).toContain('out/报告.docx')
+    expect(w.text()).toContain('不可回滚')
+  })
+
+  it('历史行（tool_name / tool_result）刷新后仍画同一张卡', () => {
+    const w = mountMessages([{ role: 'tool', tool_name: 'import_artifact',
+      tool_result: { ok: true, path: 'out/表.xlsx', bytes: 1024, notice: '不可回滚' } }])
+    expect(w.findComponent(ImportArtifactCard).exists()).toBe(true)
+    expect(w.text()).toContain('out/表.xlsx')
+  })
+
+  it('导入中（无结果）画实时态', () => {
+    const w = mountMessages([{ role: 'tool', name: 'import_artifact',
+      args: { name: '报告.docx', path: 'out/报告.docx' } }])
+    expect(w.findComponent(ImportArtifactCard).exists()).toBe(true)
+    expect(w.text()).toContain('正在导入')
   })
 })
 

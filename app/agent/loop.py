@@ -17,7 +17,7 @@ from app.agent.browser_tools import build_browser_prompt
 from app.agent.browser_session_tools import (build_browser_session_prompt, close_browser_session,
                                              redact_sensitive_step_args)
 from app.agent.web_tools import build_web_prompt, build_web_session_prompt
-from app.agent.python_tools import build_python_prompt
+from app.agent.python_tools import build_python_prompt, cleanup_run_scratch
 from app.agent.db_tools import db_confirm_summary
 from app.agent.prompts import build_app_prompt_blocks, build_clarify_prompt, build_system_prompt
 from app.agent import clarify as _cl
@@ -267,6 +267,9 @@ class AgentRunner:
             # 否则 sidecar 会在 mem_limit 1g 里攒僵尸 context。放在状态帧之后、且内部全吞：
             # 一次没收口的清理不该把对话结束的读数拖住最多 10 秒。
             await close_browser_session(self._tool_ctx)
+            # 沙箱产物目录收口（ADR-0066 决策 8）：scratch 活到 run 结束供 import_artifact 取，
+            # 三条出口都要清，否则宿主临时目录会攒成泄漏。内部 ignore_errors，不抛。
+            cleanup_run_scratch(self._tool_ctx)
             self.last_outcome = outcome
         return status
 

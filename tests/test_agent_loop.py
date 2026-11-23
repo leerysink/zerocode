@@ -2399,3 +2399,41 @@ async def test_ask_user_garbage_options_falls_back_to_free_answer(test_engine, t
     sid, status, evs, sf = await run_once(test_engine, tmp_path, turns, ask=spy_ask)
     assert status == "idle"
     assert captured["questions"][0]["options"] == []
+
+
+# ---- 沙箱 scratch 收口（ADR-0066 决策 8 / US-32）：三条出口都要清 ----
+
+@pytest.mark.asyncio
+async def test_run_close_cleans_sandbox_scratch_on_all_three_exits(test_engine, tmp_path):
+    """正常结束 / 取消 / 报错都清 scratch——钉的是收口接线，不是清理函数本身。
+
+    清理函数自己有单测不代表它被接进 run 收口；把 _inner 换成「登记 scratch 后按出口抛」，
+    漏接线时这条必红。
+    """
+    import tempfile
+    from pathlib import Path
+    from app.agent import python_tools
+    from app.agent.loop import _Cancelled
+    from app.agent.tools import ToolContext
+
+    sf = make_session_factory(test_engine)
+    sid, _uid = await _mk_owned_session(test_engine, tmp_path)
+
+    for label, exc in (("completed", None), ("cancelled", _Cancelled()),
+                       ("error", RuntimeError("boom"))):
+        rec = Recorder()
+        runner = AgentRunner(sf, ScriptedLLM([]), lambda *a, **k: {}, rec,
+                             lambda *a, **k: asyncio.sleep(0, None),
+                             lambda *a, **k: True)
+        scratch = tempfile.mkdtemp(prefix="zc-pysandbox-")
+        ctx = ToolContext(root=tmp_path, session_id=sid, session_factory=None, send=rec)
+        ctx.run_state[python_tools.SCRATCH_KEY] = scratch
+
+        async def fake_inner(*a, _exc=exc, _ctx=ctx, **k):
+            runner._tool_ctx = _ctx
+            if _exc is not None:
+                raise _exc
+
+        runner._inner = fake_inner
+        await runner.run(sid, "开始", asyncio.Event())
+        assert not Path(scratch).exists(), label

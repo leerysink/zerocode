@@ -1,0 +1,10 @@
+# 沙箱预装库（ADR-0066 决策 4/5）：办公三件 + 数据处理，开箱可用免运行期安装。
+# 运行期非 root、镜像里没有编译链（gcc），所以只放纯 Python 或有 manylinux wheel 的包。
+# 老 .doc/.xls 不在支持范围（ADR-0066），刻意不装 LibreOffice/antiword 这类转换依赖。
+python-docx>=1.1
+openpyxl>=3.1
+python-pptx>=1.0
+pandas>=2.2
+numpy>=2.0
+requests>=2.32
+python-dateutil>=2.9

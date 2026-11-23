@@ -571,9 +571,9 @@ elif [ "$MODE" = new ]; then
   ok "包已整体铺进 $DEPLOY_ROOT"
 else
   cd "$DEPLOY_ROOT" || fail "进不去 $DEPLOY_ROOT"
-  for d in backend browser frontend; do
+  for d in backend browser sandbox frontend; do
     [ -d "$PKG/$d" ] || { warn "包里缺 $d/，跳过这一棵（缺文件本该在打包时就拦住）"; continue; }
-    printf '  → 镜像同步 %s/（带 --delete，全场只有这三棵带）\n' "$d" >&2
+    printf '  → 镜像同步 %s/（带 --delete，全场只有这四棵带）\n' "$d" >&2
     rsync -a --delete "$PKG/$d/" "$DEPLOY_ROOT/$d/" || fail "镜像 $d/ 失败"
   done
   for f in docker-compose.yml init.sql apply-init.sh deploy.sh deploy_lib.sh gen_ssl.sh deploy.ps1 deploy.bat \
@@ -625,8 +625,12 @@ fi
 #     （本地实测 config --images 返回 3 项，其中 2 项根本拉不到）。
 pull_bases() {          # stdout=拉不动的镜像名（空格分隔；全到位就是空行）
   local out="" i
-  for i in $(awk '/^FROM[[:space:]]/ {print $2}' backend/Dockerfile browser/Dockerfile 2>/dev/null \
-             | grep -vE '^[$<]' | sort -u); do
+  # 逐文件读，不用一条 awk 带多个文件名：awk 遇到第一个缺失文件就**致命中断**，
+  # 后面的一个都不读——名单里任何一棵没铺上，整轮预热会静默变成空清单。
+  for i in $(for f in backend/Dockerfile browser/Dockerfile \
+                      sandbox/Dockerfile sandbox/egress/Dockerfile; do
+               [ -f "$f" ] && awk '/^FROM[[:space:]]/ {print $2}' "$f"
+             done | grep -vE '^[$<]' | sort -u); do
     docker image inspect "$i" >/dev/null 2>&1 && { ok "本地已有 $i"; continue; }
     printf '  → 预热 %s\n' "$i" >&2
     if docker pull "$i" >/dev/null 2>&1; then ok "$i 就位"; else out="$out $i"; fi
@@ -678,6 +682,13 @@ fi
 say "docker compose up -d --build（升级必须重建：平台与浏览器代码都烘在镜像里；浏览器镜像含 Chromium，首次几分钟起）"
 docker compose up -d --build || fail "起栈失败：docker compose logs backend --tail 100（镜像里的依赖装不动就回头看第 7 步的镜像源提示）"
 
+# 沙箱两个镜像必须显式 build（ADR-0066）：sandbox-image 带 profiles: [build-only]——它不是常驻
+# 服务，平台按需 docker run 起一次性容器，所以 `up -d --build` 不会构建它。漏这一步的表现是
+# run_python/run_shell 恒回「沙箱镜像未构建」，而平台其余功能一切正常，很难联想到这里。
+say "docker compose build sandbox-image sandbox-egress（沙箱执行环境 + 出口 router；首次装 pandas 等轮子，数分钟）"
+docker compose build sandbox-image sandbox-egress \
+  || fail "沙箱镜像构建失败：docker compose build sandbox-image 看日志；网络受限先设 .env 里的 ZEROCODE_APT_MIRROR / ZEROCODE_PYPI_MIRROR"
+
 say "等就绪"
 pg=""
 for _ in $(seq 1 60); do
@@ -725,6 +736,18 @@ for _ in $(seq 1 10); do
 done
 [ "$sidecar" -eq 1 ] || fail "后端容器里连不通 $burl/healthz：docker compose ps browser 看它是否在反复重启，再 docker compose logs browser --tail 100 看 Chromium 启动错误；内存紧的机器先 docker inspect -f '{{.State.OOMKilled}}' zerocode-browser"
 ok "浏览器 sidecar 就位（$burl，/healthz 已通）"
+
+# 沙箱要探两件事（ADR-0066）：镜像在 + 出口 router 在跑。只探镜像会漏掉最阴的一种——
+# 镜像 build 出来了但 router 没起，此时沙箱 fail-closed 回「出口 router 未在运行」，
+# 而平台其余功能一切正常，不探这里就联想不到根因。
+simg="$(cenv ZEROCODE_SANDBOX_IMAGE)"
+[ -n "$simg" ] || fail "容器里没有 ZEROCODE_SANDBOX_IMAGE：compose 的 backend environment 不是这一版（后端回落找 :dev tag，run_python/run_shell 固定失败）"
+docker image inspect "$simg" >/dev/null 2>&1 \
+  || fail "沙箱镜像 $simg 不在：第 7 步的 docker compose build sandbox-image sandbox-egress 没跑或失败（它带 profiles: [build-only]，up -d --build 不会构建它）"
+router="$(docker inspect -f '{{.State.Running}}' zerocode-sandbox-egress 2>/dev/null || echo missing)"
+[ "$router" = true ] \
+  || fail "出口 router zerocode-sandbox-egress 没在跑（$router）：docker compose logs sandbox-egress --tail 50 看它是不是等不到规则文件；规则由平台启动时写进 <部署根>/data/sandbox_egress/"
+ok "沙箱就位（镜像 $simg + 出口 router running）"
 
 for k in ZEROCODE_GATEWAY_DOMAIN ZEROCODE_PREVIEW_HOST ZEROCODE_PYPI_MIRROR ZEROCODE_NPM_REGISTRY ZEROCODE_SSL_ENABLE; do
   v="$(cenv "$k")"; ok "$k=${v:-（未设）}"

@@ -9,10 +9,10 @@ from app.services import memory_service as mem
 def test_tools_schema():
     names = {t["function"]["name"] for t in TOOLS}
     assert names == {"list_dir", "read_file", "search", "write_file", "edit_file",
-                     "delete_file", "move_file", "revert_change",
+                     "delete_file", "move_file", "revert_change", "import_artifact",
                      "ask_user", "todo_write", "memory_write",
                      "web_fetch", "web_download", "web_open", "web_step", "web_close",
-                     "delegate", "run_python"}
+                     "delegate", "run_python", "run_shell"}
     w = next(t for t in TOOLS if t["function"]["name"] == "write_file")
     assert set(w["function"]["parameters"]["required"]) == {"path", "content"}
 

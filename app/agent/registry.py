@@ -312,6 +312,25 @@ _RUN_PYTHON = _fn(
               "description": "传给脚本的命令行参数（≤32 个、单个 ≤2000 字符），可选"}},
     [])
 
+_RUN_SHELL = _fn(
+    "run_shell",
+    "在隔离一次性容器里执行终端命令（与 run_python 同一沙箱：工作区只读、写只进 scratch、"
+    "离线无网络、无库凭据）；经 sh -c 跑，管道与重定向可用。可用命令以镜像内已装的为限，"
+    "运行期不支持 apt（系统包由平台预装）。回退出码与输出，文本产物经 write_file 落盘",
+    {"command": {"type": "string",
+                 "description": "要执行的命令行（经 sh -c，支持管道与重定向）"}},
+    ["command"])
+
+_IMPORT_ARTIFACT = _fn(
+    "import_artifact",
+    "把本次 run_python/run_shell 生成的产物（含 docx/xlsx/pptx 等二进制）落进工作区，"
+    "落盘后用户可在文件树看到并下载。name 只能填本次产物清单里的相对名，不接受绝对路径或内容直传；"
+    "二进制未存原文、不可回滚。文本产物仍优先用 write_file",
+    {"name": {"type": "string",
+              "description": "本次执行 artifacts 清单里的相对名（如 报告.docx）"},
+     "path": {"type": "string", "description": "工作区内的目标相对路径（如 out/报告.docx）"}},
+    ["name", "path"])
+
 
 SPECS: tuple[ToolSpec, ...] = (
     ToolSpec("list_dir", _LIST_DIR, "fs", handler_ref=("app.agent.tools", "_handle_list_dir"),
@@ -331,6 +350,10 @@ SPECS: tuple[ToolSpec, ...] = (
              handler_ref=("app.agent.tools", "_handle_move_file"), result_policy=SMALL_POLICY),
     ToolSpec("revert_change", _REVERT_CHANGE, "fs", confirm=CONFIRM_WRITE,
              handler_ref=("app.agent.tools", "_handle_revert_change"), result_policy=SMALL_POLICY),
+    # 沙箱产物导入（ADR-0066 决策 7）：写语义，与 write_file 同列同档，套同一套落盘围栏。
+    ToolSpec("import_artifact", _IMPORT_ARTIFACT, "fs", scope=SCOPE_ALWAYS, confirm=CONFIRM_WRITE,
+             handler_ref=("app.agent.python_tools", "import_artifact_tool"),
+             pass_confirmed=True, result_policy=CHECK_POLICY),
     ToolSpec("ask_user", _ASK_USER, "chat"),
     ToolSpec("todo_write", _TODO_WRITE, "chat",
              handler_ref=("app.agent.tools", "_handle_todo_write"), result_policy=SMALL_POLICY),
@@ -361,6 +384,11 @@ SPECS: tuple[ToolSpec, ...] = (
     # 确认沿 write_file 档；不收录子 run 只读白名单（执行能力，非只读语义）。
     ToolSpec("run_python", _RUN_PYTHON, "python", scope=SCOPE_ALWAYS, confirm=CONFIRM_WRITE,
              handler_ref=("app.agent.python_tools", "run_python_tool"),
+             pass_confirmed=True, result_policy=CHECK_POLICY),
+    # 沙箱命令面（ADR-0066）：与 run_python 同镜像同围栏，接任意命令行。组 id 沿用 python
+    # 不改名——改组 id 会牵动前端分组与 llm 名单的同名同序钉法。
+    ToolSpec("run_shell", _RUN_SHELL, "python", scope=SCOPE_ALWAYS, confirm=CONFIRM_WRITE,
+             handler_ref=("app.agent.python_tools", "run_shell_tool"),
              pass_confirmed=True, result_policy=CHECK_POLICY),
     ToolSpec("clarify_done", _CLARIFY_DONE, "clarify", scope=SCOPE_CLARIFY),
     ToolSpec("preview_status", _PREVIEW_STATUS, "preview", scope=SCOPE_APP,

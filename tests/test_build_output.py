@@ -145,6 +145,26 @@ def _make_browser(repo: Path) -> Path:
     return b
 
 
+def _make_sandbox(repo: Path) -> Path:
+    """假仓库里的沙箱镜像源码。名单从 bo.SANDBOX_REQUIRED 遍历生成，不抄第二份（同 browser）。"""
+    s = repo / "sandbox"
+    (s / "egress").mkdir(parents=True)
+    for rel in bo.SANDBOX_REQUIRED:
+        if rel.endswith("Dockerfile"):
+            content = "FROM python:3.12-slim-trixie\n"
+        elif rel.endswith("entrypoint.sh"):
+            content = "#!/bin/sh\nnft -f /ruleset.nft\nexec sleep infinity\n"
+        elif rel == "requirements.txt":
+            content = "python-docx\nopenpyxl\npython-pptx\n"
+        else:
+            content = f"# {rel} stub\n"
+        (s / rel).write_text(content, encoding="utf-8")
+    (s / "README.md").write_text("# sandbox\n", encoding="utf-8")
+    (s / "__pycache__").mkdir()
+    (s / "__pycache__" / "x.cpython-312.pyc").write_bytes(b"\x00")
+    return s
+
+
 def _make_gateway(repo: Path) -> Path:
     """在假仓库里造网关配置，含三样**绝不能进包**的东西：私钥、现场路由、本地 .env。"""
     gw = repo / "gateway"
@@ -177,6 +197,7 @@ def fake_repo(tmp_path) -> Path:
     (tmp_path / "app" / "__pycache__" / "main.cpython-312.pyc").write_bytes(b"\x00")
     (tmp_path / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
     _make_browser(tmp_path)
+    _make_sandbox(tmp_path)
     scripts = (tmp_path / "scripts")
     scripts.mkdir()
     (scripts / "deploy.sh").write_text(DEPLOY_SH_STUB, encoding="utf-8")
@@ -1344,6 +1365,65 @@ def test_browser_required_covers_every_sidecar_source():
     assert not not_copied, f"browser/Dockerfile 没 COPY {not_copied}：容器起来即崩"
 
 
+def test_sandbox_required_covers_every_image_source():
+    """事实核对（读仓库真文件）：SANDBOX_REQUIRED 要盖住 sandbox/ 下每一个参与构建的文件。
+
+    遍历目录断言而不是再写一份名单——第二份名单本身就是会漂的双源（同 browser 那条）。
+    文档与本地入口（README.md / build.bat）不参与构建，刻意排除。
+    """
+    src = bo.REPO_ROOT / "sandbox"
+    sources = sorted(p.relative_to(src).as_posix() for p in src.rglob("*")
+                     if p.is_file() and "__pycache__" not in p.parts
+                     and p.name not in bo.SANDBOX_DOC_NAMES)
+    assert sources, "sandbox/ 下一个源文件都没有：路径漂了，本测试等于没在测"
+    missing = sorted(set(sources) - set(bo.SANDBOX_REQUIRED))
+    assert not missing, f"SANDBOX_REQUIRED 漏了 {missing}：补进 scripts/build_output.py"
+
+
+def test_missing_sandbox_source_rejects_package(fake_repo):
+    """漏一个源文件 → 打包期拒包，而不是把失败推迟到服务器上镜像构建失败。"""
+    (fake_repo / "sandbox" / "egress" / "entrypoint.sh").unlink()
+    with pytest.raises(bo.BuildError) as ei:
+        _build(fake_repo)
+    assert "沙箱镜像源码缺" in str(ei.value)
+
+
+def test_sandbox_entrypoint_ships_with_lf(fake_repo, tmp_path):
+    """entrypoint.sh 必须剥 CRLF：带 \\r 的 shebang 会让 router 容器起来即退。"""
+    ep = fake_repo / "sandbox" / "egress" / "entrypoint.sh"
+    ep.write_bytes(b"#!/bin/sh\r\nnft -f /ruleset.nft\r\nexec sleep infinity\r\n")
+    out = tmp_path / "staging-sandbox"
+    bo.copy_sandbox(fake_repo, out)
+    assert b"\r\n" not in (out / "egress" / "entrypoint.sh").read_bytes()
+
+
+def test_compose_declares_sandbox_images_and_tags_match_backend_env():
+    """交付 compose 要能 build 出两个镜像，且 tag 与后端 env 逐字同源。
+
+    tag 漂开的表现是「镜像 build 出来了但平台仍去找 :dev」，沙箱恒回「镜像未构建」。
+    """
+    y = bo.compose_yaml(ROOT)
+    assert "context: ./sandbox\n" in y
+    assert "context: ./sandbox/egress" in y
+    assert "image: zerocode-sandbox:demo" in y
+    assert "image: zerocode-sandbox-egress:demo" in y
+    assert "ZEROCODE_SANDBOX_IMAGE: zerocode-sandbox:demo" in y
+    assert "ZEROCODE_SANDBOX_EGRESS_IMAGE: zerocode-sandbox-egress:demo" in y
+    # router 必须持 NET_ADMIN 才装得上规则；沙箱本体不得持它。
+    assert "NET_ADMIN" in y
+    assert "sandbox_egress:/ruleset:ro" in y
+
+
+def test_repo_sandbox_dockerfile_pins_distro_and_non_root():
+    """事实核对：代号钉死（浮动 slim 换代即构建期炸）+ 非 root（apt 装不了是刻意的）。"""
+    dk = (bo.REPO_ROOT / "sandbox" / "Dockerfile").read_text(encoding="utf-8")
+    assert "FROM python:3.12-slim-" in dk
+    assert "USER 1000" in dk
+    eg = (bo.REPO_ROOT / "sandbox" / "egress" / "Dockerfile").read_text(encoding="utf-8")
+    assert "FROM python:3.12-slim-" in eg
+    assert "nftables" in eg
+
+
 def test_repo_browser_dockerfile_is_non_root_with_local_context():
     """事实核对（读仓库真文件，不是假仓库桩）：镜像以 uid 10001 运行，且构建上下文是 browser/。
 
@@ -1562,17 +1642,20 @@ def test_readme_keeps_per_slug_app_sync_anchored(fake_repo):
     assert "--exclude 'deploy/'" not in cmd, "deploy/ 的排除没锚在传输根上，会误伤同名子目录"
 
 
-def test_repo_deploy_kernel_mirrors_only_the_three_platform_dirs():
-    """回归（D-06）：全场只有 `backend/`、`browser/`、`frontend/` 三棵带 `--delete`，
+def test_repo_deploy_kernel_mirrors_only_the_four_platform_dirs():
+    """回归（D-06）：全场只有 `backend/`、`browser/`、`sandbox/`、`frontend/` 四棵带 `--delete`，
     `apps/`、`data/`、`store/` 一概不镜像。这条安全边界原先写在 README §4 的命令里，
     现在住进内核——钉得跟着搬：哪天有人「顺手把 apps/ 也加上」，八项现场产物立刻就没护栏了。
+
+    sandbox/ 是 ADR-0066 加进来的第四棵：它只含镜像构建源码，没有服务器现场产生的东西，
+    与另三棵同类。下面的安全断言一字未动——加一棵平台目录不放宽边界。
     """
     kernel = (bo.REPO_ROOT / "scripts" / "deploy.sh").read_text(encoding="utf-8")
     rsyncs = [l.strip() for l in kernel.splitlines()
               if l.strip().startswith("rsync ")]
     assert rsyncs, "内核里一条 rsync 都没有：搬运改了别的路，这条钉要跟着改"
-    assert 'for d in backend browser frontend; do' in kernel, "镜像范围不再是三棵平台目录"
-    assert any(l.startswith('rsync -a --delete "$PKG/$d/"') for l in rsyncs), "三棵平台目录不再是镜像同步"
+    assert 'for d in backend browser sandbox frontend; do' in kernel, "镜像范围不再是四棵平台目录"
+    assert any(l.startswith('rsync -a --delete "$PKG/$d/"') for l in rsyncs), "平台目录不再是镜像同步"
     assert any(l.startswith('rsync -a "$PKG"/') for l in rsyncs), "新增模式不再整体铺包（不带 --delete）"
     for l in rsyncs:
         assert not ("--delete" in l and "/apps" in l), f"apps/ 被带 --delete 镜像了：{l}"

@@ -118,10 +118,10 @@ async def test_base_tools_unchanged_by_preview_feature():
     from app.agent.llm import TOOLS
     assert [t["function"]["name"] for t in TOOLS] == [
         "list_dir", "read_file", "search", "write_file", "edit_file",
-        "delete_file", "move_file", "revert_change",
+        "delete_file", "move_file", "revert_change", "import_artifact",
         "ask_user", "todo_write", "memory_write",
         "web_fetch", "web_download", "web_open", "web_step", "web_close",
-        "delegate", "run_python"]
+        "delegate", "run_python", "run_shell"]
 # ---------- ctx 替身：preview_tools 只读字段，不 import ToolContext ----------
 
 class Ctx:
@@ -1165,23 +1165,24 @@ async def test_preview_context_fields_default_safely_and_are_not_shared(tmp_path
 
 
 async def test_no_command_execution_tool_exists(tmp_path):
-    """红线（ADR-0046 → ADR-0056 改写后）：工具面无通用命令执行能力，只允许平台写死的 preset
-    与隔离 Python 沙箱。
+    """红线（ADR-0046 → 0056 → 0066 改写后）：命令与代码执行只允许在隔离沙箱内，
+    或平台写死的 preset。
 
-    语义是「白名单」：除 run_python 外任何 schema 都不得出现 command/cmd/argv/shell/script 参数；
-    两个执行类工具各自锁死——run_check 只能选写死的 preset，run_python 是 sanctioned 沙箱，
-    收 code（自由代码）或 skill_dir/script/argv（技能脚本，ADR-0060），触达面由容器围栏锁死，
-    不是通用 shell。script/argv 仅在 run_python 的技能脚本模式里合法。
+    语义是「白名单」：除两个沙箱工具外任何 schema 都不得出现 command/cmd/argv/shell/script 参数。
+    三个执行类工具各自锁死——run_check 只能选写死的 preset；run_python 收 code（自由代码）或
+    skill_dir/script/argv（技能脚本，ADR-0060）；run_shell 收 command（任意命令行，ADR-0066）。
+    沙箱工具接任意输入是**刻意**的：触达面由容器围栏锁死（工作区只读、deploy 遮蔽、无凭据、
+    无 docker.sock、写只进 scratch），命令白名单在图灵完备的沙箱里可被 subprocess 绕过，属假围栏。
     """
     from app.agent import registry
     from app.agent.llm import PREVIEW_TOOL_NAMES, TOOLS
     from app.agent.tools import ToolContext, ToolError, execute_tool
     names = {t["function"]["name"] for t in TOOLS} | set(PREVIEW_TOOL_NAMES)
     assert names == {"list_dir", "read_file", "search", "write_file", "edit_file",
-                     "delete_file", "move_file", "revert_change",
+                     "delete_file", "move_file", "revert_change", "import_artifact",
                      "ask_user", "todo_write", "memory_write",
                      "web_fetch", "web_download", "web_open", "web_step", "web_close",
-                     "delegate", "run_python",
+                     "delegate", "run_python", "run_shell",
                      "preview_status", "preview_logs", "preview_restart"}
     for spec in registry.SPECS:
         props = spec.schema["function"]["parameters"].get("properties", {})
@@ -1189,11 +1190,15 @@ async def test_no_command_execution_tool_exists(tmp_path):
             assert set(props) == {"code", "skill_dir", "script", "argv"}, \
                 "run_python 是 sanctioned 沙箱：code 或技能脚本 skill_dir/script/argv（ADR-0060）"
             continue
+        if spec.name == "run_shell":
+            assert set(props) == {"command"}, \
+                "run_shell 是 sanctioned 沙箱命令面：任意命令行，围栏在容器不在命令名（ADR-0066）"
+            continue
         assert not (set(props) & {"command", "cmd", "argv", "shell", "script"}), spec.name
     check = registry.spec_of("run_check").schema["function"]["parameters"]
     assert set(check["properties"]) == {"preset"}
     assert check["properties"]["preset"]["enum"] == ["frontend_typecheck", "backend_compile"]
     ctx = ToolContext(root=tmp_path, session_id=1, session_factory=None, send=None)
-    for forbidden in ("run_shell", "exec", "terminal", "run_command", "preview_stop"):
+    for forbidden in ("exec", "terminal", "run_command", "preview_stop"):
         with pytest.raises(ToolError):
             await execute_tool(ctx, forbidden, {})

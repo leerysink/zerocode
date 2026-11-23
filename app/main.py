@@ -116,6 +116,17 @@ def create_app(database_url: str | None = None) -> FastAPI:
         app.state.dev_tasks = {}
         await run_migrations(engine)
         await _deploy_startup(app)
+        # 沙箱产物目录孤儿清扫（ADR-0066 / US-33）：崩溃或 kill -9 后 run 收口没跑，
+        # 宿主临时目录会攒下来。只收陈旧的，见 sweep_orphan_scratches 的理由。
+        from app.agent.python_tools import sweep_orphan_scratches
+        sweep_orphan_scratches()
+        # 沙箱出口 router（ADR-0066 决策 3）：起好并应用 nft 规则，沙箱共享它的 netns。
+        # 失败不卡平台启动——沙箱运行时会回一句可读引导，而不是静默变成无过滤。
+        from app.agent.sandbox_egress import ensure_egress_router
+        try:
+            await ensure_egress_router()
+        except Exception:
+            logger.warning("沙箱出口 router 启动失败，run_python/run_shell 将不可用", exc_info=True)
         # Android 壳构建队列（ADR-0042）：单 worker 串行；启动时把残留 building 收口成 failed。
         from app.deploy.apkbuild import ApkBuilder
         app.state.apk_builder = ApkBuilder(app.state.session_factory)

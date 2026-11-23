@@ -450,6 +450,20 @@ async def test_lifespan_startup_wires_deploy_state_and_never_blocks(test_engine,
     monkeypatch.setattr(sqlrun, "build_if_missing", fake_build)
     monkeypatch.setattr(provision, "ensure_zcnet", fake_zcnet)
 
+    # 沙箱孤儿清扫的接线（US-33）：函数自己有单测不代表它被接进 lifespan，漏接线这条必红。
+    from app.agent import python_tools
+    swept: list = []
+    monkeypatch.setattr(python_tools, "sweep_orphan_scratches", lambda: swept.append("sweep"))
+
+    # 出口 router 的接线（US-12/16）：漏接线时沙箱会静默失去过滤，比起不来更坏。
+    from app.agent import sandbox_egress
+    routed: list = []
+
+    async def fake_ensure_router():
+        routed.append("router")
+
+    monkeypatch.setattr(sandbox_egress, "ensure_egress_router", fake_ensure_router)
+
     app = create_app(test_engine.url.render_as_string(hide_password=False))
     with caplog.at_level(logging.WARNING):
         with TestClient(app) as tc:
@@ -458,4 +472,6 @@ async def test_lifespan_startup_wires_deploy_state_and_never_blocks(test_engine,
             assert app.state.dev_tasks == {}                     # 长任务句柄表
             assert tc.get("/api/apps").status_code == 200        # 启动清理失败没把平台卡死
     assert order == ["cleanup", "zcnet", "build", ("exit", True)]
+    assert swept == ["sweep"]
+    assert routed == ["router"]
     assert "部署环境启动清理失败" in caplog.text                  # 但必须留下告警痕迹
