@@ -492,9 +492,18 @@ async def test_lifespan_reconciles_prod_on_startup(test_engine, monkeypatch):
     monkeypatch.setattr(provision, "ensure_zcnet", _noop)
     monkeypatch.setattr(prod_mod, "reconcile", fake_reconcile)
 
-    app = create_app(test_engine.url.render_as_string(hide_password=False))
+    from tests.conftest import invite_for_registration_url
+
+    db_url = test_engine.url.render_as_string(hide_password=False)
+    app = create_app(db_url)
     with TestClient(app) as tc:
-        tc.post("/api/auth/register", json={"nickname": "lifespan-对账", "password": "pw"})  # guard 会话（Ticket 002）
+        # 注册只为拿一条会话。本文件的 autouse 夹具已经先建过 owner，所以这里通常是
+        # 「第二个账号」→ 要码（ADR-0069）；状态一律当场断言，否则 403 会伪装成下一句的 401。
+        code = await invite_for_registration_url(db_url)
+        reg = tc.post("/api/auth/register",
+                      json={"nickname": "lifespan-对账", "password": "pw",
+                            "invite_code": code})
+        assert reg.status_code == 200, reg.text
         assert tc.get("/api/apps").status_code == 200
     assert seen["notify"] == app.state.deploy_hub.publish
     assert seen["sf"] is app.state.session_factory
@@ -514,10 +523,18 @@ async def test_lifespan_prod_reconcile_failure_is_not_fatal(test_engine, monkeyp
     monkeypatch.setattr(provision, "ensure_zcnet", _noop)
     monkeypatch.setattr(prod_mod, "reconcile", boom)
 
-    app = create_app(test_engine.url.render_as_string(hide_password=False))
+    from tests.conftest import invite_for_registration_url
+
+    db_url = test_engine.url.render_as_string(hide_password=False)
+    app = create_app(db_url)
     with caplog.at_level(logging.WARNING):
         with TestClient(app) as tc:
-            tc.post("/api/auth/register", json={"nickname": "lifespan-对账", "password": "pw"})  # guard 会话（Ticket 002）
+            # 同上：另起引擎取码 + 当场校验，别让 403 伪装成下一句的 401
+            code = await invite_for_registration_url(db_url)
+            reg = tc.post("/api/auth/register",
+                          json={"nickname": "lifespan-对账", "password": "pw",
+                                "invite_code": code})
+            assert reg.status_code == 200, reg.text
             assert tc.get("/api/apps").status_code == 200
     assert "prod 启动对账失败" in caplog.text
 

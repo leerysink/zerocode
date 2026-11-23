@@ -115,9 +115,13 @@ async def test_newcomer_inherits_platform_llm_defaults_without_configuring(two_a
 
     # 再注册第三人：平台行必须仍归平台（owner NULL），否则「改一处、全员生效」当场失效
     from httpx import ASGITransport, AsyncClient
+
+    from tests.conftest import invite_for_registration
+
     async with AsyncClient(transport=ASGITransport(app=admin.app), base_url="http://t") as c:
         reg = await c.post("/api/auth/register",
-                           json={"nickname": "carol", "password": "pw-carol"})
+                           json={"nickname": "carol", "password": "pw-carol",
+                                 "invite_code": await invite_for_registration(admin.app)})
         assert reg.status_code == 200, reg.text
         carol_cfg = (await c.get("/api/config")).json()
     assert carol_cfg["llm.model"] == "shared-model"

@@ -29,6 +29,62 @@ async def mint_invite(app, n: int = 1) -> list[str]:
     return await mint_invite_with(app.state.session_factory, n)
 
 
+async def _has_actor(session_factory) -> bool:
+    async with session_factory() as s:
+        return bool((await s.execute(text("SELECT EXISTS (SELECT 1 FROM actor)"))).scalar())
+
+
+async def invite_for_registration(app):
+    """这一次注册要不要码，由库里有没有账号决定：空库返回 None（首号自举免码），
+    有号就现签一枚。免得像某些用例那样把「反正我是第一个」当成永久前提。"""
+    if not await _has_actor(app.state.session_factory):
+        return None
+    return (await mint_invite(app))[0]
+
+
+async def invite_for_registration_url(url: str):
+    """给「测试自己 create_app 出来的独立实例」用。
+
+    那种 app 的引擎归 TestClient 自己的事件循环，测试协程既不能 asyncio.run（已经在循环里）、
+    也不该直接借它的连接池（跨循环），所以另起一个引擎连同一个库。
+    """
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from app.db import make_session_factory
+
+    eng = create_async_engine(url)
+    try:
+        sf = make_session_factory(eng)
+        if not await _has_actor(sf):
+            return None
+        return (await mint_invite_with(sf, 1))[0]
+    finally:
+        await eng.dispose()
+
+
+def invite_for_registration_sync(app):
+    """同步版：给 TestClient 那批用例用（见 mint_invite_sync 里关于事件循环的说明）。"""
+    import asyncio
+
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from app.db import make_session_factory
+
+    url = app.state.engine.url.render_as_string(hide_password=False)
+
+    async def _go():
+        eng = create_async_engine(url)
+        try:
+            sf = make_session_factory(eng)
+            if not await _has_actor(sf):
+                return None
+            return (await mint_invite_with(sf, 1))[0]
+        finally:
+            await eng.dispose()
+
+    return asyncio.run(_go())
+
+
 def mint_invite_sync(app, n: int = 1) -> list[str]:
     """同步上下文里签码——供 TestClient 那批连开发库的聊天/WS 测试用（它们没有可用事件循环）。
 

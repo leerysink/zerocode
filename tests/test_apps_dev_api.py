@@ -464,10 +464,16 @@ async def test_lifespan_startup_wires_deploy_state_and_never_blocks(test_engine,
 
     monkeypatch.setattr(sandbox_egress, "ensure_egress_router", fake_ensure_router)
 
-    app = create_app(test_engine.url.render_as_string(hide_password=False))
+    db_url = test_engine.url.render_as_string(hide_password=False)
+    app = create_app(db_url)
     with caplog.at_level(logging.WARNING):
         with TestClient(app) as tc:
-            tc.post("/api/auth/register", json={"nickname": "lifespan-看门", "password": "pw"})  # guard 会话
+            from tests.conftest import invite_for_registration_url
+
+            reg = tc.post("/api/auth/register",
+                          json={"nickname": "lifespan-看门", "password": "pw",
+                                "invite_code": await invite_for_registration_url(db_url)})  # guard 会话
+            assert reg.status_code == 200, reg.text   # 不查就是下一句莫名 401
             assert isinstance(app.state.deploy_hub, DeployHub)   # WS 与引擎共用的事件总线
             assert app.state.dev_tasks == {}                     # 长任务句柄表
             assert tc.get("/api/apps").status_code == 200        # 启动清理失败没把平台卡死
