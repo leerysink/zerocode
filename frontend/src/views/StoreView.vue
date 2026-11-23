@@ -13,6 +13,8 @@ import { useCategoryStore } from '../stores/categories'
 import ZcPageHeader from '../components/zc/ZcPageHeader.vue'
 import ZcEmptyState from '../components/zc/ZcEmptyState.vue'
 import ZcEntityCard from '../components/zc/ZcEntityCard.vue'
+import ZcPagination from '../components/zc/ZcPagination.vue'
+import { usePagedList } from '../composables/usePagedList'
 
 const cats = useCategoryStore()
 
@@ -22,15 +24,15 @@ const loading = ref(false)
 const catFilter = ref('')
 const q = ref('')
 const sort = ref('latest')
-const page = ref(1)
-const PAGE_SIZE = 20
 const categories = computed(() => ['全部', ...cats.enabledKeys])
-const pagedReleases = computed(() =>
-  releases.value.slice((page.value - 1) * PAGE_SIZE, page.value * PAGE_SIZE))
-const setCategory = (c) => { catFilter.value = c === '全部' ? '' : c; page.value = 1; loadReleases() }
-const onSearch = () => { page.value = 1; loadReleases() }
-const onSort = () => { page.value = 1; loadReleases() }
+// 每页 6 张卡（ADR-0071）：全量留在 releases 里，页头统计与筛选都按全量口径算。
+// 原来这里写死 20 且不足一页就整条藏掉分页——档位是六个列表共用的一份本机偏好，藏掉等于回不去。
+const releasesPager = usePagedList(releases)
+const setCategory = (c) => { catFilter.value = c === '全部' ? '' : c; releasesPager.resetPage(); loadReleases() }
+const onSearch = () => { releasesPager.resetPage(); loadReleases() }
+const onSort = () => { releasesPager.resetPage(); loadReleases() }
 const mine = ref([])
+const minePager = usePagedList(mine)
 const myId = ref(null)
 const applyOpen = ref(false)
 const applyTarget = ref(null)
@@ -164,10 +166,9 @@ function gotoApps () { window.location.href = '/apps' }
           </div>
         </div>
         <zc-empty-state v-if="loading" loading />
-        <zc-empty-state v-else-if="!pagedReleases.length"
-                        :description="releases.length ? '该分类下暂无应用' : '还没有应用上架'" />
+        <zc-empty-state v-else-if="!releases.length" description="还没有应用上架" />
         <div v-else class="zc-store-grid">
-          <zc-entity-card v-for="r in pagedReleases" :key="r.id" class="zc-card"
+          <zc-entity-card v-for="r in releasesPager.paged" :key="r.id" class="zc-card"
                           data-test="store-card" cover-clickable @cover-click="openDetail(r)">
             <template #cover>
               <img v-if="r.screenshots && r.screenshots.length" :src="r.screenshots[0]"
@@ -230,15 +231,13 @@ function gotoApps () { window.location.href = '/apps' }
             </template>
           </zc-entity-card>
         </div>
-        <a-pagination v-if="releases.length > PAGE_SIZE" v-model:current="page"
-                      :total="releases.length" :page-size="PAGE_SIZE" :show-size-changer="false"
-                      class="zc-store-pager" />
+        <zc-pagination :pager="releasesPager" label="商店在架" />
       </a-tab-pane>
 
       <a-tab-pane key="mine" tab="我的申请">
         <a-empty v-if="!mine.length" description="还没有提过申请" />
         <a-card v-else class="zc-store-apply" data-test="store-apply-card" title="我的申请">
-          <a-table :data-source="mine" :pagination="false" row-key="id"
+          <a-table :data-source="minePager.paged" :pagination="minePager.tablePagination" row-key="id"
             :columns="[{ title: '应用', dataIndex: 'title' }, { title: '我起的名字', dataIndex: 'want_name' },
                        { title: '状态', dataIndex: 'status' }, { title: '说明', dataIndex: 'reason' },
                        { title: '操作', key: 'op' }]">
@@ -312,7 +311,6 @@ function gotoApps () { window.location.href = '/apps' }
 .zc-cat-tag { cursor: pointer; }
 .zc-store-toolbar { display: flex; align-items: center; gap: var(--zc-space-2);
   margin-bottom: var(--zc-space-2); }
-.zc-store-pager { margin-top: var(--zc-space-3); text-align: right; }
 /* 网格列宽与等高由这里给，卡内节奏在 ZcEntityCard 里 */
 .zc-store-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: var(--zc-space-4); align-items: stretch; }

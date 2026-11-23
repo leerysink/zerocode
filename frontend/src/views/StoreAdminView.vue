@@ -14,6 +14,8 @@ import { useCategoryStore } from '../stores/categories'
 import ZcPageHeader from '../components/zc/ZcPageHeader.vue'
 import ZcEmptyState from '../components/zc/ZcEmptyState.vue'
 import ZcEntityCard from '../components/zc/ZcEntityCard.vue'
+import ZcPagination from '../components/zc/ZcPagination.vue'
+import { usePagedList } from '../composables/usePagedList'
 
 const auth = useAuthStore()
 const cats = useCategoryStore()
@@ -45,6 +47,11 @@ const counts = computed(() => ({
 }))
 const shown = computed(() =>
   tab.value === 'all' ? releases.value : releases.value.filter((r) => r.status === tab.value))
+// 每页 6 张卡（ADR-0071）：分页叠在状态筛选之后，counts/stats/badge 一律按全量算。
+const shownPager = usePagedList(shown)
+const reviewPager = usePagedList(review)
+// 换 tab 就是换筛选口径，旧页码在新口径下没有对应位置，回到第 1 页最不容易看漏。
+function pickTab (key) { tab.value = key; shownPager.resetPage() }
 const stats = computed(() => [
   { key: 'all', label: '全部版本', value: counts.value.all },
   { key: 'published', label: '已上架', value: counts.value.published },
@@ -273,7 +280,7 @@ async function reject (row) {
       <div class="zc-sadm-tabs zc-panel" role="tablist" data-test="sadm-tabs">
         <button v-for="t in TABS" :key="t.key" type="button" role="tab"
                 :aria-selected="tab === t.key" :data-test="`adm-tab-${t.key}`"
-                class="zc-sadm-tab" :class="{ on: tab === t.key }" @click="tab = t.key">
+                class="zc-sadm-tab" :class="{ on: tab === t.key }" @click="pickTab(t.key)">
           {{ t.label }} <span class="n">{{ counts[t.key] }}</span>
         </button>
       </div>
@@ -282,7 +289,7 @@ async function reject (row) {
       <zc-empty-state v-else-if="!shown.length"
                       :description="releases.length ? '该状态下暂无版本' : '还没有应用上架'" />
       <div v-else class="zc-sadm-grid">
-        <zc-entity-card v-for="r in shown" :key="r.id" data-test="adm-card"
+        <zc-entity-card v-for="r in shownPager.paged" :key="r.id" data-test="adm-card"
                         :muted="r.status === 'withdrawn'"
                         :rail="r.status === 'published' ? 'var(--zc-success)' : 'var(--zc-text-weak)'"
                         cover-clickable @cover-click="openDetail(r)">
@@ -354,11 +361,12 @@ async function reject (row) {
           </template>
         </zc-entity-card>
       </div>
+      <zc-pagination :pager="shownPager" label="版本列表" />
     </template>
 
     <a-drawer v-model:open="reviewOpen" title="审批队列" width="520" placement="right">
       <a-empty v-if="!review.length" description="没有待审批的申请" />
-      <div v-for="row in review" :key="row.id" class="zc-sadm-review-row">
+      <div v-for="row in reviewPager.paged" :key="row.id" class="zc-sadm-review-row">
         <div class="zc-sadm-review-line"><b>{{ row.want_name }}</b></div>
         <div class="zc-sadm-review-sub">
           {{ row.applicant || '未知' }} 申请 · 来自 {{ row.title }} {{ row.version }} · {{ fmtDate(row.created_at) }}
@@ -371,6 +379,7 @@ async function reject (row) {
           <a-button size="small" danger data-test="adm-reject" @click="reject(row)">驳回</a-button>
         </div>
       </div>
+      <zc-pagination :pager="reviewPager" label="审批队列" />
     </a-drawer>
 
     <a-drawer v-model:open="detailOpen" title="版本详情" width="560" placement="right"

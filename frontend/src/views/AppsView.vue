@@ -28,6 +28,8 @@ import { sourcePayload } from '../utils/appSource'
 import { copyText } from '../utils/clipboard'
 import DeployLogPanel from '../components/DeployLogPanel.vue'
 import BackButton from '../components/BackButton.vue'
+import ZcPagination from '../components/zc/ZcPagination.vue'
+import { usePagedList } from '../composables/usePagedList'
 import { openWorkspaceFilesPage, resolveOpenFolderMode } from '../utils/openFolder'
 import { DEFAULT_STORE_CATEGORY } from '../utils/storeCategories'
 import { canPublish } from '../utils/publishableStacks'
@@ -38,6 +40,10 @@ import { useCategoryStore } from '../stores/categories'
 const apps = ref([])
 // 「共享给我」（规格 2026-11-16 §5.3）：独立区块、不混排；页头统计只算自有应用
 const sharedApps = ref([])
+// 每页 6 张卡（ADR-0071）：两块列表各持一条分页互不牵连；页头统计仍按全量 apps 算，
+// 5s 静默轮询只换数组内容，不动页码。
+const appsPager = usePagedList(apps)
+const sharedPager = usePagedList(sharedApps)
 const loading = ref(true)
 const showWizard = ref(false)
 const current = ref(0)
@@ -729,7 +735,7 @@ function openUninstall(a) {
              description="还没有应用——点「新建应用」，用一句话描述你要的软件"
              style="margin-top: 80px" />
     <div v-if="apps.length" class="zc-grid">
-      <a-card v-for="a in apps" :key="a.id" class="zc-card zc-metric-card"
+      <a-card v-for="a in appsPager.paged" :key="a.id" class="zc-card zc-metric-card"
               :style="{ '--zc-rail': statusColor(a.status_prod) }">
         <template #title>
           <span class="zc-dot" :style="{ background: statusColor(a.status_dev) }" />
@@ -882,6 +888,7 @@ function openUninstall(a) {
         </div>
       </a-card>
     </div>
+    <zc-pagination :pager="appsPager" label="我的应用" />
 
     <!-- 「共享给我」（规格 2026-11-16 §5.3/§5.6）：独立区块、不混排；为空时整块不渲染。
          动作按被共享者权限裁剪：可起停/重启 dev、预览、看观测与历史；破坏性动作与发布留在所有者卡片。 -->
@@ -891,7 +898,7 @@ function openUninstall(a) {
         <span class="zc-shared-count">{{ sharedApps.length }}</span>
       </h3>
       <div class="zc-grid">
-        <a-card v-for="a in sharedApps" :key="`shared-${a.id}`" class="zc-card zc-shared-card"
+        <a-card v-for="a in sharedPager.paged" :key="`shared-${a.id}`" class="zc-card zc-shared-card"
                 :style="{ '--zc-rail': statusColor(a.status_prod) }">
           <template #title>
             <span class="zc-dot" :style="{ background: statusColor(a.status_dev) }" />
@@ -991,6 +998,7 @@ function openUninstall(a) {
           </div>
         </a-card>
       </div>
+      <zc-pagination :pager="sharedPager" label="共享给我" />
     </section>
     </template>
 

@@ -38,6 +38,8 @@ function mountView () {
 beforeEach(() => {
   vi.clearAllMocks()
   document.body.innerHTML = ''
+  // 每页条数是本机一份全局偏好：不清就会把上一条用例切的档位带给下一条
+  window.localStorage.clear()
   api.authMe.mockResolvedValue({ data: { id: 1, nickname: '我' } })
   api.storeReleases.mockResolvedValue({ data: releases })
   api.storeApplications.mockResolvedValue({ data: applications })
@@ -102,17 +104,42 @@ describe('StoreView', () => {
     expect(api.storeReleases).toHaveBeenLastCalledWith({ q: '', category: '', sort: 'installs' })
   })
 
-  it('分页：每页 20 条，第二页显示余量', async () => {
-    const many = Array.from({ length: 25 }, (_, i) =>
-      ({ ...releases[0], id: i + 1, title: `应用${i + 1}` }))
+  it('分页：每页 6 条，翻页换下一批，页头统计仍按全量', async () => {
+    const many = Array.from({ length: 13 }, (_, i) =>
+      ({ ...releases[0], id: i + 1, title: `应用${String(i + 1).padStart(2, '0')}` }))
     api.storeReleases.mockResolvedValue({ data: many })
     const w = mountView()
     await flushPromises()
-    expect(w.findAll('.zc-card').length).toBe(20)
+    expect(w.findAll('.zc-card').length).toBe(6)
+    expect(w.find('[data-test="zc-pager"]').text()).toContain('共 13 条')
     await w.find('.ant-pagination-item-2').trigger('click')
     await flushPromises()
-    expect(w.findAll('.zc-card').length).toBe(5)
-    expect(w.text()).toContain('应用25')
+    expect(w.findAll('.zc-card').length).toBe(6)
+    expect(w.text()).toContain('应用07')
+    expect(w.text()).not.toContain('应用01')
+    // 页头「在架版本」数的是全量，跟着页码缩水就是撒谎（ADR-0071）
+    expect(w.find('[data-test="page-stat-on"] b').text()).toBe('13')
+    w.unmount()
+  })
+
+  it('我的申请：按每页 6 行翻页', async () => {
+    const many = Array.from({ length: 7 }, (_, i) => ({ id: i + 1, release_id: 1,
+      want_name: `备忘${String(i + 1).padStart(2, '0')}`, status: 'pending', title: '陌如玉', version: 'b2' }))
+    api.storeApplications.mockResolvedValue({ data: many })
+    const w = mountView()
+    await flushPromises()
+    const mineTab = w.findAll('.ant-tabs-tab').find((t) => t.text().includes('我的申请'))
+    await mineTab.trigger('click')
+    await flushPromises()
+    const card = w.find('[data-test="store-apply-card"]')
+    expect(card.findAll('.ant-table-row').length).toBe(6)
+    expect(card.text()).toContain('备忘01')
+    await card.find('.ant-pagination-item-2').trigger('click')
+    await flushPromises()
+    expect(card.findAll('.ant-table-row').length).toBe(1)
+    expect(card.text()).toContain('备忘07')
+    expect(card.text()).not.toContain('备忘01')
+    w.unmount()
   })
 
   it('无截图显示占位封面，有截图显示首图', async () => {

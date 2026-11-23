@@ -103,6 +103,22 @@ const STUBS = {
   'a-tooltip': slot('a-tooltip'),
   'a-dropdown': { name: 'a-dropdown', render() {
     return h('div', { class: 'stub-dropdown' }, [this.$slots.default?.(), this.$slots.overlay?.()]) } },
+  // 分页条只 doubles 到 antd 那一层：它收到的 current/total/pageSize 与发出的翻页事件都是真的
+  // 视图状态经 ZcPagination 透传过来的，而「控件本身怎么画页码」由 ZcPagination.test 负责。
+  'a-pagination': {
+    name: 'a-pagination',
+    props: ['current', 'total', 'pageSize', 'pageSizeOptions', 'showSizeChanger', 'showTotal'],
+    emits: ['update:current', 'update:pageSize'],
+    setup(props, { emit }) {
+      return () => h('div', {
+        class: 'stub-pager', 'data-current': props.current, 'data-total': props.total,
+        'data-size': props.pageSize, 'data-size-changer': props.showSizeChanger ? 'on' : 'off',
+      }, [
+        h('button', { class: 'stub-next', onClick: () => emit('update:current', props.current + 1) }, 'next'),
+        h('span', { class: 'stub-total' }, props.showTotal ? props.showTotal(props.total) : ''),
+      ])
+    },
+  },
   BackButton: { name: 'BackButton', render() { return h('button', { class: 'stub-back' }, '返回') } },
   PublishModal: { name: 'PublishModal', render() { return h('div', { class: 'stub-pub-modal' }) } },
   PublishHistory: { name: 'PublishHistory', render() { return h('div', { class: 'stub-pub-history' }) } },
@@ -1451,5 +1467,72 @@ describe('AppsView hero 几何与面卡口径（整页层级统一）', () => {
     expect(chip).toContain('border: 1px solid var(--zc-border)')
     expect(chip).toContain('border-radius: var(--zc-radius-pill)')
     expect(chip).not.toMatch(/padding:[^;]*[0-9]+px/)
+  })
+})
+
+// ---------- 列表分页（ADR-0071）：每页 6 张卡，统计口径仍是全量 ----------
+const appFixture = (n, from = 1) => Array.from({ length: n }, (_, i) => ({
+  id: from + i, name: `应用${from + i}`, slug: `pg${from + i}`, stack: 'vue3-fastapi', scale: 'small',
+  dev_port: 8300 + from + i, prod_port: 8400 + from + i, status_dev: 'stopped', status_prod: 'stopped',
+  current_version: null, preview_url: `http://10.0.1.25:${8300 + from + i}`, workspace_id: from + i,
+}))
+
+describe('AppsView 列表分页', () => {
+  // 每页条数是本机一份全局偏好，用例之间必须各起各的
+  beforeEach(() => { window.localStorage.clear() })
+
+  async function mountMany(own, shared = 0) {
+    mocks.api.listApps.mockResolvedValue({ data: appFixture(own) })
+    mocks.api.listSharedApps.mockResolvedValue({ data: appFixture(shared, 201) })
+    mocks.api.appMetricsSummary.mockResolvedValue(summaryOf([]))
+    const w = mount(AppsView, { global: { stubs: STUBS } })
+    await flushPromises()
+    return w
+  }
+  const names = (nodes) => nodes.map((c) => c.find('.zc-card-name').text())
+
+  it('我的应用每页只出 6 张卡，分页条标的是全量 13', async () => {
+    const w = await mountMany(13)
+    expect(names(w.findAll('.zc-grid')[0].findAll('.stub-card')))
+      .toEqual(['应用1', '应用2', '应用3', '应用4', '应用5', '应用6'])
+    const bar = w.findAll('.zc-pager')[0]
+    expect(bar.find('.stub-pager').attributes('data-total')).toBe('13')
+    expect(bar.find('.stub-pager').attributes('data-size')).toBe('6')
+    expect(bar.find('.stub-pager').attributes('data-size-changer')).toBe('on')
+    expect(bar.find('.stub-total').text()).toBe('共 13 条')
+  })
+
+  it('页头统计与「我的应用」计数用全量，不跟着页码缩水', async () => {
+    const w = await mountMany(13)
+    expect(w.find('.zc-hero-count').text()).toBe('13')
+    expect(w.findAll('.zc-stat-value')[0].text()).toBe('13')
+  })
+
+  it('翻到第 2 页换下一批，末页只剩余量', async () => {
+    const w = await mountMany(13)
+    await w.findAll('.zc-pager')[0].find('.stub-next').trigger('click')
+    expect(names(w.findAll('.zc-grid')[0].findAll('.stub-card')))
+      .toEqual(['应用7', '应用8', '应用9', '应用10', '应用11', '应用12'])
+    await w.findAll('.zc-pager')[0].find('.stub-next').trigger('click')
+    expect(names(w.findAll('.zc-grid')[0].findAll('.stub-card'))).toEqual(['应用13'])
+    expect(w.findAll('.zc-pager')[0].find('.stub-pager').attributes('data-current')).toBe('3')
+  })
+
+  it('「共享给我」自己一条分页，不跟着自有列表翻页', async () => {
+    const w = await mountMany(13, 9)
+    await w.findAll('.zc-pager')[0].find('.stub-next').trigger('click')
+    expect(names(w.find('.zc-shared').findAll('.stub-card')))
+      .toEqual(['应用201', '应用202', '应用203', '应用204', '应用205', '应用206'])
+    expect(w.findAll('.zc-pager')[1].find('.stub-pager').attributes('data-current')).toBe('1')
+    expect(w.findAll('.zc-pager')[1].find('.stub-pager').attributes('data-total')).toBe('9')
+  })
+
+  it('共享块标题上的计数是全量条数，分页只影响眼下这几张卡', async () => {
+    const w = await mountMany(1, 9)
+    expect(w.find('.zc-shared-count').text()).toBe('9')
+    await w.findAll('.zc-pager')[1].find('.stub-next').trigger('click')
+    expect(names(w.find('.zc-shared').findAll('.stub-card')))
+      .toEqual(['应用207', '应用208', '应用209'])
+    expect(w.find('.zc-shared-count').text()).toBe('9')
   })
 })

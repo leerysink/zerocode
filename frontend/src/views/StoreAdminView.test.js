@@ -305,3 +305,78 @@ describe('StoreAdminView 状态页签面卡（整页层级统一）', () => {
     w.unmount()
   })
 })
+// ---------- 列表分页（ADR-0071）：每页 6 张卡，统计口径保持全量 ----------
+const releaseFixture = (n, status = 'published', from = 1) => Array.from({ length: n }, (_, i) => ({
+  ...releases[0], id: from + i, status, title: `管理应用${String(from + i).padStart(3, '0')}`,
+}))
+const reviewFixture = (n) => Array.from({ length: n }, (_, i) => ({
+  ...review[0], id: 500 + i, want_name: `实例${String(i + 1).padStart(2, '0')}`,
+}))
+
+describe('StoreAdminView 列表分页', () => {
+  // 每页条数是本机一份全局偏好，用例之间必须各起各的
+  beforeEach(() => { window.localStorage.clear() })
+
+  it('版本列表每页只出 6 张卡，翻页换下一批', async () => {
+    api.storeAdminReleases.mockResolvedValue({ data: releaseFixture(13) })
+    const w = mountView()
+    await flushPromises()
+    expect(w.findAll('[data-test="adm-card"]')).toHaveLength(6)
+    expect(w.find('[data-test="zc-pager"]').text()).toContain('共 13 条')
+    await w.find('.ant-pagination-item-2').trigger('click')
+    await flushPromises()
+    expect(w.findAll('[data-test="adm-card"]')).toHaveLength(6)
+    expect(w.text()).toContain('管理应用007')
+    expect(w.text()).not.toContain('管理应用001')
+    w.unmount()
+  })
+
+  it('页头统计格与 tab 计数按全量，不随页码缩水', async () => {
+    api.storeAdminReleases.mockResolvedValue({
+      data: [...releaseFixture(13), ...releaseFixture(3, 'withdrawn', 300)],
+    })
+    const w = mountView()
+    await flushPromises()
+    expect(w.find('[data-test="page-stat-all"] b').text()).toBe('16')
+    expect(w.find('[data-test="page-stat-published"] b').text()).toBe('13')
+    expect(w.find('[data-test="adm-tab-all"] .n').text()).toBe('16')
+    await w.find('.ant-pagination-item-3').trigger('click')
+    await flushPromises()
+    expect(w.find('[data-test="page-stat-all"] b').text()).toBe('16')
+    expect(w.findAll('[data-test="adm-card"]')).toHaveLength(4)
+    w.unmount()
+  })
+
+  it('切状态 tab 回到第 1 页：换的是筛选口径，不是把旧页码带过去', async () => {
+    api.storeAdminReleases.mockResolvedValue({
+      data: [...releaseFixture(13), ...releaseFixture(3, 'withdrawn', 300)],
+    })
+    const w = mountView()
+    await flushPromises()
+    await w.find('.ant-pagination-item-2').trigger('click')
+    await w.find('[data-test="adm-tab-withdrawn"]').trigger('click')
+    await flushPromises()
+    expect(w.findAll('[data-test="adm-card"]')).toHaveLength(3)
+    expect(w.text()).toContain('管理应用300')
+    expect(w.text()).not.toContain('管理应用001')
+    expect(w.find('[data-test="zc-pager"]').text()).toContain('共 3 条')
+    w.unmount()
+  })
+
+  it('审批队列抽屉自己一条分页，队列计数仍是全量', async () => {
+    api.storeApplications.mockResolvedValue({ data: reviewFixture(13) })
+    const w = mountView()
+    await flushPromises()
+    await w.find('[data-test="adm-review-open"]').trigger('click')
+    await flushPromises()
+    const drawer = document.querySelector('.ant-drawer-content')
+    expect(drawer.querySelectorAll('.zc-sadm-review-row')).toHaveLength(6)
+    expect(drawer.querySelector('.ant-pagination-item-2')).toBeTruthy()
+    drawer.querySelector('.ant-pagination-item-2').click()
+    await flushPromises()
+    expect(drawer.textContent).toContain('实例07')
+    expect(drawer.textContent).not.toContain('实例01')
+    expect(w.find('[data-test="page-stat-review"] b').text()).toBe('13')
+    w.unmount()
+  })
+})
