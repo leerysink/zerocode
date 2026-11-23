@@ -4,7 +4,7 @@
 // 主语与设置页分明：设置页 = 对我自己配东西，这里 = 对别人的账号做事（ADR-0062 的分区纪律）。
 import { computed, onMounted, ref } from 'vue'
 import { message } from 'ant-design-vue'
-import { ReloadOutlined, SaveOutlined, StopOutlined, UndoOutlined } from '@ant-design/icons-vue'
+import { PlusOutlined, ReloadOutlined, SaveOutlined, StopOutlined, UndoOutlined } from '@ant-design/icons-vue'
 import * as api from '../api'
 import { useAuthStore } from '../stores/auth'
 import ZcPageHeader from '../components/zc/ZcPageHeader.vue'
@@ -25,6 +25,14 @@ const quotaOpen = ref(false)
 const quotaTarget = ref(null)
 const quotaForm = ref({ max_apps: null, max_running_stacks: null })
 const quotaSaving = ref(false)
+
+const inviteColumns = [
+  { title: '码', dataIndex: 'code_masked', width: 120 },
+  { title: '状态', dataIndex: 'status', width: 90 },
+  { title: '使用者', dataIndex: 'used_by_nickname', width: 120 },
+  { title: '签发于', dataIndex: 'created_at', width: 170 },
+  { title: '操作', key: 'action', width: 80 },
+]
 
 const columns = [
   { title: '昵称', dataIndex: 'nickname' },
@@ -125,6 +133,55 @@ async function saveQuota () {
   }
 }
 
+// ---- 邀请码（ADR-0069）：关门后平台唯一的入口凭据 ----
+const invites = ref([])
+const inviteOpen = ref(false)
+const issued = ref(null)
+const inviteWorking = ref(false)
+const INVITE_LABEL = { unused: '未使用', used: '已使用', revoked: '已作废' }
+
+async function loadInvites () {
+  if (!isFounder.value) return   // 非管理员不发治理请求：后端会 403，前端不该先挨一下
+  try {
+    invites.value = (await api.adminInvites()).data
+  } catch (e) {
+    message.error(e.response?.data?.detail || '邀请码列表加载失败')
+  }
+}
+
+async function issueInvite () {
+  inviteWorking.value = true
+  try {
+    // 明文只在这里出现一次：不进列表状态、不进日志、不进 URL
+    issued.value = (await api.adminIssueInvite()).data
+    inviteOpen.value = true
+    await loadInvites()
+  } catch (e) {
+    message.error(e.response?.data?.detail || '签发失败')
+  } finally {
+    inviteWorking.value = false
+  }
+}
+
+async function copyInvite () {
+  try {
+    await navigator.clipboard.writeText(issued.value.code)
+    message.success('已复制邀请码')
+  } catch {
+    message.warning('复制未成功，请手动选中复制')
+  }
+}
+
+async function revokeInvite (row) {
+  try {
+    await api.adminRevokeInvite(row.id)
+    message.success('该码已作废')
+    await loadInvites()
+  } catch (e) {
+    message.error(e.response?.data?.detail || '作废失败')
+  }
+}
+
 // ---- 平台默认（ADR-0068）：owner NULL 打底行，普通账号的设置页对这些键是只读的 ----
 const DEFAULT_KEYS = ['quota.max_apps', 'quota.max_running_stacks',
   'llm.base_url', 'llm.model', 'llm.api_key']
@@ -135,6 +192,7 @@ const defaultsDirty = computed(() =>
   DEFAULT_KEYS.some((k) => JSON.stringify(defaults.value[k]) !== JSON.stringify(defaultsRaw.value[k])))
 
 async function loadDefaults () {
+  if (!isFounder.value) return
   try {
     const data = (await api.adminConfig()).data
     defaults.value = Object.fromEntries(DEFAULT_KEYS.map((k) => [k, data[k] ?? null]))
@@ -161,7 +219,7 @@ async function saveDefaults () {
   }
 }
 
-onMounted(() => { load(); loadDefaults() })
+onMounted(() => { load(); loadDefaults(); loadInvites() })
 </script>
 
 <template>
@@ -177,6 +235,43 @@ onMounted(() => { load(); loadDefaults() })
           </a-button>
         </template>
       </zc-page-header>
+
+      <div class="zc-panel" data-test="admin-invites">
+        <h3 class="zc-group-title">邀请码</h3>
+        <p class="zc-quota-note">
+          自助注册已关闭（ADR-0069）：新人必须凭一枚一次性码进来。码用掉即失效，未使用的可随时作废。
+        </p>
+        <a-table :data-source="invites" :columns="inviteColumns" row-key="id" size="small"
+                 :pagination="false" data-test="invite-table">
+          <template #bodyCell="{ column, record }">
+            <template v-if="column.dataIndex === 'status'">
+              <a-tag :color="record.status === 'unused' ? 'blue' : 'default'"
+                     data-test="invite-status">{{ INVITE_LABEL[record.status] || record.status }}</a-tag>
+            </template>
+            <template v-else-if="column.dataIndex === 'created_at'">
+              {{ fmtTime(record.created_at) }}
+            </template>
+            <template v-else-if="column.key === 'action'">
+              <a-button v-if="record.status === 'unused'" type="link" danger size="small"
+                        :data-test="`invite-revoke-${record.id}`" @click="revokeInvite(record)">
+                作废
+              </a-button>
+            </template>
+          </template>
+        </a-table>
+        <a-button type="primary" :loading="inviteWorking" data-test="invite-issue"
+                  @click="issueInvite"><plus-outlined /> 签发一枚</a-button>
+      </div>
+
+      <a-modal v-model:open="inviteOpen" :footer="null" title="邀请码已签发" data-test="invite-reveal">
+        <p class="zc-quota-note">
+          完整码<b>只在这里出现一次</b>，列表里往后只有掩码。发给谁、谁就能建一个账号，请自行确认。
+        </p>
+        <a-input-group compact>
+          <a-input :value="issued?.code" readonly data-test="invite-plain" style="width: calc(100% - 88px)" />
+          <a-button type="primary" data-test="invite-copy" @click="copyInvite">复制</a-button>
+        </a-input-group>
+      </a-modal>
 
       <div class="zc-panel" data-test="admin-defaults">
         <h3 class="zc-group-title">平台默认</h3>

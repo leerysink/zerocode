@@ -96,6 +96,12 @@
             <a-input-password v-model:value="form.password" placeholder="登录口令" size="large"
                               :autocomplete="mode === 'login' ? 'current-password' : 'new-password'" />
           </a-form-item>
+          <!-- 空库首位免码自举，其余一律凭码（ADR-0069）：字段按后端 registration-mode 出现，
+               免得第一人在自己机器上被一个无处索取的码挡住，也免得别人填了个根本不看的框。 -->
+          <a-form-item v-if="mode === 'register' && requireInvite" name="inviteCode" label="邀请码">
+            <a-input v-model:value="form.inviteCode" placeholder="管理员签发的一次性邀请码"
+                     size="large" autocomplete="one-time-code" data-test="login-invite" />
+          </a-form-item>
           <p v-if="mode === 'register'" class="pwd-hint">口令用于以后登录，请牢记。</p>
           <a-alert v-if="error" type="error" show-icon :message="error" class="login-error" />
           <a-button type="primary" html-type="submit" block size="large" :loading="loading" class="login-submit">
@@ -103,7 +109,7 @@
           </a-button>
         </a-form>
 
-        <p class="card-foot">{{ mode === 'login' ? '还没有账号？切到「注册」即可创建。' : '已有账号？切到「登录」直接进入。' }}</p>
+        <p class="card-foot">{{ mode === 'login' ? (requireInvite ? '还没有账号？注册需要邀请码。' : '还没有账号？切到「注册」即可创建。') : '已有账号？切到「登录」直接进入。' }}</p>
       </div>
       <p class="side-foot">zerocode · 让每个人都能构建应用</p>
     </main>
@@ -115,6 +121,7 @@
 import { reactive, ref, onMounted, onUnmounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '../stores/auth'
+import { registrationMode } from '../api'
 
 const router = useRouter()
 const route = useRoute()
@@ -122,7 +129,17 @@ const auth = useAuthStore()
 const mode = ref('login')
 const loading = ref(false)
 const error = ref('')
-const form = reactive({ nickname: '', password: '' })
+const form = reactive({ nickname: '', password: '', inviteCode: '' })
+// fail-closed：拉不到模式就当「要码」。宁可多问一个框，不能把入口当敞开的设计让人撞 403
+const requireInvite = ref(true)
+
+async function loadMode () {
+  try {
+    requireInvite.value = (await registrationMode()).data.require_invite !== false
+  } catch {
+    requireInvite.value = true
+  }
+}
 
 function setMode(m) {
   mode.value = m
@@ -136,7 +153,10 @@ async function submit() {
     if (mode.value === 'login') {
       await auth.login({ nickname: form.nickname, password: form.password })
     } else {
-      await auth.register({ nickname: form.nickname, password: form.password })
+      await auth.register({
+        nickname: form.nickname, password: form.password,
+        invite_code: form.inviteCode || undefined,
+      })
     }
     router.replace(typeof route.query.next === 'string' ? route.query.next : '/')
   } catch (e) {
@@ -192,6 +212,7 @@ async function termLoop() {
 }
 
 onMounted(() => {
+  loadMode()
   if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
     termText.value = PROMPT
     termSteps.value = TERM_STEPS.length

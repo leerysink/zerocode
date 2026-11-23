@@ -40,6 +40,14 @@ beforeEach(() => {
   api.adminBan.mockResolvedValue({ data: accounts[1] })
   api.adminUnban.mockResolvedValue({ data: accounts[1] })
   api.adminConfig.mockResolvedValue({ data: {} })
+  api.adminInvites.mockResolvedValue({ data: [
+    { id: 1, code_masked: '····a1b2', status: 'unused', created_at: '2026-11-23T06:00:00',
+      used_at: null, used_by_nickname: null },
+    { id: 2, code_masked: '····c3d4', status: 'used', created_at: '2026-11-23T06:10:00',
+      used_at: '2026-11-23T07:00:00', used_by_nickname: '小明' },
+  ] })
+  api.adminIssueInvite.mockResolvedValue({ data: { id: 3, code: 'plain-new-code' } })
+  api.adminRevokeInvite.mockResolvedValue({ data: { id: 1, status: 'revoked' } })
   api.adminPutConfig.mockResolvedValue({ data: { ok: true } })
 })
 
@@ -152,7 +160,8 @@ describe('AdminView', () => {
     const w = mountView()
     await flushPromises()
     expect(w.find('[data-test="admin-head"]').exists()).toBe(true)
-    expect(w.text()).not.toContain('小明')
+    // 收窄到名册表：邀请码区里合法地会出现「小明」（那是用者列），整页文本判不出名册是否空
+    expect(w.find('[data-test="admin-accounts"]').text()).not.toContain('小明')
     expect(w.find('[data-test="page-stat-账号"]').text()).toContain('0')
   })
 
@@ -193,5 +202,46 @@ describe('AdminView', () => {
 
     expect(api.adminPutQuota).toHaveBeenCalledWith(2,
       { max_apps: 10, max_running_stacks: 0 })
+  })
+})
+
+describe('AdminView 邀请码（ADR-0069）', () => {
+  it('邀请码：列表只出掩码，明文只在签发弹层里露面一次', async () => {
+    const w = mountView()
+    await flushPromises()
+    const panel = w.find('[data-test="admin-invites"]')
+    expect(panel.text()).toContain('····a1b2')
+    expect(panel.text()).toContain('未使用')
+    expect(panel.text()).toContain('小明')
+    expect(panel.text()).not.toContain('plain-new-code')
+
+    await w.find('[data-test="invite-issue"]').trigger('click')
+    await flushPromises()
+    expect(api.adminIssueInvite).toHaveBeenCalledTimes(1)
+    // a-modal 传送到 body：取 .ant-modal-content（对齐 StoreAdminView.test.js 的口径）
+    const reveal = [...document.querySelectorAll('.ant-modal-content')]
+      .find((m) => m.textContent.includes('只在这里出现一次'))
+    expect(reveal).toBeTruthy()
+    expect(reveal.querySelector('[data-test="invite-plain"]').value).toBe('plain-new-code')
+  })
+
+  it('邀请码：只有未使用的行给作废按钮，作废后重拉列表', async () => {
+    const w = mountView()
+    await flushPromises()
+    expect(w.find('[data-test="invite-revoke-1"]').exists()).toBe(true)
+    expect(w.find('[data-test="invite-revoke-2"]').exists()).toBe(false)
+
+    api.adminInvites.mockClear()
+    await w.find('[data-test="invite-revoke-1"]').trigger('click')
+    await flushPromises()
+    expect(api.adminRevokeInvite).toHaveBeenCalledWith(1)
+    expect(api.adminInvites).toHaveBeenCalledTimes(1)
+  })
+
+  it('非管理员不发邀请码请求（治理面三重读口一起被视图挡住）', async () => {
+    const w = mountView({ id: 9, is_founder: false })
+    await flushPromises()
+    expect(api.adminInvites).not.toHaveBeenCalled()
+    expect(api.adminConfig).not.toHaveBeenCalled()
   })
 })

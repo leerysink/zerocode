@@ -157,10 +157,18 @@ async def env(app_, tmp_path, monkeypatch):
     from httpx import AsyncClient, ASGITransport
 
     monkeypatch.setenv("ZEROCODE_DATA_DIR", str(tmp_path / "data"))
+    from tests.conftest import mint_invite
+
     clients = {}
-    for name in ("matrix-founder", "matrix-owner", "matrix-stranger", "matrix-collab"):
+    for i, name in enumerate(("matrix-founder", "matrix-owner", "matrix-stranger",
+                              "matrix-collab")):
         c = AsyncClient(transport=ASGITransport(app=app_), base_url="http://t")
-        r = await c.post("/api/auth/register", json={"nickname": name, "password": "pw-" + name})
+        body = {"nickname": name, "password": "pw-" + name}
+        if i:
+            # 首位免码自举、其余一律凭码（ADR-0069）。逐枚现签：签码要有签发者，
+            # 而签发者要到第一号落地才存在。
+            body["invite_code"] = (await mint_invite(app_))[0]
+        r = await c.post("/api/auth/register", json=body)
         assert r.status_code == 200, r.text
         c.app = app_
         clients[name] = c

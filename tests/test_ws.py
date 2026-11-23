@@ -33,12 +33,17 @@ def client(monkeypatch):
     monkeypatch.setattr(deploy_engine, "stop_all_dev_on_exit", _noop)
     monkeypatch.setattr(provision, "ensure_zcnet", _noop)
     monkeypatch.setattr(sqlrun, "build_if_missing", _noop)
+    from tests.conftest import mint_invite_sync
+
     app = create_app()  # 开发库；lifespan 负责迁移
     with TestClient(app) as c:
         # Ticket 002 全局 guard：业务接口需登录态。开发库无清理机制，随机昵称注册不跨轮冲突；
         # 遗留账号无口令/不入生产语义，仅测试痕迹。
+        # 开发库里早有账号 → 注册一律凭码（ADR-0069），所以先签一枚再进来。
+        c.app_ = app          # 旁路建号（_register_actor）也要能拿到 app
         reg = c.post("/api/auth/register",
-                     json={"nickname": f"ws-test-{secrets.token_hex(4)}", "password": "test-pw"})
+                     json={"nickname": f"ws-test-{secrets.token_hex(4)}", "password": "test-pw",
+                           "invite_code": mint_invite_sync(app)[0]})
         assert reg.status_code == 200, reg.text
         tmp = tempfile.mkdtemp()
         ws = c.post("/api/workspaces", json={"root_path": tmp}).json()
@@ -1180,9 +1185,14 @@ def _set_token(client, token) -> None:
 
 def _register_actor(client, prefix: str) -> dict:
     """注册一个旁路账号（随机昵称）并还原调用者 cookie：返回 {id, token, nickname}。"""
+    from tests.conftest import mint_invite_sync
+
     saved = _jar_token(client)
     nick = f"{prefix}-{secrets.token_hex(4)}"
-    r = client.post("/api/auth/register", json={"nickname": nick, "password": "test-pw"})
+    # 旁路账号同样是「第二个及以后」，凭码进来（ADR-0069）
+    r = client.post("/api/auth/register",
+                    json={"nickname": nick, "password": "test-pw",
+                          "invite_code": mint_invite_sync(client.app_)[0]})
     assert r.status_code == 200, r.text
     token = r.cookies.get("zc_actor")   # 注册响应自己的 Set-Cookie，不翻易冲突的 jar
     _set_token(client, token)

@@ -35,10 +35,14 @@ def client(monkeypatch):
     monkeypatch.setattr(deploy_engine, "stop_all_dev_on_exit", _noop)
     monkeypatch.setattr(provision, "ensure_zcnet", _noop)
     monkeypatch.setattr(sqlrun, "build_if_missing", _noop)
+    from tests.conftest import mint_invite_sync
+
     app = create_app()
     with TestClient(app) as c:
+        c.app_ = app
         reg = c.post("/api/auth/register",
-                     json={"nickname": f"wsauth-a-{secrets.token_hex(4)}", "password": "test-pw"})
+                     json={"nickname": f"wsauth-a-{secrets.token_hex(4)}", "password": "test-pw",
+                           "invite_code": mint_invite_sync(app)[0]})
         assert reg.status_code == 200, reg.text
         tmp = tempfile.mkdtemp()
         ws = c.post("/api/workspaces", json={"root_path": tmp}).json()
@@ -85,9 +89,12 @@ def test_跨用户连他人会话流被拒(client):
     """B 带自己的有效会话连 A 的 session：连接被拒（close code 4404，越权统一语义的 WS 映射）。"""
     client.app.state.llm_factory = lambda cfg: ScriptedLLM(_done("串话"))
     token_a = client.cookies.get("zc_actor")
+    from tests.conftest import mint_invite_sync
+
     nick_b = f"wsauth-b-{secrets.token_hex(4)}"
     r = client.post("/api/auth/register",
-                    json={"nickname": nick_b, "password": "test-pw"})
+                    json={"nickname": nick_b, "password": "test-pw",
+                          "invite_code": mint_invite_sync(client.app_)[0]})
     assert r.status_code == 200, r.text
     token_b = client.cookies.get("zc_actor")  # register 的 Set-Cookie 已写进 jar
     # 先 clear 再 set：jar 里已有域匹配的 A cookie，叠 set 会发重复 Cookie 头

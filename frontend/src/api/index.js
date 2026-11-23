@@ -199,11 +199,15 @@ export const authRegister = (data) => http.post('/auth/register', data) // {nick
 export const authLogin = (data) => http.post('/auth/login', data)
 export const authLogout = () => http.post('/auth/logout')
 export const authMe = () => http.get('/auth/me')
+export const registrationMode = () => http.get('/auth/registration-mode') // {require_invite}：未登录可读（ADR-0069）
 
 // ---- 账号治理台（规格 2026-11-23 / ADR-0067~0070，仅管理员）----
 export const adminAccounts = () => http.get('/admin/accounts')
 export const adminBan = (id, data) => http.post(`/admin/accounts/${id}/ban`, data) // {reason, stop_stacks?}
 export const adminUnban = (id) => http.post(`/admin/accounts/${id}/unban`)
+export const adminInvites = () => http.get('/admin/invites')
+export const adminIssueInvite = () => http.post('/admin/invites', {}) // 响应里的 code 是它唯一一次以明文露面
+export const adminRevokeInvite = (id) => http.post(`/admin/invites/${id}/revoke`)
 export const adminConfig = () => http.get('/admin/config')
 export const adminPutConfig = (data) => http.put('/admin/config', data) // 恒写 owner NULL 平台行
 export const adminPutQuota = (id, data) => http.put(`/admin/accounts/${id}/quota`, data) // {max_apps, max_running_stacks}，null=不限

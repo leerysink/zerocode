@@ -1,9 +1,13 @@
 # app/api/auth.py
-"""登录体系端点（Ticket 002 / ADR-0003）：register/login/logout/me。
+"""登录体系端点（Ticket 002 / ADR-0003）：register/login/logout/me/registration-mode。
 
 actor 即登录主体：cookie `zc_actor` 是会话凭据，一次登录一条会话（identity.open_session）；
 口令 bcrypt 落库。同一账号允许多人同时在线，上限 actor.max_sessions（默认 10），坐满时挤掉
 最久未活动的那条；登出只作废当前会话。
+
+注册门禁（ADR-0069）：`actor` 表为空时免码放行且该号即管理员（首号自举），
+一旦有号，注册一律要一枚有效邀请码。本模块下所有路径都不经全局 guard（main.py 对
+`/api/auth*` 放行），所以 `registration-mode` 天然是未登录可读的。
 """
 
 from fastapi import APIRouter, HTTPException, Request, Response
@@ -11,7 +15,7 @@ from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
-from app.store import identity
+from app.store import identity, invites
 from app.store.identity import ACTOR_COOKIE, COOKIE_MAX_AGE, hash_password, verify_password
 
 router = APIRouter(prefix="/api/auth")
@@ -20,6 +24,11 @@ router = APIRouter(prefix="/api/auth")
 class CredIn(BaseModel):
     nickname: str | None = None
     password: str | None = None
+    invite_code: str | None = None
+
+
+async def _platform_is_empty(s) -> bool:
+    return not (await s.execute(text("SELECT EXISTS (SELECT 1 FROM actor)"))).scalar()
 
 
 def _clean_credential(body: CredIn) -> tuple[str, str]:
@@ -51,6 +60,12 @@ async def register(request: Request, response: Response, body: CredIn):
                 "VALUES (:n, :p, :f) RETURNING id, nickname, is_founder"),
                 {"n": nickname, "p": hash_password(password),
                  "f": is_first})).mappings().first()
+            if not is_first:
+                # 关门后新账号一律凭码（ADR-0069）。核销与建号**同一个事务**：昵称撞车、
+                # 码被别人抢先核走，都整体回滚——失败不消耗名额（US-10）。
+                # 首号即使带了码也不核销：那个码仍然有效，留给下一个人用。
+                if not await invites.redeem(s, (body.invite_code or "").strip(), row["id"]):
+                    raise HTTPException(403, "需要有效邀请码，请向管理员索取")
             if is_first:
                 founder_id = row["id"]
                 for table in ("workspace", "app_project", "model_config"):
@@ -70,6 +85,15 @@ async def register(request: Request, response: Response, body: CredIn):
     _issue_session(response, await identity.open_session(
         request.app.state.session_factory, row["id"]))
     return dict(row)
+
+
+@router.get("/registration-mode")
+async def registration_mode(request: Request):
+    """现在注册要不要邀请码。给登录页决定那个字段出不出现——第一人在自己机器上
+    不该被一枚无处索取的码挡住，而界面预先告诉他「要码」比让他提交后吃 403 诚实。
+    """
+    async with request.app.state.session_factory() as s:
+        return {"require_invite": not await _platform_is_empty(s)}
 
 
 @router.post("/login")

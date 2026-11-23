@@ -56,13 +56,18 @@ async def test_首注册创始人承接全部无主存量(anon_client):
 
 
 async def test_第二个注册者不触发承接(anon_client):
+    """ADR-0003 的承接只属于首号。第二人现在得凭邀请码进来（ADR-0069），
+    但**这条用例断言的东西一字未改**：关门不该动到承接语义。"""
+    from tests.conftest import mint_invite
+
     await _seed_ownerless(anon_client.app)
     r1 = await anon_client.post("/api/auth/register",
                                 json={"nickname": "first", "password": "pw1"})
     first_id = r1.json()["id"]
     # 首位承接后新登记的资源属于自己，第二注册者不得染指
     r2 = await anon_client.post("/api/auth/register",
-                                json={"nickname": "second", "password": "pw2"})
+                                json={"nickname": "second", "password": "pw2",
+                                      "invite_code": (await mint_invite(anon_client.app))[0]})
     assert r2.status_code == 200, r2.text
     assert r2.json()["is_founder"] is False
     async with anon_client.app.state.session_factory() as s:

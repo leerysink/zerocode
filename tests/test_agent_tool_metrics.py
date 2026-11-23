@@ -177,7 +177,10 @@ async def _assert_third_sees_nothing(client):
     from httpx import AsyncClient, ASGITransport
     c = AsyncClient(transport=ASGITransport(app=client.app), base_url="http://t")
     try:
-        r = await c.post("/api/auth/register", json={"nickname": "carol", "password": "pw-c"})
+        from tests.conftest import mint_invite
+        r = await c.post("/api/auth/register",
+                         json={"nickname": "carol", "password": "pw-c",
+                               "invite_code": (await mint_invite(client.app))[0]})
         assert r.status_code == 200, r.text
         assert (await c.get("/api/agent/tool-metrics")).json()["totals"]["calls"] == 0
     finally:

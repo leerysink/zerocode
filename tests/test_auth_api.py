@@ -4,7 +4,11 @@
 
 
 async def test_新用户可注册并获得会话cookie(client):
-    r = await client.post("/api/auth/register", json={"nickname": "alice", "password": "pw123"})
+    # client 已是首位（管理员）账号，再建号即第二人 → 一律凭码（ADR-0069）
+    from tests.conftest import mint_invite
+    r = await client.post("/api/auth/register",
+                          json={"nickname": "alice", "password": "pw123",
+                                "invite_code": (await mint_invite(client.app))[0]})
     assert r.status_code == 200
     assert "zc_actor" in r.cookies  # 注册即登录：当场下发会话 cookie
     me = await client.get("/api/auth/me")
@@ -13,8 +17,13 @@ async def test_新用户可注册并获得会话cookie(client):
 
 
 async def test_重复昵称注册被拒(client):
-    await client.post("/api/auth/register", json={"nickname": "alice", "password": "pw123"})
-    r = await client.post("/api/auth/register", json={"nickname": "alice", "password": "other"})
+    from tests.conftest import mint_invite
+
+    codes = await mint_invite(client.app, 2)
+    await client.post("/api/auth/register",
+                      json={"nickname": "alice", "password": "pw123", "invite_code": codes[0]})
+    r = await client.post("/api/auth/register",
+                          json={"nickname": "alice", "password": "other", "invite_code": codes[1]})
     assert r.status_code == 409
 
 
@@ -24,7 +33,11 @@ async def test_缺口令注册被拒(client):
 
 
 async def test_正确口令可登录并重建会话(client):
-    await client.post("/api/auth/register", json={"nickname": "alice", "password": "pw123"})
+    from tests.conftest import mint_invite
+
+    await client.post("/api/auth/register",
+                      json={"nickname": "alice", "password": "pw123",
+                            "invite_code": (await mint_invite(client.app))[0]})
     # 模拟换浏览器：另开一个无 cookie 的 client（不能复用 client/anon_client，同一实例），靠登录拿回会话
     from httpx import AsyncClient, ASGITransport
     async with AsyncClient(transport=ASGITransport(app=client.app), base_url="http://t") as fresh:
@@ -36,7 +49,11 @@ async def test_正确口令可登录并重建会话(client):
 
 
 async def test_错误口令不能登录(client):
-    await client.post("/api/auth/register", json={"nickname": "alice", "password": "pw123"})
+    from tests.conftest import mint_invite
+
+    await client.post("/api/auth/register",
+                      json={"nickname": "alice", "password": "pw123",
+                            "invite_code": (await mint_invite(client.app))[0]})
     r = await client.post("/api/auth/login", json={"nickname": "alice", "password": "wrong"})
     assert r.status_code == 401
 
@@ -48,7 +65,11 @@ async def test_无口令的存量actor无法被任何口令登录(client):
 
 
 async def test_登出后会话作废(client):
-    await client.post("/api/auth/register", json={"nickname": "alice", "password": "pw123"})
+    from tests.conftest import mint_invite
+
+    await client.post("/api/auth/register",
+                      json={"nickname": "alice", "password": "pw123",
+                            "invite_code": (await mint_invite(client.app))[0]})
     assert (await client.get("/api/auth/me")).status_code == 200
     assert (await client.post("/api/auth/logout")).status_code == 200
     assert (await client.get("/api/auth/me")).status_code == 401

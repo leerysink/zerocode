@@ -3,6 +3,57 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 from app.db import make_engine, run_migrations
 
+
+async def mint_invite_with(session_factory, n: int = 1) -> list[str]:
+    """签 n 枚有效邀请码（ADR-0069 关门后建第二个账号的唯一途径）。
+
+    走 `app.store.invites` 而不是拼 SQL：核销条件与状态口径要和生产同一份实现。
+    created_by 取库里最早的账号（首注册即管理员），与治理台签发同语义。
+    """
+    from app.store import invites
+
+    out = []
+    async with session_factory() as s:
+        admin = (await s.execute(text("SELECT id FROM actor ORDER BY id LIMIT 1"))).scalar()
+        if admin is None:
+            raise AssertionError(
+                "库里还没有任何账号：首位账号免码自举（ADR-0069），无需也没有签发者。"
+                "在第一个账号注册之前签码是用法错误，请在建号之后再逐枚签发。")
+        for _ in range(n):
+            out.append((await invites.issue(s, created_by=admin))["code"])
+        await s.commit()
+    return out
+
+
+async def mint_invite(app, n: int = 1) -> list[str]:
+    return await mint_invite_with(app.state.session_factory, n)
+
+
+def mint_invite_sync(app, n: int = 1) -> list[str]:
+    """同步上下文里签码——供 TestClient 那批连开发库的聊天/WS 测试用（它们没有可用事件循环）。
+
+    **另起一个临时引擎并 dispose**，绝不复用 `app.state.engine`：asyncpg 连接绑死创建它的
+    事件循环，在 `asyncio.run` 里借道应用的连接池会把跨循环的连接放回池里，等应用自己
+    下一次取用时才炸——那种失败离根因隔了十个用例，最难查。
+    """
+    import asyncio
+
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from app.db import make_session_factory
+
+    url = app.state.engine.url.render_as_string(hide_password=False)
+
+    async def _go():
+        eng = create_async_engine(url)
+        try:
+            return await mint_invite_with(make_session_factory(eng), n)
+        finally:
+            await eng.dispose()
+
+    return asyncio.run(_go())
+
+
 @pytest.fixture
 async def test_engine():
     """建测试库（不存在时）并返回 engine；测试库幂等迁移后由各测试自行使用。"""
@@ -127,12 +178,18 @@ async def client(anon_client):
 async def two_auth_clients(app_):
     """两个独立注册账号各自的已登录 httpx client（隔离测试专用接缝，Ticket 002 接通）。
 
-    005–009 的隔离用例一律经由本接缝取双账号，不得各自拼 cookie，保证认证靶心只有一个。"""
+    005–009 的隔离用例一律经由本接缝取双账号，不得各自拼 cookie，保证认证靶心只有一个。
+    第二个账号凭邀请码进来（ADR-0069）：alice 是空库首位、免码且当选创始人，
+    所以本夹具给出的**第一个 client 就是管理员**，第二个是普通账号——
+    治理面的双身份用例直接拿这两个，不必再自己造号。"""
     from httpx import AsyncClient, ASGITransport
     out = []
     for name in ("alice", "bob"):
         c = AsyncClient(transport=ASGITransport(app=app_), base_url="http://t")
-        r = await c.post("/api/auth/register", json={"nickname": name, "password": "pw-" + name})
+        body = {"nickname": name, "password": "pw-" + name}
+        if out:
+            body["invite_code"] = (await mint_invite(app_))[0]
+        r = await c.post("/api/auth/register", json=body)
         assert r.status_code == 200, r.text
         c.app = app_
         out.append(c)

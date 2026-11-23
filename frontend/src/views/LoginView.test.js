@@ -10,13 +10,14 @@ import Antd from 'ant-design-vue'
 
 vi.mock('../api', () => ({
   authLogin: vi.fn(), authRegister: vi.fn(), authLogout: vi.fn(), authMe: vi.fn(),
+  registrationMode: vi.fn(),
 }))
 vi.mock('vue-router', () => ({
   useRoute: () => ({ query: {} }),
   useRouter: () => ({ replace: vi.fn() }),
 }))
 
-import { authLogin } from '../api'
+import { authLogin, authRegister, registrationMode } from '../api'
 import LoginView from '../views/LoginView.vue'
 import { useAuthStore } from '../stores/auth'
 
@@ -60,6 +61,63 @@ describe('LoginView 提交链路', () => {
     await submitForm(host)
     expect(authLogin).toHaveBeenCalledWith({ nickname: 'uimoke925a', password: 'smoke-pwd-123' })
     expect(useAuthStore().user?.nickname).toBe('uimoke925a')
+    app.unmount()
+  })
+})
+
+describe('注册门禁（ADR-0069）', () => {
+  beforeEach(() => {
+    document.body.innerHTML = ''
+    vi.clearAllMocks()
+  })
+
+  async function openRegister(requireInvite) {
+    registrationMode.mockResolvedValue({ data: { require_invite: requireInvite } })
+    authRegister.mockResolvedValue({ data: { id: 2, nickname: '新来的人' } })
+    const h = mountLogin()
+    await nextTick()
+    const tabs = [...h.host.querySelectorAll('[role="tab"]')]
+    tabs.find((b) => b.textContent.includes('注册')).click()
+    await nextTick()
+    return h
+  }
+
+  it('要码：注册模式出现邀请码字段，并随提交带出去', async () => {
+    const { host, app } = await openRegister(true)
+    await inputInto(host, 0, '新来的人')
+    await inputInto(host, 1, 'pw-123456')
+    const invite = host.querySelector('[data-test="login-invite"]')
+    expect(invite).toBeTruthy()
+    invite.value = 'CODE-1'
+    invite.dispatchEvent(new Event('input', { bubbles: true }))
+    await nextTick()
+
+    await submitForm(host)
+    expect(authRegister).toHaveBeenCalledWith(
+      expect.objectContaining({ nickname: '新来的人', invite_code: 'CODE-1' }))
+    app.unmount()
+  })
+
+  it('空库首位：不出现邀请码字段，提交也不带 invite_code', async () => {
+    const { host, app } = await openRegister(false)
+    await inputInto(host, 0, '首号')
+    await inputInto(host, 1, 'pw-123456')
+    expect(host.querySelector('[data-test="login-invite"]')).toBeFalsy()
+
+    await submitForm(host)
+    expect(authRegister).toHaveBeenCalledTimes(1)
+    expect(authRegister.mock.calls[0][0].invite_code).toBeUndefined()
+    app.unmount()
+  })
+
+  it('模式接口挂了当「要码」处理：宁可多一个框，不能把入口当敞开', async () => {
+    registrationMode.mockRejectedValue(new Error('boom'))
+    const { host, app } = mountLogin()
+    await nextTick()
+    const tabs = [...host.querySelectorAll('[role="tab"]')]
+    tabs.find((b) => b.textContent.includes('注册')).click()
+    await nextTick()
+    expect(host.querySelector('[data-test="login-invite"]')).toBeTruthy()
     app.unmount()
   })
 })

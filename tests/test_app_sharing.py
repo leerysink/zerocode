@@ -95,10 +95,16 @@ async def env(app_, tmp_path, monkeypatch):
     from httpx import AsyncClient, ASGITransport
 
     monkeypatch.setenv("ZEROCODE_DATA_DIR", str(tmp_path / "data"))
+    from tests.conftest import mint_invite
+
     clients = {}
-    for name in ("share-founder", "share-owner", "share-collab"):
+    for i, name in enumerate(("share-founder", "share-owner", "share-collab")):
         c = AsyncClient(transport=ASGITransport(app=app_), base_url="http://t")
-        r = await c.post("/api/auth/register", json={"nickname": name, "password": "pw-" + name})
+        body = {"nickname": name, "password": "pw-" + name}
+        if i:
+            # 首位免码自举、其余凭码（ADR-0069）：逐枚现签，签发者要等第一号落地才存在
+            body["invite_code"] = (await mint_invite(app_))[0]
+        r = await c.post("/api/auth/register", json=body)
         assert r.status_code == 200, r.text
         c.app = app_
         clients[name] = c
@@ -758,8 +764,10 @@ async def test_revoke_and_leave_lifecycle(env):
     sf = app.state.session_factory
     other = AsyncClient(transport=ASGITransport(app=app), base_url="http://t")
     try:
+        from tests.conftest import mint_invite
         r = await other.post("/api/auth/register",
-                             json={"nickname": "share-collab-2", "password": "pw2"})
+                             json={"nickname": "share-collab-2", "password": "pw2",
+                                   "invite_code": (await mint_invite(app))[0]})
         assert r.status_code == 200, r.text
         other_id = (await other.get("/api/auth/me")).json()["id"]
 

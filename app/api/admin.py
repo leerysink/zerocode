@@ -15,6 +15,7 @@ from app.deploy import engine, prod, quota
 from app.deploy import tasks as deploy_tasks
 from app.deploy.errors import DeployError
 from app.services import app_service, config_service
+from app.store import invites
 
 router = APIRouter(prefix="/api/admin")
 
@@ -188,6 +189,41 @@ async def unban_account(request: Request, actor_id: int):
             {"u": actor_id})
         await s.commit()
     return await _load_account(sf, actor_id)
+
+
+# ---- 邀请码（ADR-0069）：关门后平台唯一的入口凭据 ----
+
+@router.get("/invites")
+async def list_invites(request: Request):
+    """码列表：一律掩码回显。明文只在签发响应里出现一次。"""
+    require_admin(request.state.actor, "治理台仅管理员可见")
+    async with request.app.state.session_factory() as s:
+        return await invites.list_recent(s)
+
+
+@router.post("/invites", status_code=200)
+async def issue_invite(request: Request):
+    """签一枚一次性邀请码。**响应里的 code 是它唯一一次以明文露面**——
+    因此前端不得把它存进日志、URL 或列表状态里长期驻留。
+    """
+    require_admin(request.state.actor, "治理台仅管理员可见")
+    async with request.app.state.session_factory() as s:
+        issued = await invites.issue(s, created_by=request.state.actor["id"])
+        await s.commit()
+    return issued
+
+
+@router.post("/invites/{invite_id}/revoke")
+async def revoke_invite(request: Request, invite_id: int):
+    """作废一枚未使用的码。已使用的拒 409：那是历史，不是还能收回的名额。"""
+    require_admin(request.state.actor, "治理台仅管理员可见")
+    try:
+        async with request.app.state.session_factory() as s:
+            out = await invites.revoke(s, invite_id)
+            await s.commit()
+    except DeployError as e:
+        raise HTTPException(e.status, str(e))
+    return out
 
 
 # ---- 平台默认（ADR-0068）：治理台是 owner NULL 行的唯一可写视图 ----
