@@ -3,9 +3,10 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { createPinia, setActivePinia } from 'pinia'
 
-vi.mock('../api', () => ({ getConfig: vi.fn(), putConfig: vi.fn() }))
+vi.mock('../api', () => ({ getConfig: vi.fn(), putConfig: vi.fn(), configMeta: vi.fn() }))
 
-import { getConfig, putConfig } from '../api'
+import { configMeta, getConfig, putConfig } from '../api'
+import { useAuthStore } from './auth'
 import { useConfigStore } from './config'
 
 beforeEach(() => {
@@ -101,6 +102,62 @@ describe('config store 子任务委派上限', () => {
     await store.save()
     expect(putConfig).toHaveBeenCalledWith(expect.objectContaining({
       'subrun.max_tasks': 2, 'subrun.max_rounds': 20 }))
+  })
+})
+
+describe('config store 平台级键只读（ADR-0068）', () => {
+  const PREFIXES = ['llm.', 'memory.', 'clarify.', 'subrun.', 'quota.']
+
+  async function loadAs (founder) {
+    useAuthStore().user = { id: 1, is_founder: founder }
+    getConfig.mockResolvedValue({ data: {} })
+    configMeta.mockResolvedValue({ data: { user_prefixes: PREFIXES } })
+    putConfig.mockResolvedValue({ data: { ok: true } })
+    const store = useConfigStore()
+    await store.loadConfig()
+    return store
+  }
+
+  it('普通账号的保存 payload 里不含任何平台级键——后端对越权批次是整批 403', async () => {
+    const store = await loadAs(false)
+    store.form.maxToolRounds = 99
+    store.form.model = 'mine'
+    store.form.openFolderMode = 'system'
+    await store.save()
+    const payload = putConfig.mock.calls[0][0]
+    expect(payload['llm.model']).toBe('mine')
+    expect(Object.keys(payload).some((k) => k.startsWith('agent.'))).toBe(false)
+    expect(payload['fs.open_folder_mode']).toBeUndefined()
+  })
+
+  it('管理员照旧整批发送：他改 agent.* 改的就是平台默认，不存在越权', async () => {
+    const store = await loadAs(true)
+    store.form.maxToolRounds = 99
+    await store.save()
+    expect(putConfig.mock.calls[0][0]['agent.max_tool_rounds']).toBe(99)
+  })
+
+  it('fieldLocked 按键前缀判定，且 quota.* 虽是账号级形态也对普通账号锁死', async () => {
+    const store = await loadAs(false)
+    expect(store.fieldLocked('model')).toBe(false)
+    expect(store.fieldLocked('maxToolRounds')).toBe(true)
+    expect(store.fieldLocked('memoryTopK')).toBe(false)
+    expect(store.canEditKey('quota.max_apps')).toBe(false)
+    await loadAs(true)
+    expect(useConfigStore().fieldLocked('maxToolRounds')).toBe(false)
+  })
+
+  it('清单拉不到时退回「不过滤，由后端裁决」：一个辅助请求不该锁死整个设置页', async () => {
+    useAuthStore().user = { id: 1, is_founder: false }
+    getConfig.mockResolvedValue({ data: {} })
+    configMeta.mockRejectedValue(new Error('boom'))
+    putConfig.mockResolvedValue({ data: { ok: true } })
+    const store = useConfigStore()
+    await store.loadConfig()
+    expect(store.userPrefixes).toEqual([])
+    store.form.maxToolRounds = 99
+    await store.save()
+    expect(putConfig.mock.calls[0][0]['agent.max_tool_rounds']).toBe(99)
   })
 })
 

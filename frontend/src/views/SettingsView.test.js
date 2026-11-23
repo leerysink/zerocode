@@ -20,6 +20,7 @@ import SettingsView from './SettingsView.vue'
 // 源码扫描要跨环境可用就走 Vite 的原始导入
 import TEMPLATE from './SettingsView.vue?raw'
 import { SETTINGS_SECTIONS } from '../utils/settingsSections'
+import * as api from '../api'
 import { useConfigStore } from '../stores/config'
 import { useThemeStore } from '../stores/theme'
 import { useAuthStore } from '../stores/auth'
@@ -85,6 +86,31 @@ describe('分区表与 config store 的一致性', () => {
 })
 
 describe('设置中心形态', () => {
+  it('普通账号：平台级键置灰并写明归谁维护，账号级键仍可编辑（ADR-0068）', async () => {
+    // 清单走后端 meta，前端不抄常量；测试里直接灌 store，等于拿到过一次 meta 的状态
+    api.getConfig.mockResolvedValue({ data: {} })
+    api.configMeta.mockResolvedValue({ data: { user_prefixes:
+      ['llm.', 'memory.', 'clarify.', 'subrun.', 'quota.'] } })
+    const pinia = createPinia()
+    setActivePinia(pinia)
+    useAuthStore().user = { id: 2, nickname: '小明', is_founder: false }
+    const w = mount(SettingsView, { global: { plugins: [Antd, pinia] }, attachTo: document.body })
+    await flushPromises()
+    expect(useConfigStore().userPrefixes).toContain('llm.')
+
+    await w.find('[data-test="set-nav-behavior"]').trigger('click')
+    await flushPromises()
+    // 「写入前确认」是 agent.* → 平台级：置灰 + 提示，但**不隐藏**（隐藏会让人以为没这个开关）
+    expect(w.findAll('[data-test="set-locked-hint"]').length).toBeGreaterThan(0)
+    const locked = w.findAll('.ant-switch-disabled')
+    expect(locked.length).toBeGreaterThan(0)
+
+    // 同一页里 clarify.* 是账号级：它不该被锁
+    await w.find('[data-test="set-nav-access"]').trigger('click')
+    await flushPromises()
+    expect(w.findAll('[data-test="set-locked-hint"]').length).toBe(0)
+  })
+
   it('八个分区都在左侧导航里，且切换不碰路由', async () => {
     const w = mountView()
     await flushPromises()

@@ -63,6 +63,13 @@ const routes = [
     name: 'store-admin',
     component: () => import('../views/StoreAdminView.vue'),
   },
+  {
+    // 账号治理台（管理员）：封禁/解封、配额、邀请码、平台默认；门禁同样双层
+    // （视图判 is_founder，app/api/admin.py 逐端点 require_admin）。
+    path: '/admin',
+    name: 'admin',
+    component: () => import('../views/AdminView.vue'),
+  },
 ]
 
 const router = createRouter({

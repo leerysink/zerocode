@@ -44,6 +44,7 @@ export const getFileChange = (sessionId, changeId) =>
 export const getConfig = () => http.get('/config')
 export const putConfig = (data) => http.put('/config', data)
 export const pgStatus = () => http.get('/config/pg-status')
+export const configMeta = () => http.get('/config/meta') // {user_prefixes}：账号级前缀真源在后端（ADR-0068）
 export const testLLM = (data) => http.post('/config/test-llm', data) // {base_url, api_key, model}
 export const tree = (workspaceId) => http.get('/fs/tree', { params: { workspace_id: workspaceId } })
 export const readFile = (workspaceId, path) =>
@@ -198,6 +199,14 @@ export const authRegister = (data) => http.post('/auth/register', data) // {nick
 export const authLogin = (data) => http.post('/auth/login', data)
 export const authLogout = () => http.post('/auth/logout')
 export const authMe = () => http.get('/auth/me')
+
+// ---- 账号治理台（规格 2026-11-23 / ADR-0067~0070，仅管理员）----
+export const adminAccounts = () => http.get('/admin/accounts')
+export const adminBan = (id, data) => http.post(`/admin/accounts/${id}/ban`, data) // {reason, stop_stacks?}
+export const adminUnban = (id) => http.post(`/admin/accounts/${id}/unban`)
+export const adminConfig = () => http.get('/admin/config')
+export const adminPutConfig = (data) => http.put('/admin/config', data) // 恒写 owner NULL 平台行
+export const adminPutQuota = (id, data) => http.put(`/admin/accounts/${id}/quota`, data) // {max_apps, max_running_stacks}，null=不限
 
 // ---- 账户级技能库（Ticket 001~003 / ADR-0004）----
 export const listSkills = () => http.get('/skills')

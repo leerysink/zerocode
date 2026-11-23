@@ -77,11 +77,15 @@ async def login(request: Request, response: Response, body: CredIn):
     nickname = (body.nickname or "").strip()
     async with request.app.state.session_factory() as s:
         row = (await s.execute(text(
-            "SELECT id, nickname, password_hash FROM actor WHERE nickname = :n"),
+            "SELECT id, nickname, password_hash, banned_at FROM actor WHERE nickname = :n"),
             {"n": nickname})).mappings().first()
         if row is None or not verify_password(body.password or "", row["password_hash"]):
             # 用户不存在与口令错统一 401，不泄露昵称存在性；无口令存量行同理遭拒
             raise HTTPException(401, "昵称或口令不正确")
+        if row["banned_at"] is not None:
+            # 此处**刻意**放弃上一条不泄露存在性的口径（规格 2026-11-23 US-11）：
+            # 「你已被封禁」本身就是存在性信息，但让人对着正确口令反复吃闭门羹更糟。
+            raise HTTPException(401, "该账号已被封禁")
         actor_id = row["id"]
     # 每次登录新增一条会话，其他人照常在线（上限见 identity.open_session）
     _issue_session(response, await identity.open_session(

@@ -19,6 +19,7 @@ from pydantic import BaseModel
 from sqlalchemy import text
 from app.deploy import apkbuild, compose, engine, mobile, mpbuild, mpcreds, prod, records, shell, sqlrun
 from app.deploy import provision
+from app.deploy import quota
 from app.deploy import tasks as deploy_tasks
 from app.deploy.errors import DeployError
 from app.deploy.provision import read_cred
@@ -402,8 +403,9 @@ def _spawn(request: Request, app_id: int, coro_factory) -> None:
 
 
 async def _dev_task(request: Request, app_id: int, action, *, docker_gate: bool = False,
-                    env: str = "dev", owner_only: bool = True) -> dict:
-    """生命周期端点共用一条链：取应用 →（启动类）同步 Docker 预检 → 起后台任务 → 202。
+                    env: str = "dev", owner_only: bool = True,
+                    stack_gate: bool = False) -> dict:
+    """生命周期端点共用一条链：取应用 →（启动类）同步闸门 → 起后台任务 → 202。
 
     `action` 在**请求时**按模块属性取出（engine.start_dev 等），monkeypatch 才拦得住。
 
@@ -414,6 +416,10 @@ async def _dev_task(request: Request, app_id: int, action, *, docker_gate: bool 
     这个映射点只在同步调用时存在——放进 create_task 后用户只会看到 202 + WS 静默（审查 I-1，探针实证）。
     stop 关闸门：Docker 缺失时 `compose down` 本就无意义，更不该挡住用户关栈的意图
     （失败交后台 done 回调留痕 + 平台启动清理兜底）。
+
+    `stack_gate`（**仅** start/restart 开）：按账号的并发容器栈上限（ADR-0070）。与
+    `docker_gate` 分开传，因为二者会各自演化——Docker 可用性挡不住房源被占满，反之亦然；
+    更要紧的是 stop 永远不该被额度挡住（停栈是逃生通道，超额时恰恰要用它降下来）。
 
     `env`（Task 8）：prod 端点复用同一条链，但预检走 `prod.preflight_docker`——prod.py 的 D-1
     模块级名字纪律让测试替身拦得住这个属性；dev 行为（默认值）不动。
@@ -431,6 +437,8 @@ async def _dev_task(request: Request, app_id: int, action, *, docker_gate: bool 
             app, _role = await _require_app(request, app_id)
         if docker_gate and env == "prod" and app["status_prod"] == "publishing":
             raise DeployError("发布/回滚进行中，请等待完成", status=409)
+        if stack_gate:
+            await quota.ensure_can_start_stack(sf, app_id, env)
         if docker_gate:
             if env == "prod":
                 await prod.preflight_docker()
@@ -444,7 +452,8 @@ async def _dev_task(request: Request, app_id: int, action, *, docker_gate: bool 
 
 @router.post("/{app_id}/dev/start", status_code=202)
 async def dev_start(request: Request, app_id: int):
-    return await _dev_task(request, app_id, engine.start_dev, docker_gate=True, owner_only=False)
+    return await _dev_task(request, app_id, engine.start_dev, docker_gate=True,
+                           owner_only=False, stack_gate=True)
 
 
 @router.post("/{app_id}/dev/stop", status_code=202)
@@ -454,7 +463,8 @@ async def dev_stop(request: Request, app_id: int):
 
 @router.post("/{app_id}/dev/restart", status_code=202)
 async def dev_restart(request: Request, app_id: int):
-    return await _dev_task(request, app_id, engine.restart_dev, docker_gate=True, owner_only=False)
+    return await _dev_task(request, app_id, engine.restart_dev, docker_gate=True,
+                           owner_only=False, stack_gate=True)
 
 
 @router.get("/{app_id}/dev/status")
@@ -870,6 +880,9 @@ async def _publish_gates(request: Request, app: dict, *, force: bool) -> None:
     if app["status_prod"] == "publishing":
         # _spawn 只挡本进程在跑的任务；publishing 可能是上一进程遗留，按状态再挡一道
         raise DeployError("发布进行中，请等待完成", status=409)
+    # 启动闸（ADR-0070）：发布一定会让 prod 栈起来（新起或换版），所以它与 prod/start 同闸。
+    # 放在 chat 确认**之前**：额度不够的发布不该先把用户问一遍「是否继续」再拒掉。
+    await quota.ensure_can_start_stack(request.app.state.session_factory, app_id, "prod")
     if not force:
         active = list(request.app.state.hub.running_session_ids())
         if active:
@@ -919,6 +932,9 @@ async def rollback(request: Request, app_id: int, body: RollbackIn):
             # 终审 I-2：与 publish 端点同款二次闸——_spawn 只挡本进程，publishing 可能是
             # 另一进程在跑/遗留，回滚插队会与在跑的发布互踩 current_version 与容器
             raise DeployError("发布/回滚进行中，请等待完成", status=409)
+        # 回滚内部 `compose up -d`（prod.py:732），所以它与 publish 同闸（ADR-0070 的第七个入口之一）。
+        # 净增规则让它对「prod 正在跑、只是切版本」的回滚天然放行。
+        await quota.ensure_can_start_stack(sf, app_id, "prod")
         await prod.preflight_docker()
         _spawn(request, app_id, lambda: prod.rollback(sf, app, body.version, notify=hub.publish))
     except DeployError as e:
@@ -929,7 +945,7 @@ async def rollback(request: Request, app_id: int, body: RollbackIn):
 @router.post("/{app_id}/prod/start", status_code=202)
 async def prod_start(request: Request, app_id: int):
     return await _dev_task(request, app_id, prod.prod_start, docker_gate=True, env="prod",
-                           owner_only=False)
+                           owner_only=False, stack_gate=True)
 
 
 @router.post("/{app_id}/prod/stop", status_code=202)
@@ -940,7 +956,7 @@ async def prod_stop(request: Request, app_id: int):
 @router.post("/{app_id}/prod/restart", status_code=202)
 async def prod_restart(request: Request, app_id: int):
     return await _dev_task(request, app_id, prod.prod_restart, docker_gate=True, env="prod",
-                           owner_only=False)
+                           owner_only=False, stack_gate=True)
 
 
 @router.get("/{app_id}/prod/status")

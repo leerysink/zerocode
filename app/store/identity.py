@@ -93,8 +93,10 @@ async def close_session(session_factory, token: str) -> None:
 
 
 async def by_token(session_factory, token: str | None) -> dict | None:
-    """命中即续期 last_seen_at；无 token / 未知 token 一律 None（由端点转 401）。
+    """命中即续期 last_seen_at；无 token / 未知 token / **被封账号** 一律 None（由端点转 401）。
 
+    封禁判定放在这里是刻意的：全局 guard 中间件对每个 /api/* 都过这一处（app/main.py），
+    所以它是「掉线」的唯一真源——写在 login 或各业务端点上都会漏掉已发出去的凭据。
     用 `UPDATE ... FROM ... RETURNING` 一次完成「查 + 续期」，副作用是续期即写库——只读 GET 上
     也接受一次写，这是刻意的，别改成 SELECT（那样长期不用的人会被误判为失效身份，而我们需要的是
     「这台设备还在用」）；这列同时是 LRU 淘汰的排序依据。
@@ -104,7 +106,7 @@ async def by_token(session_factory, token: str | None) -> dict | None:
     async with session_factory() as s:
         r = (await s.execute(text(
             "UPDATE actor_session AS ses SET last_seen_at = now() FROM actor a "
-            "WHERE ses.token = :t AND a.id = ses.actor_id "
+            "WHERE ses.token = :t AND a.id = ses.actor_id AND a.banned_at IS NULL "
             "RETURNING a.id, a.nickname, ses.token, a.created_at, ses.last_seen_at, a.is_founder"),
             {"t": token})).mappings().first()
         await s.commit()

@@ -31,6 +31,9 @@ async def test_engine():
             # store_category 不被上面任何表引用（条目只存 key，没建外键），CASCADE 带不到它，
             # 但分类字典的用例会增改停用它——不清就等于把上一轮的运营改动漏给下一轮（ADR-0061 §4）。
             "store_category, "
+            # invite_code 的 created_by 外键指向 actor，CASCADE 本会带它一起清；写进名单是为了
+            # 让「治理面每轮从零开始」这件事在名单上可读，而不是靠外键图的隐式行为（ADR-0069）。
+            "invite_code, "
             "actor_session, actor RESTART IDENTITY CASCADE"))
         await conn.execute(text(
             "INSERT INTO app_config (key, value) VALUES "
@@ -57,7 +60,12 @@ async def test_engine():
             # 值显式取 false：绝大多数既有用例测的是别的接缝，不该先撞上这道写入门禁；
             # 澄清自身的用例各自打开（见 tests/test_agent_loop.py 的 clarify 夹具）。
             "('clarify.enabled', 'false'), "
-            "('clarify.ask_remind_at', '6') "
+            "('clarify.ask_remind_at', '6'), "
+            # 账号配额平台默认（ADR-0068）：与 changelog/V20261123_01 同值。清库会把 owner NULL
+            # 的打底行带走，不重放则「平台默认存在」这一事实在测试里时有时无——第一个用例看得到
+            # 迁移播的行、后面的用例看不到，「默认 10」与「缺键=不限」两条断言会互相掩盖。
+            "('quota.max_apps', '10'), "
+            "('quota.max_running_stacks', '4') "
             "ON CONFLICT DO NOTHING"))
         # 分类字典种子与 changelog/V20261120_02 同值：清库后必须重放，否则「其他」锁死、
         # 停用分类不影响存量 label 这类事实在测试里根本不存在。

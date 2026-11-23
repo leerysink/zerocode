@@ -1,6 +1,7 @@
 // config store：系统配置加载/保存，负责表单字段 ↔ 后端配置键（app_config 表 llm.*/agent.*/clarify.*/memory.*/fs.*）的字段映射
 import { defineStore } from 'pinia'
-import { getConfig, putConfig } from '../api'
+import { configMeta, getConfig, putConfig } from '../api'
+import { useAuthStore } from './auth'
 
 // 表单字段 → 后端配置键（键固定，见 Global Constraints）
 const FIELD_TO_KEY = {
@@ -91,12 +92,37 @@ export const useConfigStore = defineStore('config', {
     },
     saving: false,
     loaded: false, // 是否已从后端拉到过配置（ensureLoaded 的去重依据）
+    // 账号级前缀清单，来自 GET /api/config/meta（后端 USER_PREFIXES 是唯一真源）。
+    // 空数组 = 还没拉到 = 前端不做任何猜测，整批发出去由后端裁决；拉到之后才按键分「可编辑 / 只读」。
+    // 刻意不在这里抄一份前缀常量：抄的那份与后端分叉时，症状是普通账号一点保存就整批 403。
+    userPrefixes: [],
   }),
+  getters: {
+    /** 这个配置键当前调用者可写吗（ADR-0068：平台级键归管理员，`quota.` 也归管理员）。 */
+    canEditKey: (state) => (key) => {
+      if (!key || !state.userPrefixes.length) return true   // 未知清单：不猜，交给后端
+      if (key.startsWith('quota.')) return false            // 形态是账号级、语义是治理权
+      return state.userPrefixes.some((p) => key.startsWith(p))
+    },
+    /** 表单字段对当前账号是否只读。管理员恒可写（他改平台键就是改平台默认）。 */
+    fieldLocked() {
+      return (field) => {
+        if (useAuthStore().user?.is_founder) return false
+        return !this.canEditKey(FIELD_TO_KEY[field])
+      }
+    },
+  },
   actions: {
     async loadConfig() {
       const data = (await getConfig()).data
       for (const [field, key] of Object.entries(FIELD_TO_KEY)) {
         if (data[key] !== undefined) this.form[field] = data[key]
+      }
+      // 与配置同批拉清单：设置页要么两者都新，要么都不过滤，不会按一份过期清单置灰
+      try {
+        this.userPrefixes = (await configMeta()).data.user_prefixes || []
+      } catch {
+        this.userPrefixes = []   // 辅助请求失败不该锁死设置页：退回「不过滤，由后端裁决」
       }
       this.loaded = true
     },
@@ -109,7 +135,12 @@ export const useConfigStore = defineStore('config', {
       this.saving = true
       try {
         const payload = {}
-        for (const [field, key] of Object.entries(FIELD_TO_KEY)) payload[key] = this.form[field]
+        for (const [field, key] of Object.entries(FIELD_TO_KEY)) {
+          // 只读键不发送：后端对越权批次是**整批 403**（不做半写），夹带一个平台键会连同
+          // 用户自己那几项改动一起失败——那是最让人摸不着头脑的报错方式。
+          if (this.fieldLocked(field)) continue
+          payload[key] = this.form[field]
+        }
         // 掩码密钥（sk-***）由后端过滤，不会覆盖真实 api_key
         await putConfig(payload)
       } finally {

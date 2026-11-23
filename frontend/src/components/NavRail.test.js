@@ -55,13 +55,21 @@ describe('NavRail', () => {
     expect(wrapper.find('a.router-link-active').exists()).toBe(false)
   })
 
-  it('创始人多一个管理入口：指向 /store-admin，非创始人仍四入口', async () => {
+  it('创始人多「管理」「治理」两个入口；非创始人仍四入口', async () => {
     const founder = await mountAt('/', { id: 1, is_founder: true })
     expect(founder.findAll('a').map((l) => l.attributes('href')))
-      .toEqual(['/apps', '/store', '/store-admin', '/settings', '/skills'])
+      .toEqual(['/apps', '/store', '/store-admin', '/admin', '/settings', '/skills'])
+    expect(founder.findAll('a').map((l) => l.text()).slice(2, 4)).toEqual(['管理', '治理'])
     const plain = await mountAt('/', { id: 2, is_founder: false })
     expect(plain.findAll('a').map((l) => l.attributes('href')))
       .toEqual(['/apps', '/store', '/settings', '/skills'])
+  })
+
+  it('治理台高亮治理入口，不与运营的「管理」串台', async () => {
+    const wrapper = await mountAt('/admin', { id: 1, is_founder: true })
+    const active = wrapper.findAll('a.router-link-active')
+    expect(active).toHaveLength(1)
+    expect(active[0].attributes('href')).toBe('/admin')
   })
 
   it('管理页高亮管理入口', async () => {

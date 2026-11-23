@@ -13,6 +13,7 @@ from app.deploy import gateway_routes
 from app.deploy.errors import DeployError
 from app.deploy.nics import app_url
 from app.deploy.ports import allocate_pair
+from app.deploy import quota
 from app.deploy.settings import REPO_ROOT, deploy_cfg, preview_url, resolve_apps_root
 from app.deploy.slugs import validate_slug
 # 快照铺源排在 app.deploy 之后导入只是行文顺序，不是依赖要求：app/source/materialize.py
@@ -175,6 +176,8 @@ async def create_app_project(session_factory, *, name: str, slug: str, scale: st
     if root_path.exists() and any(root_path.iterdir()):
         raise DeployError(f"目录已存在且非空: {root_path}", status=409)
     # R-A：先分配端口对（只读探测），真实端口进 mapping 再渲染模板
+    # 创建闸跑在分配之前：端口是全局共享的稀缺资源，先占再拒等于让越限尝试白吃一格（ADR-0070）
+    await quota.ensure_app_creation_allowed(session_factory, owner_user_id)
     async with session_factory() as s:
         prod_port, dev_port = await allocate_pair(s)
     today = datetime.date.today().strftime("%Y%m%d")

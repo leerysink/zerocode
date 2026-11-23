@@ -3,7 +3,7 @@ export const NAV_RAIL_WIDTH = 64
 </script>
 <script setup>
 import { computed, onMounted, ref, watch } from 'vue'
-import { AppstoreOutlined, AuditOutlined, SettingOutlined, ShopOutlined, ThunderboltOutlined } from '@ant-design/icons-vue'
+import { AppstoreOutlined, AuditOutlined, SettingOutlined, ShopOutlined, TeamOutlined, ThunderboltOutlined } from '@ant-design/icons-vue'
 import * as api from '../api'
 import { useAuthStore } from '../stores/auth'
 
@@ -32,6 +32,10 @@ defineExpose({ refreshPending, pendingReview })
       <audit-outlined />管理
       <span v-if="pendingReview" class="zc-rail-badge" data-test="rail-admin-badge"
             :title="`${pendingReview} 条申请待审批`">{{ pendingReview > 9 ? '9+' : pendingReview }}</span>
+    </router-link>
+    <!-- 治理台（仅管理员）：对别人的账号做事，与「管理」（管商店版本行）主语不同 -->
+    <router-link v-if="isFounder" to="/admin" data-test="rail-gov">
+      <team-outlined />治理
     </router-link>
     <router-link to="/settings"><setting-outlined />设置</router-link>
     <router-link to="/skills"><thunderbolt-outlined />技能</router-link>

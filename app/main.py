@@ -211,6 +211,9 @@ def create_app(database_url: str | None = None) -> FastAPI:
     from app.api import store as store_api
     app.include_router(store_api.router)
     app.include_router(store_api.apps_ext)
+    # 账号治理台（规格 2026-11-23 / ADR-0067~0070）：/api/admin 账号名册、封禁、配额、邀请码
+    from app.api import admin as admin_api
+    app.include_router(admin_api.router)
     # 账户级技能库（Ticket 001 / ADR-0004）：/api/skills 列表 + 直链安装
     from app.api import skills as skills_api
     app.include_router(skills_api.router)

@@ -1,6 +1,6 @@
 import asyncio
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from app.agent.llm import OpenAICompatLLM
 from app.services import config_service
 
@@ -15,12 +15,30 @@ async def get_config(request: Request):
 
 @router.put("")
 async def put_config(request: Request, body: dict):
-    uid = request.state.actor["id"]
+    """账号自己的配置写入。平台级键与 `quota.` 由 `set_many` 整批拒绝（ADR-0068）；
+    管理员在这里改的仍是**他自己**的覆盖行——平台默认走 /api/admin/config。"""
+    actor = request.state.actor
+    uid = actor["id"]
     body = {k: v for k, v in body.items() if not (k == "llm.api_key" and v == "sk-***")}
-    async with request.app.state.session_factory() as s:
-        await config_service.set_many(s, body, owner_user_id=uid)
-        await s.commit()
+    try:
+        async with request.app.state.session_factory() as s:
+            await config_service.set_many(s, body, owner_user_id=uid,
+                                          actor_is_admin=bool(actor.get("is_founder")))
+            await s.commit()
+    except config_service.ConfigPermissionError as e:
+        raise HTTPException(403, str(e))
     return {"ok": True}
+
+@router.get("/meta")
+async def config_meta():
+    """哪些前缀是账号级可写的（ADR-0068）。
+
+    前端设置页需要按键决定「可编辑 / 由管理员统一维护」，而保存是一条 PUT 全量 34 键的链——
+    前端自己抄一份前缀清单迟早与后端分叉，分叉的代价是普通账号一点保存就整批 403。
+    所以这里把真源交出去，前端只认这一份。
+    """
+    return {"user_prefixes": list(config_service.USER_PREFIXES)}
+
 
 @router.get("/pg-status")
 async def pg_status(request: Request):

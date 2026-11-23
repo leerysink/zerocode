@@ -15,6 +15,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from app.deploy.errors import DeployError
 from app.deploy.settings import preview_url
+from app.api.gates import require_admin
 from app.store import release as release_svc
 from app.store import applications as apps_svc
 from app.store import categories
@@ -30,9 +31,12 @@ def _http(e: DeployError):
 
 
 def _require_founder(actor: dict) -> None:
-    """运营台门禁：商店管理与分类字典的写操作只对创始人开放（ADR-0061）。"""
-    if not actor.get("is_founder"):
-        raise HTTPException(403, "商店管理仅创始人可见")
+    """运营台门禁：商店管理与分类字典的写操作只对创始人开放（ADR-0061）。
+
+    谓词与治理台共用 `gates.is_admin`（ADR-0067：管理员真身就是 is_founder）；
+    文案原样保留——`StoreAdminView` 与它的测试钉着这句。
+    """
+    require_admin(actor, "商店管理仅创始人可见")
 
 
 async def current_actor(request: Request) -> dict:

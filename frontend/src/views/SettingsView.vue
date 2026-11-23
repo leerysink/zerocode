@@ -301,17 +301,23 @@ async function save() {
               <div class="zc-row-label">
                 <span class="zc-row-name">{{ row.label }}</span>
                 <span v-if="row.desc" class="zc-row-desc">{{ row.desc }}</span>
+                <!-- 只读不隐藏：隐藏会让人以为平台没这个开关，而不是「轮不到我改」（ADR-0068） -->
+                <span v-if="store.fieldLocked(row.form)" class="zc-row-desc zc-locked"
+                      data-test="set-locked-hint">由管理员统一维护，对所有账号生效</span>
               </div>
               <div class="zc-row-control">
-                <a-switch v-if="row.type === 'switch'" v-model:checked="store.form[row.form]" />
+                <a-switch v-if="row.type === 'switch'" v-model:checked="store.form[row.form]"
+                          :disabled="store.fieldLocked(row.form)" />
                 <a-input-number v-else-if="row.type === 'number'" v-model:value="store.form[row.form]"
-                                :min="row.min" :max="row.max" :step="row.step || 1" style="width: 180px" />
+                                :min="row.min" :max="row.max" :step="row.step || 1" style="width: 180px"
+                                :disabled="store.fieldLocked(row.form)" />
                 <a-input v-else-if="row.type === 'text'" v-model:value="store.form[row.form]"
-                         :placeholder="row.placeholder" />
+                         :placeholder="row.placeholder" :disabled="store.fieldLocked(row.form)" />
                 <a-input-password v-else-if="row.type === 'password'" v-model:value="store.form[row.form]"
-                                  :placeholder="row.placeholder" />
+                                  :placeholder="row.placeholder" :disabled="store.fieldLocked(row.form)" />
                 <a-select v-else-if="row.type === 'select'" v-model:value="store.form[row.form]"
-                          :options="row.options" style="width: 260px" />
+                          :options="row.options" style="width: 260px"
+                          :disabled="store.fieldLocked(row.form)" />
               </div>
             </div>
 
@@ -409,6 +415,7 @@ async function save() {
   border-radius: var(--zc-radius-inner); }
 /* 分组：标题 + 细线替代卡片外壳，组间大留白 */
 .zc-group + .zc-group { margin-top: var(--zc-space-5); }
+.zc-locked { color: var(--zc-text-sub); font-style: normal; }
 .zc-group-title {
   font-size: var(--zc-font-md);
   font-weight: 600;

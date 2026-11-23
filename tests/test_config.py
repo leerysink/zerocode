@@ -42,6 +42,32 @@ async def test_put_config_partial_and_mask_sentinel(client):
         assert rf.status_code == 200
 
 @pytest.mark.asyncio
+async def test_quota_keys_are_user_scoped(client):
+    """`quota.` 归入账号级前缀（ADR-0068）：写入落 owner 行，读侧压过平台默认。
+
+    这里的反向断言是真靶心：若 `quota.` 漏出 USER_PREFIXES，set_many 会把它当平台级键
+    写进 owner NULL 行——账号的一次覆盖就此洗掉了全平台打底值，而读侧看起来仍是「对的数」。
+    """
+    from sqlalchemy import text
+
+    from app.services import config_service
+
+    uid = (await client.get("/api/auth/me")).json()["id"]
+    sf = client.app.state.session_factory
+    async with sf() as s:
+        await config_service.set_many(s, {"quota.max_apps": 3}, owner_user_id=uid,
+                                      actor_is_admin=True)
+        await s.commit()
+    async with sf() as s:
+        platform = (await s.execute(text(
+            "SELECT value FROM app_config WHERE key='quota.max_apps' "
+            "AND owner_user_id IS NULL"))).scalar()
+        view = await config_service.get_all(s, owner_user_id=uid)
+    assert platform == 10, platform          # 打底行未被账号覆盖洗掉
+    assert view["quota.max_apps"] == 3       # 该账号读到自己那一行
+
+
+@pytest.mark.asyncio
 async def test_test_llm_endpoint(client, monkeypatch):
     import app.api.config_api as capi
 
