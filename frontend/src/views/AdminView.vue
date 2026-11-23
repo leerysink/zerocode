@@ -227,7 +227,7 @@ onMounted(() => { load(); loadDefaults(); loadInvites() })
     <a-empty v-if="!isFounder" data-test="admin-denied" description="治理台仅管理员可见" />
     <template v-else>
       <zc-page-header data-test="admin-head" title="账号治理"
-                      subtitle="账号封禁与解封、按人配额；邀请码与平台默认配置陆续接入本页"
+                      subtitle="账号封禁与解封、按人配额、邀请码签发与平台默认配置"
                       :stats="stats">
         <template #actions>
           <a-button data-test="admin-refresh" :loading="loading" @click="load">
