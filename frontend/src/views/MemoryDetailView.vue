@@ -12,6 +12,7 @@ import { normalizeId } from '../utils/openFolder'
 import { TYPE_LABELS, groupMemories } from '../utils/memory'
 import { useThemeStore } from '../stores/theme'
 import MemoryItemList from '../components/memory/MemoryItemList.vue'
+import MarkdownView from '../components/MarkdownView.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -311,7 +312,7 @@ onMounted(() => {
               <a-button size="small" @click="cancelEdit">取消</a-button>
             </div>
           </div>
-          <div v-else class="zc-memd-content">{{ active.content }}</div>
+          <MarkdownView v-else class="zc-memd-content" :content="active.content" />
         </template>
       </div>
     </div>
@@ -451,15 +452,14 @@ onMounted(() => {
   gap: 8px;
 }
 .zc-memd-content {
+  /* 排版（段落/列表/代码/颜色）来自 markdown.less 的 .md；这里只定本页的容器与字阶。
+     不再用 white-space: pre-wrap——markdown-it 已按 breaks 把换行转成 <br>，留着会翻倍。 */
   flex: 1;
   min-height: 0;
   overflow: auto;
   padding: 14px 16px;
   font-size: 13px;
   line-height: 1.8;
-  color: var(--zc-text);
-  white-space: pre-wrap;
-  word-break: break-word;
 }
 .zc-memd-form {
   flex: 1;

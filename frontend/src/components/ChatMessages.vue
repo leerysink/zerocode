@@ -465,82 +465,8 @@ onBeforeUnmount(cancelFill)
   word-break: break-word;
 }
 
-/* Markdown 正文（v-html 内容需 :deep 穿透） */
-.zc-md {
-  width: 100%;
-  min-width: 0;
-  font-size: 14px;
-  line-height: 1.75;
-  color: var(--zc-text);
-  word-break: break-word;
-}
-.zc-md :deep(p) {
-  margin: 0 0 8px;
-}
-.zc-md :deep(p:last-child) {
-  margin-bottom: 0;
-}
-.zc-md :deep(h1),
-.zc-md :deep(h2),
-.zc-md :deep(h3),
-.zc-md :deep(h4) {
-  margin: 14px 0 8px;
-  font-size: 15px;
-  font-weight: 600;
-}
-.zc-md :deep(ul),
-.zc-md :deep(ol) {
-  margin: 0 0 8px;
-  padding-left: 22px;
-}
-.zc-md :deep(li) {
-  margin: 2px 0;
-}
-.zc-md :deep(code) {
-  font-family: ui-monospace, SFMono-Regular, Consolas, 'Courier New', monospace;
-  font-size: 13px;
-  background: rgba(var(--zc-primary-rgb), 0.08);
-  border-radius: 4px;
-  padding: 1px 5px;
-}
-.zc-md :deep(pre) {
-  margin: 8px 0;
-  background: var(--zc-bg-code);
-  border: 1px solid var(--zc-border);
-  border-radius: 6px;
-  padding: 10px 12px;
-  overflow-x: auto;
-}
-.zc-md :deep(pre code) {
-  background: transparent;
-  padding: 0;
-  font-size: 12.5px;
-  line-height: 1.7;
-}
-.zc-md :deep(blockquote) {
-  margin: 8px 0;
-  padding: 2px 12px;
-  border-left: 3px solid var(--zc-border);
-  color: var(--zc-text-sub);
-}
-.zc-md :deep(a) {
-  color: var(--zc-primary);
-}
-.zc-md :deep(table) {
-  border-collapse: collapse;
-  margin: 8px 0;
-}
-.zc-md :deep(th),
-.zc-md :deep(td) {
-  border: 1px solid var(--zc-border);
-  padding: 4px 10px;
-  font-size: 13px;
-}
-.zc-md :deep(hr) {
-  border: none;
-  border-top: 1px solid var(--zc-border);
-  margin: 12px 0;
-}
+/* Markdown 正文排版已上收至 styles/markdown.less 的 .md（多处页面共用，不再各留一份）。
+   这里只剩聊天气泡独有的流式光标。 */
 
 /* 流式光标：追加在最后一个块级元素尾部 */
 .zc-md.is-streaming :deep(> :last-child)::after {

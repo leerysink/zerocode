@@ -8,6 +8,7 @@ import { PlusOutlined, ReloadOutlined, SearchOutlined } from '@ant-design/icons-
 import { createMemory, deleteMemory, listMemories, updateMemory } from '../api'
 import { TYPE_LABELS, groupMemories } from '../utils/memory'
 import { openMemoryDetailPage } from '../utils/openFolder'
+import MarkdownView from './MarkdownView.vue'
 
 const props = defineProps({
   workspaceId: { type: [Number, String], required: true },
@@ -268,7 +269,7 @@ onMounted(load)
                 @change="toggleEnabled(m)"
               />
             </div>
-            <div class="zc-mem-content">{{ m.content }}</div>
+            <MarkdownView class="zc-mem-content" :content="m.content" />
             <div class="zc-mem-item-actions">
               <a-button size="small" type="link" @click="openDetail(m)">查看具体</a-button>
               <a-button size="small" type="link" @click="startEdit(m)">编辑</a-button>
@@ -360,11 +361,11 @@ onMounted(load)
   white-space: nowrap;
 }
 .zc-mem-content {
+  /* 排版来自 markdown.less 的 .md；这里是紧凑预览自己的字阶与 120px 截断。
+     块级元素（列表/标题）会在截断边缘被切掉，行内粗体与代码正常。 */
   font-size: 12px;
   color: var(--zc-text-sub, #666);
   line-height: 1.6;
-  white-space: pre-wrap;
-  word-break: break-word;
   margin-bottom: 4px;
   max-height: 120px;
   overflow: hidden;

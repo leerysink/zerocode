@@ -110,6 +110,21 @@ describe('MemoryPanel - 列表与分组', () => {
     expect(text).toContain('F2')
   })
 
+  it('预览正文按 Markdown 渲染，标记不再原样露出', async () => {
+    mocks.api.listMemories.mockResolvedValue({
+      data: [{
+        id: '1', type: 'fact', title: 'F1', enabled: true,
+        content: '必须**同时改两处**，否则出现 `背景跳变`。',
+      }],
+      headers: {},
+    })
+    const wrapper = await mountPanel()
+
+    expect(wrapper.find('.zc-mem-content strong').text()).toBe('同时改两处')
+    expect(wrapper.find('.zc-mem-content code').text()).toBe('背景跳变')
+    expect(wrapper.find('.zc-mem-content').text()).not.toContain('**')
+  })
+
   it('id 是字符串不被 Number() 截断（开关透传）', async () => {
     const bigId = '9223372036854775807' // 2^63 - 1，过 Number() 会变
     const data = [{ id: bigId, type: 'fact', content: '大整数 id', title: 'Big', enabled: true }]

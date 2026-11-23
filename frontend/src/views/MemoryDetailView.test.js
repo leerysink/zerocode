@@ -155,6 +155,22 @@ describe('MemoryDetailView 地址与取数', () => {
     expect(wrapper.find('.zc-memd-status').text()).toContain('2026-11-02 09:30')
   })
 
+  it('正文按 Markdown 渲染：中文句里的标记变成元素，不再原样露出 ** 和反引号', async () => {
+    mocks.api.listMemories.mockResolvedValue({
+      data: [{
+        ...ROWS[0],
+        content: '所以**不能引用 base.css 的 :root 变量**——必须同时改 `base.css` 与 index.html 两处。',
+      }],
+      headers: {},
+    })
+
+    const wrapper = await mountView()
+
+    expect(wrapper.find('.zc-memd-content strong').text()).toBe('不能引用 base.css 的 :root 变量')
+    expect(wrapper.find('.zc-memd-content code').text()).toBe('base.css')
+    expect(wrapper.find('.zc-memd-content').text()).not.toContain('**')
+  })
+
   it('当前记忆不在列表里：右栏说清「已不存在」，左栏仍可用', async () => {
     const wrapper = await mountView({ memoryId: '99' })
 
