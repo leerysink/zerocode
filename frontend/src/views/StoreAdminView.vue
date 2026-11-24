@@ -14,6 +14,7 @@ import { useCategoryStore } from '../stores/categories'
 import ZcPageHeader from '../components/zc/ZcPageHeader.vue'
 import ZcEmptyState from '../components/zc/ZcEmptyState.vue'
 import ZcEntityCard from '../components/zc/ZcEntityCard.vue'
+import ZcShotCarousel from '../components/zc/ZcShotCarousel.vue'
 import ZcPagination from '../components/zc/ZcPagination.vue'
 import { usePagedList } from '../composables/usePagedList'
 
@@ -294,7 +295,8 @@ async function reject (row) {
                         :rail="r.status === 'published' ? 'var(--zc-success)' : 'var(--zc-text-weak)'"
                         cover-clickable @cover-click="openDetail(r)">
           <template #cover>
-            <img v-if="r.screenshots && r.screenshots.length" :src="r.screenshots[0]" alt="" />
+            <zc-shot-carousel v-if="r.screenshots && r.screenshots.length"
+                              :shots="r.screenshots" />
             <div v-else class="zc-sadm-cover-ph"><appstore-outlined /></div>
           </template>
           <template #badge>

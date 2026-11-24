@@ -13,6 +13,7 @@ import { useCategoryStore } from '../stores/categories'
 import ZcPageHeader from '../components/zc/ZcPageHeader.vue'
 import ZcEmptyState from '../components/zc/ZcEmptyState.vue'
 import ZcEntityCard from '../components/zc/ZcEntityCard.vue'
+import ZcShotCarousel from '../components/zc/ZcShotCarousel.vue'
 import ZcPagination from '../components/zc/ZcPagination.vue'
 import { usePagedList } from '../composables/usePagedList'
 
@@ -171,8 +172,8 @@ function gotoApps () { window.location.href = '/apps' }
           <zc-entity-card v-for="r in releasesPager.paged" :key="r.id" class="zc-card"
                           data-test="store-card" cover-clickable @cover-click="openDetail(r)">
             <template #cover>
-              <img v-if="r.screenshots && r.screenshots.length" :src="r.screenshots[0]"
-                   class="zc-cover-img" alt="" />
+              <zc-shot-carousel v-if="r.screenshots && r.screenshots.length"
+                                :shots="r.screenshots" />
               <div v-else class="zc-cover-placeholder"><appstore-outlined /></div>
             </template>
             <template v-if="r.installed" #badge>
@@ -316,7 +317,6 @@ function gotoApps () { window.location.href = '/apps' }
   gap: var(--zc-space-4); align-items: stretch; }
 @media (max-width: 1100px) { .zc-store-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @media (max-width: 680px) { .zc-store-grid { grid-template-columns: 1fr; } }
-.zc-cover-img { display: block; width: 100%; height: 100%; object-fit: cover; }
 .zc-cover-placeholder { position: absolute; inset: 0; display: flex; align-items: center;
   justify-content: center; font-size: 40px; color: var(--zc-cover-placeholder); }
 .zc-store-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
