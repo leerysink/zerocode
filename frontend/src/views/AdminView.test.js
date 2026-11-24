@@ -74,6 +74,46 @@ describe('AdminView', () => {
     expect(w.find('[data-test="acct-unban"]').exists()).toBe(true)
   })
 
+  it('两张表各自按 10 条分页，翻页互不影响且统计仍用全量', async () => {
+    const manyAccounts = Array.from({ length: 13 }, (_, i) => ({
+      ...accounts[i % accounts.length], id: i + 1, nickname: `账号${i + 1}`,
+      banned_at: i === 12 ? '2026-11-23T05:00:00' : null,
+    }))
+    const manyInvites = Array.from({ length: 12 }, (_, i) => ({
+      id: i + 1, code_masked: `····code${i + 1}`, status: 'unused',
+      created_at: '2026-11-23T06:00:00', used_at: null, used_by_nickname: null,
+    }))
+    api.adminAccounts.mockResolvedValue({ data: manyAccounts })
+    api.adminInvites.mockResolvedValue({ data: manyInvites })
+    const w = mountView()
+    await flushPromises()
+
+    const accountTable = w.find('[data-test="admin-accounts"]')
+    const inviteTable = w.find('[data-test="invite-table"]')
+    expect(accountTable.findAll('tbody tr[data-row-key]')).toHaveLength(10)
+    expect(inviteTable.findAll('tbody tr[data-row-key]')).toHaveLength(10)
+    expect(accountTable.text()).toContain('账号10')
+    expect(accountTable.text()).not.toContain('账号11')
+    expect(w.find('[data-test="page-stat-账号"]').text()).toContain('13')
+    expect(w.find('[data-test="page-stat-已封禁"]').text()).toContain('1')
+
+    const accountPager = w.find('[data-test="account-pagination"]')
+    const invitePager = w.find('[data-test="invite-pagination"]')
+    await accountPager.find('[title="2"]').trigger('click')
+    await flushPromises()
+    expect(accountTable.findAll('tbody tr[data-row-key]')).toHaveLength(3)
+    expect(accountTable.text()).toContain('账号13')
+    expect(accountPager.find('.ant-pagination-item-active').text()).toBe('2')
+    expect(invitePager.find('.ant-pagination-item-active').text()).toBe('1')
+
+    await invitePager.find('[title="2"]').trigger('click')
+    await flushPromises()
+    expect(inviteTable.findAll('tbody tr[data-row-key]')).toHaveLength(2)
+    expect(inviteTable.text()).toContain('····code12')
+    expect(invitePager.find('.ant-pagination-item-active').text()).toBe('2')
+    expect(accountPager.find('.ant-pagination-item-active').text()).toBe('2')
+  })
+
   it('本人那行只给禁用的「本人」，不给封禁按钮（自封 = 锁死平台）', async () => {
     const w = mountView()
     await flushPromises()
@@ -223,6 +263,26 @@ describe('AdminView 邀请码（ADR-0069）', () => {
       .find((m) => m.textContent.includes('只在这里出现一次'))
     expect(reveal).toBeTruthy()
     expect(reveal.querySelector('[data-test="invite-plain"]').value).toBe('plain-new-code')
+  })
+
+  it('签发新邀请码后回到第一页，刚签发的码立即可见', async () => {
+    const older = Array.from({ length: 11 }, (_, i) => ({
+      id: i + 1, code_masked: `····old${i + 1}`, status: 'unused',
+      created_at: '2026-11-23T06:00:00', used_at: null, used_by_nickname: null,
+    }))
+    const newest = { id: 12, code_masked: '····new1', status: 'unused',
+      created_at: '2026-11-24T06:00:00', used_at: null, used_by_nickname: null }
+    api.adminInvites.mockResolvedValueOnce({ data: older }).mockResolvedValueOnce({ data: [newest, ...older] })
+    const w = mountView()
+    await flushPromises()
+    await w.find('[data-test="invite-pagination"] [title="2"]').trigger('click')
+    await flushPromises()
+    expect(w.find('[data-test="invite-table"]').text()).toContain('····old11')
+
+    await w.find('[data-test="invite-issue"]').trigger('click')
+    await flushPromises()
+    expect(w.find('[data-test="invite-pagination"] .ant-pagination-item-active').text()).toBe('1')
+    expect(w.find('[data-test="invite-table"]').text()).toContain('····new1')
   })
 
   it('邀请码：只有未使用的行给作废按钮，作废后重拉列表', async () => {

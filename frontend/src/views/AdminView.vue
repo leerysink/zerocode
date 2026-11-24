@@ -13,8 +13,18 @@ import ZcEmptyState from '../components/zc/ZcEmptyState.vue'
 const auth = useAuthStore()
 const isFounder = computed(() => !!auth.user?.is_founder)
 const myId = computed(() => auth.user?.id)
+const PAGE_SIZE = 10
+const showTotal = (total) => `共 ${total} 条`
 
 const accounts = ref([])
+const accountPage = ref(1)
+const pagedAccounts = computed(() => {
+  const current = Math.min(accountPage.value, Math.max(1, Math.ceil(accounts.value.length / PAGE_SIZE)))
+  const start = (current - 1) * PAGE_SIZE
+  return accounts.value.slice(start, start + PAGE_SIZE)
+})
+const currentAccountPage = computed(() =>
+  Math.min(accountPage.value, Math.max(1, Math.ceil(accounts.value.length / PAGE_SIZE))))
 const loading = ref(false)
 const banOpen = ref(false)
 const banTarget = ref(null)
@@ -135,6 +145,14 @@ async function saveQuota () {
 
 // ---- 邀请码（ADR-0069）：关门后平台唯一的入口凭据 ----
 const invites = ref([])
+const invitePage = ref(1)
+const pagedInvites = computed(() => {
+  const current = Math.min(invitePage.value, Math.max(1, Math.ceil(invites.value.length / PAGE_SIZE)))
+  const start = (current - 1) * PAGE_SIZE
+  return invites.value.slice(start, start + PAGE_SIZE)
+})
+const currentInvitePage = computed(() =>
+  Math.min(invitePage.value, Math.max(1, Math.ceil(invites.value.length / PAGE_SIZE))))
 const inviteOpen = ref(false)
 const issued = ref(null)
 const inviteWorking = ref(false)
@@ -155,6 +173,7 @@ async function issueInvite () {
     // 明文只在这里出现一次：不进列表状态、不进日志、不进 URL
     issued.value = (await api.adminIssueInvite()).data
     inviteOpen.value = true
+    invitePage.value = 1
     await loadInvites()
   } catch (e) {
     message.error(e.response?.data?.detail || '签发失败')
@@ -241,7 +260,7 @@ onMounted(() => { load(); loadDefaults(); loadInvites() })
         <p class="zc-quota-note">
           自助注册已关闭（ADR-0069）：新人必须凭一枚一次性码进来。码用掉即失效，未使用的可随时作废。
         </p>
-        <a-table :data-source="invites" :columns="inviteColumns" row-key="id" size="small"
+        <a-table :data-source="pagedInvites" :columns="inviteColumns" row-key="id" size="small"
                  :pagination="false" data-test="invite-table">
           <template #bodyCell="{ column, record }">
             <template v-if="column.dataIndex === 'status'">
@@ -259,6 +278,10 @@ onMounted(() => { load(); loadDefaults(); loadInvites() })
             </template>
           </template>
         </a-table>
+        <a-pagination v-if="invites.length > PAGE_SIZE" class="zc-admin-pager"
+                      data-test="invite-pagination" :current="currentInvitePage"
+                      :total="invites.length" :page-size="PAGE_SIZE" :show-size-changer="false"
+                      :show-total="showTotal" @change="invitePage = $event" />
         <a-button type="primary" :loading="inviteWorking" data-test="invite-issue"
                   @click="issueInvite"><plus-outlined /> 签发一枚</a-button>
       </div>
@@ -300,7 +323,7 @@ onMounted(() => { load(); loadDefaults(); loadInvites() })
       </div>
 
       <div class="zc-panel">
-        <a-table data-test="admin-accounts" class="zc-accounts" :data-source="accounts"
+        <a-table data-test="admin-accounts" class="zc-accounts" :data-source="pagedAccounts"
                  :loading="loading" :columns="columns" row-key="id" :pagination="false" size="small">
           <template #bodyCell="{ column, record }">
             <template v-if="column.dataIndex === 'is_founder'">
@@ -346,6 +369,10 @@ onMounted(() => { load(); loadDefaults(); loadInvites() })
             </template>
           </template>
         </a-table>
+        <a-pagination v-if="accounts.length > PAGE_SIZE" class="zc-admin-pager"
+                      data-test="account-pagination" :current="currentAccountPage"
+                      :total="accounts.length" :page-size="PAGE_SIZE" :show-size-changer="false"
+                      :show-total="showTotal" @change="accountPage = $event" />
         <zc-empty-state v-if="!loading && !accounts.length" description="还没有账号" />
       </div>
 
@@ -399,6 +426,7 @@ onMounted(() => { load(); loadDefaults(); loadInvites() })
   padding: var(--zc-space-5);
 }
 .zc-accounts :deep(.ant-table-cell) { vertical-align: middle; }
+.zc-admin-pager { margin-top: var(--zc-space-3); display: flex; justify-content: flex-end; }
 .zc-banned { color: var(--zc-danger); }
 .zc-banned-reason { color: var(--zc-text-sub); }
 .zc-ok { color: var(--zc-text-sub); }
