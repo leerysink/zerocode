@@ -295,54 +295,56 @@ async function save() {
         </template>
 
         <template v-else>
-          <section v-for="g in current.groups" :key="g.title" class="zc-group">
-            <h3 class="zc-group-title">{{ g.title }}</h3>
-            <div v-for="row in g.rows" :key="row.form" class="zc-row">
-              <div class="zc-row-label">
-                <span class="zc-row-name">{{ row.label }}</span>
-                <span v-if="row.desc" class="zc-row-desc">{{ row.desc }}</span>
-                <!-- 只读不隐藏：隐藏会让人以为平台没这个开关，而不是「轮不到我改」（ADR-0068） -->
-                <span v-if="store.fieldLocked(row.form)" class="zc-row-desc zc-locked"
-                      data-test="set-locked-hint">由管理员统一维护，对所有账号生效</span>
+          <section class="zc-form-card zc-panel" data-test="set-form-card">
+            <section v-for="g in current.groups" :key="g.title" class="zc-group">
+              <h3 class="zc-group-title">{{ g.title }}</h3>
+              <div v-for="row in g.rows" :key="row.form" class="zc-row">
+                <div class="zc-row-label">
+                  <span class="zc-row-name">{{ row.label }}</span>
+                  <span v-if="row.desc" class="zc-row-desc">{{ row.desc }}</span>
+                  <!-- 只读不隐藏：隐藏会让人以为平台没这个开关，而不是「轮不到我改」（ADR-0068） -->
+                  <span v-if="store.fieldLocked(row.form)" class="zc-row-desc zc-locked"
+                        data-test="set-locked-hint">由管理员统一维护，对所有账号生效</span>
+                </div>
+                <div class="zc-row-control">
+                  <a-switch v-if="row.type === 'switch'" v-model:checked="store.form[row.form]"
+                            :disabled="store.fieldLocked(row.form)" />
+                  <a-input-number v-else-if="row.type === 'number'" v-model:value="store.form[row.form]"
+                                  :min="row.min" :max="row.max" :step="row.step || 1" style="width: 180px"
+                                  :disabled="store.fieldLocked(row.form)" />
+                  <a-input v-else-if="row.type === 'text'" v-model:value="store.form[row.form]"
+                           :placeholder="row.placeholder" :disabled="store.fieldLocked(row.form)" />
+                  <a-input-password v-else-if="row.type === 'password'" v-model:value="store.form[row.form]"
+                                    :placeholder="row.placeholder" :disabled="store.fieldLocked(row.form)" />
+                  <a-select v-else-if="row.type === 'select'" v-model:value="store.form[row.form]"
+                            :options="row.options" style="width: 260px"
+                            :disabled="store.fieldLocked(row.form)" />
+                </div>
               </div>
-              <div class="zc-row-control">
-                <a-switch v-if="row.type === 'switch'" v-model:checked="store.form[row.form]"
-                          :disabled="store.fieldLocked(row.form)" />
-                <a-input-number v-else-if="row.type === 'number'" v-model:value="store.form[row.form]"
-                                :min="row.min" :max="row.max" :step="row.step || 1" style="width: 180px"
-                                :disabled="store.fieldLocked(row.form)" />
-                <a-input v-else-if="row.type === 'text'" v-model:value="store.form[row.form]"
-                         :placeholder="row.placeholder" :disabled="store.fieldLocked(row.form)" />
-                <a-input-password v-else-if="row.type === 'password'" v-model:value="store.form[row.form]"
-                                  :placeholder="row.placeholder" :disabled="store.fieldLocked(row.form)" />
-                <a-select v-else-if="row.type === 'select'" v-model:value="store.form[row.form]"
-                          :options="row.options" style="width: 260px"
-                          :disabled="store.fieldLocked(row.form)" />
-              </div>
-            </div>
 
-            <div v-if="g.title === '模型接入'" class="zc-group-actions">
-              <a-button type="primary" :loading="testing" data-test="set-test" @click="runTest">测试连接</a-button>
-            </div>
-            <div v-if="g.title === '执行与预览'" class="zc-row">
-              <div class="zc-row-label">
-                <span class="zc-row-name">PostgreSQL</span>
-                <span class="zc-row-desc">平台库读数，只看不改</span>
+              <div v-if="g.title === '模型接入'" class="zc-group-actions">
+                <a-button type="primary" :loading="testing" data-test="set-test" @click="runTest">测试连接</a-button>
               </div>
-              <div class="zc-row-control">
-                <a-spin v-if="!pg" />
-                <template v-else>
-                  <a-tag :color="pg.ok ? 'green' : 'red'">{{ pg.ok ? '正常' : '异常' }}</a-tag>
-                  <span class="zc-pg-version">{{ pg.ok ? pg.version : pg.error }}</span>
-                </template>
+              <div v-if="g.title === '执行与预览'" class="zc-row">
+                <div class="zc-row-label">
+                  <span class="zc-row-name">PostgreSQL</span>
+                  <span class="zc-row-desc">平台库读数，只看不改</span>
+                </div>
+                <div class="zc-row-control">
+                  <a-spin v-if="!pg" />
+                  <template v-else>
+                    <a-tag :color="pg.ok ? 'green' : 'red'">{{ pg.ok ? '正常' : '异常' }}</a-tag>
+                    <span class="zc-pg-version">{{ pg.ok ? pg.version : pg.error }}</span>
+                  </template>
+                </div>
               </div>
+            </section>
+
+            <div v-if="hasForm" class="zc-save-bar">
+              <a-button type="primary" :loading="store.saving" data-test="set-save" @click="save">保存</a-button>
             </div>
           </section>
         </template>
-
-        <div v-if="hasForm" class="zc-save-bar">
-          <a-button type="primary" :loading="store.saving" data-test="set-save" @click="save">保存</a-button>
-        </div>
       </main>
     </div>
 
@@ -414,6 +416,8 @@ async function save() {
   background: var(--zc-bg-inset); border-left: 3px solid rgba(var(--zc-primary-rgb), 0.45);
   border-radius: var(--zc-radius-inner); }
 /* 分组：标题 + 细线替代卡片外壳，组间大留白 */
+.zc-form-card { padding: var(--zc-space-4); }
+.zc-form-card > .zc-group:first-child > .zc-group-title { margin-top: 0; }
 .zc-group + .zc-group { margin-top: var(--zc-space-5); }
 .zc-locked { color: var(--zc-text-sub); font-style: normal; }
 .zc-group-title {
@@ -443,9 +447,9 @@ async function save() {
   display: flex;
   justify-content: flex-end;
   gap: var(--zc-space-2);
-  padding: var(--zc-space-3) 0;
+  padding: var(--zc-space-3) 0 0;
   margin-top: var(--zc-space-4);
-  background: var(--zc-bg);
+  background: var(--zc-bg-card);
   border-top: 1px solid var(--zc-border-soft);
 }
 .zc-models { font-size: var(--zc-font-xs); }

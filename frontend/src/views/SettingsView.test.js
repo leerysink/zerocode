@@ -136,6 +136,18 @@ describe('设置中心形态', () => {
     expect(w.find('[data-test="set-save"]').exists()).toBe(false)
   })
 
+  it('模型接入的保存按钮与配置行同住一张卡片', async () => {
+    const w = mountView()
+    await flushPromises()
+    await w.find('[data-test="set-nav-access"]').trigger('click')
+    await flushPromises()
+    const card = w.find('[data-test="set-form-card"]')
+    expect(card.exists()).toBe(true)
+    expect(card.find('[data-test="set-save"]').exists()).toBe(true)
+    expect(card.find('[data-test="set-test"]').exists()).toBe(true)
+    expect(card.text()).toContain('Base URL')
+  })
+
   it('模型库行操作：编辑直点，删除收在 ☰ 里', async () => {
     const w = mountView()
     await flushPromises()
