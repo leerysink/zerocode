@@ -488,12 +488,67 @@ def test_acme_commands_are_executable_shell():
 
 # ---------------------------------------------------------------- 装 Docker 的命令（US-10 / D-09）
 
+def _docker_list_line(r) -> str:
+    """apt 分支里写 /etc/apt/sources.list.d/docker.list 的那一行——发行版段只在这一行上。"""
+    for line in out(r).splitlines():
+        if "sources.list.d/docker.list" in line:
+            return line
+    raise AssertionError(f"apt 分支里没有写 docker.list 的命令：{out(r)!r}")
+
+
 def test_install_commands_apt_branch_installs_the_compose_v2_plugin():
     text = out(sh("zc_install_commands", "apt-get", ""))
     assert "docker-compose-plugin" in text, "装成 python 版 docker-compose 等于没装"
     assert "systemctl enable --now docker" in text
     assert "ca-certificates" in text and "curl" in text
-    assert "download.docker.com/linux/debian" in text
+    assert "download.docker.com/linux/" in text
+
+
+def test_install_commands_apt_branch_resolves_the_distro_line_at_runtime():
+    """apt 源里的发行版段必须运行期算：写死 debian 在每台 Ubuntu 上都是 404。
+
+    2026-11-24 全新 Ubuntu 26.04 实撞——resolute 只存在于 /docker-ce/linux/ubuntu/dists/，
+    debian 线下没有这个代号，装环境那一步直接死在 apt-get update。断言只盯写 sources.list
+    的那一行：gpg 那行按设计仍取 debian（同一个 key），整段文本断 'linux/debian' 会假绿。
+    """
+    deb_line = _docker_list_line(sh("zc_install_commands", "apt-get", ""))
+    assert "zc_docker_repo_suite" in deb_line, "发行版段被写死了，Ubuntu 上必 404"
+    assert "/linux/debian " not in deb_line and "/linux/ubuntu " not in deb_line, deb_line
+
+
+def _eval_apt_source_line(line: str, tmp_path: Path, os_release: str):
+    """把生成出来的那一行真 eval 一遍，返回 (结果, 落盘的源)。
+
+    现场死在 apt-get update 404 的正是这一行的拼接结果，纯文本断言钉不住它。
+    /etc/os-release 与 /etc/apt/sources.list.d/docker.list 是唯二不落地的绝对路径，
+    改写到 tmp_path 再跑——引用与判定逻辑一个字没动。
+    """
+    rel = tmp_path / "os-release"
+    rel.write_text(os_release, encoding="utf-8", newline="\n")
+    lst = tmp_path / "docker.list"
+    snippet = (line.replace("/etc/os-release", rel.as_posix())
+                   .replace("/etc/apt/sources.list.d/docker.list", lst.as_posix()))
+    script = ('set -uo pipefail; source "$LIB"; dpkg() { printf "amd64\\n"; }; '
+              'IFS= read -r zc_line; eval "$zc_line"')
+    r = sh("bash", "-c", script, stdin=snippet + "\n", env={"LIB": LIB.as_posix()})
+    written = lst.read_text(encoding="utf-8").strip() if lst.exists() else ""
+    return r, written
+
+
+def test_emitted_apt_source_line_resolves_to_the_ubuntu_line_on_ubuntu(tmp_path):
+    line = _docker_list_line(sh("zc_install_commands", "apt-get", "mirrors.aliyun.com"))
+    r, written = _eval_apt_source_line(line, tmp_path, UBUNTU_OS_RELEASE)
+    assert r.returncode == 0, err(r)
+    assert "docker-ce/linux/ubuntu resolute stable" in written, written
+    assert "arch=amd64 signed-by=/etc/apt/keyrings/docker.asc" in written, written
+
+
+def test_emitted_apt_source_line_writes_nothing_when_the_distro_is_unplaceable(tmp_path):
+    """认不出发行版时宁可什么都不写：一份拼错的源会把症状推给 apt-get update 的 404。"""
+    line = _docker_list_line(sh("zc_install_commands", "apt-get", "mirrors.aliyun.com"))
+    r, written = _eval_apt_source_line(line, tmp_path, "ID=arch\n")
+    assert r.returncode != 0
+    assert written == "", written
 
 
 def test_install_commands_are_emitted_without_sudo_for_the_root_runner():
@@ -506,8 +561,57 @@ def test_install_commands_are_emitted_without_sudo_for_the_root_runner():
 def test_install_commands_honours_the_mirror_host():
     """境内机直连 download.docker.com 拉不通——镜像站走 /docker-ce/linux/<distro> 约定路径。"""
     text = out(sh("zc_install_commands", "apt-get", "mirrors.aliyun.com"))
-    assert "https://mirrors.aliyun.com/docker-ce/linux/debian" in text
+    assert "https://mirrors.aliyun.com/docker-ce/linux/" in text
     assert "download.docker.com" not in text, text
+
+
+UBUNTU_OS_RELEASE = '''NAME="Ubuntu"
+ID=ubuntu
+ID_LIKE=debian
+VERSION_ID="26.04"
+VERSION_CODENAME=resolute
+'''
+
+DEBIAN_OS_RELEASE = '''NAME="Debian GNU/Linux"
+ID=debian
+VERSION_ID="13"
+VERSION_CODENAME=trixie
+'''
+
+MINT_OS_RELEASE = '''NAME="Linux Mint"
+ID=linuxmint
+ID_LIKE="ubuntu debian"
+VERSION_ID="22"
+UBUNTU_CODENAME=noble
+'''
+
+
+def test_docker_repo_suite_takes_ubuntu_codenames_from_the_ubuntu_line():
+    assert out(sh("zc_docker_repo_suite", stdin=UBUNTU_OS_RELEASE)) == "ubuntu resolute"
+
+
+def test_docker_repo_suite_takes_debian_codenames_from_the_debian_line():
+    assert out(sh("zc_docker_repo_suite", stdin=DEBIAN_OS_RELEASE)) == "debian trixie"
+
+
+def test_docker_repo_suite_maps_derivatives_by_id_like():
+    """Mint / Pop!_OS 的 ID 两条线都不命中，但包都在 ubuntu 线下，代号常只写在 UBUNTU_CODENAME。"""
+    assert out(sh("zc_docker_repo_suite", stdin=MINT_OS_RELEASE)) == "ubuntu noble"
+
+
+def test_docker_repo_suite_refuses_to_invent_a_codename():
+    """猜代号的代价是装到旧版 docker 且不报错；认不出就非零退出、stdout 留空。"""
+    r = sh("zc_docker_repo_suite", stdin="ID=ubuntu\nVERSION_ID=\"26.04\"\n")
+    assert r.returncode != 0
+    assert out(r) == "", "认不出时不许吐出一串拼错的仓库段"
+    assert "代号" in err(r), err(r)
+
+
+def test_docker_repo_suite_names_the_distro_it_couldnt_place():
+    r = sh("zc_docker_repo_suite", stdin="ID=arch\n")
+    assert r.returncode != 0
+    assert out(r) == ""
+    assert "arch" in err(r), "报错要指名我们放不进两条线的那个 ID"
 
 
 def test_install_commands_dnf_and_yum_use_their_own_repo_tooling():

@@ -57,6 +57,7 @@ done
 for want in zc_normalize_root zc_valid_password zc_env_render zc_env_backup zc_merge_plan \
             zc_env_gaps zc_pkg_manager zc_busy zc_port_holder_kind zc_port_holder_pid \
             zc_install_commands zc_answers_get zc_answers_put \
+            zc_docker_repo_suite \
             zc_add_docker_group_command zc_untouchables zc_daemon_json_plan zc_daemon_json_write; do
   declare -F "$want" >/dev/null || fail "deploy_lib.sh 里缺 $want——这份 lib 比 deploy.sh 旧，重打包再传"
 done

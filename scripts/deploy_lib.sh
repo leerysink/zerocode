@@ -297,6 +297,48 @@ zc_port_holder_pid() { # stdin=ss 里那一行占用信息 ; stdout=pid（认不
 # docker-compose（Python 版）：本仓库的预检与 deploy 全流程都用 `docker compose` 子命令。
 # $2 给镜像站主机名时，docker-ce 仓库走约定的 /docker-ce/linux/<distro> 路径——境内机直连
 # download.docker.com 拉不通，这一条决定「一键」在真实目标机上是否成立。
+#
+# <distro> 只能由运行期的 /etc/os-release 决定：docker 的 apt 仓库分 ubuntu 与 debian 两条线发布，
+# 代号只在各自那条线里有。写死 debian 时，Ubuntu 的 resolute/noble 在 debian 线下不存在，
+# 症状是装环境那一步 apt-get update 报 404 后整条链路死掉（2026-11-24 全新 Ubuntu 26.04 实撞）。
+# gpg 那行仍取 debian 段：两条线下是同一个 Docker 官方 key，镜像站两条线都全，要跟着发行版走的只有 deb 源那行。
+
+zc_os_release_value() { # $1=键名 $2=os-release 全文 ; stdout=去引号后的值（键缺失时空）
+  local raw
+  raw="$(printf '%s\n' "$2" | grep -E "^[[:space:]]*${1}=" | tail -n1 | cut -d= -f2- | tr -d '\r')"
+  raw="${raw#\"}"; raw="${raw%\"}"; raw="${raw#\'}"; raw="${raw%\'}"
+  printf '%s\n' "$raw"
+}
+
+zc_docker_repo_suite() { # stdin=/etc/os-release 内容 ; stdout="<distro> <codename>"；认不出则非零退出且 stdout 空
+  local text id like codename distro=""
+  text="$(cat)"
+  id="$(zc_os_release_value ID "$text")"
+  like="$(zc_os_release_value ID_LIKE "$text")"
+  case " $id " in
+    *ubuntu*|*debian*) distro="$id" ;;
+    *)
+      case " $like " in
+        *ubuntu*) distro=ubuntu ;;
+        *debian*) distro=debian ;;
+        *)
+          printf '认不出这台机器属于哪条 docker-ce 仓库线（ID=%s ID_LIKE=%s）：apt 包只按 ubuntu 与 debian 两条线发布。\n' \
+            "${id:-（空）}" "${like:-（空）}" >&2
+          printf '  请按 https://docs.docker.com/engine/install/ 手工装好 Docker Engine 与 compose v2 插件，再重跑本脚本。\n' >&2
+          return 2 ;;
+      esac ;;
+  esac
+  codename="$(zc_os_release_value VERSION_CODENAME "$text")"
+  # Mint / Pop!_OS 这类派生版未必填 VERSION_CODENAME，但它们的包就在 ubuntu 线下，代号在 UBUNTU_CODENAME 里。
+  [ -n "$codename" ] || [ "$distro" != ubuntu ] || codename="$(zc_os_release_value UBUNTU_CODENAME "$text")"
+  if [ -z "$codename" ]; then
+    printf '%s 的 /etc/os-release 里没有发行版代号（VERSION_CODENAME 与 UBUNTU_CODENAME 都是空的）。\n' "$distro" >&2
+    printf '  不猜代号：猜错会装上旧版 docker 而且一路不报错。确认代号后手工写 /etc/apt/sources.list.d/docker.list，\n' >&2
+    printf '  或按 https://docs.docker.com/engine/install/ 装好 Docker Engine 与 compose v2 插件，再重跑本脚本。\n' >&2
+    return 3
+  fi
+  printf '%s %s\n' "$distro" "$codename"
+}
 
 zc_install_commands() { # $1=apt-get|dnf|yum $2=镜像站主机名（可空） ; stdout=每行一条命令
   local pm="${1:-}" mirror="${2:-}" base="https://download.docker.com"
@@ -309,7 +351,7 @@ apt-get install -y ca-certificates curl gnupg
 install -m 0755 -d /etc/apt/keyrings
 curl -fsSL ${base}/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
 chmod a+r /etc/apt/keyrings/docker.asc
-echo "deb [arch=\$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] ${base}/linux/debian \$(. /etc/os-release && echo "\${VERSION_CODENAME:-stable}") stable" > /etc/apt/sources.list.d/docker.list
+ZC_DOCKER_SUITE="\$(zc_docker_repo_suite < /etc/os-release)" && echo "deb [arch=\$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] ${base}/linux/\${ZC_DOCKER_SUITE} stable" > /etc/apt/sources.list.d/docker.list
 apt-get update
 apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 systemctl enable --now docker
