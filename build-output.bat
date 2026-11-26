@@ -29,6 +29,8 @@ REM    build-output.bat --gateway-domain <domain>   gateway wildcard domain (env
 REM    build-output.bat --apt-mirror mirrors.aliyun.com   Debian + docker-ce mirror host (env: ZEROCODE_APT_MIRROR)
 REM    build-output.bat --pypi-mirror https://mirrors.aliyun.com/pypi/simple   (env: ZEROCODE_PYPI_MIRROR)
 REM    build-output.bat --npm-registry https://registry.npmmirror.com   (env: ZEROCODE_NPM_REGISTRY)
+REM    build-output.bat --no-images          skip the ~450MB image bundle (deploy pulls instead)
+REM    build-output.bat --refresh-images     pull the 5 platform images before saving them
 REM
 REM  --no-pause matters more than it looks: every exit path ends in `pause`
 REM  so a double-clicked window stays open long enough to read the Chinese

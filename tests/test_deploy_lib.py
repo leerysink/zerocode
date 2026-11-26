@@ -669,3 +669,60 @@ def test_install_commands_refuses_an_unknown_manager():
 def test_add_docker_group_command_names_the_current_user():
     assert out(sh("zc_add_docker_group_command", "deploy")) == "usermod -aG docker deploy"
     assert out(sh("zc_add_docker_group_command", "")) == ""
+
+
+# ---------------------------------------------------------------- 镜像包（ADR-0072）
+
+def _images_manifest(tmp_path, pairs):
+    p = tmp_path / "manifest.tsv"
+    p.write_bytes(("# 注释\n" + "".join(f"{r}\t{i}\n" for r, i in pairs)).encode("utf-8"))
+    return p
+
+
+def _images_docker_stub(tmp_path, ids: dict):
+    """docker 桩：只回答 image inspect 的 ID 查询；没登记的镜像返回非零（缺），别的子命令也非零。"""
+    lines = ["#!/bin/sh", 'last=""', 'for a in "$@"; do last="$a"; done',
+             'if [ "$1 $2" = "image inspect" ]; then', '  case "$last" in']
+    for ref, img_id in ids.items():
+        lines.append(f'    "{ref}") printf "%s\n" "{img_id}"; exit 0 ;;')
+    lines += ["  esac", "fi", "exit 1"]
+    p = tmp_path / "docker"
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+    p.chmod(0o755)
+    return p
+
+
+def test_image_manifest_parses_pairs_and_skips_comments(tmp_path):
+    p = tmp_path / "manifest.tsv"
+    p.write_bytes(b"# header\r\npg:16\tsha256:a\r\n\r\npy:3\tsha256:b\r\n")
+    r = sh("zc_image_manifest", str(p))
+    assert r.returncode == 0, err(r)
+    assert out(r).splitlines() == ["pg:16\tsha256:a", "py:3\tsha256:b"]
+
+
+def test_image_manifest_rejects_missing_empty_and_malformed(tmp_path):
+    assert sh("zc_image_manifest", str(tmp_path / "nope.tsv")).returncode == 3
+    empty = tmp_path / "empty.tsv"
+    empty.write_text("# only comments\n", encoding="utf-8")
+    assert sh("zc_image_manifest", str(empty)).returncode == 3
+    bad = tmp_path / "bad.tsv"
+    bad.write_text("no-tab-here\n", encoding="utf-8", newline="\n")
+    assert sh("zc_image_manifest", str(bad)).returncode == 3
+
+
+def test_images_ready_true_only_when_every_id_matches(tmp_path):
+    _images_docker_stub(tmp_path, {"pg:16": "sha256:a", "py:3": "sha256:b"})
+    p = _images_manifest(tmp_path, [("pg:16", "sha256:a"), ("py:3", "sha256:b")])
+    assert _only(tmp_path, "zc_images_ready", str(p)).returncode == 0
+
+
+def test_images_ready_is_false_on_id_drift_or_missing_image(tmp_path):
+    _images_docker_stub(tmp_path, {"pg:16": "sha256:OLD"})
+    drift = _images_manifest(tmp_path, [("pg:16", "sha256:NEW")])
+    assert _only(tmp_path, "zc_images_ready", str(drift)).returncode == 1
+    missing = _images_manifest(tmp_path, [("pg:16", "sha256:OLD"), ("gone:1", "sha256:x")])
+    assert _only(tmp_path, "zc_images_ready", str(missing)).returncode == 1
+
+
+def test_images_ready_reports_unusable_manifest(tmp_path):
+    assert _only(tmp_path, "zc_images_ready", str(tmp_path / "nope.tsv")).returncode == 2

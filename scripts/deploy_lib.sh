@@ -175,7 +175,7 @@ zc_merge_plan() { # $1=new|upgrade $2=部署根 ; stdout=「会动什么 / 不�
 新增部署 · 部署根 ${root}
 
 铺包（整体一次，此根下没有现场产物要保）：
-  把交付包内容 rsync -a 到 ${root}（不带 --delete；包就是全新的）
+  把交付包内容 rsync -a 到 ${root}（不带 --delete；包就是全新的；images/ 不铺——第 7 步直接 load 进 docker）
   mkdir -p ${root}/apps ${root}/data ${root}/store ${root}/gateway/certs ${root}/gateway/routes
   生成 ${root}/.env（没有旧文件，无需备份）
   首次 docker compose up -d --build：建 pgdata 卷、建平台库、重放 init.sql
@@ -264,6 +264,40 @@ zc_env_gaps() { # stdout=每行一个缺口：docker-cli|compose-plugin|daemon|d
       *) printf 'docker-group\n' ;;
     esac
   fi
+  return 0
+}
+
+# ---------------------------------------------------------------- 镜像包（ADR-0072）
+#
+# 包里的 images/ 是打包机 docker save 出的平台安装期镜像快照 + manifest。部署端只有一条判定：
+# 本机镜像 ID 与 manifest 全一致就不必再 load；缺任何一项（或升级包带了新快照）就 load 一次，
+# 之后整段联网预热与 compose pull 都跳过。格式必须与 build_output.py 的 image_manifest_text 对齐。
+
+zc_image_manifest() { # $1=manifest 文件 ; stdout=每行 "镜像<TAB>ID"；3=缺失、为空或格式不对
+  local file="${1:-}" line ref id n=0
+  [ -f "$file" ] || return 3
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"
+    case "$line" in ''|'#'*) continue ;; esac
+    ref="${line%%$'\t'*}"; id="${line#*$'\t'}"
+    if [ "$ref" = "$line" ] || [ -z "$ref" ] || [ -z "$id" ]; then
+      printf '镜像包清单格式不对（每行「镜像<TAB>ID」）：%s\n' "$line" >&2
+      return 3
+    fi
+    printf '%s\t%s\n' "$ref" "$id"
+    n=$((n + 1))
+  done < "$file"
+  [ "$n" -gt 0 ] || { printf '镜像包清单是空的（只有注释？）：%s\n' "$file" >&2; return 3; }
+}
+
+zc_images_ready() { # $1=manifest 文件 ; 0=全齐且 ID 一致 1=需要 load 2=清单不可用
+  local pairs="" ref id cur
+  pairs="$(zc_image_manifest "$1")" || return 2
+  while IFS=$'\t' read -r ref id; do
+    [ -n "$ref" ] || continue
+    cur="$(docker image inspect --format '{{.Id}}' "$ref" 2>/dev/null)" || return 1
+    [ "$cur" = "$id" ] || return 1
+  done <<< "$pairs"
   return 0
 }
 

@@ -57,7 +57,7 @@ done
 for want in zc_normalize_root zc_valid_password zc_env_render zc_env_backup zc_merge_plan \
             zc_env_gaps zc_pkg_manager zc_busy zc_port_holder_kind zc_port_holder_pid \
             zc_install_commands zc_answers_get zc_answers_put \
-            zc_docker_repo_suite \
+            zc_docker_repo_suite zc_images_ready \
             zc_add_docker_group_command zc_untouchables zc_daemon_json_plan zc_daemon_json_write; do
   declare -F "$want" >/dev/null || fail "deploy_lib.sh 里缺 $want——这份 lib 比 deploy.sh 旧，重打包再传"
 done
@@ -573,8 +573,9 @@ printf '%s\n' "$(zc_merge_plan "$MODE" "$DEPLOY_ROOT")" >&2
 if [ "$IN_PLACE" = 1 ]; then
   ok "包就在部署根里，跳过合并搬运"
 elif [ "$MODE" = new ]; then
-  printf '  → 铺包 %s/ → %s/（不带 --delete：这个根下没有现场产物要保）\n' "$PKG" "$DEPLOY_ROOT" >&2
-  rsync -a "$PKG"/ "$DEPLOY_ROOT"/ || fail "铺包失败：$PKG → $DEPLOY_ROOT"
+  printf '  → 铺包 %s/ → %s/（不带 --delete：这个根下没有现场产物要保；images/ 不铺，第 7 步直接 load 进 docker）\n' "$PKG" "$DEPLOY_ROOT" >&2
+  # --exclude 放在 SRC 之后：红线测试按行首 rsync -a "$PKG"/ 认「新模式」那一行
+  rsync -a "$PKG"/ --exclude images/ "$DEPLOY_ROOT"/ || fail "铺包失败：$PKG → $DEPLOY_ROOT"
   ok "包已整体铺进 $DEPLOY_ROOT"
 else
   cd "$DEPLOY_ROOT" || fail "进不去 $DEPLOY_ROOT"
@@ -623,6 +624,30 @@ if [ -n "$OLD_ROOT" ] && [ "$OLD_ROOT" != "$DEPLOY_ROOT" ]; then
   warn "换根后记得核对 $DEPLOY_ROOT/apps 里既有工程的位置，与库里的 root_path 是否一致"
 fi
 
+# 镜像包（ADR-0072）：打包器在 images/ 里放了平台安装期五个镜像的快照 + manifest。本机镜像 ID
+# 与清单全一致就跳过 load；否则 load 一次（升级包带新快照时，同 tag 覆盖旧镜像）。load 成功后
+# 整段联网预热与 compose pull 都跳过——境内机上那一步就是安装耗时的大头。没有镜像包
+# （--no-images 出的包、或更早的包）时保持原行为，下面两条腿照跑。
+IMAGES_READY=0
+IMG_MANIFEST="$PKG/images/manifest.tsv"
+IMG_TAR="$PKG/images/zerocode-images.tar.gz"
+if [ -f "$IMG_MANIFEST" ]; then
+  if [ ! -f "$IMG_TAR" ]; then
+    warn "images/ 里有清单却缺 tar（$IMG_TAR）：本次回退到联网预热"
+  elif zc_images_ready "$IMG_MANIFEST"; then
+    ok "本地镜像与包内清单一致，跳过 docker load"
+    IMAGES_READY=1
+  else
+    say "docker load 包内镜像（数百 MB，视磁盘几分钟；ADR-0072）"
+    docker load -i "$IMG_TAR" \
+      || fail "包内镜像加载失败：$IMG_TAR（文件损坏或磁盘满）。删掉 images/ 重跑本脚本可回退到联网拉取"
+    zc_images_ready "$IMG_MANIFEST" \
+      || fail "镜像已从包内加载，但仍与 manifest 不一致：包被改过或加载不完整，重新打包再传"
+    IMAGES_READY=1
+    ok "包内镜像已就位（本次安装免拉取）"
+  fi
+fi
+
 # 预热分两条腿，各管各的镜像，因为「能 pull」这件事只有 compose 自己说得准：
 #   - Dockerfile 的 FROM 基础镜像（python / node / openresty…）是镜像构建期的真卡点，逐个拉、
 #     拉不动当场指名（US-12）。
@@ -654,29 +679,33 @@ pull_service_images() { # 0=都到位（或这版插件没这个能力，已降�
   ok "compose 侧服务镜像就位（本包的构建目标已跳过）"
 }
 
-PULLFAIL="$(pull_bases)"
-COMPOSE_PULL_BAD=0
-pull_service_images || COMPOSE_PULL_BAD=1
-# 装 docker 那一步才问 mirror（US-11），但「机器上早就有 docker、只是拉不动 Docker Hub」才是境内
-# 演示机最常见的形态——那时候安装分支根本不会进，所以这里必须再给一次机会，否则第 7 步的报错
-# 会让人去重跑一个永远不会触发的提问。
-if { [ -n "$PULLFAIL" ] || [ "$COMPOSE_PULL_BAD" = 1 ]; } \
-   && ask_yes "上面这些镜像拉不动。现在配 registry 镜像加速吗？写 /etc/docker/daemon.json 并重启 docker 后重拉（y/N）" n; then
-  # 默认值取本机实测可达的 daocloud 公共加速站；阿里云/腾讯的官方加速器只对自家云内机器开放，
-  # 本地机器访问是 403（2026-11 实测），别照着旧提示填。
-  PULL_MIRROR="$(ask '镜像站地址（如 https://docker.m.daocloud.io，或 https://docker.1ms.run）' 'https://docker.m.daocloud.io')"
-  valid_mirror "$PULL_MIRROR" || fail "镜像站地址只允许字母、数字与 . : / _ - ：$PULL_MIRROR"
-  apply_registry_mirror "$PULL_MIRROR"
-  wait_docker_ready || warn "重启 docker 后环境判定仍有缺口：$(printf '%s ' $(zc_env_gaps))"
+if [ "$IMAGES_READY" = 1 ]; then
+  ok "包内镜像就是本次要用的：跳过联网预热与 compose pull（新鲜度由打包端 --refresh-images 负责）"
+else
   PULLFAIL="$(pull_bases)"
   COMPOSE_PULL_BAD=0
   pull_service_images || COMPOSE_PULL_BAD=1
-fi
-[ -z "$PULLFAIL" ] && [ "$COMPOSE_PULL_BAD" = 0 ] || fail "基础镜像拉不动：${PULLFAIL:-（见上面 compose 的报错）}
+  # 装 docker 那一步才问 mirror（US-11），但「机器上早就有 docker、只是拉不动 Docker Hub」才是境内
+  # 演示机最常见的形态——那时候安装分支根本不会进，所以这里必须再给一次机会，否则第 7 步的报错
+  # 会让人去重跑一个永远不会触发的提问。
+  if { [ -n "$PULLFAIL" ] || [ "$COMPOSE_PULL_BAD" = 1 ]; } \
+     && ask_yes "上面这些镜像拉不动。现在配 registry 镜像加速吗？写 /etc/docker/daemon.json 并重启 docker 后重拉（y/N）" n; then
+    # 默认值取本机实测可达的 daocloud 公共加速站；阿里云/腾讯的官方加速器只对自家云内机器开放，
+    # 本地机器访问是 403（2026-11 实测），别照着旧提示填。
+    PULL_MIRROR="$(ask '镜像站地址（如 https://docker.m.daocloud.io，或 https://docker.1ms.run）' 'https://docker.m.daocloud.io')"
+    valid_mirror "$PULL_MIRROR" || fail "镜像站地址只允许字母、数字与 . : / _ - ：$PULL_MIRROR"
+    apply_registry_mirror "$PULL_MIRROR"
+    wait_docker_ready || warn "重启 docker 后环境判定仍有缺口：$(printf '%s ' $(zc_env_gaps))"
+    PULLFAIL="$(pull_bases)"
+    COMPOSE_PULL_BAD=0
+    pull_service_images || COMPOSE_PULL_BAD=1
+  fi
+  [ -z "$PULLFAIL" ] && [ "$COMPOSE_PULL_BAD" = 0 ] || fail "基础镜像拉不动：${PULLFAIL:-（见上面 compose 的报错）}
   build 会在同一个地方卡住（表现是半路没动静），所以停在这里比让它跑二十分钟诚实。
   处置：上面那句提问回答 y（本步就能写 daemon.json 并重启 docker）；或手工写
   /etc/docker/daemon.json 的 registry-mirrors 再 systemctl restart docker；或换可达网络。
   应用构建期的 pip/npm 源是另一条通道，用第 4 步问过的两个键。"
+fi
 
 if [ "$DROP_DB" = 1 ]; then
   printf '  → docker compose down -v（删的是你在第 3 步确认过的 pgdata 卷）\n' >&2

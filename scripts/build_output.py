@@ -18,10 +18,12 @@ docker-compose.yml、.env.example、部署说明、中央网关配置（`gateway
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -94,6 +96,23 @@ BROWSER_SESSION_TTL_BAKED = "120"
 # Chromium 在**镜像构建期**下载；只进 browser 服务的 build args，不进容器运行期 env。
 PLAYWRIGHT_DOWNLOAD_HOST_ENV = "PLAYWRIGHT_DOWNLOAD_HOST"
 PLAYWRIGHT_DOWNLOAD_HOST_BAKED = "https://cdn.npmmirror.com/binaries/playwright"
+
+# 部署包内置的镜像快照（ADR-0072）：打包机 docker save 出的平台**安装期**镜像，部署机
+# docker load 后跳过联网预热与 compose pull。名单固定五个，覆盖 deploy.sh 的预热对象、网关与
+# sqlrunner 基座；应用模板的构建镜像（node/maven/jdk/redis）刻意不进包——它们要配合在线装
+# npm/maven 依赖才有意义，塞进来只让包胖 700MB 左右。改名单之前先改 ADR-0072。
+IMAGE_REFS = (
+    "pgvector/pgvector:pg16",       # docker-compose.yml 的 pg 服务（唯一的 registry 服务镜像）
+    "python:3.12-slim",             # backend/Dockerfile 的 FROM
+    "python:3.12-slim-trixie",      # browser/ sandbox/ sandbox/egress 三个 Dockerfile 的 FROM
+    "openresty/openresty:alpine",   # gateway/docker-compose.yml（第 9 步才起，本就不在预热名单）
+    "postgres:16-alpine",           # sqlrunner/Dockerfile：平台首启构建 zerocode-sqlrunner 的基座
+)
+# 打包机缺镜像时的兜底源：境内直连 Docker Hub 常拉不动（本机实测），daocloud 是实测可达的
+# 公共加速站。拉到后 tag 回官方名，包里镜像引用与 compose/Dockerfile 字面逐字一致。
+IMAGE_MIRROR = "docker.m.daocloud.io"
+IMAGE_BUNDLE_TAR = "zerocode-images.tar.gz"
+IMAGE_BUNDLE_MANIFEST = "manifest.tsv"
 
 # 预置应用复制时的剔除名单：deploy/ 是凭据禁区（compose.py 的 STACK_SECRETS 就落在那里），
 # 其余都是可再生的依赖/产物目录——带上它们只会让包体膨胀几十倍且把本机路径带过去。
@@ -1242,6 +1261,8 @@ def dockerignore() -> str:
     没有它，`docker compose build` 每次会把整个 apps/（含两个应用的全部源码）传给 daemon——
     慢且毫无意义，因为它们运行期靠同路径挂载进容器，不是烘进镜像的。gateway/ 同理：它由
     独立的 compose 项目在宿主上挂载自己的配置文件，镜像是平台后端，不是网关。
+    images/ 是包内镜像快照（ADR-0072，约 450MB）：漏了它，in-place 部署时每次 build 都要把
+    这份快照整个传给 daemon。
     """
     return """# 由 scripts/build_output.py 生成：只让 backend/ 与 frontend/dist 进构建上下文
 apps
@@ -1249,6 +1270,7 @@ browser
 data
 store
 gateway
+images
 init.sql
 apply-init.sh
 README-deploy.md
@@ -1371,9 +1393,14 @@ def readme_md(presets, deploy_root: str, generated_at: str, dist_stamp: str,
   换根的代价不是重打包，而是**重建镜像**（镜像 `WORKDIR` 变了；起栈本来就带 `--build`，见第 7 步）；
   这台机器上已经跑过应用时，还要人工核对新根 `apps/` 里既有工程的位置与库里的 `root_path`
   一致（ADR-0013）。
-- 服务器能访问 Docker Hub 与 **PyPI**：平台与应用栈的基础镜像（`pgvector/pgvector:pg16`、
-  `python:3.12-slim`、`node:20-alpine`、`maven`、`openresty` 等）**在服务器上在线拉取**，
-  本包不含镜像 tar；`docker compose build` 还要在镜像里跑 `pip install -r requirements.txt`。
+- **本包默认内含镜像包**（`images/`，约 450MB，ADR-0072）：平台安装期要用的五个镜像
+  （`pgvector/pgvector:pg16`、`python:3.12-slim`、`python:3.12-slim-trixie`、
+  `openresty/openresty:alpine`、`postgres:16-alpine`）已由打包机 `docker save` 好，
+  `deploy.sh` 第 7 步先 `docker load` 再起栈，**安装期不再从 Docker Hub 拉镜像**。
+  用 `build-output.bat --no-images` 可出约 3MB 的小包，那时服务器仍要能访问 Docker Hub。
+  两种情况下 `docker compose build` 都要在镜像里跑 `pip install -r requirements.txt`，
+  服务器仍需可达 **PyPI**（或第 4 步配的镜像源）；应用模板的构建镜像（`node:20-alpine`、
+  `maven`、`eclipse-temurin`、`redis` 等）不在包内，首次建应用/发布时仍在线拉。
   网络受限时可以在打包时就配好镜像源（`build-output.bat --apt-mirror mirrors.aliyun.com`
   `--pypi-mirror https://mirrors.aliyun.com/pypi/simple`
   `--npm-registry https://registry.npmmirror.com`，三个可只给其一、默认全不给；docker-ce 仓库
@@ -1430,7 +1457,7 @@ docker daemon 起不来）、保证发行版 `/etc/wsl.conf` 里 `[boot] systemd
 | 4 运行参数 | `POSTGRES_USER`、`POSTGRES_PASSWORD`、`PLATFORM_PORT`、`PG_PORT`、`ZEROCODE_PREVIEW_HOST`、PyPI / npm / apt 三个镜像源、要不要起中央网关（答「起」才接着问网关域名与 `ZEROCODE_SSL_ENABLE`） | 口令**只进 `.env`**，不进 `.deploy-answers`；升级时直接回车就沿用 `.env` 里的既有值。`ZEROCODE_PREVIEW_HOST` 的打包默认值是 `localhost`（本机演示用的），脚本发现它没被改就换成探测到的宿主 IP |
 | 5 宿主端口 | 控制台端口（起网关时还有 80/443）被占了怎么办 | 占用者是**容器**才问「stop 它腾地方？」（只 stop 不删，`docker start <名字>` 可恢复）；是**宿主进程**就报 PID 让你自己确认再 kill。脚本不代劳 kill，也不劝你改 `PLATFORM_PORT` 买单 |
 | 6 落盘 | 不问：合并 `.env`、铺包或按升级合并、把答案写进 `.deploy-answers` | 升级模式只镜像 `backend/`、`browser/`、`sandbox/`、`frontend/` 四棵，八项现场产物一个不碰（§4） |
-| 7 起平台栈 | 不问 | 先核 compose 里声明了 `browser` 服务，再预热 `docker pull` 基础镜像——拉不动就当场停，不等 build 卡二十分钟；起栈一律 `up -d --build`：平台代码与前端 dist 都烘在镜像里，只 `up -d` 会静默停在旧镜像。**沙箱两个镜像还要显式 build**：`docker compose build sandbox-image sandbox-egress`——`sandbox-image` 带 `profiles: [build-only]`（它不是常驻服务，平台按需 `docker run` 起一次性容器），`up -d --build` **不会**构建它，漏这一步的表现是 `run_python`/`run_shell` 恒回「沙箱镜像未构建」 |
+| 7 起平台栈 | 不问 | 先核 compose 里声明了 `browser` 服务；有 `images/` 就 `docker load`（manifest 与本地镜像 ID 全一致则跳过），**load 成功后不再联网预热或 pull**；没有镜像包时才预热 `docker pull` 基础镜像——拉不动就当场停，不等 build 卡二十分钟；起栈一律 `up -d --build`：平台代码与前端 dist 都烘在镜像里，只 `up -d` 会静默停在旧镜像。**沙箱两个镜像还要显式 build**：`docker compose build sandbox-image sandbox-egress`——`sandbox-image` 带 `profiles: [build-only]`（它不是常驻服务，平台按需 `docker run` 起一次性容器），`up -d --build` **不会**构建它，漏这一步的表现是 `run_python`/`run_shell` 恒回「沙箱镜像未构建」 |
 | 8 重放与自检 | 不问：`bash apply-init.sh`，然后从后端容器实探探针与 sidecar | `compose 里有 browser 服务` 不等于 `Chromium 起得来`，自检探的是 `$ZEROCODE_BROWSER_URL/healthz`。沙箱同理要探两件事：`docker image inspect zerocode-sandbox:demo` 在，且 `zerocode-sandbox-egress` 容器 running——**镜像在但 router 没起**时沙箱会回「出口 router 未在运行」，那是 fail-closed 不是降级 |
 | 9 中央网关 | 升级时问「要按新的 `gateway/docker-compose.yml` 重建吗」 | **不签证书**：`gateway/certs/` 里已有 `gateway.crt` 与 `gateway.key` 就起网关，缺就跳过起网关并指路 `bash gen_ssl.sh`（缺证书的 openresty 是半死状态，比不起难查）；`gateway/certs/`、`gateway/routes/`、`gateway/.env` 是现场产物，不覆盖也不删 |
 
@@ -1574,6 +1601,8 @@ bash deploy.sh          # 第 1 问选 upgrade
   `.env.example`、`README-deploy.md`、`.dockerignore`，以及
   `gateway/nginx.conf`、`gateway/docker-compose.yml`、`gateway/make-cert.sh`、
   `gateway/make-cert.ps1`、`gateway/404.html`、`gateway/lua/router.lua`、`gateway/.env.example`。
+- `images/` 只在包侧使用：新增与升级都不把它铺进部署根，镜像在第 7 步直接 `docker load`
+  （本机镜像已与 manifest 一致时连 load 都跳过）。升级包带新快照时，同 tag 的旧镜像被覆盖。
 - 八项现场产物一个不碰（下表）。
 - `.env` 合并写：只动本次问到的键，既有键与注释原样保留；动之前静默备份 `.env.bak-<UTC>`（留 5 份）。
 - 起栈：一律 `docker compose up -d --build`（平台代码与前端 dist 都烘在镜像里，镜像已存在时
@@ -1611,6 +1640,9 @@ bash deploy.sh          # 第 1 问选 upgrade
 
 ## 5. 已知代价（不是 bug）
 
+- **镜像包让交付包从约 3MB 涨到约 450MB**：快照来自打包机本地镜像，`pg16` 这类浮动 tag 的
+  新鲜度由打包时 `--refresh-images`（或先手工 pull）负责，部署机不再向 registry 取最新；
+  `--no-images` 保留小包路径。`images/` 不铺进部署根——第 7 步直接 load 进 docker。
 - **`apply-init.sh`（第 8 步会跑它）是每次发布不可省的唯一 schema 通道**：镜像里根本没有 `changelog/`
   （`docker compose build` 只 COPY 了 `backend/app` 与 `frontend/dist`），所以 backend 首启时
   `app/db.py::run_migrations` 面对不存在的目录会拿空迭代器**静默空转**，不报错也不建表。
@@ -1653,7 +1685,7 @@ bash deploy.sh          # 第 1 问选 upgrade
 | 控制台里「打开/复制预览地址」指向 localhost | 那是 `ZEROCODE_PREVIEW_HOST` 的打包默认值（本机演示用的）。第 4 步改成服务器 IP 或域名；另外宿主防火墙与安全组要放行应用端口（默认 8210-8399） |
 | 应用栈起不来、报路径不存在 | 部署根与容器内路径不一致（ADR-0013）：核对 `.env` 的 `DEPLOY_ROOT`、实际目录、容器里 `printenv DEPLOY_ROOT` 三者；第 7 步的自检会打印这一项 |
 | 发布后新表/新列没出现 | 没跑 `apply-init.sh`（升级/新增的第 8 步会自动跑）——镜像里没有 changelog，backend 不会自己补 schema |
-| 拉镜像超时 / 第 7 步报「基础镜像拉不动」 | 服务器访问不了 Docker Hub。第 7 步停下来后会**当场问**要不要配 registry mirror（写 `/etc/docker/daemon.json` 并重启 docker，然后重拉）；机器上早就装着 docker 时也要走这一步——环境保障那步的加速提问只在真的要装 docker 时才出现。也可以手工写 daemon.json 后 `systemctl restart docker` 再重跑，或换可达网络。这里停下来是刻意的：让它跑到 build 里卡二十分钟不报错更难查 |
+| 拉镜像超时 / 第 7 步报「基础镜像拉不动」 | 默认包自带镜像本不该走到这里——先确认包里有 `images/`（`--no-images` 出的包没有）。没有镜像包时这才是常态：服务器访问不了 Docker Hub。第 7 步停下来后会**当场问**要不要配 registry mirror（写 `/etc/docker/daemon.json` 并重启 docker，然后重拉）；机器上早就装着 docker 时也要走这一步——环境保障那步的加速提问只在真的要装 docker 时才出现。也可以手工写 daemon.json 后 `systemctl restart docker` 再重跑，或换可达网络。这里停下来是刻意的：让它跑到 build 里卡二十分钟不报错更难查 |
 | 发布报 `docker compose -f …prod-compose.yml… 超时（600s）`、记账停在 build 步 | 应用的 prod 镜像要在**构建期**装依赖（`pip install` / `npm install`），境内机直连官方源会等到超时——dev 预览正常不代表发布能过，两条通道不同。在第 4 步改 `ZEROCODE_PYPI_MIRROR` 与 `ZEROCODE_NPM_REGISTRY`，平台会把同一份源经 `build.args` 注进每个应用的 prod 构建（ADR-0025）；`deploy.build_timeout` 调大只是把 10 分钟换成 30 分钟，不是修法 |
 | 控制台里应用地址点进去全 404 | 逐项核对：① 网关起了吗（`docker compose -f gateway/docker-compose.yml ps`）；② 平台 `.env` 与 `gateway/.env` 的域名是否一致；③ 应用 prod 是否 `running`（进没进 `gateway/routes/routes.json`）；④ 浏览器是否信任了自签 CA |
 | 域名打不开（未备案 / 443 被拦），想先走 IP | 把部署根 `.env` 的 `ZEROCODE_SSL_ENABLE` 设成 `false` 并 `docker compose up -d`：控制台、发布记录、应用 README 的应用地址一起改成 `http://<ZEROCODE_PREVIEW_HOST>:<prod 端口>`，网关不用停；宿主防火墙要放行应用端口段（默认 8210-8399）。备案或证书就绪后改回 `true` |
@@ -1676,6 +1708,87 @@ bash deploy.sh          # 第 1 问选 upgrade
 > 第 5 步的宿主端口预检点名，或最终在 `docker compose up` 时报 `port is already allocated`。
 
 """
+
+
+# ---------------------------------------------------------------- 镜像包（ADR-0072）
+
+def mirror_ref(ref: str) -> str:
+    """Docker Hub 官方镜像在镜像站里的路径要带 library/ 前缀；带命名空间的保持原样。"""
+    if "/" not in ref:
+        return f"{IMAGE_MIRROR}/library/{ref}"
+    return f"{IMAGE_MIRROR}/{ref}"
+
+
+def _run_docker(args) -> subprocess.CompletedProcess:
+    return subprocess.run(["docker", *args], capture_output=True, text=True,
+                          encoding="utf-8", errors="replace")
+
+
+def _docker_save(refs, fh) -> None:
+    """docker save 的层 tar 直接流进 gzip：先落一份未压缩 tar（约 1.6GB）再压会平白多占一块盘。"""
+    proc = subprocess.Popen(["docker", "save", *refs], stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE)
+    try:
+        while True:
+            chunk = proc.stdout.read(1 << 20)
+            if not chunk:
+                break
+            fh.write(chunk)
+    finally:
+        _, err = proc.communicate()
+    if proc.returncode != 0:
+        raise BuildError(f"docker save 失败（退出码 {proc.returncode}）："
+                         f"{(err or b'').decode('utf-8', 'replace').strip()}")
+
+
+def image_manifest_text(pairs) -> str:
+    """manifest 是部署端唯一能核对「包内快照 = 本机镜像」的依据，格式与 deploy_lib.sh 逐字对应。"""
+    lines = ["# zerocode 镜像包清单 —— build_output.py 生成，勿手改（ADR-0072）",
+             "# 格式：镜像引用<TAB>镜像 ID；deploy.sh 用它判断本地快照是否与包内一致"]
+    lines += [f"{ref}\t{img_id}" for ref, img_id in pairs]
+    return "\n".join(lines) + "\n"
+
+
+def save_images(dst: Path, *, refresh: bool = False, run=None, save=None) -> dict:
+    """把 IMAGE_REFS 保存成 images/<tar.gz> + manifest，返回摘要。
+
+    缺镜像时先试官方源、失败再经 IMAGE_MIRROR 拉并 tag 回官方名；refresh=True 时连本地已有的
+    也重新拉（--refresh-images，pg16 这类浮动 tag 的新鲜度入口）。run/save 是可注入的接缝：
+    单测不打真 docker。
+    """
+    run = run or _run_docker
+    save = save or _docker_save
+    dst.mkdir(parents=True, exist_ok=True)
+    for ref in IMAGE_REFS:
+        has = run(["image", "inspect", ref]).returncode == 0
+        if has and not refresh:
+            continue
+        source = ref
+        if run(["pull", ref]).returncode != 0:
+            source = mirror_ref(ref)
+            print(f"  ! 官方源拉不动 {ref}，改用 {source}", file=sys.stderr)
+            if run(["pull", source]).returncode != 0:
+                raise BuildError(
+                    f"镜像拉不到：{ref}（官方源与 {source} 都失败）。\n"
+                    f"  处置：先手工 docker pull {source} && docker tag {source} {ref} 再重跑打包。")
+            if run(["tag", source, ref]).returncode != 0:
+                raise BuildError(f"docker tag {source} → {ref} 失败")
+        print(f"  → 镜像就位 {ref}" + (f"（经 {source}）" if source != ref else ""),
+              file=sys.stderr)
+    pairs = []
+    for ref in IMAGE_REFS:
+        r = run(["image", "inspect", "--format", "{{.Id}}", ref])
+        img_id = (r.stdout or "").strip()
+        if r.returncode != 0 or not img_id:
+            raise BuildError(f"读不到镜像 ID：{ref}"
+                             f"（docker image inspect 失败：{(r.stderr or '').strip()}）")
+        pairs.append((ref, img_id))
+    tar = dst / IMAGE_BUNDLE_TAR
+    print(f"  → docker save {len(IMAGE_REFS)} 个镜像 → images/{IMAGE_BUNDLE_TAR}", file=sys.stderr)
+    with gzip.open(tar, "wb", compresslevel=1) as fh:
+        save(IMAGE_REFS, fh)
+    _write(dst / IMAGE_BUNDLE_MANIFEST, image_manifest_text(pairs))
+    return {"refs": len(pairs), "bytes": tar.stat().st_size, "refreshed": refresh}
 
 
 # ---------------------------------------------------------------- 复制与装配
@@ -2021,13 +2134,17 @@ def build(repo_root: Path = REPO_ROOT, out: Path | None = None, slugs=DEFAULT_SL
           allow_stale_dist: bool = False, gateway_domain: str | None = None,
           apt_mirror: str | None = None, pypi_mirror: str | None = None,
           npm_registry: str | None = None,
-          playwright_download_host: str | None = None) -> dict:
+          playwright_download_host: str | None = None,
+          with_images: bool = True, refresh_images: bool = False) -> dict:
     """装配整个 build-output 目录，返回摘要（供 main 打印与单测断言）。
 
     四个可选参数（域名 + 三个镜像源）都是三级取值：显式参数 > 打包机环境变量 > 默认值。
     它们的存在是为了把「打包机上手动改过的约定」记进产物：那些改动只活在打包机的用户级配置里
     （npm 的 .npmrc、pip 的 pip.conf、apt 的 sources.list），容器一个都继承不到——于是
     「本地装得上、服务器上装不上」，而仓库里没有任何一处痕迹。
+
+    with_images 默认 True（ADR-0072）：把安装期镜像快照打进 images/，部署机 load 后免拉取；
+    出 3MB 小包用 with_images=False。refresh_images 只影响打包机是否先把镜像拉新。
     """
     repo_root = Path(repo_root)
     out = Path(out) if out else repo_root / DEFAULT_OUT_NAME
@@ -2059,7 +2176,8 @@ def build(repo_root: Path = REPO_ROOT, out: Path | None = None, slugs=DEFAULT_SL
     try:
         summary = _assemble(repo_root, staging, presets, root, dist, dist_stamp, generated_at,
                             gateway_domain=domain, mirrors=mirrors,
-                            playwright_download_host=pw_host)
+                            playwright_download_host=pw_host,
+                            with_images=with_images, refresh_images=refresh_images)
     except OSError as e:
         shutil.rmtree(staging, ignore_errors=True)
         raise BuildError(f"装配时遇到文件系统错误（磁盘满 / 路径过长 / 文件被占用？）：{e}") from e
@@ -2097,7 +2215,8 @@ def _assemble(repo_root: Path, staging: Path, presets, root: str,
               dist: Path, dist_stamp: str, generated_at: str | None,
               gateway_domain: str = DEFAULT_GATEWAY_DOMAIN,
               mirrors: Mirrors = DEFAULT_MIRRORS,
-              playwright_download_host: str = PLAYWRIGHT_DOWNLOAD_HOST_BAKED) -> dict:
+              playwright_download_host: str = PLAYWRIGHT_DOWNLOAD_HOST_BAKED,
+              with_images: bool = True, refresh_images: bool = False) -> dict:
     """往暂存目录里装配整份交付包，返回摘要；任何失败由 build() 负责丢弃暂存目录。"""
     stamp = generated_at or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     backend_files = copy_backend(repo_root, staging / "backend", root, mirrors)
@@ -2122,6 +2241,9 @@ def _assemble(repo_root: Path, staging: Path, presets, root: str,
     _write(staging / "README-deploy.md",
            readme_md(presets, root, stamp, dist_stamp, gateway_domain, mirrors))
 
+    # 镜像包放在装配末尾：前面任何一道闸门拒包时，docker save 那几分钟就不必白花。
+    images = save_images(staging / "images", refresh=refresh_images) if with_images else None
+
     # 出包终检：整个交付目录里不许有任何 .env（.env.example 是模板，名字不同、内容是占位符）
     leaked = [str(p.relative_to(staging)) for p in staging.rglob(".env")]
     if leaked:
@@ -2142,6 +2264,7 @@ def _assemble(repo_root: Path, staging: Path, presets, root: str,
         "frontend_files": frontend_files,
         "gateway_files": gateway_files,
         "init_sql_bytes": len(init_sql.encode("utf-8")),
+        "images": images,
         "dist_stamp": dist_stamp,
         "generated_at": stamp,
     }
@@ -2194,7 +2317,14 @@ def main(argv=None) -> int:
                     help=f"浏览器 sidecar 镜像构建期的 Chromium 下载源（完整 http(s) 地址；"
                          f"默认取环境变量 {PLAYWRIGHT_DOWNLOAD_HOST_ENV}，"
                          f"都没有则 {PLAYWRIGHT_DOWNLOAD_HOST_BAKED}）")
+    ap.add_argument("--no-images", action="store_true",
+                    help="不打镜像包（默认随包约 450MB；关掉后安装期仍需联网拉镜像）")
+    ap.add_argument("--refresh-images", action="store_true",
+                    help="打包前先把 5 个平台安装镜像拉新（默认用打包机本地快照）")
     args = ap.parse_args(argv)
+    if args.no_images and args.refresh_images:
+        print("✗ --refresh-images 只对镜像包生效，不能与 --no-images 同用", file=sys.stderr)
+        return 2
 
     slugs = tuple(s.strip() for s in (args.slugs or "").split(",") if s.strip())
     try:
@@ -2202,7 +2332,9 @@ def main(argv=None) -> int:
                         deploy_root=args.deploy_root, allow_stale_dist=args.allow_stale_dist,
                         gateway_domain=args.gateway_domain, apt_mirror=args.apt_mirror,
                         pypi_mirror=args.pypi_mirror, npm_registry=args.npm_registry,
-                        playwright_download_host=args.playwright_download_host)
+                        playwright_download_host=args.playwright_download_host,
+                        with_images=not args.no_images,
+                        refresh_images=args.refresh_images)
     except BuildError as e:
         print(f"✗ 打包失败：{e}", file=sys.stderr)
         return 1
@@ -2225,6 +2357,13 @@ def main(argv=None) -> int:
     print(f"  沙箱镜像 {summary['sandbox_files']} 个文件（sandbox/；run_python/run_shell 执行环境 + 出口 router）")
     print(f"  前端 dist     {summary['frontend_files']} 个文件（构建于 {summary['dist_stamp']}）")
     print(f"  网关配置      {summary['gateway_files']} 个文件（gateway/；certs/ 与运行期 routes.json 不入包）")
+    if summary["images"]:
+        mb = summary["images"]["bytes"] / (1024 * 1024)
+        fresh = "已刷新到最新" if summary["images"]["refreshed"] else "打包机本地快照"
+        print(f"  镜像包        {summary['images']['refs']} 个 / {mb:.0f} MB（{fresh}；"
+              f"deploy.sh 第 7 步 load 后免拉取，ADR-0072）")
+    else:
+        print("  镜像包        （未打：--no-images，安装期仍需联网拉镜像）")
     print(f"  init.sql      {summary['init_sql_bytes']:,} 字节（changelog 全量合成 + 预置应用种子）")
     if summary["presets"]:
         for p in summary["presets"]:

@@ -5,6 +5,7 @@
 打包器的职责是「装配文件 + 守住三条硬约束」，这些都能纯文件层面验证。
 边界优先：重放安全、端口撞号、凭据泄漏、陈旧 dist、部署根形态各成一组。
 """
+import gzip
 import json
 import os
 import re
@@ -229,6 +230,8 @@ def _build(repo: Path, **kw) -> dict:
     kw.setdefault("deploy_root", ROOT)
     kw.setdefault("generated_at", STAMP)
     kw.setdefault("out", repo / "build-output")
+    # 这组用例的前提是「不碰 docker」；镜像包路径由下面的专项用例注入假 seam 覆盖。
+    kw.setdefault("with_images", False)
     return bo.build(repo_root=repo, **kw)
 
 
@@ -2786,3 +2789,115 @@ def test_placeholder_survives_the_replay_safety_audits(fake_repo):
     sql = (_build(fake_repo)["out"] / "init.sql").read_text(encoding="utf-8")
     assert sql.count(f"{PLACEHOLDER}/apps/") == 2                 # 两个预置应用，一处一行
     assert "INSERT INTO workspace (name, root_path)" in sql
+
+
+# ---------------------------------------------------------------- 镜像包（ADR-0072）
+
+def _fake_id(ref: str) -> str:
+    return "sha256:" + ref.replace("/", "_").replace(":", "_")
+
+
+class _FakeDocker:
+    """docker 接缝的假实现：记录调用，按 present/pull_fail 剧本回放，不碰真 docker。"""
+
+    def __init__(self, present=(), pull_fail=()):
+        self.present = set(present)
+        self.pull_fail = set(pull_fail)
+        self.calls = []
+
+    def __call__(self, args):
+        args = list(args)
+        self.calls.append(args)
+        if args[:2] == ["image", "inspect"]:
+            ref = args[-1]
+            ok = ref in self.present
+            out = _fake_id(ref) + "\n" if ok else ""
+            return subprocess.CompletedProcess(["docker", *args], 0 if ok else 1, out, "")
+        if args[0] == "pull":
+            return subprocess.CompletedProcess(["docker", *args],
+                                               0 if args[1] not in self.pull_fail else 1, "", "")
+        if args[0] == "tag":
+            self.present.add(args[2])
+            return subprocess.CompletedProcess(["docker", *args], 0, "", "")
+        return subprocess.CompletedProcess(["docker", *args], 0, "", "")
+
+
+def _no_save(refs, fh):
+    raise AssertionError("不该走到 docker save 的用例调用了 save")
+
+
+def test_image_refs_cover_every_pullable_image():
+    """名单手写在打包器里；漏一个，那个镜像就回到服务器现场拉。"""
+    refs = set(bo.IMAGE_REFS)
+    compose = bo.compose_yaml(ROOT)
+    for img in re.findall(r"^\s*image:\s*(\S+)", compose, re.M):
+        if img.startswith("zerocode-"):
+            assert img not in refs, f"构建目标 {img} 混进了镜像包名单"
+        else:
+            assert img in refs, f"compose 的服务镜像 {img} 不在镜像包名单"
+    gw = (bo.REPO_ROOT / "gateway" / "docker-compose.yml").read_text(encoding="utf-8")
+    for img in re.findall(r"^\s*image:\s*(\S+)", gw, re.M):
+        assert img in refs, f"网关镜像 {img} 不在镜像包名单"
+    sources = [(bo.backend_dockerfile(ROOT), "backend/Dockerfile")]
+    sources += [((bo.REPO_ROOT / rel).read_text(encoding="utf-8"), rel)
+                for rel in ("browser/Dockerfile", "sandbox/Dockerfile",
+                            "sandbox/egress/Dockerfile", "app/deploy/sqlrunner/Dockerfile")]
+    for text, origin in sources:
+        for base in re.findall(r"^FROM\s+(\S+)", text, re.M):
+            assert base in refs, f"{origin} 的 FROM {base} 不在镜像包名单"
+
+
+def test_build_without_images_leaves_no_bundle(fake_repo):
+    s = _build(fake_repo)
+    assert s["images"] is None
+    assert not (s["out"] / "images").exists()
+
+
+def test_build_with_images_writes_bundle(fake_repo, monkeypatch):
+    fake = _FakeDocker(present=bo.IMAGE_REFS)
+    monkeypatch.setattr(bo, "_run_docker", fake)
+    monkeypatch.setattr(bo, "_docker_save", lambda refs, fh: fh.write(b"FAKE-TAR"))
+    s = _build(fake_repo, with_images=True)
+    images = s["out"] / "images"
+    manifest = (images / bo.IMAGE_BUNDLE_MANIFEST).read_text(encoding="utf-8")
+    pairs = [l.split("\t") for l in manifest.splitlines() if l and not l.startswith("#")]
+    assert [ref for ref, _ in pairs] == list(bo.IMAGE_REFS)
+    assert all(img_id for _, img_id in pairs)
+    assert gzip.decompress((images / bo.IMAGE_BUNDLE_TAR).read_bytes()) == b"FAKE-TAR"
+    assert "images" in bo.dockerignore().split()
+
+
+def test_save_images_uses_daocloud_when_official_is_unreachable(tmp_path):
+    ref = bo.IMAGE_REFS[0]
+    fake = _FakeDocker(present=set(bo.IMAGE_REFS) - {ref}, pull_fail={ref})
+    fake.present.add(bo.mirror_ref(ref))
+    info = bo.save_images(tmp_path / "images", run=fake,
+                          save=lambda refs, fh: fh.write(b"T"))
+    assert info["refs"] == len(bo.IMAGE_REFS)
+    assert ["pull", bo.mirror_ref(ref)] in fake.calls
+    assert ["tag", bo.mirror_ref(ref), ref] in fake.calls
+
+
+def test_official_names_get_the_library_prefix_on_the_mirror():
+    assert bo.mirror_ref("python:3.12-slim") == "docker.m.daocloud.io/library/python:3.12-slim"
+    assert bo.mirror_ref("pgvector/pgvector:pg16") == "docker.m.daocloud.io/pgvector/pgvector:pg16"
+
+
+def test_save_images_aborts_when_both_sources_fail(tmp_path):
+    ref = bo.IMAGE_REFS[0]
+    fake = _FakeDocker(present=set(bo.IMAGE_REFS) - {ref}, pull_fail={ref, bo.mirror_ref(ref)})
+    with pytest.raises(bo.BuildError, match="镜像拉不到"):
+        bo.save_images(tmp_path / "images", run=fake, save=_no_save)
+
+
+def test_refresh_images_pulls_even_when_present(tmp_path):
+    fake = _FakeDocker(present=bo.IMAGE_REFS)
+    info = bo.save_images(tmp_path / "images", refresh=True, run=fake,
+                          save=lambda refs, fh: fh.write(b"T"))
+    assert info["refreshed"] is True
+    assert sum(1 for c in fake.calls if c and c[0] == "pull") == len(bo.IMAGE_REFS)
+
+
+def test_main_rejects_refresh_images_together_with_no_images(capsys):
+    assert bo.main(["--no-images", "--refresh-images"]) == 2
+    assert "--no-images" in capsys.readouterr().err
