@@ -656,7 +656,9 @@ pull_service_images || COMPOSE_PULL_BAD=1
 # 会让人去重跑一个永远不会触发的提问。
 if { [ -n "$PULLFAIL" ] || [ "$COMPOSE_PULL_BAD" = 1 ]; } \
    && ask_yes "上面这些镜像拉不动。现在配 registry 镜像加速吗？写 /etc/docker/daemon.json 并重启 docker 后重拉（y/N）" n; then
-  PULL_MIRROR="$(ask '镜像站地址（如 https://<id>.mirror.aliyuncs.com，或 mirrors.aliyun.com）' '')"
+  # 默认值取本机实测可达的 daocloud 公共加速站；阿里云/腾讯的官方加速器只对自家云内机器开放，
+  # 本地机器访问是 403（2026-11 实测），别照着旧提示填。
+  PULL_MIRROR="$(ask '镜像站地址（如 https://docker.m.daocloud.io，或 https://docker.1ms.run）' 'https://docker.m.daocloud.io')"
   valid_mirror "$PULL_MIRROR" || fail "镜像站地址只允许字母、数字与 . : / _ - ：$PULL_MIRROR"
   apply_registry_mirror "$PULL_MIRROR"
   wait_docker_ready || warn "重启 docker 后环境判定仍有缺口：$(printf '%s ' $(zc_env_gaps))"
