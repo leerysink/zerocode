@@ -304,6 +304,43 @@ def test_daemon_json_write_creates_a_missing_parent_dir(tmp_path):
     assert Path(target).is_file(), "父目录不存在时没写，也没建"
 
 
+def test_daemon_json_write_merges_into_file_with_other_keys(tmp_path):
+    """已有 log-driver 等键时不能只警告了事（恢复步骤空转）：备份后把 registry-mirrors
+    合并进去，别的键一个不动。"""
+    target = tmp_path / "daemon.json"
+    target.write_text('{"log-driver": "json-file", "max-concurrent-downloads": 3}\n', encoding="utf-8")
+    r = sh("zc_daemon_json_write", str(target), "https://a.m")
+    assert r.returncode == 0, err(r)
+    import json
+    data = json.loads(target.read_text(encoding="utf-8"))
+    assert data["log-driver"] == "json-file"
+    assert data["max-concurrent-downloads"] == 3
+    assert data["registry-mirrors"] == ["https://a.m"]
+    assert list(tmp_path.glob("daemon.json.bak.*")), "改宿主的 daemon.json 前必须留备份"
+
+
+def test_daemon_json_merge_prepends_new_mirror_and_keeps_existing(tmp_path):
+    """合并时新地址排前（旧的可能是本地不可达的云厂商加速器），既有条目不丢、不重复。"""
+    target = tmp_path / "daemon.json"
+    target.write_text(
+        '{"log-driver": "json-file", "registry-mirrors": ["https://old.m", "https://new.m"]}\n',
+        encoding="utf-8")
+    r = sh("zc_daemon_json_write", str(target), "https://new.m")
+    assert r.returncode == 0, err(r)
+    import json
+    data = json.loads(target.read_text(encoding="utf-8"))
+    assert data["registry-mirrors"] == ["https://new.m", "https://old.m"]
+
+
+def test_daemon_json_merge_refuses_broken_json(tmp_path):
+    target = tmp_path / "daemon.json"
+    bad = '{"log-driver": "json-file",\n'
+    target.write_text(bad, encoding="utf-8")
+    r = sh("zc_daemon_json_write", str(target), "https://a.m")
+    assert r.returncode == 3, err(r)
+    assert target.read_text(encoding="utf-8") == bad, "坏 JSON 被改动了"
+
+
 # ---------------------------------------------------------------- 环境缺口（US-10）
 #
 # 这一组全部把 PATH 收成只有一个桩目录：本机可能真的装着 docker，而这几支用例断言的正是

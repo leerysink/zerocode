@@ -213,8 +213,14 @@ apply_registry_mirror() { # $1=镜像站地址 ; 把 registry-mirrors 落进 /et
       ok "已写入 registry mirror 并重启 docker"
       ;;
     *)
-      warn "/etc/docker/daemon.json 已存在且含别的顶层键（判定为 $plan）——不做覆盖式写入。"
-      warn "请手工把 registry-mirrors 加进去再 systemctl restart docker。"
+      # 已有别的顶层键：交回 write 做「备份 + 只动 registry-mirrors」的合并；合不了（没 python、
+      # 原文件是坏 JSON）才退回人工——只警告不落笔，这个恢复步骤等于空转（2026-11-26 实撞）。
+      if zc_daemon_json_write /etc/docker/daemon.json "$url" >/dev/null; then
+        systemctl restart docker >/dev/null 2>&1 || warn "daemon.json 合并好了，systemctl restart docker 没成：手工重启才生效"
+        ok "已把 registry mirror 合并进现有 daemon.json（原文件已备份）并重启 docker"
+      else
+        warn "/etc/docker/daemon.json 已存在且含别的顶层键（判定为 $plan），自动合并没成：按上面的提示手工加 registry-mirrors 再 systemctl restart docker。"
+      fi
       ;;
   esac
 }

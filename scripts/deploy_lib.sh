@@ -390,7 +390,8 @@ zc_add_docker_group_command() { # $1=用户名 ; stdout=一条 usermod（空用�
 #
 # /etc/docker/daemon.json 是宿主上 docker 的行为定义。已有别的键（log-driver、data-root）时
 # 直接写新文件会把它们抹掉——那是「部署一个演示平台，顺手改了整台机器的 docker」，不可接受。
-# 所以判定与写入分成两支：plan 只说不写，write 只在安全时落笔。
+# 所以判定与写入分成两支：plan 只说不写；write 在已有别的键时先备份、只增改 registry-mirrors
+# 一个键（python 解析 + 校验后再换文件），工具缺失或原文件是坏 JSON 才退回人工。
 
 zc_daemon_json_plan() { # $1=daemon.json 路径 $2=mirror URL ; stdout=write-new|already-configured|merge-required
   local file="${1:-}" mirror="${2:-}" keys
@@ -469,7 +470,7 @@ zc_acme_install_cmd() { # $1=acme.sh路径 $2=域名 $3=key路径 $4=crt路径 $
     "$(zc_shquote "$3")" "$(zc_shquote "$4")" "$(zc_shdquote "$5")"
 }
 
-zc_daemon_json_write() { # $1=文件 $2=逗号分隔的 mirror 列表 ; 只在该文件不存在或只含 registry-mirrors 时落笔
+zc_daemon_json_write() { # $1=文件 $2=逗号分隔的 mirror 列表 ; 新文件只写 registry-mirrors；已有别的键则备份后合并
   local file="${1:-}" mirrors="${2:-}" keys url seen m sep i f
   local -a raw_list=() wanted=() existing=()
   IFS=',' read -r -a raw_list <<<"$mirrors"
@@ -481,9 +482,8 @@ zc_daemon_json_write() { # $1=文件 $2=逗号分隔的 mirror 列表 ; 只在�
   if [ -s "$file" ]; then
     keys="$(zc_daemon_json_keys "$file")"
     if [ -n "$keys" ] && [ "$keys" != "registry-mirrors" ]; then
-      printf '%s 还含有别的顶层键（%s），本脚本不做覆盖式写入。\n' "$file" "$keys" >&2
-      printf '  请手工把 "registry-mirrors" 加进去再 systemctl restart docker——自动合并别的键，风险不该由部署来冒。\n' >&2
-      return 3
+      zc_daemon_json_merge "$file" "$mirrors"
+      return $?
     fi
     mapfile -t existing < <(grep -oE '"https?://[^"]+"' "$file" 2>/dev/null | tr -d '"')
     for url in "${existing[@]}"; do
@@ -511,5 +511,44 @@ zc_daemon_json_write() { # $1=文件 $2=逗号分隔的 mirror 列表 ; 只在�
     printf '  ]\n}\n'
   } > "$tmp" || { printf '写 %s 失败\n' "$tmp" >&2; return 2; }
   mv -- "$tmp" "$file" || { printf '就位 %s 失败\n' "$file" >&2; rm -f -- "$tmp"; return 2; }
+  printf '%s\n' "$file"
+}
+
+zc_daemon_json_merge() { # $1=文件 $2=逗号分隔 mirrors ; 0=已合并（原文件备份为 .bak.<时间>），3=不敢改
+  # 只碰 registry-mirrors 一个键：python 解析原文件 → 新地址排前、既有条目去重保留 → 写临时文件 →
+  # cp -p 备份原文件 → mv 换入。没 python 或原文件不是合法 JSON 对象时一律不动，退回人工。
+  local file="${1:-}" mirrors="${2:-}" py tmp bak
+  py="$(command -v python3 || command -v python || true)"
+  [ -n "$py" ] || {
+    printf '没找到 python3/python，无法安全合并 %s。\n' "$file" >&2
+    printf '  请手工把 "registry-mirrors" 加进去再 systemctl restart docker。\n' >&2
+    return 3
+  }
+  tmp="${file}.tmp.$$"
+  if ! "$py" - "$file" "$tmp" "$mirrors" <<'PY'
+import json, sys
+src, dst, raw = sys.argv[1], sys.argv[2], sys.argv[3]
+want = [m.strip() for m in raw.split(",") if m.strip()]
+with open(src, encoding="utf-8") as f:
+    data = json.load(f)
+if not isinstance(data, dict):
+    raise SystemExit("daemon.json 顶层不是 JSON 对象")
+cur = data.get("registry-mirrors", [])
+if not isinstance(cur, list):
+    raise SystemExit("registry-mirrors 不是数组")
+data["registry-mirrors"] = want + [m for m in cur if m not in want]
+with open(dst, "w", encoding="utf-8") as f:
+    json.dump(data, f, ensure_ascii=False, indent=2)
+    f.write("\n")
+PY
+  then
+    rm -f -- "$tmp"
+    printf '解析不了 %s（不是合法 JSON 对象，或 registry-mirrors 不是数组），不敢改。\n' "$file" >&2
+    printf '  请手工处理后再 systemctl restart docker。\n' >&2
+    return 3
+  fi
+  bak="${file}.bak.$(date +%Y%m%d-%H%M%S)"
+  cp -p -- "$file" "$bak" || { rm -f -- "$tmp"; printf '备份 %s 失败，不动原文件。\n' "$file" >&2; return 2; }
+  mv -- "$tmp" "$file" || { rm -f -- "$tmp"; printf '就位 %s 失败（备份在 %s）\n' "$file" "$bak" >&2; return 2; }
   printf '%s\n' "$file"
 }
