@@ -22,6 +22,17 @@ const candidates = ref(null) // GitHub 仓库多命中候选（{path} 清单）
 const candidateUrl = ref('')
 const pendingPath = ref(null) // 候选清单中正在安装的那一行（避免逐行按钮 loading 串扰）
 
+// 清单分页：全量留在 skills（计数徽标按全量口径），只切当前页渲染
+const PAGE_SIZE = 10
+const page = ref(1)
+const currentPage = computed(() =>
+  Math.min(page.value, Math.max(1, Math.ceil(skills.value.length / PAGE_SIZE))))
+const pagedSkills = computed(() => {
+  const start = (currentPage.value - 1) * PAGE_SIZE
+  return skills.value.slice(start, start + PAGE_SIZE)
+})
+const showTotal = (total) => `共 ${total} 条`
+
 // ---- AI 生成通道（两段式：草稿 → 确认安装）----
 const prompt = ref('')
 const draft = ref(null)          // generate 返回体 {name, description, content, warnings}
@@ -347,7 +358,7 @@ function removeSkill(record) {
         <span class="zc-count-badge" data-test="skill-count">{{ skills.length }}</span>
       </template>
       <a-table
-        :data-source="skills"
+        :data-source="pagedSkills"
         :loading="loading"
         :columns="columns"
         row-key="id"
@@ -383,6 +394,10 @@ function removeSkill(record) {
           <a-empty description="还没有技能" />
         </template>
       </a-table>
+      <a-pagination v-if="skills.length > PAGE_SIZE" class="zc-skills-pager"
+                    data-test="skill-pagination" :current="currentPage"
+                    :total="skills.length" :page-size="PAGE_SIZE" :show-size-changer="false"
+                    :show-total="showTotal" @change="page = $event" />
     </a-card>
 
     <!-- 详情抽屉（只读浏览母本，001/002） -->
@@ -441,6 +456,7 @@ function removeSkill(record) {
 }
 .zc-skill-name { font-size: 13px; }
 .zc-skill-sub { font-size: 11px; color: var(--zc-text-sub); margin-top: 2px; }
+.zc-skills-pager { margin-top: var(--zc-space-3); display: flex; justify-content: flex-end; }
 .zc-tip {
   margin: 8px 0 0;
   color: var(--zc-text-sub);

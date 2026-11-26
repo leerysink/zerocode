@@ -79,6 +79,22 @@ const STUBS = {
   },
   'a-switch': slot('a-switch'),
   'a-empty': slot('a-empty'),
+  // 分页桩：按 total/pageSize 渲染页码按钮，点击回抛 change（与真组件的事件同名）
+  'a-pagination': {
+    name: 'a-pagination',
+    props: ['current', 'total', 'pageSize', 'showSizeChanger', 'showTotal'],
+    emits: ['change'],
+    render() {
+      const pages = Math.max(1, Math.ceil((this.total || 0) / (this.pageSize || 10)))
+      return h('div', { class: 'stub-pagination' },
+        Array.from({ length: pages }, (_, i) =>
+          h('button', {
+            class: ['stub-page', { active: this.current === i + 1 }],
+            'data-page': String(i + 1),
+            onClick: () => this.$emit('change', i + 1),
+          }, String(i + 1))))
+    },
+  },
   'SkillDetailDrawer': {
     name: 'SkillDetailDrawer',
     props: { open: Boolean, title: String, files: Array, skillMd: String, confirmable: Boolean, confirming: Boolean },
@@ -296,6 +312,54 @@ describe('SkillsView AI 生成卡片', () => {
     const wrapper = await mountView()
     const cells = wrapper.findAll('[data-key="source"]').map((c) => c.text())
     expect(cells).toEqual(['AI 生成', 'GitHub', 'future-type'])
+  })
+})
+
+describe('SkillsView 技能清单分页（默认每页 10 行）', () => {
+  const mkSkills = (n) => Array.from({ length: n }, (_, i) => ({
+    id: i + 1, name: `skill-${i + 1}`, description: 'd', source_type: 'github', enabled: true,
+    file_count: 1, total_bytes: 10, has_scripts: false,
+  }))
+  // 取名称单元格本身：不能拿整页文本判，「skill-1」行的副信息「1 文件」会拼出 skill-11
+  const rowNames = (w) =>
+    w.findAll('[data-key="name"] .zc-skill-name').map((n) => n.text())
+
+  it('超过 10 条才挂分页条：第 1 页 10 行，翻到第 2 页只剩余数，计数仍按全量', async () => {
+    mocks.api.listSkills.mockResolvedValue({ data: mkSkills(12) })
+    const w = await mountView()
+    expect(rowNames(w)).toHaveLength(10)
+    expect(rowNames(w)[0]).toBe('skill-1')
+    expect(rowNames(w)[9]).toBe('skill-10')
+    expect(w.find('[data-test="skill-count"]').text()).toBe('12')
+
+    await w.find('[data-test="skill-pagination"] [data-page="2"]').trigger('click')
+    expect(rowNames(w)).toEqual(['skill-11', 'skill-12'])
+    expect(w.find('[data-test="skill-count"]').text()).toBe('12')
+  })
+
+  it('恰 10 条不挂分页条', async () => {
+    mocks.api.listSkills.mockResolvedValue({ data: mkSkills(10) })
+    const w = await mountView()
+    expect(w.findAll('.stub-table-row')).toHaveLength(10)
+    expect(w.find('[data-test="skill-pagination"]').exists()).toBe(false)
+  })
+
+  it('在末页删掉该页唯一一条 → 派生 clamp 回第 1 页，分页条随之隐藏', async () => {
+    mocks.api.listSkills.mockResolvedValue({ data: mkSkills(11) })
+    mocks.api.deleteSkill.mockResolvedValue({ data: { ok: true } })
+    mocks.antd.Modal.confirm.mockImplementation(({ onOk }) => onOk())
+    const w = await mountView()
+    await w.find('[data-test="skill-pagination"] [data-page="2"]').trigger('click')
+    expect(w.findAll('.stub-table-row')).toHaveLength(1)
+
+    const delBtn = w.findAll('.stub-table-row')[0].findAll('.stub-a-button')
+      .find((b) => b.text().replace(/\s+/g, '') === '删除')
+    await delBtn.trigger('click')
+    await flushPromises()
+
+    expect(mocks.api.deleteSkill).toHaveBeenCalledWith(11)
+    expect(w.findAll('.stub-table-row')).toHaveLength(10)
+    expect(w.find('[data-test="skill-pagination"]').exists()).toBe(false)
   })
 })
 
