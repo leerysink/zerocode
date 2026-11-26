@@ -39,6 +39,8 @@ build-output*.zip
 # 一次性工单/草稿产物（本机工作记录，不入库）
 .scratch/
 .qoder-tmp/
+# Qoder 工作区：.qoder/worktrees/ 下是本机 git worktree 副本（含嵌套 .git），不入库
+.qoder/
 
 # Gateway 自签证书（本机生成，不入库）
 gateway/certs/
