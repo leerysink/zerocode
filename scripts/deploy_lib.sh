@@ -301,6 +301,17 @@ zc_images_ready() { # $1=manifest 文件 ; 0=全齐且 ID 一致 1=需要 load 2
   return 0
 }
 
+zc_build_plan() { # $1=快照就绪(1=就绪，同 IMAGES_READY) $2=部署根 $3=打包烘的根 ; stdout=skip|build
+  # skip＝包内快照就是本次要跑的镜像（升级的新代码经新快照 load 进来），up -d 即可；
+  # 换根必须 build：backend 镜像 WORKDIR 是构建期值（ADR-0034），快照烘的是打包根。
+  local ready="${1:-0}" root="${2:-}" baked="${3:-}"
+  if [ "$ready" = 1 ] && [ -n "$root" ] && [ "$root" = "$baked" ]; then
+    printf 'skip\n'
+  else
+    printf 'build\n'
+  fi
+}
+
 # ---------------------------------------------------------------- 端口占用者（US-10 之后的腾端口）
 #
 # 沿用现有脚本的立场：容器可以问完人再 stop，宿主进程一律不代劳 kill——认不出它是 ssh 还是

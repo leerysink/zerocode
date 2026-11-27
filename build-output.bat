@@ -18,7 +18,7 @@ REM  running batch file, which splits echo text into bogus commands.
 REM  Human-facing Chinese output comes from the Python script instead.
 REM
 REM  Usage: build-output.bat [args forwarded to scripts\build_output.py]
-REM    build-output.bat                        platform only, no preset apps
+REM    build-output.bat                        platform only, no presets, no images
 REM    build-output.bat --slugs test1          preset a single app
 REM    build-output.bat --slugs test1,sqlc002  ship test1 and sqlc002 as presets
 REM    build-output.bat --deploy-root /srv/zc  different server deploy root
@@ -29,8 +29,8 @@ REM    build-output.bat --gateway-domain <domain>   gateway wildcard domain (env
 REM    build-output.bat --apt-mirror mirrors.aliyun.com   Debian + docker-ce mirror host (env: ZEROCODE_APT_MIRROR)
 REM    build-output.bat --pypi-mirror https://mirrors.aliyun.com/pypi/simple   (env: ZEROCODE_PYPI_MIRROR)
 REM    build-output.bat --npm-registry https://registry.npmmirror.com   (env: ZEROCODE_NPM_REGISTRY)
-REM    build-output.bat --no-images          skip the ~450MB image bundle (deploy pulls instead)
-REM    build-output.bat --refresh-images     pull the 5 platform images before saving them
+REM    build-output.bat --images           include the ~1GB+ image bundle (off by default)
+REM    build-output.bat --refresh-images    with --images: pull the 5 base images before saving
 REM
 REM  --no-pause matters more than it looks: every exit path ends in `pause`
 REM  so a double-clicked window stays open long enough to read the Chinese

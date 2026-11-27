@@ -380,20 +380,24 @@ embedding 模型（见 ADR-0012）；embedding 未配置时**降级为关键词�
 
 把平台打到演示服务器所需的**一次性交付目录**，由 `build-output.bat`（入口）调 Python 脚本生成，
 可反复重跑、每次覆盖重建。内容边界：后端源码与 Dockerfile、前端 `dist`、合成的 `init.sql`、
-`docker-compose.yml`、`.env.example`、部署说明、预置应用源码，以及默认随包产出的**镜像包**
-（`--no-images` 可关，见下节）。**不含**任何凭据。
+`docker-compose.yml`、`.env.example`、部署说明、预置应用源码；默认不含镜像包，
+加 `build-output.bat --images` 才产出**镜像包**（见下节）。**不含**任何凭据。
 它是生成物而非真相源——真相仍在 `changelog/`、`app/`、`frontend/` 与各应用的 `app.json`。
 
 ## 镜像包（image bundle）
 
 `build-output/images/` 下的平台**安装期**镜像快照：打包机 `docker save` 出的 gzip tar + manifest，
-固定五个——`pgvector/pgvector:pg16`、`python:3.12-slim`、`python:3.12-slim-trixie`、
-`openresty/openresty:alpine`、`postgres:16-alpine`（平台首启构建 `zerocode-sqlrunner` 的基座）。
-它只解决**安装期免拉取**：应用模板的构建镜像（node/maven/jdk/redis）不进包，构建期 pip/npm/apt
-也仍在线。打包默认产出，`--no-images` 关、`--refresh-images` 先把五个镜像拉新再存；打包机缺镜像
-时自动经 `docker.m.daocloud.io` 拉取并回官方 tag，有本地快照时默认不再联网刷新。部署时 deploy.sh
-在预热前 `docker load`（manifest 里镜像 ID 与本地全一致才跳过），load 成功后**彻底跳过**联网预热
-与 compose pull——同 tag 的新 tar 即覆盖旧快照（ADR-0072）。
+五个基础镜像——`pgvector/pgvector:pg16`、`python:3.12-slim`、`python:3.12-slim-trixie`、
+`openresty/openresty:alpine`、`postgres:16-alpine`（平台首启构建 `zerocode-sqlrunner` 的基座）——
+加四个打包机 build 好的服务镜像（`zerocode-platform/browser/sandbox/sandbox-egress:demo`，
+打包机先 `compose build` 再 save，构建成本只在打包机付一次）。
+它解决**安装期免拉取＋同根免构建**：应用模板的构建镜像（node/maven/jdk/redis）不进包，应用的
+构建期 pip/npm/apt 也仍在线。打包默认产出约 3MB 小包，`build-output.bat --images` 才内置快照；
+`--refresh-images` 须与 `--images` 同用，先把五个基础镜像拉新再存；打包机缺基础镜像时自动经
+`docker.m.daocloud.io` 拉取并回官方 tag，有本地快照时默认不再联网刷新。部署时 deploy.sh 在预热前 `docker load`（manifest 里镜像 ID 与本地全一致才跳过），
+load 成功后**彻底跳过**联网预热与 compose pull；快照就绪且部署根＝打包根时 `up -d` 跳过
+`--build`（`zc_build_plan`；换根仍重建，WORKDIR 是构建期值），同 tag 的新 tar 即覆盖旧快照
+（ADR-0072，2026-11-26 修订）。
 
 ## init.sql（全量初始化脚本）
 

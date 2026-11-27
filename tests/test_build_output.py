@@ -230,8 +230,7 @@ def _build(repo: Path, **kw) -> dict:
     kw.setdefault("deploy_root", ROOT)
     kw.setdefault("generated_at", STAMP)
     kw.setdefault("out", repo / "build-output")
-    # 这组用例的前提是「不碰 docker」；镜像包路径由下面的专项用例注入假 seam 覆盖。
-    kw.setdefault("with_images", False)
+    # 这组用例默认不碰 docker；镜像包路径由下面的专项用例注入假 seam 覆盖。
     return bo.build(repo_root=repo, **kw)
 
 
@@ -429,16 +428,29 @@ def test_repo_deploy_kernel_warms_only_pullable_images():
     assert "pull_bases" in code and "FROM" in code, "构建期基础镜像的预热退化了（境内机真卡点）"
 
 
-def test_repo_deploy_kernel_always_rebuilds_buildable_images():
-    """回归钉（2026-11-04 线上实撞）：平台后端与前端 dist 都烘在镜像里（backend/Dockerfile 只
-    COPY backend/app 与 frontend/dist），镜像已存在时 `docker compose up -d` 不会重建。同根升级
-    因此静默停在旧镜像——新包传上去，控制台还是旧版（uni-app 选项整块消失）。起栈必须无条件
-    带 --build，不许再有「根没变就不重建」的分支。"""
+def test_repo_deploy_kernel_skips_build_only_when_snapshot_ready_and_same_root():
+    """回归钉（2026-11-04 实撞）：平台代码与前端 dist 烘在镜像里，裸 `up -d` 会让升级静默停旧版。
+    ADR-0072 修订后免重建只有一个合法出口：快照就绪且部署根＝打包根（升级的新代码经新快照 load
+    进来，compose 见镜像 ID 变化会重建容器）。无快照或换根仍必须 --build（WORKDIR 是构建期值），
+    且判定走 zc_build_plan 桩测函数，不许在脚本里手写 if 绕开。"""
     kernel = (bo.REPO_ROOT / "scripts" / "deploy.sh").read_text(encoding="utf-8")
     code = "\n".join(l for l in kernel.splitlines() if not l.lstrip().startswith("#"))
-    assert "docker compose up -d --build" in code, "起栈不再重建镜像：升级会静默留在旧版"
-    assert not re.search(r"docker compose up -d(?! --build)", code), "又出现了不带 --build 的起栈分支"
-    assert "不必重建镜像" not in code
+    assert "docker compose up -d --build" in code, "无快照/换根的重建分支没了"
+    assert 'zc_build_plan "$IMAGES_READY" "$DEPLOY_ROOT" "$BAKED_ROOT"' in code, \
+        "免重建判定没走 zc_build_plan（快照就绪＋同根）"
+    assert 'if [ "$BUILD_PLAN" = skip ]' in code and "docker compose up -d ||" in code, \
+        "快照就绪的免重建分支没了"
+
+
+def test_repo_deploy_kernel_keeps_apt_mirror_out_of_daemon_json():
+    """通道拆分回归钉（2026-11-26 实撞）：apt 镜像站（deb/GPG，/docker-ce 约定路径）与 registry
+    加速（Registry v2 代理）是两条通道；把 apt 站写进 registry-mirrors 只会 404 回落直连。
+    第 2 步安装分支不许写 daemon.json，registry 加速的唯一入口是第 7 步拉不动时的提问。"""
+    kernel = (bo.REPO_ROOT / "scripts" / "deploy.sh").read_text(encoding="utf-8")
+    body = kernel[kernel.index("ensure_docker() {"):kernel.index('say "2/9')]
+    assert "apply_registry_mirror" not in body, "安装分支又把 apt 镜像站写进 daemon.json"
+    assert "zc_install_commands" in body, "安装命令生成没了"
+    assert 'apply_registry_mirror "$PULL_MIRROR"' in kernel, "第 7 步的 registry 加速入口没了"
 
 
 def test_repo_deploy_kernel_waits_for_the_daemon_it_just_started():
@@ -2289,13 +2301,13 @@ def test_readme_documents_the_packaged_gateway_instead_of_denying_it(fake_repo):
     assert (out / "gateway" / "docker-compose.yml").is_file()
 
 
-def test_readme_tells_upgraders_up_is_always_build(fake_repo):
-    """README 的升级说明必须与脚本一致：同根升级也要重建镜像。写成「根没变就 up -d」会把人
-    引向「包传了就该生效」的错觉（2026-11-04 uni-app 实撞）。"""
+def test_readme_documents_snapshot_skip_and_fallback_build(fake_repo):
+    """README 的起栈说明必须与脚本一致：快照就绪且同根免重建，无快照或换根 --build。
+    只写一面都会误导（2026-11-04 uni-app 实撞：裸 up -d 停旧版；2026-11-26 实撞：弱机全量 build 两小时）。"""
     out = _build(fake_repo)["out"]
     readme = (out / "README-deploy.md").read_text(encoding="utf-8")
     assert "up -d --build" in readme
-    assert "没变就 `docker compose up -d`" not in readme, "README 还在教「根没变不必重建」"
+    assert "免重建" in readme, "README 没写快照就绪免重建"
 
 
 # ---------------------------------------------------------------- 网关入包（ADR-0018）
@@ -2403,6 +2415,27 @@ def test_bat_forwards_gateway_domain_instead_of_swallowing_it():
     block = bat[bat.index(":parse_args"):bat.index(":args_done")]
     assert "--gateway-domain" not in block, f"bat 把 --gateway-domain 当自己的开关吃了：{block}"
     assert "build-output.bat --gateway-domain" in bat, "header 用法区没写这个参数"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="build-output.bat 只能在 cmd.exe 下执行")
+@pytest.mark.parametrize("flags,expected", [([], []), (["--images"], ["--images"])])
+def test_bat_forwards_images_flag_to_packager(tmp_path, flags, expected):
+    bat_dir = tmp_path / "bat entry"
+    (bat_dir / "scripts").mkdir(parents=True)
+    bat = bat_dir / "build-output.bat"
+    bat.write_bytes((bo.REPO_ROOT / "build-output.bat").read_bytes())
+    (bat_dir / "scripts" / "build_output.py").write_text(
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        "Path(os.environ['ZC_ARGS_OUT']).write_text(json.dumps(sys.argv[1:]), encoding='utf-8')\n",
+        encoding="utf-8")
+    args_out = tmp_path / "args.json"
+    env = dict(os.environ, ZC_ARGS_OUT=str(args_out))
+    r = subprocess.run(["cmd.exe", "/d", "/c", str(bat), "--skip-frontend", "--no-pause", *flags],
+                       cwd=bat_dir, env=env, capture_output=True, text=True,
+                       encoding="utf-8", errors="replace")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert json.loads(args_out.read_text(encoding="utf-8")) == expected
 
 
 def test_bad_gateway_domain_preserves_previous_package(fake_repo, monkeypatch):
@@ -2832,9 +2865,12 @@ def test_image_refs_cover_every_pullable_image():
     compose = bo.compose_yaml(ROOT)
     for img in re.findall(r"^\s*image:\s*(\S+)", compose, re.M):
         if img.startswith("zerocode-"):
-            assert img not in refs, f"构建目标 {img} 混进了镜像包名单"
+            assert img not in refs, f"构建目标 {img} 混进了基础镜像名单"
         else:
             assert img in refs, f"compose 的服务镜像 {img} 不在镜像包名单"
+    built = {img for img in re.findall(r"^\s*image:\s*(\S+)", compose, re.M)
+             if img.startswith("zerocode-")}
+    assert built == set(bo.BUILT_IMAGE_REFS), "构建目标名单与 compose 的 tag 漂移"
     gw = (bo.REPO_ROOT / "gateway" / "docker-compose.yml").read_text(encoding="utf-8")
     for img in re.findall(r"^\s*image:\s*(\S+)", gw, re.M):
         assert img in refs, f"网关镜像 {img} 不在镜像包名单"
@@ -2847,6 +2883,61 @@ def test_image_refs_cover_every_pullable_image():
             assert base in refs, f"{origin} 的 FROM {base} 不在镜像包名单"
 
 
+def _fake_image_tools(monkeypatch):
+    fake = _FakeDocker(present=set(bo.IMAGE_REFS) | set(bo.BUILT_IMAGE_REFS))
+    builds = []
+
+    def fake_compose(args):
+        builds.append(list(args))
+        return subprocess.CompletedProcess(["docker", *args], 0, "", "")
+
+    monkeypatch.setattr(bo, "_run_docker", fake)
+    monkeypatch.setattr(bo, "_run_compose", fake_compose)
+    monkeypatch.setattr(bo, "_docker_save", lambda refs, fh: fh.write(b"FAKE-TAR"))
+    return fake, builds
+
+
+def test_build_defaults_to_without_images(fake_repo, monkeypatch):
+    fake, builds = _fake_image_tools(monkeypatch)
+    s = bo.build(repo_root=fake_repo, out=fake_repo / "default-output",
+                 slugs=("demo1", "demo2"), generated_at=STAMP)
+    assert s["images"] is None
+    assert not (s["out"] / "images").exists()
+    assert fake.calls == [] and builds == []
+
+
+def test_main_images_flag_builds_bundle(fake_repo, monkeypatch):
+    _fake_image_tools(monkeypatch)
+    monkeypatch.setattr(bo, "REPO_ROOT", fake_repo)
+    out = fake_repo / "cli-output"
+    try:
+        rc = bo.main(["--out", str(out), "--images"])
+    except SystemExit as e:
+        rc = e.code
+    assert rc == 0
+    assert (out / "images" / bo.IMAGE_BUNDLE_TAR).is_file()
+
+
+def test_main_refresh_images_requires_images_flag(fake_repo, monkeypatch, capsys):
+    _fake_image_tools(monkeypatch)
+    monkeypatch.setattr(bo, "REPO_ROOT", fake_repo)
+    assert bo.main(["--out", str(fake_repo / "cli-output"), "--refresh-images"]) == 2
+    assert "--images" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("with_images,expected", [
+    (False, "本包未包含镜像包"),
+    (True, "本包包含镜像包"),
+])
+def test_readme_reflects_image_bundle_choice(fake_repo, monkeypatch, with_images, expected):
+    if with_images:
+        _fake_image_tools(monkeypatch)
+    readme = (_build(fake_repo, with_images=with_images)["out"] / "README-deploy.md").read_text(
+        encoding="utf-8")
+    assert expected in readme
+    assert "build-output.bat --images" in readme
+
+
 def test_build_without_images_leaves_no_bundle(fake_repo):
     s = _build(fake_repo)
     assert s["images"] is None
@@ -2854,14 +2945,24 @@ def test_build_without_images_leaves_no_bundle(fake_repo):
 
 
 def test_build_with_images_writes_bundle(fake_repo, monkeypatch):
-    fake = _FakeDocker(present=bo.IMAGE_REFS)
+    fake = _FakeDocker(present=set(bo.IMAGE_REFS) | set(bo.BUILT_IMAGE_REFS))
+    builds = []
+
+    def fake_compose(args):
+        builds.append(list(args))
+        return subprocess.CompletedProcess(["docker", *args], 0, "", "")
+
     monkeypatch.setattr(bo, "_run_docker", fake)
+    monkeypatch.setattr(bo, "_run_compose", fake_compose)
     monkeypatch.setattr(bo, "_docker_save", lambda refs, fh: fh.write(b"FAKE-TAR"))
     s = _build(fake_repo, with_images=True)
+    staging = s["out"].parent / (s["out"].name + ".staging")
+    assert builds == [["compose", "-f", str(staging / "docker-compose.yml"),
+                       "build", *bo.BUILT_SERVICES]], "打包机没先 build 四个服务镜像"
     images = s["out"] / "images"
     manifest = (images / bo.IMAGE_BUNDLE_MANIFEST).read_text(encoding="utf-8")
     pairs = [l.split("\t") for l in manifest.splitlines() if l and not l.startswith("#")]
-    assert [ref for ref, _ in pairs] == list(bo.IMAGE_REFS)
+    assert [ref for ref, _ in pairs] == list(bo.IMAGE_REFS + bo.BUILT_IMAGE_REFS)
     assert all(img_id for _, img_id in pairs)
     assert gzip.decompress((images / bo.IMAGE_BUNDLE_TAR).read_bytes()) == b"FAKE-TAR"
     assert "images" in bo.dockerignore().split()
@@ -2869,11 +2970,12 @@ def test_build_with_images_writes_bundle(fake_repo, monkeypatch):
 
 def test_save_images_uses_daocloud_when_official_is_unreachable(tmp_path):
     ref = bo.IMAGE_REFS[0]
-    fake = _FakeDocker(present=set(bo.IMAGE_REFS) - {ref}, pull_fail={ref})
+    fake = _FakeDocker(present=(set(bo.IMAGE_REFS) - {ref}) | set(bo.BUILT_IMAGE_REFS),
+                       pull_fail={ref})
     fake.present.add(bo.mirror_ref(ref))
     info = bo.save_images(tmp_path / "images", run=fake,
                           save=lambda refs, fh: fh.write(b"T"))
-    assert info["refs"] == len(bo.IMAGE_REFS)
+    assert info["refs"] == len(bo.IMAGE_REFS) + len(bo.BUILT_IMAGE_REFS)
     assert ["pull", bo.mirror_ref(ref)] in fake.calls
     assert ["tag", bo.mirror_ref(ref), ref] in fake.calls
 
@@ -2885,19 +2987,54 @@ def test_official_names_get_the_library_prefix_on_the_mirror():
 
 def test_save_images_aborts_when_both_sources_fail(tmp_path):
     ref = bo.IMAGE_REFS[0]
-    fake = _FakeDocker(present=set(bo.IMAGE_REFS) - {ref}, pull_fail={ref, bo.mirror_ref(ref)})
+    fake = _FakeDocker(present=(set(bo.IMAGE_REFS) - {ref}) | set(bo.BUILT_IMAGE_REFS),
+                       pull_fail={ref, bo.mirror_ref(ref)})
     with pytest.raises(bo.BuildError, match="镜像拉不到"):
         bo.save_images(tmp_path / "images", run=fake, save=_no_save)
 
 
-def test_refresh_images_pulls_even_when_present(tmp_path):
+def test_save_images_never_pulls_built_targets(tmp_path):
+    """构建目标不在任何 registry：缺了只能拒包让打包机先 build，走 pull 兜底是假希望。"""
     fake = _FakeDocker(present=bo.IMAGE_REFS)
+    with pytest.raises(bo.BuildError, match="构建目标镜像缺失"):
+        bo.save_images(tmp_path / "images", run=fake, save=_no_save)
+    assert not [c for c in fake.calls if c and c[0] == "pull"
+                and c[1] in bo.BUILT_IMAGE_REFS]
+
+
+def test_build_service_images_builds_the_four_services(tmp_path):
+    calls = []
+
+    def run(args):
+        calls.append(list(args))
+        return subprocess.CompletedProcess(["docker", *args], 0, "", "")
+
+    bo.build_service_images(tmp_path, run=run)
+    assert calls == [["compose", "-f", str(tmp_path / "docker-compose.yml"),
+                      "build", *bo.BUILT_SERVICES]]
+
+
+def test_build_service_images_aborts_on_failure(tmp_path):
+    def run(args):
+        return subprocess.CompletedProcess(["docker", *args], 1, "", "boom")
+
+    with pytest.raises(bo.BuildError, match="compose build 失败"):
+        bo.build_service_images(tmp_path, run=run)
+
+
+def test_refresh_images_pulls_even_when_present(tmp_path):
+    fake = _FakeDocker(present=set(bo.IMAGE_REFS) | set(bo.BUILT_IMAGE_REFS))
     info = bo.save_images(tmp_path / "images", refresh=True, run=fake,
                           save=lambda refs, fh: fh.write(b"T"))
     assert info["refreshed"] is True
+    # refresh 只拉基础镜像；构建目标的新鲜度由打包机 compose build 负责，不走 pull
     assert sum(1 for c in fake.calls if c and c[0] == "pull") == len(bo.IMAGE_REFS)
 
 
-def test_main_rejects_refresh_images_together_with_no_images(capsys):
-    assert bo.main(["--no-images", "--refresh-images"]) == 2
-    assert "--no-images" in capsys.readouterr().err
+def test_main_rejects_removed_no_images_flag(capsys):
+    try:
+        rc = bo.main(["--no-images"])
+    except SystemExit as e:
+        rc = e.code
+    assert rc == 2
+    assert "unrecognized arguments: --no-images" in capsys.readouterr().err

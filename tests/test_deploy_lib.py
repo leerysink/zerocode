@@ -726,3 +726,19 @@ def test_images_ready_is_false_on_id_drift_or_missing_image(tmp_path):
 
 def test_images_ready_reports_unusable_manifest(tmp_path):
     assert _only(tmp_path, "zc_images_ready", str(tmp_path / "nope.tsv")).returncode == 2
+
+
+def test_build_plan_skips_only_when_ready_and_same_root():
+    assert out(sh("zc_build_plan", "1", "/opt/zerocode", "/opt/zerocode")) == "skip"
+
+
+def test_build_plan_builds_when_root_changed():
+    assert out(sh("zc_build_plan", "1", "/srv/zc", "/opt/zerocode")) == "build"
+
+
+def test_build_plan_builds_without_snapshot():
+    assert out(sh("zc_build_plan", "0", "/opt/zerocode", "/opt/zerocode")) == "build"
+
+
+def test_build_plan_builds_on_empty_root():
+    assert out(sh("zc_build_plan", "1", "", "/opt/zerocode")) == "build"

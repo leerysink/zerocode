@@ -57,7 +57,7 @@ done
 for want in zc_normalize_root zc_valid_password zc_env_render zc_env_backup zc_merge_plan \
             zc_env_gaps zc_pkg_manager zc_busy zc_port_holder_kind zc_port_holder_pid \
             zc_install_commands zc_answers_get zc_answers_put \
-            zc_docker_repo_suite zc_images_ready \
+            zc_docker_repo_suite zc_images_ready zc_build_plan \
             zc_add_docker_group_command zc_untouchables zc_daemon_json_plan zc_daemon_json_write; do
   declare -F "$want" >/dev/null || fail "deploy_lib.sh 里缺 $want——这份 lib 比 deploy.sh 旧，重打包再传"
 done
@@ -252,10 +252,12 @@ ensure_docker() {
         # 装的是 Docker Engine + compose v2 插件；不装 Docker Desktop（ADR-0035：license 与
         # docker CLI 的接管权都会跟这条路打架）。
         printf '\n▶ 用 %s 安装 Docker Engine 与 compose v2 插件\n' "$pm" >&2
-        mh=""
         MIRROR_HOST=""
-        if ask_yes "先配 registry 镜像加速？境内机直连 Docker Hub 常拉不动基础镜像（y/N）" n; then
-          mh="$(ask '镜像站地址（如 https://<id>.mirror.aliyuncs.com，或 mirrors.aliyun.com）' '')"
+        # 只问 apt 安装通道：境内直连 download.docker.com 取 GPG 常被 reset（2026-11-26 实撞）。
+        # registry 加速（daemon.json）是另一条通道——apt 镜像站不讲 Registry v2，写进去只会
+        # 404 回落直连——留给第 7 步拉不动时的提问，这里不写。
+        if ask_yes "境内直连 download.docker.com 常被 reset。用镜像站装 Docker Engine？(Y/n)" y; then
+          mh="$(ask 'apt 安装镜像站（只管 docker-ce 的 deb/GPG，如 mirrors.tuna.tsinghua.edu.cn）' 'mirrors.tuna.tsinghua.edu.cn')"
           valid_mirror "$mh" || fail "镜像站地址只允许字母、数字与 . : / _ - ：$mh"
           # 先摘出主机名：apt 源里的 docker-ce 仓库走镜像站的 /docker-ce/linux/<distro> 约定路径。
           MIRROR_HOST="$(printf '%s' "$mh" | sed -n 's|^https\?://\([^/]\+\).*|\1|p')"
@@ -268,7 +270,6 @@ ensure_docker() {
           # 必须在 root 的当前 shell 里展开，所以用 eval；镜像站地址已经过 valid_mirror 收窄。
           eval "$line" || fail "这条命令没跑过去：$line"
         done < <(zc_install_commands "$pm" "$MIRROR_HOST")
-        apply_registry_mirror "$mh"
         ;;
       *)
         printf '  docker CLI 与 compose 都在，缺的是「能连上守护进程」那一环。\n' >&2
@@ -627,7 +628,7 @@ fi
 # 镜像包（ADR-0072）：打包器在 images/ 里放了平台安装期五个镜像的快照 + manifest。本机镜像 ID
 # 与清单全一致就跳过 load；否则 load 一次（升级包带新快照时，同 tag 覆盖旧镜像）。load 成功后
 # 整段联网预热与 compose pull 都跳过——境内机上那一步就是安装耗时的大头。没有镜像包
-# （--no-images 出的包、或更早的包）时保持原行为，下面两条腿照跑。
+# （默认小包、未加 --images 的包、或更早的包）时保持原行为，下面两条腿照跑。
 IMAGES_READY=0
 IMG_MANIFEST="$PKG/images/manifest.tsv"
 IMG_TAR="$PKG/images/zerocode-images.tar.gz"
@@ -685,9 +686,9 @@ else
   PULLFAIL="$(pull_bases)"
   COMPOSE_PULL_BAD=0
   pull_service_images || COMPOSE_PULL_BAD=1
-  # 装 docker 那一步才问 mirror（US-11），但「机器上早就有 docker、只是拉不动 Docker Hub」才是境内
-  # 演示机最常见的形态——那时候安装分支根本不会进，所以这里必须再给一次机会，否则第 7 步的报错
-  # 会让人去重跑一个永远不会触发的提问。
+  # 第 2 步的镜像站提问只管 apt 安装通道（不写 daemon.json）；registry 加速只在这里问——
+  # 「机器上早就有 docker、只是拉不动 Docker Hub」才是境内演示机最常见的形态，那时候安装
+  # 分支根本不会进，所以这里必须是 registry 加速的唯一入口。
   if { [ -n "$PULLFAIL" ] || [ "$COMPOSE_PULL_BAD" = 1 ]; } \
      && ask_yes "上面这些镜像拉不动。现在配 registry 镜像加速吗？写 /etc/docker/daemon.json 并重启 docker 后重拉（y/N）" n; then
     # 默认值取本机实测可达的 daocloud 公共加速站；阿里云/腾讯的官方加速器只对自家云内机器开放，
@@ -713,19 +714,31 @@ if [ "$DROP_DB" = 1 ]; then
   warn "旧栈与 pgdata 卷已清除"
 fi
 
-# 平台代码与前端 dist 都烘在镜像里（backend/Dockerfile 只 COPY backend/app 与 frontend/dist），
-# 部署根里的同名文件只是构建上下文：镜像已存在时 `docker compose up -d` 不会重建，升级就会
-# 静默停在旧镜像——现象是「新包传上去了，控制台还是旧版」（2026-11-04 uni-app 选项实撞）。
-# 所以起栈一律 --build；缓存命中时只多几十秒，比静默不升级便宜得多。
-say "docker compose up -d --build（升级必须重建：平台与浏览器代码都烘在镜像里；浏览器镜像含 Chromium，首次几分钟起）"
-docker compose up -d --build || fail "起栈失败：docker compose logs backend --tail 100（镜像里的依赖装不动就回头看第 7 步的镜像源提示）"
+# 平台代码与前端 dist 都烘在镜像里（backend/Dockerfile 只 COPY backend/app 与 frontend/dist）。
+# 快照就绪且部署根＝打包根：包内快照就是本次要跑的镜像（升级的新代码经新快照 load 进来，
+# compose up -d 见镜像 ID 变化会重建容器），跳过 --build——新机器由此免掉整段 pip/apt/Playwright
+# 构建（2 核演示机全量 build 实测约 2 小时，2026-11-26）。无快照或换根仍 --build：WORKDIR 是
+# 构建期值（ADR-0034）。判定在 zc_build_plan（桩测覆盖）。
+BUILD_PLAN="$(zc_build_plan "$IMAGES_READY" "$DEPLOY_ROOT" "$BAKED_ROOT")"
+if [ "$BUILD_PLAN" = skip ]; then
+  say "docker compose up -d（快照就绪且部署根未变：免重建）"
+  docker compose up -d || fail "起栈失败：docker compose logs backend --tail 100"
+else
+  say "docker compose up -d --build（无快照或换根：必须重建；浏览器镜像含 Chromium，首次几分钟起）"
+  docker compose up -d --build || fail "起栈失败：docker compose logs backend --tail 100（镜像里的依赖装不动就回头看第 7 步的镜像源提示）"
+fi
 
-# 沙箱两个镜像必须显式 build（ADR-0066）：sandbox-image 带 profiles: [build-only]——它不是常驻
-# 服务，平台按需 docker run 起一次性容器，所以 `up -d --build` 不会构建它。漏这一步的表现是
-# run_python/run_shell 恒回「沙箱镜像未构建」，而平台其余功能一切正常，很难联想到这里。
-say "docker compose build sandbox-image sandbox-egress（沙箱执行环境 + 出口 router；首次装 pandas 等轮子，数分钟）"
-docker compose build sandbox-image sandbox-egress \
-  || fail "沙箱镜像构建失败：docker compose build sandbox-image 看日志；网络受限先设 .env 里的 ZEROCODE_APT_MIRROR / ZEROCODE_PYPI_MIRROR"
+# 沙箱两个镜像：快照里已含（BUILT_IMAGE_REFS），就绪即跳过显式 build；无快照时必须显式 build
+# （ADR-0066）：sandbox-image 带 profiles: [build-only]——它不是常驻服务，平台按需 docker run
+# 起一次性容器，`up -d --build` 不会构建它。漏这一步的表现是 run_python/run_shell 恒回
+# 「沙箱镜像未构建」，而平台其余功能一切正常，很难联想到这里。
+if [ "$IMAGES_READY" = 1 ]; then
+  ok "沙箱两镜像已含在包内快照，跳过显式 build"
+else
+  say "docker compose build sandbox-image sandbox-egress（沙箱执行环境 + 出口 router；首次装 pandas 等轮子，数分钟）"
+  docker compose build sandbox-image sandbox-egress \
+    || fail "沙箱镜像构建失败：docker compose build sandbox-image 看日志；网络受限先设 .env 里的 ZEROCODE_APT_MIRROR / ZEROCODE_PYPI_MIRROR"
+fi
 
 say "等就绪"
 pg=""
